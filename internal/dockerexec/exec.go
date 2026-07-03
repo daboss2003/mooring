@@ -227,5 +227,16 @@ func minimalEnv() []string {
 			env = append(env, k+"="+v)
 		}
 	}
+	// Disable BuildKit's default provenance/SBOM attestations. Without this, even a
+	// FULLY-CACHED `compose up --build` re-exports the image wrapped in a fresh
+	// attestation manifest (it embeds a build timestamp), which changes the image's
+	// manifest-list digest every deploy — so Compose sees "the image changed" and
+	// RECREATES the container of a service that didn't change at all (only its build
+	// dir is cache-keyed, so the layers are CACHED, but the attestation churns the
+	// digest). Turning attestations off makes a cached build reproduce the identical
+	// digest, so unchanged build-services stay running across deploys. Provenance for a
+	// locally-built app image (that never leaves the host) adds no supply-chain value
+	// here; upstream-image integrity is handled by digest-pinning instead.
+	env = append(env, "BUILDX_NO_DEFAULT_ATTESTATIONS=1")
 	return env
 }

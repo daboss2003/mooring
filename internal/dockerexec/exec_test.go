@@ -24,6 +24,21 @@ func TestJobArgvIsStaticAndTerminated(t *testing.T) {
 	}
 }
 
+// The docker exec env must disable BuildKit default attestations, or a fully-cached
+// `compose up --build` re-exports a new image digest each deploy and needlessly
+// recreates unchanged build-services.
+func TestMinimalEnvDisablesAttestations(t *testing.T) {
+	found := false
+	for _, kv := range minimalEnv() {
+		if kv == "BUILDX_NO_DEFAULT_ATTESTATIONS=1" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("minimalEnv() must set BUILDX_NO_DEFAULT_ATTESTATIONS=1, got %v", minimalEnv())
+	}
+}
+
 func TestJobArgvIncludesEnvFile(t *testing.T) {
 	j := Job{Project: "shop", ConfigFiles: []string{"/c.yml"}, EnvFile: "/run/x.env", Action: []string{"up", "-d"}}
 	got := strings.Join(j.argv(), " ")
