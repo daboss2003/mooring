@@ -33,6 +33,7 @@ import (
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
+	"github.com/daboss2003/mooring/internal/imagescan"
 	"github.com/daboss2003/mooring/internal/l4"
 	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/ops"
@@ -92,6 +93,7 @@ type Deps struct {
 	ConfigPath  string               // for SIGHUP allowlist+auth reload
 	Version     string               // the running Mooring build version (for the Server tab's .deb cleanup)
 	UpdateCheck *updatecheck.Checker // self-update / security-advisory posture (nil when disabled)
+	ImageScans  *imagescan.Store     // per-app Trivy scan results (surface on the Server tab)
 	Log         *slog.Logger
 	Monitor     *monitor.Monitor
 	OpsStore    *ops.ConfigStore
@@ -168,6 +170,7 @@ type Server struct {
 	footprintOnce  sync.Once            // lazily builds the Server-tab disk-footprint cache
 	footprintC     *footprintCache      // cached on-disk footprint (off-request refresh)
 	updateCheck    *updatecheck.Checker // self-update / security-advisory posture (may be nil)
+	imageScans     *imagescan.Store     // per-app Trivy scan results (may be nil)
 }
 
 // New builds a Server from a validated config and its dependencies.
@@ -185,6 +188,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		configPath:    d.ConfigPath,
 		version:       d.Version,
 		updateCheck:   d.UpdateCheck,
+		imageScans:    d.ImageScans,
 		db:            d.DB,
 		sessions:      session.New(d.DB, cfg.Session.IdleTimeout.D(), cfg.Session.AbsoluteTimeout.D()),
 		audit:         audit.New(d.DB, log),

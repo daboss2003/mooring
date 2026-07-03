@@ -217,6 +217,9 @@ func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) 
 	if s.opsStore != nil {
 		add("ops", s.opsStore.DeleteApp(slug))
 	}
+	if s.imageScans != nil {
+		add("vuln scans", s.imageScans.Delete(ctx, slug))
+	}
 	if s.alertStore != nil {
 		add("alerts", s.alertStore.DeleteApp(ctx, slug))
 	}

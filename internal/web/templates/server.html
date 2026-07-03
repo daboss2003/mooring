@@ -73,6 +73,49 @@
   </section>
   {{end}}
 
+  {{/* Image / dependency vulnerabilities (opt-in Trivy scan). */}}
+  {{with .Server}}
+  <section class="panel">
+    <h2>Vulnerabilities <span class="muted">(image + dependency scan)</span></h2>
+    {{if not .ScanEnabled}}
+    <p class="muted">Off. To scan each deployed app's images (from the registry) and its dependencies for known CVEs, set <code>server.image_scan_enabled: true</code> in <code>/etc/mooring/config.yaml</code>. High/Critical findings raise an alert. Trivy never gets the Docker socket. Note it's resource-heavy (it downloads a vulnerability database).</p>
+    {{else if not .Scans}}
+    <p class="muted">Scanning is enabled — results appear here after the first scan completes (a few minutes after start, then on schedule).</p>
+    {{else}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>App</th><th class="num">Critical</th><th class="num">High</th><th class="num">Medium</th><th class="num">Low</th><th>Scanned</th><th>Top findings</th></tr></thead>
+      <tbody>
+        {{range .Scans}}
+        <tr class="{{if gt .Critical 0}}is-warn{{end}}">
+          <td>{{.Project}}</td>
+          <td class="num">{{if gt .Critical 0}}<span class="pill pill-down">{{.Critical}}</span>{{else}}0{{end}}</td>
+          <td class="num">{{if gt .High 0}}<span class="pill pill-warn">{{.High}}</span>{{else}}0{{end}}</td>
+          <td class="num">{{.Medium}}</td>
+          <td class="num">{{.Low}}</td>
+          <td class="mono">{{if .ScannedAt}}{{unixTime .ScannedAt}}{{else}}—{{end}}{{if .Error}} <span class="muted">({{.Error}})</span>{{end}}</td>
+          <td>
+            {{if .Reports}}
+            <details>
+              <summary class="link">view</summary>
+              {{range .Reports}}
+              <div class="mt1"><strong class="mono">{{.Target}}</strong>
+                {{if .Top}}<ul class="root-list">
+                  {{range .Top}}<li class="mono">{{.Severity}} · {{.ID}} · {{.Package}} {{.Installed}}{{if .Fixed}} → fixed {{.Fixed}}{{end}}{{if .URL}} <a href="{{.URL}}" target="_blank" rel="noopener noreferrer">↗</a>{{end}}</li>{{end}}
+                </ul>{{else}}<span class="muted"> clean</span>{{end}}
+              </div>
+              {{end}}
+            </details>
+            {{else}}<span class="muted">clean</span>{{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    <p class="muted">Findings are the app's known CVEs. Fix by upgrading the flagged packages (rebuild the app / bump the base image / update dependencies) and redeploying.</p>
+    {{end}}
+  </section>
+  {{end}}
+
   {{/* Read-only file view (opt-in). */}}
   {{with .Server}}
   <section class="panel">

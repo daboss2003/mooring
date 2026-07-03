@@ -11,6 +11,7 @@ import (
 
 	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/hostmon"
+	"github.com/daboss2003/mooring/internal/imagescan"
 	"github.com/daboss2003/mooring/internal/serverinfo"
 )
 
@@ -46,6 +47,10 @@ type serverView struct {
 	// file view (opt-in)
 	FileEnabled bool
 	FileRoots   []serverinfo.Root
+
+	// image vulnerability scans (opt-in): per-app Trivy results, worst-first.
+	ScanEnabled bool
+	Scans       []imagescan.AppScan
 }
 
 // hostmonSampleView mirrors hostmon.Sample for the template (kept local so the
@@ -175,6 +180,12 @@ func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 	fb := s.fileBrowser()
 	v.FileEnabled = fb.Enabled()
 	v.FileRoots = fb.Roots()
+	v.ScanEnabled = s.cfg.Server.ImageScanEnabled
+	if s.imageScans != nil {
+		if scans, err := s.imageScans.List(r.Context()); err == nil {
+			v.Scans = scans
+		}
+	}
 	s.render(w, r, "server.html", tmplData{Title: "Server — Mooring", Server: v, Error: r.URL.Query().Get("err")})
 }
 

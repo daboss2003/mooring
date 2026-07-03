@@ -29,6 +29,7 @@ import (
 	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/hostmon"
+	"github.com/daboss2003/mooring/internal/imagescan"
 	"github.com/daboss2003/mooring/internal/l4"
 	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/ntfy"
@@ -253,6 +254,47 @@ func cmdServe(args []string) error {
 		log.Info("self-update check enabled", "interval", iv)
 	}
 
+	// App-image / dependency vulnerability scanning (OPT-IN, HEAVY). Trivy scans each
+	// deployed app's upstream images (from the registry) + build checkouts (as a
+	// filesystem) — NEVER via the docker socket — and alerts on High/Critical. Results
+	// surface on the Server tab.
+	scanStore := imagescan.NewStore(db)
+	if cfg.Server.ImageScanEnabled {
+		iv := cfg.Server.ImageScanInterval.D()
+		if iv <= 0 {
+			iv = 24 * time.Hour
+		}
+		appsRoot := cfg.DataDir + "-apps"
+		targetsFn := func(context.Context) []imagescan.Target {
+			var out []imagescan.Target
+			apps, _ := gitStore.List()
+			for _, app := range apps {
+				def, err := defStore.Current(app.Project)
+				if err != nil || def == nil {
+					continue
+				}
+				hasBuild := false
+				for _, svc := range def.Spec.Compose.Services {
+					if svc.Build != nil {
+						hasBuild = true
+						continue
+					}
+					if svc.Image != "" {
+						out = append(out, imagescan.Target{Project: app.Project, Kind: imagescan.KindImage, Ref: svc.Image, Label: svc.Image})
+					}
+				}
+				if hasBuild {
+					out = append(out, imagescan.Target{Project: app.Project, Kind: imagescan.KindFS, Ref: filepath.Join(appsRoot, app.Project), Label: app.Project + " dependencies"})
+				}
+			}
+			return out
+		}
+		scanRunner := imagescan.NewRunner(imagescan.New("docker", imagescan.TrivyImage, 5*time.Minute), scanStore, alertStore, targetsFn, iv, log)
+		wg.Add(1)
+		go func() { defer wg.Done(); scanRunner.Run(ctx) }()
+		log.Info("image vulnerability scanning enabled", "interval", iv)
+	}
+
 	if cfg.Alerting.Enabled {
 		// The "open in dashboard" link in notifications is derived from admin.hostname
 		// (we already know where the dashboard lives) — no separate admin_url.
@@ -386,6 +428,7 @@ func cmdServe(args []string) error {
 		ConfigPath:  *configPath,
 		Version:     Version,
 		UpdateCheck: updateChecker,
+		ImageScans:  scanStore,
 		Log:         log,
 		Monitor:     mon,
 		OpsStore:    opsStore,

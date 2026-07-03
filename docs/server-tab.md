@@ -110,6 +110,39 @@ unattended box), and it's the exact "notify me to update" behavior other PaaS to
 the security-advisory layer added on top. With `version_check_enabled` off (the default),
 Mooring never contacts GitHub.
 
+## Scanning your apps for vulnerabilities (Trivy)
+
+Mooring can scan each **deployed app** for known CVEs and alert you on High/Critical
+findings — the "does my stack have a vulnerability" half. It's **opt-in and resource-heavy**
+(Trivy downloads a vulnerability database and scanning takes CPU/RAM), so it's off by default:
+
+```yaml
+server:
+  image_scan_enabled: true         # off by default
+  image_scan_interval: 24h         # optional; default 24h, floored at 1h
+```
+
+How it scans — **without ever giving Trivy the Docker socket** (Mooring's core security
+invariant):
+
+- **Upstream `image:` services** (e.g. `emqx/emqx:5.8.3`) are scanned **from the registry**
+  (`trivy image`) — no local Docker access needed.
+- **Build services** (your own code) are scanned as a **filesystem** (`trivy fs`) over the
+  checkout for language-dependency CVEs (npm / go / pip / …) — this is what catches the
+  vulnerabilities `npm audit` reports in your built image.
+
+Results appear on **Server → Vulnerabilities** (per-app Critical/High/Medium/Low counts + the
+top findings with fixed-in versions), and **High/Critical** totals raise an alert through your
+[alert channels](./alerting.md) (Critical when there are critical findings). It **re-scans on a
+schedule** — not just on deploy — because new CVEs are disclosed against unchanged images every
+day. Fix findings by upgrading the flagged packages (rebuild / bump the base image / update
+dependencies) and redeploying.
+
+> **Coverage note:** the filesystem scan covers your app's *dependencies*; base-image OS
+> packages are covered when they're upstream `image:` services. Giving Trivy the Docker socket
+> to scan the exact built-image layers would break the read-only-socket model, so Mooring
+> doesn't.
+
 ## Summary of config keys
 
 ```yaml
@@ -120,6 +153,8 @@ server:
       path: /var/log/myapp
   version_check_enabled: true      # optional; enables the self-update + security-advisory check
   version_check_interval: 6h       # optional; default 6h (floored at 1h)
+  image_scan_enabled: true         # optional; enables Trivy CVE scanning of deployed apps
+  image_scan_interval: 24h         # optional; default 24h (floored at 1h)
 ```
 
 All are optional and default to off. The host monitor, processes, and disk-usage views need no

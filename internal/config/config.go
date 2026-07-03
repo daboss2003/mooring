@@ -107,6 +107,16 @@ type ServerConfig struct {
 	VersionCheckEnabled bool `yaml:"version_check_enabled"`
 	// VersionCheckInterval is how often to poll (default 6h; clamped to a 1h floor).
 	VersionCheckInterval Duration `yaml:"version_check_interval"`
+
+	// ImageScanEnabled turns on periodic vulnerability scanning of each deployed app's
+	// images + dependencies with Trivy (High/Critical → an alert; results on the Server
+	// tab). OPT-IN and HEAVY (Trivy downloads a vuln DB + scans) — off by default. The
+	// scanner never gets the Docker socket: upstream images are scanned from the
+	// registry, build checkouts as a filesystem.
+	ImageScanEnabled bool `yaml:"image_scan_enabled"`
+	// ImageScanInterval is how often to re-scan (default 24h; clamped to a 1h floor).
+	// Re-scanning unchanged images matters — new CVEs are disclosed daily.
+	ImageScanInterval Duration `yaml:"image_scan_interval"`
 }
 
 // ServerFileRoot is one named, browsable directory.
