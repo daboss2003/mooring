@@ -81,6 +81,7 @@ cat > "$OUT/index.html" <<'HTML'
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="google-site-verification" content="PkuSMId0UAbJlQ-wI8AB1HFFVsSbJrXy2oOtxfDBClk">
 <title>Mooring — self-hosted PaaS for Docker | CapRover, Coolify &amp; Dokploy alternative</title>
 <meta name="description" content="Mooring is a lightweight, security-first self-hosted PaaS and control plane for Docker. Deploy multi-service apps from one typed YAML with automatic HTTPS, monitoring, alerts, backups, Git deploys and self-healing — no Docker Swarm or Kubernetes. A self-hosted Heroku/Railway and CapRover/Coolify/Dokploy alternative.">
 <meta name="keywords" content="self-hosted PaaS, self hosted paas, Docker PaaS, control plane for Docker, CapRover alternative, Coolify alternative, Dokploy alternative, Dokku alternative, Heroku alternative self-hosted, Railway alternative, Docker deployment platform, docker compose dashboard, deploy docker apps, self-hosted platform as a service, Mooring">
@@ -153,5 +154,9 @@ cat > "$OUT/sitemap.xml" <<'SITEMAP'
   <url><loc>https://daboss2003.github.io/mooring/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>
 </urlset>
 SITEMAP
+
+# Search-engine site-verification files (kept so they survive each re-publish).
+# Google Search Console (HTML-file method); add the Bing BingSiteAuth.xml here too.
+printf 'google-site-verification: googlebd8c74b732cfc831.html\n' > "$OUT/googlebd8c74b732cfc831.html"
 
 echo ">> done. Serve ./$OUT/ at your apt domain (e.g. https://daboss2003.github.io/mooring)."
