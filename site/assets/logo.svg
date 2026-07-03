@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="Mooring">
+  <title>Mooring</title>
+  <circle cx="12" cy="12" r="9"/>
+  <circle cx="12" cy="12" r="2.6"/>
+  <path d="M12 2.4v4.2M12 17.4v4.2M2.4 12h4.2M17.4 12h4.2M5.1 5.1l3 3M15.9 15.9l3 3M18.9 5.1l-3 3M8.1 15.9l-3 3"/>
+</svg>
