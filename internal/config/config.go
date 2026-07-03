@@ -98,6 +98,15 @@ type ServerConfig struct {
 	// behind password+TOTP re-auth. Must be absolute. It also must be within the
 	// service's writable paths for the delete to succeed (see docs).
 	DebCacheDir string `yaml:"deb_cache_dir"`
+
+	// VersionCheckEnabled turns on the periodic self-update check: Mooring asks the
+	// GitHub API whether a newer release exists and whether the RUNNING version is
+	// affected by a published security advisory (→ a persistent banner + a CRITICAL
+	// alert). OPT-IN (default off): when off, Mooring never contacts GitHub. When on,
+	// it contacts ONLY api.github.com and sends no telemetry payload.
+	VersionCheckEnabled bool `yaml:"version_check_enabled"`
+	// VersionCheckInterval is how often to poll (default 6h; clamped to a 1h floor).
+	VersionCheckInterval Duration `yaml:"version_check_interval"`
 }
 
 // ServerFileRoot is one named, browsable directory.

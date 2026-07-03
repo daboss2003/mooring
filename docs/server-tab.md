@@ -84,6 +84,32 @@ delete of files. Guardrails (all enforced after resolving symlinks):
   detected and not rendered.
 - **Audited** — every file read (and every denial) is written to the Audit log.
 
+## Staying up to date (self-update + security alerts)
+
+Mooring can watch **itself** for updates and, critically, for **security advisories** that
+affect the version you're running — so a compromised/vulnerable Mooring tells you to update
+immediately instead of sitting there silently. It's **opt-in**:
+
+```yaml
+server:
+  version_check_enabled: true      # off by default
+  version_check_interval: 6h       # optional; default 6h, floored at 1h
+```
+
+When enabled, Mooring periodically asks the **GitHub API** (only `api.github.com`, no
+telemetry payload — just public GETs) whether:
+
+- a **newer release** exists → a banner appears on every page: *"Mooring vX.Y.Z is available."*
+- the **running version is affected by a published security advisory** → a **red banner** on
+  every page *and* a **CRITICAL alert** through your configured [alert channels](./alerting.md)
+  (critical alerts bypass quiet hours). The alert is de-duplicated so you're not re-paged every
+  tick for the same advisory.
+
+The check runs even when nobody is watching the dashboard (a compromise must surface on an
+unattended box), and it's the exact "notify me to update" behavior other PaaS tools do — with
+the security-advisory layer added on top. With `version_check_enabled` off (the default),
+Mooring never contacts GitHub.
+
 ## Summary of config keys
 
 ```yaml
@@ -92,7 +118,9 @@ server:
   file_roots:                      # optional; enables the read-only file viewer
     - name: app-logs
       path: /var/log/myapp
+  version_check_enabled: true      # optional; enables the self-update + security-advisory check
+  version_check_interval: 6h       # optional; default 6h (floored at 1h)
 ```
 
-Both are optional and default to off. The host monitor, processes, and disk-usage
-views need no configuration.
+All are optional and default to off. The host monitor, processes, and disk-usage views need no
+configuration.

@@ -36,6 +36,13 @@
     </div>
   </aside>
   <div class="content-col">
+    {{if .UpdateBanner}}
+    <div class="update-banner{{if .UpdateBanner.Security}} update-banner-crit{{end}}" role="alert">
+      {{if .UpdateBanner.Security}}<span class="update-banner-ico">{{template "icon-incident"}}</span>{{end}}
+      <span class="update-banner-msg">{{.UpdateBanner.Message}}</span>
+      {{if .UpdateBanner.URL}}<a class="update-banner-link" href="{{.UpdateBanner.URL}}" target="_blank" rel="noopener noreferrer">details ↗</a>{{end}}
+    </div>
+    {{end}}
 {{end}}
 {{end}}
 

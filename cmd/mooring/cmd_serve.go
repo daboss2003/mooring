@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/edge"
 	"github.com/daboss2003/mooring/internal/envstore"
+	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/hostmon"
 	"github.com/daboss2003/mooring/internal/l4"
@@ -41,6 +43,7 @@ import (
 	"github.com/daboss2003/mooring/internal/setupstore"
 	"github.com/daboss2003/mooring/internal/socketproxy"
 	"github.com/daboss2003/mooring/internal/store"
+	"github.com/daboss2003/mooring/internal/updatecheck"
 	"github.com/daboss2003/mooring/internal/web"
 )
 
@@ -226,6 +229,30 @@ func cmdServe(args []string) error {
 			}
 		}()
 	}
+	// Self-update + security-advisory check (OPT-IN). Polls the GitHub API for a newer
+	// release + published advisories affecting THIS version → a dashboard banner, and a
+	// CRITICAL alert (pages regardless of quiet hours) when the running version is
+	// itself vulnerable. Runs unconditionally (not gated on a watching operator) so a
+	// Mooring compromise surfaces even on an unattended box. Contacts only api.github.com.
+	var updateChecker *updatecheck.Checker
+	if cfg.Server.VersionCheckEnabled {
+		// A hardened, non-redirect-following client for unauthenticated public GETs —
+		// NOT the OAuth client (which follows redirects for the connect flow).
+		ucHTTP := &http.Client{
+			Timeout:       20 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			Transport:     &http.Transport{DisableKeepAlives: true, TLSHandshakeTimeout: 5 * time.Second},
+		}
+		iv := cfg.Server.VersionCheckInterval.D()
+		if iv <= 0 {
+			iv = 6 * time.Hour
+		}
+		updateChecker = updatecheck.New(github.New(ucHTTP, github.DefaultAPIBase, ""), "daboss2003", "mooring", Version, iv, alertStore, log)
+		wg.Add(1)
+		go func() { defer wg.Done(); updateChecker.Run(ctx) }()
+		log.Info("self-update check enabled", "interval", iv)
+	}
+
 	if cfg.Alerting.Enabled {
 		// The "open in dashboard" link in notifications is derived from admin.hostname
 		// (we already know where the dashboard lives) — no separate admin_url.
@@ -358,6 +385,7 @@ func cmdServe(args []string) error {
 		DB:          db,
 		ConfigPath:  *configPath,
 		Version:     Version,
+		UpdateCheck: updateChecker,
 		Log:         log,
 		Monitor:     mon,
 		OpsStore:    opsStore,

@@ -42,6 +42,7 @@ import (
 	"github.com/daboss2003/mooring/internal/session"
 	"github.com/daboss2003/mooring/internal/setupstore"
 	"github.com/daboss2003/mooring/internal/store"
+	"github.com/daboss2003/mooring/internal/updatecheck"
 )
 
 // maxConcurrentLogStreams caps simultaneous live log streams (each holds a
@@ -88,8 +89,9 @@ const loginBodyLimit = 64 << 10
 // shown disabled).
 type Deps struct {
 	DB          *store.DB
-	ConfigPath  string // for SIGHUP allowlist+auth reload
-	Version     string // the running Mooring build version (for the Server tab's .deb cleanup)
+	ConfigPath  string               // for SIGHUP allowlist+auth reload
+	Version     string               // the running Mooring build version (for the Server tab's .deb cleanup)
+	UpdateCheck *updatecheck.Checker // self-update / security-advisory posture (nil when disabled)
 	Log         *slog.Logger
 	Monitor     *monitor.Monitor
 	OpsStore    *ops.ConfigStore
@@ -163,8 +165,9 @@ type Server struct {
 	gitDeploy      *dockerexec.Semaphore         // single-flight repo deploy (1 at a time)
 	logStreams     chan struct{}                 // concurrency cap on live log streams
 	sec            atomic.Pointer[secState]
-	footprintOnce  sync.Once       // lazily builds the Server-tab disk-footprint cache
-	footprintC     *footprintCache // cached on-disk footprint (off-request refresh)
+	footprintOnce  sync.Once            // lazily builds the Server-tab disk-footprint cache
+	footprintC     *footprintCache      // cached on-disk footprint (off-request refresh)
+	updateCheck    *updatecheck.Checker // self-update / security-advisory posture (may be nil)
 }
 
 // New builds a Server from a validated config and its dependencies.
@@ -181,6 +184,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		cfg:           cfg,
 		configPath:    d.ConfigPath,
 		version:       d.Version,
+		updateCheck:   d.UpdateCheck,
 		db:            d.DB,
 		sessions:      session.New(d.DB, cfg.Session.IdleTimeout.D(), cfg.Session.AbsoluteTimeout.D()),
 		audit:         audit.New(d.DB, log),

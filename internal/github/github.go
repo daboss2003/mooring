@@ -187,6 +187,72 @@ func (c *Client) CreateDeployKey(ctx context.Context, token, owner, repo, title,
 // ErrKeyExists means an identical deploy key is already installed (treat as success).
 var ErrKeyExists = errors.New("github: deploy key already exists")
 
+// Release is the subset of a GitHub release Mooring's update check needs.
+type Release struct {
+	TagName    string `json:"tag_name"`
+	HTMLURL    string `json:"html_url"`
+	Prerelease bool   `json:"prerelease"`
+	Draft      bool   `json:"draft"`
+}
+
+// Advisory is the subset of a repository security advisory the update check needs.
+// Vulnerabilities carry the affected version ranges Mooring matches its running
+// version against.
+type Advisory struct {
+	GHSAID          string              `json:"ghsa_id"`
+	Summary         string              `json:"summary"`
+	Severity        string              `json:"severity"` // low|medium|high|critical
+	HTMLURL         string              `json:"html_url"`
+	Vulnerabilities []AdvisoryVulnRange `json:"vulnerabilities"`
+}
+
+// AdvisoryVulnRange is one affected-package range within an advisory.
+type AdvisoryVulnRange struct {
+	VulnerableVersionRange string `json:"vulnerable_version_range"`
+	PatchedVersions        string `json:"patched_versions"`
+}
+
+// LatestRelease returns owner/repo's latest published (non-draft, non-prerelease)
+// release. UNAUTHENTICATED — public data, no token, no telemetry payload.
+func (c *Client) LatestRelease(ctx context.Context, owner, repo string) (Release, error) {
+	var rel Release
+	req, err := c.unauthGet(ctx, "/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/releases/latest")
+	if err != nil {
+		return Release{}, err
+	}
+	if err := c.do(req, &rel); err != nil {
+		return Release{}, err
+	}
+	return rel, nil
+}
+
+// SecurityAdvisories returns owner/repo's PUBLISHED security advisories (the ones a
+// maintainer disclosed). UNAUTHENTICATED. Used to detect that the running Mooring
+// version is itself vulnerable/compromised.
+func (c *Client) SecurityAdvisories(ctx context.Context, owner, repo string) ([]Advisory, error) {
+	var out []Advisory
+	req, err := c.unauthGet(ctx, "/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/security-advisories?state=published&per_page=100")
+	if err != nil {
+		return nil, err
+	}
+	if err := c.do(req, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// unauthGet builds an UNauthenticated GitHub API GET (no Authorization header) with
+// the standard Accept + API-version headers.
+func (c *Client) unauthGet(ctx context.Context, path string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBase+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	return req, nil
+}
+
 func (c *Client) authedGet(ctx context.Context, token, path string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBase+path, nil)
 	if err != nil {

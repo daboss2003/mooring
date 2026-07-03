@@ -74,6 +74,10 @@ type tmplData struct {
 	Server      *serverView
 	ServerFiles *serverFilesView
 
+	// UpdateBanner is the global self-update / security-advisory banner (nil = none),
+	// backfilled into every authenticated page by render().
+	UpdateBanner *updateBannerView
+
 	// GitHub connect (M20): the connect-repo page + repo picker.
 	GitHubEnabled bool
 	GitHubLogin   string
@@ -339,6 +343,9 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	}
 	if data.IdleTimeoutMs == 0 {
 		data.IdleTimeoutMs = s.cfg.Session.IdleTimeout.D().Milliseconds()
+	}
+	if data.UpdateBanner == nil {
+		data.UpdateBanner = s.updateBanner()
 	}
 	var buf bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&buf, name, data); err != nil {

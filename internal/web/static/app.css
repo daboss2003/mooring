@@ -416,3 +416,26 @@ input:focus, select:focus, textarea:focus {
   .menu-toggle { display: inline-flex; }
   .content-col { width: 100%; }
 }
+
+/* ── Global self-update / security-advisory banner ─────────────────────────── */
+.update-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 22px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--warn-border, #a9781f);
+  background: var(--warn-bg, #2a2410);
+  color: var(--warn-fg, #f4d58a);
+  font-size: 14px;
+}
+.update-banner-crit {
+  border-color: var(--danger-border, #b3352f);
+  background: var(--danger-bg, #2c1414);
+  color: var(--danger-fg, #f3b1ad);
+  font-weight: 600;
+}
+.update-banner-ico { display: inline-flex; width: 18px; height: 18px; flex: 0 0 auto; }
+.update-banner-msg { flex: 1 1 auto; }
+.update-banner-link { color: inherit; text-decoration: underline; white-space: nowrap; }
