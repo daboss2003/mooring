@@ -99,24 +99,36 @@ type ServerConfig struct {
 	// service's writable paths for the delete to succeed (see docs).
 	DebCacheDir string `yaml:"deb_cache_dir"`
 
-	// VersionCheckEnabled turns on the periodic self-update check: Mooring asks the
+	// VersionCheckEnabled controls the periodic self-update check: Mooring asks the
 	// GitHub API whether a newer release exists and whether the RUNNING version is
 	// affected by a published security advisory (→ a persistent banner + a CRITICAL
-	// alert). OPT-IN (default off): when off, Mooring never contacts GitHub. When on,
-	// it contacts ONLY api.github.com and sends no telemetry payload.
-	VersionCheckEnabled bool `yaml:"version_check_enabled"`
+	// alert). It is ON by default (a *bool so "unset" means on); set it to false to
+	// disable — then Mooring never contacts GitHub. When on it contacts ONLY
+	// api.github.com and sends no telemetry payload.
+	VersionCheckEnabled *bool `yaml:"version_check_enabled"`
 	// VersionCheckInterval is how often to poll (default 6h; clamped to a 1h floor).
 	VersionCheckInterval Duration `yaml:"version_check_interval"`
 
-	// ImageScanEnabled turns on periodic vulnerability scanning of each deployed app's
+	// ImageScanEnabled controls periodic vulnerability scanning of each deployed app's
 	// images + dependencies with Trivy (High/Critical → an alert; results on the Server
-	// tab). OPT-IN and HEAVY (Trivy downloads a vuln DB + scans) — off by default. The
-	// scanner never gets the Docker socket: upstream images are scanned from the
+	// tab). ON by default (set false to disable). It is HEAVY — Trivy downloads a
+	// vulnerability database and scanning uses CPU/RAM — so a small box may want it off.
+	// The scanner never gets the Docker socket: upstream images are scanned from the
 	// registry, build checkouts as a filesystem.
-	ImageScanEnabled bool `yaml:"image_scan_enabled"`
+	ImageScanEnabled *bool `yaml:"image_scan_enabled"`
 	// ImageScanInterval is how often to re-scan (default 24h; clamped to a 1h floor).
 	// Re-scanning unchanged images matters — new CVEs are disclosed daily.
 	ImageScanInterval Duration `yaml:"image_scan_interval"`
+}
+
+// VersionCheckOn reports whether the self-update check is enabled (default on).
+func (s ServerConfig) VersionCheckOn() bool {
+	return s.VersionCheckEnabled == nil || *s.VersionCheckEnabled
+}
+
+// ImageScanOn reports whether app vulnerability scanning is enabled (default on).
+func (s ServerConfig) ImageScanOn() bool {
+	return s.ImageScanEnabled == nil || *s.ImageScanEnabled
 }
 
 // ServerFileRoot is one named, browsable directory.

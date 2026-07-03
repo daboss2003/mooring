@@ -84,6 +84,33 @@ func TestServerTabConfigValidated(t *testing.T) {
 	mustReject(t, validYAML(t, "server:\n  deb_cache_dir: \"relative\"\n"), "absolute")
 }
 
+func TestServerChecksDefaultOn(t *testing.T) {
+	// Unset → both checks default ON.
+	cfg, err := Parse([]byte(validYAML(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Server.VersionCheckOn() || !cfg.Server.ImageScanOn() {
+		t.Error("version check + image scan must default ON when unset")
+	}
+	// Explicit false → OFF.
+	off, err := Parse([]byte(validYAML(t, "server:\n  version_check_enabled: false\n  image_scan_enabled: false\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Server.VersionCheckOn() || off.Server.ImageScanOn() {
+		t.Error("explicit false must disable both checks")
+	}
+	// Explicit true → ON.
+	on, err := Parse([]byte(validYAML(t, "server:\n  version_check_enabled: true\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on.Server.VersionCheckOn() {
+		t.Error("explicit true must enable")
+	}
+}
+
 func TestValidConfigLoads(t *testing.T) {
 	cfg, err := Parse([]byte(validYAML(t, "")))
 	if err != nil {

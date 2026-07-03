@@ -236,7 +236,7 @@ func cmdServe(args []string) error {
 	// itself vulnerable. Runs unconditionally (not gated on a watching operator) so a
 	// Mooring compromise surfaces even on an unattended box. Contacts only api.github.com.
 	var updateChecker *updatecheck.Checker
-	if cfg.Server.VersionCheckEnabled {
+	if cfg.Server.VersionCheckOn() {
 		// A hardened, non-redirect-following client for unauthenticated public GETs —
 		// NOT the OAuth client (which follows redirects for the connect flow).
 		ucHTTP := &http.Client{
@@ -259,7 +259,7 @@ func cmdServe(args []string) error {
 	// filesystem) — NEVER via the docker socket — and alerts on High/Critical. Results
 	// surface on the Server tab.
 	scanStore := imagescan.NewStore(db)
-	if cfg.Server.ImageScanEnabled {
+	if cfg.Server.ImageScanOn() {
 		iv := cfg.Server.ImageScanInterval.D()
 		if iv <= 0 {
 			iv = 24 * time.Hour

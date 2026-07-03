@@ -84,78 +84,88 @@ delete of files. Guardrails (all enforced after resolving symlinks):
   detected and not rendered.
 - **Audited** — every file read (and every denial) is written to the Audit log.
 
-## Staying up to date (self-update + security alerts)
+## Staying up to date
 
-Mooring can watch **itself** for updates and, critically, for **security advisories** that
-affect the version you're running — so a compromised/vulnerable Mooring tells you to update
-immediately instead of sitting there silently. It's **opt-in**:
+Mooring keeps an eye on itself. Every few hours it quietly checks whether a newer version has
+been released and — more importantly — whether the version you're running has a known security
+problem. This is on out of the box; you don't have to set anything up.
+
+Two things can show up:
+
+- **A newer version is out.** You'll see a banner on every page: *"Mooring 0.5.0 is available."*
+  There's no rush — update when it suits you.
+- **Your version has a security hole.** This one matters, so it's loud: a red banner on every
+  page, and if you've set up [alerts](./alerting.md), a high-priority message right away (it
+  ignores your quiet hours). Update as soon as you can.
+
+All it does is ask GitHub about Mooring's own releases and security advisories. Nothing about
+your server or your apps ever leaves the box — it's just Mooring reading public information about
+itself.
+
+If you'd rather it didn't reach out to GitHub at all, turn it off:
 
 ```yaml
 server:
-  version_check_enabled: true      # off by default
-  version_check_interval: 6h       # optional; default 6h, floored at 1h
+  version_check_enabled: false
 ```
 
-When enabled, Mooring periodically asks the **GitHub API** (only `api.github.com`, no
-telemetry payload — just public GETs) whether:
+## Scanning your apps for known vulnerabilities
 
-- a **newer release** exists → a banner appears on every page: *"Mooring vX.Y.Z is available."*
-- the **running version is affected by a published security advisory** → a **red banner** on
-  every page *and* a **CRITICAL alert** through your configured [alert channels](./alerting.md)
-  (critical alerts bypass quiet hours). The alert is de-duplicated so you're not re-paged every
-  tick for the same advisory.
+Mooring also scans the apps you deploy for known security vulnerabilities (the CVEs you hear
+about) and warns you when something serious turns up. This is on by default too.
 
-The check runs even when nobody is watching the dashboard (a compromise must surface on an
-unattended box), and it's the exact "notify me to update" behavior other PaaS tools do — with
-the security-advisory layer added on top. With `version_check_enabled` off (the default),
-Mooring never contacts GitHub.
+It re-scans once a day — not only when you deploy. That's deliberate: new vulnerabilities are
+found in software all the time, so an image that looked fine last week might not be fine today.
 
-## Scanning your apps for vulnerabilities (Trivy)
+The important part is *how* it scans, because Mooring never lets the scanner touch the Docker
+socket (that's the core of how Mooring talks to Docker safely). So:
 
-Mooring can scan each **deployed app** for known CVEs and alert you on High/Critical
-findings — the "does my stack have a vulnerability" half. It's **opt-in and resource-heavy**
-(Trivy downloads a vulnerability database and scanning takes CPU/RAM), so it's off by default:
+- **Off-the-shelf images** — like the database or message broker you pull from Docker Hub — are
+  checked straight from the registry they came from.
+- **Your own code** is checked by reading your project's dependency files (`package-lock.json`,
+  `go.sum`, and the like), which is where most of an app's vulnerabilities actually live.
+
+You'll find the results under **Server → Vulnerabilities**: how many Critical / High / Medium /
+Low issues each app has, and the worst ones spelled out with the version that fixes them.
+Anything **High or Critical** also sends you an alert. To clear a finding, update the flagged
+package (bump a dependency, or update the base image) and redeploy.
+
+One heads-up: scanning is a bit heavy. The first run downloads a vulnerability database (a few
+hundred MB) and each scan uses some CPU and memory. On a small server you might prefer to turn
+it off:
 
 ```yaml
 server:
-  image_scan_enabled: true         # off by default
-  image_scan_interval: 24h         # optional; default 24h, floored at 1h
+  image_scan_enabled: false
 ```
 
-How it scans — **without ever giving Trivy the Docker socket** (Mooring's core security
-invariant):
+(There's one thing it can't see: the exact operating-system packages inside an image you build
+yourself. Getting at those would mean handing the scanner the Docker socket, which would undo
+Mooring's security model — so it doesn't.)
 
-- **Upstream `image:` services** (e.g. `emqx/emqx:5.8.3`) are scanned **from the registry**
-  (`trivy image`) — no local Docker access needed.
-- **Build services** (your own code) are scanned as a **filesystem** (`trivy fs`) over the
-  checkout for language-dependency CVEs (npm / go / pip / …) — this is what catches the
-  vulnerabilities `npm audit` reports in your built image.
+## All the Server-tab config keys
 
-Results appear on **Server → Vulnerabilities** (per-app Critical/High/Medium/Low counts + the
-top findings with fixed-in versions), and **High/Critical** totals raise an alert through your
-[alert channels](./alerting.md) (Critical when there are critical findings). It **re-scans on a
-schedule** — not just on deploy — because new CVEs are disclosed against unchanged images every
-day. Fix findings by upgrading the flagged packages (rebuild / bump the base image / update
-dependencies) and redeploying.
-
-> **Coverage note:** the filesystem scan covers your app's *dependencies*; base-image OS
-> packages are covered when they're upstream `image:` services. Giving Trivy the Docker socket
-> to scan the exact built-image layers would break the read-only-socket model, so Mooring
-> doesn't.
-
-## Summary of config keys
+Everything on this page works with sensible defaults, so most people never touch this. But if you
+want to adjust it, here are all the keys — the two checks above are **on by default**, the rest
+are opt-in:
 
 ```yaml
 server:
-  deb_cache_dir: /root/downloads   # optional; enables old-.deb cleanup
-  file_roots:                      # optional; enables the read-only file viewer
+  # Self-update + security check — ON by default; set false to stop it contacting GitHub.
+  version_check_enabled: false
+  version_check_interval: 6h       # how often to check (default 6h)
+
+  # App vulnerability scanning — ON by default; set false on a small server if it's too heavy.
+  image_scan_enabled: false
+  image_scan_interval: 24h         # how often to re-scan (default 24h)
+
+  # Clean up old downloaded .deb files from the dashboard — off unless you set this.
+  deb_cache_dir: /root/downloads
+
+  # Read-only file browser — off unless you list folders here.
+  file_roots:
     - name: app-logs
       path: /var/log/myapp
-  version_check_enabled: true      # optional; enables the self-update + security-advisory check
-  version_check_interval: 6h       # optional; default 6h (floored at 1h)
-  image_scan_enabled: true         # optional; enables Trivy CVE scanning of deployed apps
-  image_scan_interval: 24h         # optional; default 24h (floored at 1h)
 ```
 
-All are optional and default to off. The host monitor, processes, and disk-usage views need no
-configuration.
+The host monitor, top processes, and disk-usage views need no configuration at all.

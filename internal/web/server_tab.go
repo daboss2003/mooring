@@ -180,7 +180,7 @@ func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 	fb := s.fileBrowser()
 	v.FileEnabled = fb.Enabled()
 	v.FileRoots = fb.Roots()
-	v.ScanEnabled = s.cfg.Server.ImageScanEnabled
+	v.ScanEnabled = s.cfg.Server.ImageScanOn()
 	if s.imageScans != nil {
 		if scans, err := s.imageScans.List(r.Context()); err == nil {
 			v.Scans = scans
