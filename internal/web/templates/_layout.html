@@ -13,7 +13,7 @@
 {{if .Username}}
 <div class="layout" data-layout data-idle-ms="{{.IdleTimeoutMs}}">
   <aside class="sidebar" data-sidebar>
-    <div class="sidebar-brand"><span class="brand-mark">{{template "icon-wheel"}}</span> <span class="brand-text">Mooring</span></div>
+    <div class="sidebar-brand"><span class="brand-mark">{{template "icon-hook"}}</span> <span class="brand-text">Mooring</span></div>
     <nav class="sidenav">
       <div class="nav-group-label">Monitor</div>
       <a href="/" data-nav data-exact><span class="ico">{{template "icon-grid"}}</span> Overview</a>
@@ -72,7 +72,7 @@
 {{end}}
 
 {{/* ---- inline SVG icon set (stroke = currentColor; CSP-safe markup) ---- */}}
-{{define "icon-wheel"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="2.6"/><path d="M12 2.4v4.2M12 17.4v4.2M2.4 12h4.2M17.4 12h4.2M5.1 5.1l3 3M15.9 15.9l3 3M18.9 5.1l-3 3M8.1 15.9l-3 3"/></svg>{{end}}
+{{define "icon-hook"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="4.4" r="2.5"/><path d="M12 6.9v6.7"/><path d="M12 13.6c0 3.7-2.9 5.4-5.4 3.9C4.8 16.4 5.1 13.7 7.4 13.2"/></svg>{{end}}
 {{define "icon-grid"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>{{end}}
 {{define "icon-plus"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M12 8v8M8 12h8"/></svg>{{end}}
 {{define "icon-branch"}}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="6" y1="4" x2="6" y2="14"/><circle cx="6" cy="18" r="2.4"/><circle cx="18" cy="6" r="2.4"/><path d="M18 8.4a8 8 0 0 1-8 8"/></svg>{{end}}

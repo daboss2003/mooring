@@ -11,10 +11,10 @@
   </defs>
   <rect width="1200" height="630" fill="url(#bg)"/>
   <rect width="1200" height="630" fill="url(#glow)"/>
-  <g transform="translate(90,150)" fill="none" stroke="#a5b4fc" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="45" cy="45" r="42"/>
-    <circle cx="45" cy="45" r="12"/>
-    <path d="M45 -2v18M45 74v18M-2 45h18M74 45h18M12 12l13 13M65 65l13 13M78 12L65 25M25 65 12 78"/>
+  <g transform="translate(96,120) scale(3.6)" fill="none" stroke="#a5b4fc" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="4.4" r="2.5"/>
+    <path d="M12 6.9v6.7"/>
+    <path d="M12 13.6c0 3.7-2.9 5.4-5.4 3.9C4.8 16.4 5.1 13.7 7.4 13.2"/>
   </g>
   <text x="205" y="200" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="58" font-weight="700" fill="#ffffff">Mooring</text>
   <text x="92" y="330" font-family="Segoe UI, Helvetica, Arial, sans-serif" font-size="52" font-weight="700" fill="#ffffff">A self-hosted PaaS for Docker.</text>
