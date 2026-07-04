@@ -167,10 +167,11 @@ type Server struct {
 	gitDeploy      *dockerexec.Semaphore         // single-flight repo deploy (1 at a time)
 	logStreams     chan struct{}                 // concurrency cap on live log streams
 	sec            atomic.Pointer[secState]
-	footprintOnce  sync.Once            // lazily builds the Server-tab disk-footprint cache
-	footprintC     *footprintCache      // cached on-disk footprint (off-request refresh)
-	updateCheck    *updatecheck.Checker // self-update / security-advisory posture (may be nil)
-	imageScans     *imagescan.Store     // per-app Trivy scan results (may be nil)
+	footprintOnce  sync.Once                    // lazily builds the Server-tab disk-footprint cache
+	footprintC     *footprintCache              // cached on-disk footprint (off-request refresh)
+	updateCheck    *updatecheck.Checker         // self-update / security-advisory posture (may be nil)
+	imageScans     *imagescan.Store             // per-app Trivy scan results (may be nil)
+	pendingApps    atomic.Pointer[[]pendingApp] // undeployed mooring.*.yaml siblings found in connected repos
 }
 
 // New builds a Server from a validated config and its dependencies.
@@ -468,6 +469,8 @@ func (s *Server) Handler() http.Handler {
 	// config stays on /apps/{project}/git (handleGitSave) — no discovery, slug fixed.
 	mux.HandleFunc("POST /git", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleGitConnect))))
 	mux.HandleFunc("POST /git/choose", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleGitChoose))))
+	// Add a mooring.*.yaml found in a connected repo (but not yet deployed) as its own app.
+	mux.HandleFunc("POST /git/add-definition", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAddDefinition))))
 	mux.HandleFunc("GET /apps/{project}/git", s.requireAuth(s.withCSRFToken(s.handleGitGet)))
 	mux.HandleFunc("POST /apps/{project}/git", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleGitSave))))
 	mux.HandleFunc("POST /apps/{project}/git/fetch", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitFetch))))

@@ -74,6 +74,10 @@ func (s *Server) pollAllRepos(ctx context.Context) {
 		}
 		s.pollOneRepo(ctx, c.Project)
 	}
+	// After fetching, look for mooring.*.yaml files committed to a connected repo that
+	// aren't deployed as their own app yet (e.g. a newly-added mooring.staging.yaml), so
+	// the Apps page can offer to add them. Reads the just-fetched object stores (no network).
+	s.scanPendingApps(ctx, cfgs)
 }
 
 // pollOneRepo FETCHES a single repo (never deploys), holding the single-flight gate

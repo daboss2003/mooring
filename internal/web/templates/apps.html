@@ -4,6 +4,33 @@
   <h1><span>Apps</span></h1>
   <p class="muted">Every app Mooring manages. Open one to view logs and start, stop, restart, or redeploy it.</p>
 
+  {{if .PendingApps}}
+  <section class="panel pending-apps">
+    <h2>New app definitions found</h2>
+    <p class="muted">These <code>mooring.*.yaml</code> files were found in a connected repo but aren't deployed as their own app yet. Add one to create it (it reuses the repo's existing credentials; you then Fetch &amp; Deploy as usual).</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>App</th><th>File</th><th>Repo</th><th></th></tr></thead>
+      <tbody>
+        {{range .PendingApps}}
+        <tr>
+          <td><strong>{{.Name}}</strong> <span class="muted mono">{{.Slug}}</span></td>
+          <td class="mono">{{.Path}}</td>
+          <td class="mono muted">{{.RepoURL}}</td>
+          <td>
+            <form method="post" action="/git/add-definition" class="inline">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="slug" value="{{.Slug}}">
+              <input type="hidden" name="path" value="{{.Path}}">
+              <button type="submit" class="btn btn-sm btn-primary">Add as app</button>
+            </form>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+  </section>
+  {{end}}
+
   <section class="panel">
     <h2><span>All apps {{if .AppsRows}}<span class="muted">({{len .AppsRows}})</span>{{end}}</span> <a href="/git/new" class="btn btn-sm btn-primary">+ New app</a></h2>
     {{if .AppsRows}}

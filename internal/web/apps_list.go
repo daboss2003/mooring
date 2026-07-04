@@ -45,9 +45,10 @@ func (s *Server) appsRows() []appsRow {
 // handleAppsList renders the Apps table.
 func (s *Server) handleAppsList(w http.ResponseWriter, r *http.Request) {
 	s.render(w, r, "apps.html", tmplData{
-		Title:     "Apps — Mooring",
-		CSRFToken: CSRFToken(r.Context()),
-		Username:  sessionUser(r),
-		AppsRows:  s.appsRows(),
+		Title:       "Apps — Mooring",
+		CSRFToken:   CSRFToken(r.Context()),
+		Username:    sessionUser(r),
+		AppsRows:    s.appsRows(),
+		PendingApps: s.pendingAppsList(),
 	})
 }

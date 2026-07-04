@@ -59,6 +59,10 @@ type tmplData struct {
 	// Apps list (table view).
 	AppsRows []appsRow
 
+	// PendingApps are mooring.*.yaml definitions found in connected repos that aren't
+	// deployed as their own app yet — surfaced on the Apps page with a one-click "Add".
+	PendingApps []pendingApp
+
 	// API tokens screen (view + revoke).
 	APITokenRows []apiTokenRow
 
