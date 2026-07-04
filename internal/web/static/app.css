@@ -404,7 +404,9 @@ input:focus, select:focus, textarea:focus {
   width: 100%; max-width: 380px; background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--radius); padding: 2rem 1.75rem; box-shadow: var(--shadow-lg);
 }
-.brand-big { font-size: 1.55rem; font-weight: 700; letter-spacing: -0.01em; }
+.brand-big { font-size: 1.55rem; font-weight: 700; letter-spacing: -0.01em; display: inline-flex; align-items: center; gap: 10px; }
+.auth-mark { display: inline-flex; }
+.auth-mark svg { width: 34px; height: 34px; }
 .card form { display: grid; gap: 0.3rem; margin-top: 1.2rem; }
 .card button[type=submit] { margin-top: 0.7rem; width: 100%; justify-content: center; padding: 0.65rem; }
 

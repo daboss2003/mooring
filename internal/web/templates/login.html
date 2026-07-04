@@ -1,7 +1,7 @@
 {{template "top" .}}
 <main class="auth">
   <div class="card">
-    <div class="brand-big">⎈ Mooring</div>
+    <div class="brand-big"><span class="auth-mark">{{template "icon-hook"}}</span> Mooring</div>
     <p class="muted">Sign in to the ops dashboard.</p>
     {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
     <form method="post" action="/login" autocomplete="off">
