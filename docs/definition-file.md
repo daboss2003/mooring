@@ -196,6 +196,20 @@ build:
 - `install` / `build` run as build steps; each must be a single line (a newline is rejected so a value
   can't inject extra build steps). The build context is your repo checkout, confined to the app's
   directory.
+- **Package manager** — Mooring picks it from the lockfile you committed, so you rarely set `install`:
+  - **Node** (`language: node`): `pnpm-lock.yaml` → **pnpm** (provisioned via Corepack), `yarn.lock` →
+    **yarn** (Yarn Berry when a `.yarnrc.yml` sits beside it — installed with `--immutable`, else
+    classic v1), otherwise **npm**. It installs with a frozen lockfile and, for a Node *server*, strips
+    devDependencies from the shipped image (`pnpm prune --prod` / `yarn install --production` /
+    `npm prune --omit=dev`). The same detection drives a **`static`** SPA's build stage (its
+    `node_modules` is discarded — only the built output dir ships).
+  - **Python** (`language: python`): `poetry.lock` → **poetry**, a `Pipfile` → **pipenv**, otherwise
+    **pip**. poetry/pipenv install the project's *production* dependencies into the system interpreter.
+  - Go (modules), Ruby (bundler), and PHP (composer) each have one mainstream tool, so there's nothing
+    to choose.
+  - Set `install:` explicitly to override the default command (e.g. a workspace filter, or a manager
+    with no committed lockfile). A Yarn Berry app on the **PnP** linker generally also needs a custom
+    `start` (e.g. `yarn node …`); switching Berry to `nodeLinker: node-modules` avoids that.
 
 ### `spec.setup` (an advanced setup script)
 

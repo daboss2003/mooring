@@ -46,11 +46,13 @@ func (s Spec) src(p string) string {
 	return s.Dir + "/" + p
 }
 
-// Builder generates a Dockerfile for one language/stack.
+// Builder generates a Dockerfile for one language/stack. files is the build root's
+// file set (same as Detect sees) so a builder can pick the dependency manager from the
+// committed lockfile (e.g. pnpm-lock.yaml → pnpm); builders that don't care ignore it.
 type Builder interface {
 	Name() string
 	Detect(files map[string]bool) bool // does this stack match the repo's top-level files?
-	Dockerfile(s Spec) (string, error)
+	Dockerfile(s Spec, files map[string]bool) (string, error)
 }
 
 // registry maps an explicit language to its builder.
@@ -120,7 +122,7 @@ func Generate(s Spec, files map[string]bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return b.Dockerfile(s)
+	return b.Dockerfile(s, files)
 }
 
 // --- shared, security-critical helpers ---
