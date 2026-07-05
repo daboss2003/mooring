@@ -15,14 +15,14 @@
     <h2>Open alerts</h2>
     {{if .Firing}}
     <div class="table-scroll"><table class="grid">
-      <thead><tr><th>Level</th><th>Target</th><th>Detail</th><th>Since (UTC)</th><th>Actions</th></tr></thead>
+      <thead><tr><th>Level</th><th>Target</th><th>Detail</th><th>Since</th><th>Actions</th></tr></thead>
       <tbody>
         {{range .Firing}}
         <tr class="lvl-{{.Level}}">
           <td>{{.Level}}{{if .Acked}} <span class="badge">ack</span>{{end}}</td>
           <td class="mono">{{.Target}}</td>
           <td class="wrap-cell">{{.Detail}}</td>
-          <td class="mono">{{.Since}}</td>
+          <td class="mono">{{template "ts" .Since}}</td>
           <td class="queue-actions">
             <form method="post" action="/alerts/ack" class="inline">
               <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">

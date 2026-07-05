@@ -57,6 +57,12 @@
 </html>
 {{end}}
 
+{{/* ts renders a unix timestamp (int64 pipeline) as a <time data-ts> element that
+     app.js rewrites to the viewer's local timezone; the fallback text is the UTC
+     instant. The element is built here (auto-escaped) rather than via template.HTML,
+     so nothing bypasses html/template escaping. 0/absent → an em-dash. */}}
+{{define "ts"}}{{if gt . 0}}<time data-ts="{{.}}">{{unixTS .}}</time>{{else}}—{{end}}{{end}}
+
 {{define "nav"}}
 <header class="topbar">
   <button type="button" class="menu-toggle" data-menu-toggle aria-label="Toggle navigation">{{template "icon-menu"}}</button>

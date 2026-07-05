@@ -19,11 +19,11 @@
     <p class="muted">Backups are unavailable (no encryption key configured).</p>
     {{else if .BackupRows}}
     <div class="table-scroll"><table class="grid">
-      <thead><tr><th>Created (UTC)</th><th>Size</th><th>Checksum</th><th></th></tr></thead>
+      <thead><tr><th>Created</th><th>Size</th><th>Checksum</th><th></th></tr></thead>
       <tbody>
         {{range .BackupRows}}
         <tr>
-          <td class="mono">{{.When}}</td>
+          <td class="mono">{{template "ts" .When}}</td>
           <td class="mono">{{.Size}}</td>
           <td class="mono small">{{.SHA}}…</td>
           <td class="queue-actions">

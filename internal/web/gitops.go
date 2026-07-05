@@ -197,7 +197,7 @@ type gitView struct {
 	StagedCommit        string
 	UpdateState         string
 	CommitsBehind       int
-	LastFetchAt         string
+	LastFetchAt         int64 // unix seconds; the "ts" template renders it localised; 0 ⇒ "never"
 	LastFetchError      string
 	Diff                *gitDiffView
 	WriteDisabledReason string
@@ -258,7 +258,7 @@ func (s *Server) gitViewFor(ctx context.Context, project string) *gitView {
 		WriteDisabledReason: s.writeDisabledReason(),
 	}
 	if cfg.LastFetchAt > 0 {
-		gv.LastFetchAt = time.Unix(cfg.LastFetchAt, 0).UTC().Format("2006-01-02 15:04:05Z")
+		gv.LastFetchAt = cfg.LastFetchAt
 	}
 	gv.Diff = s.buildDiff(ctx, project, cfg)
 	return gv
@@ -298,7 +298,7 @@ func (s *Server) handleGitGet(w http.ResponseWriter, r *http.Request) {
 		gv.CommitsBehind = cfg.CommitsBehind
 		gv.LastFetchError = cfg.LastFetchError
 		if cfg.LastFetchAt > 0 {
-			gv.LastFetchAt = time.Unix(cfg.LastFetchAt, 0).UTC().Format("2006-01-02 15:04:05Z")
+			gv.LastFetchAt = cfg.LastFetchAt
 		}
 		// Consume the one-time rotated-token flash (opaque handle in the URL, the
 		// secret only ever lived server-side).

@@ -16,7 +16,7 @@ type apiTokenRow struct {
 	ID      string
 	Scopes  []string
 	CIDRs   []string
-	Expires string
+	Expires int64  // unix seconds; the "ts" template renders it localised
 	State   string // active | expired | revoked
 }
 
@@ -46,7 +46,7 @@ func (s *Server) handleAPITokens(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = append(rows, apiTokenRow{
 			ID: rc.ID, Scopes: rc.Scopes, CIDRs: cidrs,
-			Expires: time.Unix(rc.ExpiresAt, 0).UTC().Format("2006-01-02 15:04:05Z"),
+			Expires: rc.ExpiresAt,
 			State:   state,
 		})
 	}

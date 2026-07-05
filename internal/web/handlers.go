@@ -6,7 +6,6 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/monitor"
@@ -101,7 +100,7 @@ type tmplData struct {
 
 type eventRow struct {
 	Seq     int64
-	When    string
+	When    int64 // unix seconds; the "ts" template renders it localised
 	Actor   string
 	IP      string
 	Action  string
@@ -277,7 +276,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		e.When = time.Unix(ts, 0).UTC().Format("2006-01-02 15:04:05Z")
+		e.When = ts
 		events = append(events, e)
 	}
 	// rows.Next() returns false on error too; without this a truncated audit view

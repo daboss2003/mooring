@@ -10,6 +10,37 @@
     if (token) evt.detail.headers["X-CSRF-Token"] = token;
   });
 
+  // ---- localise server timestamps to the viewer's own timezone ----
+  // The server renders every instant as <time data-ts="<unix-seconds>">…UTC</time>
+  // (the CSP forbids inline JS, so it can't localise itself). Here we rewrite each
+  // element's text to the browser's local timezone — so an operator in WAT/IST/PST
+  // sees their own wall-clock, not UTC. Re-run over any fragment swapped in by the
+  // live poller below. The <time> fallback text stays valid (labelled UTC) if this
+  // never runs. Uses textContent only (never innerHTML) — CSP/XSS-safe.
+  var TS_FMT;
+  try {
+    TS_FMT = new Intl.DateTimeFormat(undefined, {
+      year: "numeric", month: "short", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit",
+      timeZoneName: "short",
+    });
+  } catch (_) { TS_FMT = null; }
+  function localizeTimes(root) {
+    var scope = root || document;
+    var nodes = scope.querySelectorAll ? scope.querySelectorAll("time[data-ts]") : [];
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.getAttribute("data-localized") === "1") continue;
+      var ts = parseInt(el.getAttribute("data-ts"), 10);
+      if (!ts || isNaN(ts)) continue;
+      var d = new Date(ts * 1000);
+      el.textContent = TS_FMT ? TS_FMT.format(d) : d.toLocaleString();
+      el.setAttribute("title", d.toString());
+      el.setAttribute("data-localized", "1");
+    }
+  }
+  localizeTimes(document);
+
   // Lifecycle + log streaming (M4). Buttons carry data-lc-url (POST, streamed
   // response) or data-log-url (GET, SSE). The CSRF token rides the header.
   var logSource = null;
@@ -284,7 +315,7 @@
       if (!dashFocused()) return;
       fetch(url, { credentials: "same-origin", redirect: "error", headers: { "X-Requested-With": "fetch" } })
         .then(function (r) { return r.ok ? r.text() : null; })
-        .then(function (html) { if (html !== null) el.innerHTML = html; })
+        .then(function (html) { if (html !== null) { el.innerHTML = html; localizeTimes(el); } })
         .catch(function () { /* transient; try again next tick */ });
     };
     setInterval(pull, ms);

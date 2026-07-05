@@ -32,7 +32,7 @@ type serverView struct {
 	Host    hostmonSampleView
 	Procs   []hostmon.Process
 	ProcErr string
-	At      string
+	At      int64 // unix seconds; the "ts" template renders it localised
 
 	// disk footprint (cached; computed off the request path)
 	Footprint      serverinfo.Footprint
@@ -197,7 +197,7 @@ func (s *Server) handleServerPartial(w http.ResponseWriter, r *http.Request) {
 // buildServerLive gathers the cheap, always-available live data: host metrics
 // (from the read-plane snapshot) and a fresh top-by-memory process list.
 func (s *Server) buildServerLive() *serverView {
-	v := &serverView{At: time.Now().Format("15:04:05")}
+	v := &serverView{At: time.Now().Unix()}
 	if snap := s.snapshot(); snap != nil && snap.HostOK {
 		v.HostOK = true
 		v.Host = hostmonSampleView{

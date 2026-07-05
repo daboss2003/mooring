@@ -40,12 +40,12 @@
   <div class="table-scroll table-tall">
     <table class="grid grid-audit">
       <thead>
-        <tr><th>When (UTC)</th><th>Actor</th><th>IP</th><th>Action</th><th>Target</th><th>Outcome</th><th>Level</th><th>Detail</th></tr>
+        <tr><th>When</th><th>Actor</th><th>IP</th><th>Action</th><th>Target</th><th>Outcome</th><th>Level</th><th>Detail</th></tr>
       </thead>
       <tbody>
         {{range .Events}}
         <tr>
-          <td class="mono muted">{{.When}}</td>
+          <td class="mono muted">{{template "ts" .When}}</td>
           <td>{{if .Actor}}{{.Actor}}{{else}}<span class="muted">—</span>{{end}}</td>
           <td class="mono">{{if .IP}}{{.IP}}{{else}}<span class="muted">—</span>{{end}}</td>
           <td><code class="chip">{{.Action}}</code></td>

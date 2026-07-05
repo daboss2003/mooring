@@ -44,7 +44,7 @@
         <tr><td>Deployed commit</td><td class="mono">{{if .DeployedCommit}}{{.DeployedCommit}}{{else}}— (never deployed){{end}}</td></tr>
         <tr><td>Staged commit</td><td class="mono">{{if .StagedCommit}}{{.StagedCommit}}{{else}}— (not fetched){{end}}</td></tr>
         <tr><td>Commits behind</td><td>{{.CommitsBehind}}</td></tr>
-        <tr><td>Last fetch</td><td>{{if .LastFetchAt}}{{.LastFetchAt}}{{else}}never{{end}}</td></tr>
+        <tr><td>Last fetch</td><td>{{if .LastFetchAt}}{{template "ts" .LastFetchAt}}{{else}}never{{end}}</td></tr>
         {{if .LastFetchError}}<tr><td>Last fetch error</td><td class="health-unhealthy wrap-cell">{{.LastFetchError}}</td></tr>{{end}}
       </tbody>
     </table></div>

@@ -2,7 +2,6 @@ package web
 
 import (
 	"net/http"
-	"time"
 
 	"github.com/daboss2003/mooring/internal/selfheal"
 )
@@ -28,7 +27,7 @@ type incidentApp struct {
 type incidentSvc struct{ App, Service string }
 
 type incidentEvent struct {
-	When    string
+	When    int64 // unix seconds; the "ts" template renders it localised
 	Action  string
 	Target  string
 	Outcome string
@@ -49,7 +48,7 @@ func (s *Server) handleIncidents(w http.ResponseWriter, r *http.Request) {
 			for _, f := range firing {
 				iv.Alerts = append(iv.Alerts, firingView{
 					RuleID: f.RuleID, Target: f.Target, Level: f.Level, Detail: f.Detail,
-					Since: time.Unix(f.Since, 0).UTC().Format("2006-01-02 15:04:05Z"), Acked: f.Acked,
+					Since: f.Since, Acked: f.Acked,
 				})
 			}
 		}
@@ -92,7 +91,7 @@ func (s *Server) handleIncidents(w http.ResponseWriter, r *http.Request) {
 				if err := rows.Scan(&ts, &e.Action, &e.Target, &e.Outcome, &e.Detail); err != nil {
 					break
 				}
-				e.When = time.Unix(ts, 0).UTC().Format("2006-01-02 15:04:05Z")
+				e.When = ts
 				iv.Failures = append(iv.Failures, e)
 			}
 		}

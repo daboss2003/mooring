@@ -48,7 +48,7 @@
           {{else}}<span class="pill">{{if .UpdateState}}{{.UpdateState}}{{else}}not fetched{{end}}</span>{{end}}
         </td></tr>
         <tr><td>Deployed commit</td><td class="mono">{{if .DeployedCommit}}{{.DeployedCommit}}{{else}}— (never deployed){{end}}</td></tr>
-        <tr><td>Last checked</td><td>{{if .LastFetchAt}}{{.LastFetchAt}}{{else}}never{{end}}</td></tr>
+        <tr><td>Last checked</td><td>{{if .LastFetchAt}}{{template "ts" .LastFetchAt}}{{else}}never{{end}}</td></tr>
         {{if .LastFetchError}}<tr><td>Last error</td><td class="health-unhealthy wrap-cell">{{.LastFetchError}}</td></tr>{{end}}
       </tbody>
     </table></div>

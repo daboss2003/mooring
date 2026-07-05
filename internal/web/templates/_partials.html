@@ -96,7 +96,7 @@
   </div>
 </section>
 {{end}}
-{{if $snap}}<p class="muted small">Updated {{$snap.At.Format "15:04:05 MST"}}{{if $snap.Version}} · engine {{$snap.Version}}{{end}}</p>{{end}}
+{{if $snap}}<p class="muted small">Updated {{template "ts" $snap.At.Unix}}{{if $snap.Version}} · engine {{$snap.Version}}{{end}}</p>{{end}}
 {{end}}
 
 {{/* statwait is a placeholder stat card shown before the first sample arrives. */}}

@@ -17,7 +17,7 @@ import (
 
 type backupRow struct {
 	ID   string
-	When string
+	When int64 // unix seconds; the "ts" template renders it localised
 	Size string
 	SHA  string
 }
@@ -46,7 +46,7 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 		}
 		data.BackupRows = append(data.BackupRows, backupRow{
 			ID:   rc.ID,
-			When: time.Unix(rc.CreatedAt, 0).UTC().Format("2006-01-02 15:04:05Z"),
+			When: rc.CreatedAt,
 			Size: humanBytes(uint64(rc.SizeBytes)),
 			SHA:  sha,
 		})

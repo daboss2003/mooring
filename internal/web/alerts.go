@@ -31,7 +31,7 @@ type firingView struct {
 	Target string
 	Level  string
 	Detail string
-	Since  string
+	Since  int64 // unix seconds; the "ts" template renders it localised
 	Acked  bool
 }
 
@@ -55,7 +55,7 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request) {
 		for _, f := range firing {
 			av.Firing = append(av.Firing, firingView{
 				RuleID: f.RuleID, Target: f.Target, Level: f.Level, Detail: f.Detail,
-				Since: time.Unix(f.Since, 0).UTC().Format("2006-01-02 15:04:05Z"), Acked: f.Acked,
+				Since: f.Since, Acked: f.Acked,
 			})
 		}
 	}

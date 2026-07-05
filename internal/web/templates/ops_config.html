@@ -8,7 +8,7 @@
     sent server-side in the header you name — never to your browser.</p>
   {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
   {{if .OpsStatus}}
-  <p class="muted small">Last probe {{unixTime .OpsStatus.LastProbeAt}} — mode <strong>{{.OpsStatus.Mode}}</strong>{{if .OpsStatus.Version}} (v{{.OpsStatus.Version}}){{end}}{{if .OpsStatus.LastError}} · {{.OpsStatus.LastError}}{{end}}</p>
+  <p class="muted small">Last probe {{template "ts" .OpsStatus.LastProbeAt}} — mode <strong>{{.OpsStatus.Mode}}</strong>{{if .OpsStatus.Version}} (v{{.OpsStatus.Version}}){{end}}{{if .OpsStatus.LastError}} · {{.OpsStatus.LastError}}{{end}}</p>
   {{end}}
 
   <section class="panel">

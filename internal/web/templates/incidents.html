@@ -25,7 +25,7 @@
           <td class="mono">{{.Target}}</td>
           <td>{{if eq .Level "security"}}<span class="pill pill-down">{{.Level}}</span>{{else}}<span class="pill pill-warn">{{.Level}}</span>{{end}}</td>
           <td class="wrap-cell">{{.Detail}}</td>
-          <td class="mono">{{.Since}}</td>
+          <td class="mono">{{template "ts" .Since}}</td>
           <td>{{if .Acked}}<span class="pill">acked</span>{{else}}<span class="pill pill-warn">firing</span>{{end}}</td>
         </tr>
         {{end}}
@@ -78,11 +78,11 @@
   <section class="panel">
     <h2>Recent failures</h2>
     <div class="table-scroll"><table class="grid">
-      <thead><tr><th>When (UTC)</th><th>Action</th><th>Target</th><th>Outcome</th><th>Detail</th></tr></thead>
+      <thead><tr><th>When</th><th>Action</th><th>Target</th><th>Outcome</th><th>Detail</th></tr></thead>
       <tbody>
         {{range .Failures}}
         <tr class="{{if eq .Outcome "deny"}}out-deny{{end}}">
-          <td class="mono">{{.When}}</td>
+          <td class="mono">{{template "ts" .When}}</td>
           <td>{{.Action}}</td>
           <td class="mono">{{.Target}}</td>
           <td>{{if eq .Outcome "deny"}}<span class="pill pill-down">deny</span>{{else}}<span class="pill pill-warn">error</span>{{end}}</td>

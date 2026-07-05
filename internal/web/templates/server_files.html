@@ -43,7 +43,7 @@
             {{else}}<a href="/server/files?root={{pathEscape $.ServerFiles.Root}}&amp;path={{pathEscape $child}}">{{template "icon-file"}} {{.Name}}</a>{{end}}
           </td>
           <td class="num">{{if not .IsDir}}{{humanBytes .Size}}{{end}}</td>
-          <td class="mono">{{.Mod.Format "2006-01-02 15:04"}}</td>
+          <td class="mono">{{template "ts" .Mod.Unix}}</td>
         </tr>
         {{end}}
       </tbody>

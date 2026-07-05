@@ -15,7 +15,7 @@
           <td class="mono">{{.ID}}</td>
           <td>{{range .Scopes}}<span class="badge">{{.}}</span> {{end}}</td>
           <td class="mono small">{{range .CIDRs}}{{.}}<br>{{end}}</td>
-          <td class="mono">{{.Expires}}</td>
+          <td class="mono">{{template "ts" .Expires}}</td>
           <td>
             {{if eq .State "active"}}<span class="pill pill-ok">active</span>
             {{else if eq .State "expired"}}<span class="pill">expired</span>

@@ -8,7 +8,6 @@ import (
 	"html/template"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/ops"
@@ -28,7 +27,9 @@ var templateFuncs = template.FuncMap{
 	// URL path segment (review #3/#10): '/' '?' '#' etc. become %-encoded so the
 	// {project} route matches and r.PathValue decodes back to the exact value.
 	"pathEscape": url.PathEscape,
-	"unixTime":   func(ts int64) string { return time.Unix(ts, 0).UTC().Format("2006-01-02 15:04:05Z") },
+	// unixTS renders a unix timestamp's UTC display text; the "ts" template wraps it
+	// in a <time data-ts> element app.js localises to the viewer's timezone.
+	"unixTS": unixTS,
 	// sparkPoints builds an SVG polyline "points" string from Mooring-computed
 	// health scores (0..1). The values are numeric (never app strings), so the
 	// output is safe to embed in an html/template-escaped attribute.

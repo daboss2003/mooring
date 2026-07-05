@@ -92,7 +92,7 @@
           <td class="num">{{if gt .High 0}}<span class="pill pill-warn">{{.High}}</span>{{else}}0{{end}}</td>
           <td class="num">{{.Medium}}</td>
           <td class="num">{{.Low}}</td>
-          <td class="mono">{{if .ScannedAt}}{{unixTime .ScannedAt}}{{else}}—{{end}}{{if .Error}} <span class="muted">({{.Error}})</span>{{end}}</td>
+          <td class="mono">{{if .ScannedAt}}{{template "ts" .ScannedAt}}{{else}}—{{end}}{{if .Error}} <span class="muted">({{.Error}})</span>{{end}}</td>
           <td>
             {{if .Reports}}
             <details>
@@ -176,7 +176,7 @@
       {{end}}
     </tbody>
   </table></div>
-  <p class="muted">Top {{len .Procs}} by resident memory{{if .At}} · updated {{.At}}{{end}}. Read-only — Mooring can't signal or kill processes.</p>
+  <p class="muted">Top {{len .Procs}} by resident memory{{if .At}} · updated {{template "ts" .At}}{{end}}. Read-only — Mooring can't signal or kill processes.</p>
   {{else}}
   <p class="muted">No process data.</p>
   {{end}}
