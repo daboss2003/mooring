@@ -59,9 +59,20 @@
       count: document.getElementById(base + "-count"),
     };
   }
-  function paneQuery(pre) {
+  // paneTerms returns the filter split into words (lowercased). A line must contain
+  // EVERY word to match (AND filter) — so "error worker" shows only lines mentioning both,
+  // in any order. Empty ⇒ no filter (show all).
+  function paneTerms(pre) {
     var f = paneParts(pre).filter;
-    return f ? f.value.trim().toLowerCase() : "";
+    if (!f) return [];
+    return f.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  }
+  // lineMatches reports whether a line contains all the terms (case-insensitive substrings).
+  function lineMatches(line, terms) {
+    if (!terms.length) return true;
+    var ll = line.toLowerCase();
+    for (var i = 0; i < terms.length; i++) { if (ll.indexOf(terms[i]) === -1) return false; }
+    return true;
   }
   function updateStreamCount(pre) {
     var p = paneParts(pre);
@@ -73,8 +84,8 @@
   // live lines are appended incrementally below so streaming stays cheap.
   function renderStream(pre) {
     if (!pre._lines) return;
-    var q = paneQuery(pre);
-    var shown = q ? pre._lines.filter(function (l) { return l.toLowerCase().indexOf(q) !== -1; }) : pre._lines;
+    var terms = paneTerms(pre);
+    var shown = terms.length ? pre._lines.filter(function (l) { return lineMatches(l, terms); }) : pre._lines;
     pre._shown = shown.length;
     pre.textContent = shown.length ? shown.join("\n") + "\n" : "";
     pre.scrollTop = pre.scrollHeight;
@@ -100,8 +111,7 @@
     if (!pre._lines) pre._lines = [];
     pre._lines.push(line);
     if (pre._lines.length === 1) pre.textContent = ""; // drop any pre-stream placeholder
-    var q = paneQuery(pre);
-    if (!q || line.toLowerCase().indexOf(q) !== -1) {
+    if (lineMatches(line, paneTerms(pre))) {
       pre.textContent += line + "\n";
       pre.scrollTop = pre.scrollHeight;
       pre._shown++;
