@@ -1,0 +1,7 @@
+# Code owners for Mooring.
+# Combined with a branch-protection / ruleset that "requires review from Code Owners",
+# every PR touching these paths needs an approving review from an owner below before it
+# can be merged. The last matching pattern wins.
+#
+# Everything is owned by the maintainer. Add more owners as `@user` / `@org/team`.
+*       @daboss2003
