@@ -43,35 +43,89 @@
 
   // Lifecycle + log streaming (M4). Buttons carry data-lc-url (POST, streamed
   // response) or data-log-url (GET, SSE). The CSRF token rides the header.
-  var logSource = null;
-  var logLines = []; // buffered lines of the current log stream — the source of truth for filtering
-  var logShown = 0;  // how many lines are currently visible under the active filter
+  var logSource = null; // the SSE EventSource for the live log stream (null when idle)
 
-  // logMatches: case-insensitive substring test for the log filter word.
-  function logMatches(line, q) { return !q || line.toLowerCase().indexOf(q) !== -1; }
-
-  // updateLogCount refreshes the "N / M matching" (or "M lines") readout beside the filter.
-  function updateLogCount() {
-    var cnt = document.getElementById("log-count");
-    if (!cnt) return;
-    var f = document.getElementById("log-filter");
-    var q = f ? f.value.trim() : "";
-    cnt.textContent = q ? (logShown + " / " + logLines.length + " matching") : (logLines.length + " lines");
+  // ---- filterable streaming panes (live logs + deploy/build output) ----
+  // A pane is a <pre id="X-output">. If a toolbar <div id="X-tools"> with an
+  // <input id="X-filter"> + <span id="X-count"> exists, the pane gains a live word-filter:
+  // every line is buffered ON the element (pre._lines) so the filter can re-scan the whole
+  // stream, and only lines containing the filter word (case-insensitive) are shown. All
+  // writes are textContent (never innerHTML) — hostile stream output is inert.
+  function paneParts(pre) {
+    var base = pre.id.replace(/-output$/, "");
+    return {
+      tools: document.getElementById(base + "-tools"),
+      filter: document.getElementById(base + "-filter"),
+      count: document.getElementById(base + "-count"),
+    };
   }
-
-  // renderLog rebuilds the visible <pre> from the buffer, showing only lines that contain
-  // the filter word (case-insensitive). Called when the filter text changes; live lines are
-  // appended incrementally in the stream handler (below) so streaming stays cheap.
-  function renderLog() {
-    var out = document.getElementById("log-output");
-    if (!out) return;
-    var f = document.getElementById("log-filter");
-    var q = f ? f.value.trim().toLowerCase() : "";
-    var shown = q ? logLines.filter(function (l) { return logMatches(l, q); }) : logLines;
-    logShown = shown.length;
-    out.textContent = shown.length ? shown.join("\n") + "\n" : "";
-    out.scrollTop = out.scrollHeight;
-    updateLogCount();
+  function paneQuery(pre) {
+    var f = paneParts(pre).filter;
+    return f ? f.value.trim().toLowerCase() : "";
+  }
+  function updateStreamCount(pre) {
+    var p = paneParts(pre);
+    if (!p.count) return;
+    var q = p.filter ? p.filter.value.trim() : "";
+    p.count.textContent = q ? (pre._shown + " / " + pre._lines.length + " matching") : (pre._lines.length + " lines");
+  }
+  // renderStream rebuilds the pane from its buffer under the current filter (on filter change);
+  // live lines are appended incrementally below so streaming stays cheap.
+  function renderStream(pre) {
+    if (!pre._lines) return;
+    var q = paneQuery(pre);
+    var shown = q ? pre._lines.filter(function (l) { return l.toLowerCase().indexOf(q) !== -1; }) : pre._lines;
+    pre._shown = shown.length;
+    pre.textContent = shown.length ? shown.join("\n") + "\n" : "";
+    pre.scrollTop = pre.scrollHeight;
+    updateStreamCount(pre);
+  }
+  // startStream resets a pane's buffer and reveals/wires its filter toolbar (if any).
+  function startStream(pre) {
+    pre._lines = []; pre._pending = ""; pre._shown = 0;
+    pre.textContent = "";
+    var p = paneParts(pre);
+    if (p.tools) p.tools.hidden = false;
+    if (p.filter) {
+      p.filter.value = ""; // each open starts unfiltered (a page's stream input is shared)
+      if (!p.filter.getAttribute("data-wired")) {
+        p.filter.addEventListener("input", function () { renderStream(pre); });
+        p.filter.setAttribute("data-wired", "1");
+      }
+    }
+    updateStreamCount(pre);
+  }
+  // pushStreamLine buffers one COMPLETE line and appends it if it matches the filter.
+  function pushStreamLine(pre, line) {
+    if (!pre._lines) pre._lines = [];
+    pre._lines.push(line);
+    if (pre._lines.length === 1) pre.textContent = ""; // drop any pre-stream placeholder
+    var q = paneQuery(pre);
+    if (!q || line.toLowerCase().indexOf(q) !== -1) {
+      pre.textContent += line + "\n";
+      pre.scrollTop = pre.scrollHeight;
+      pre._shown++;
+    }
+    updateStreamCount(pre);
+  }
+  // pushStreamChunk buffers a raw text chunk that may contain partial lines, holding the
+  // trailing partial until its newline arrives (for byte-stream sources like deploy output).
+  function pushStreamChunk(pre, text) {
+    var buf = (pre._pending || "") + text;
+    var parts = buf.split("\n");
+    pre._pending = parts.pop();
+    for (var i = 0; i < parts.length; i++) pushStreamLine(pre, parts[i]);
+  }
+  // flushStream emits any trailing partial line when the stream ends.
+  function flushStream(pre) {
+    if (pre._pending) { pushStreamLine(pre, pre._pending); pre._pending = ""; }
+  }
+  // teardownStream resets a pane's buffer + hides its toolbar (on Close). No-op for a
+  // non-filterable pane (e.g. the config preview, which has no toolbar).
+  function teardownStream(pre) {
+    pre._lines = []; pre._pending = ""; pre._shown = 0;
+    var p = paneParts(pre);
+    if (p.tools) p.tools.hidden = true;
   }
 
   // showStream reveals a streaming <pre> (logs / deploy output) and ensures a "Close"
@@ -90,14 +144,10 @@
     closeBtn.className = "stream-close btn btn-sm btn-ghost";
     closeBtn.textContent = "✕ Close";
     closeBtn.addEventListener("click", function () {
-      // logSource + the filter toolbar belong to the log pre ONLY — closing an unrelated
-      // stream (deploy output, config preview) must not tear down a live log stream.
-      if (pre.id === "log-output") {
-        if (logSource) { logSource.close(); logSource = null; }
-        logLines = []; logShown = 0;
-        var tools = document.getElementById("log-tools");
-        if (tools) tools.hidden = true;
-      }
+      // The SSE handle belongs to the log pane only — closing another stream (deploy
+      // output, config preview) must not tear down a live log stream.
+      if (pre.id === "log-output" && logSource) { logSource.close(); logSource = null; }
+      teardownStream(pre); // reset this pane's buffer + hide its filter toolbar
       pre.hidden = true;
       pre.textContent = "";
       closeBtn.remove(); // drop the button entirely; showStream recreates it next open
@@ -147,33 +197,11 @@
       var logOut = document.getElementById("log-output");
       if (!logOut) return;
       if (logSource) logSource.close();
-      logLines = []; logShown = 0;
       showStream(logOut);
-      // Reveal the filter toolbar and wire the input once (re-render on every keystroke).
-      var tools = document.getElementById("log-tools");
-      if (tools) tools.hidden = false;
-      var filter = document.getElementById("log-filter");
-      if (filter) {
-        filter.value = ""; // each log view starts unfiltered (the input is shared across services)
-        if (!filter.getAttribute("data-wired")) {
-          filter.addEventListener("input", renderLog);
-          filter.setAttribute("data-wired", "1");
-        }
-      }
+      startStream(logOut); // reset buffer + reveal/wire the word-filter
       logOut.textContent = "… connecting to logs …";
-      updateLogCount();
       logSource = new EventSource(logURL);
-      logSource.onmessage = function (e) {
-        logLines.push(e.data);
-        if (logLines.length === 1) logOut.textContent = ""; // drop the "connecting…" placeholder
-        var q = filter ? filter.value.trim().toLowerCase() : "";
-        if (logMatches(e.data, q)) {           // append only lines matching the active filter
-          logOut.textContent += e.data + "\n";
-          logOut.scrollTop = logOut.scrollHeight;
-          logShown++;
-        }
-        updateLogCount();
-      };
+      logSource.onmessage = function (e) { pushStreamLine(logOut, e.data); };
       logSource.onerror = function () { logOut.textContent += "\n[log stream ended]\n"; logSource.close(); };
       return;
     }
@@ -183,7 +211,7 @@
     var confirmMsg = btn.getAttribute("data-lc-confirm");
     if (confirmMsg && !window.confirm(confirmMsg)) return;
     var out = document.getElementById("deploy-output");
-    if (out) { showStream(out); out.textContent = "$ " + lcURL + "\n"; }
+    if (out) { showStream(out); startStream(out); pushStreamLine(out, "$ " + lcURL); } // filterable build/deploy log
     btn.disabled = true;
     fetch(lcURL, {
       method: "POST",
@@ -194,14 +222,14 @@
       var dec = new TextDecoder();
       function pump() {
         return reader.read().then(function (r) {
-          if (r.done) { btn.disabled = false; return; }
-          if (out) { out.textContent += dec.decode(r.value, { stream: true }); out.scrollTop = out.scrollHeight; }
+          if (r.done) { if (out) flushStream(out); btn.disabled = false; return; }
+          if (out) pushStreamChunk(out, dec.decode(r.value, { stream: true }));
           return pump();
         });
       }
       return pump();
     }).catch(function (e) {
-      if (out) out.textContent += "\n[request failed: " + e + "]\n";
+      if (out) { flushStream(out); pushStreamLine(out, "[request failed: " + e + "]"); }
       btn.disabled = false;
     });
   });
