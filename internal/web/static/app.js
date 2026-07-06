@@ -44,6 +44,35 @@
   // Lifecycle + log streaming (M4). Buttons carry data-lc-url (POST, streamed
   // response) or data-log-url (GET, SSE). The CSRF token rides the header.
   var logSource = null;
+  var logLines = []; // buffered lines of the current log stream — the source of truth for filtering
+  var logShown = 0;  // how many lines are currently visible under the active filter
+
+  // logMatches: case-insensitive substring test for the log filter word.
+  function logMatches(line, q) { return !q || line.toLowerCase().indexOf(q) !== -1; }
+
+  // updateLogCount refreshes the "N / M matching" (or "M lines") readout beside the filter.
+  function updateLogCount() {
+    var cnt = document.getElementById("log-count");
+    if (!cnt) return;
+    var f = document.getElementById("log-filter");
+    var q = f ? f.value.trim() : "";
+    cnt.textContent = q ? (logShown + " / " + logLines.length + " matching") : (logLines.length + " lines");
+  }
+
+  // renderLog rebuilds the visible <pre> from the buffer, showing only lines that contain
+  // the filter word (case-insensitive). Called when the filter text changes; live lines are
+  // appended incrementally in the stream handler (below) so streaming stays cheap.
+  function renderLog() {
+    var out = document.getElementById("log-output");
+    if (!out) return;
+    var f = document.getElementById("log-filter");
+    var q = f ? f.value.trim().toLowerCase() : "";
+    var shown = q ? logLines.filter(function (l) { return logMatches(l, q); }) : logLines;
+    logShown = shown.length;
+    out.textContent = shown.length ? shown.join("\n") + "\n" : "";
+    out.scrollTop = out.scrollHeight;
+    updateLogCount();
+  }
 
   // showStream reveals a streaming <pre> (logs / deploy output) and ensures a "Close"
   // button sits just above it — so an opened log/output panel can always be dismissed
@@ -61,7 +90,14 @@
     closeBtn.className = "stream-close btn btn-sm btn-ghost";
     closeBtn.textContent = "✕ Close";
     closeBtn.addEventListener("click", function () {
-      if (logSource) { logSource.close(); logSource = null; }
+      // logSource + the filter toolbar belong to the log pre ONLY — closing an unrelated
+      // stream (deploy output, config preview) must not tear down a live log stream.
+      if (pre.id === "log-output") {
+        if (logSource) { logSource.close(); logSource = null; }
+        logLines = []; logShown = 0;
+        var tools = document.getElementById("log-tools");
+        if (tools) tools.hidden = true;
+      }
       pre.hidden = true;
       pre.textContent = "";
       closeBtn.remove(); // drop the button entirely; showStream recreates it next open
@@ -111,12 +147,32 @@
       var logOut = document.getElementById("log-output");
       if (!logOut) return;
       if (logSource) logSource.close();
+      logLines = []; logShown = 0;
       showStream(logOut);
-      logOut.textContent = "… connecting to logs …\n";
+      // Reveal the filter toolbar and wire the input once (re-render on every keystroke).
+      var tools = document.getElementById("log-tools");
+      if (tools) tools.hidden = false;
+      var filter = document.getElementById("log-filter");
+      if (filter) {
+        filter.value = ""; // each log view starts unfiltered (the input is shared across services)
+        if (!filter.getAttribute("data-wired")) {
+          filter.addEventListener("input", renderLog);
+          filter.setAttribute("data-wired", "1");
+        }
+      }
+      logOut.textContent = "… connecting to logs …";
+      updateLogCount();
       logSource = new EventSource(logURL);
       logSource.onmessage = function (e) {
-        logOut.textContent += e.data + "\n";
-        logOut.scrollTop = logOut.scrollHeight;
+        logLines.push(e.data);
+        if (logLines.length === 1) logOut.textContent = ""; // drop the "connecting…" placeholder
+        var q = filter ? filter.value.trim().toLowerCase() : "";
+        if (logMatches(e.data, q)) {           // append only lines matching the active filter
+          logOut.textContent += e.data + "\n";
+          logOut.scrollTop = logOut.scrollHeight;
+          logShown++;
+        }
+        updateLogCount();
       };
       logSource.onerror = function () { logOut.textContent += "\n[log stream ended]\n"; logSource.close(); };
       return;

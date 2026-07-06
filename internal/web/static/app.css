@@ -387,6 +387,10 @@ input:focus, select:focus, textarea:focus {
 }
 /* "Close" button injected above an opened log/output/preview stream so it can be dismissed */
 .stream-close { display: block; width: fit-content; margin: 0.75rem 0 -0.25rem auto; }
+/* Log filter toolbar: a word-filter input + a live "N / M matching" count, shown above the log stream */
+.log-tools { display: flex; gap: 0.6rem; align-items: center; margin: 0.75rem 0 0.4rem; }
+.log-filter { flex: 1 1 auto; min-width: 0; margin: 0; }
+.log-count { white-space: nowrap; flex: 0 0 auto; }
 .spark { width: 100%; max-width: 320px; height: 36px; color: var(--primary); display: block; margin-bottom: 0.6rem; }
 
 /* ============================= alerts / errors ============================= */

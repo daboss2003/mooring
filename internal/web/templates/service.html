@@ -36,6 +36,10 @@
   </section>
 
   <pre id="deploy-output" class="stream" hidden></pre>
+  <div id="log-tools" class="log-tools" hidden>
+    <input type="text" id="log-filter" class="log-filter" placeholder="Filter logs — type a word to show only matching lines" aria-label="Filter logs" autocomplete="off" spellcheck="false">
+    <span id="log-count" class="log-count muted small" aria-live="polite"></span>
+  </div>
   <pre id="log-output" class="stream" hidden></pre>
 
   {{/* Per-service ops (queues + metrics): refreshed in place on a timer like the
