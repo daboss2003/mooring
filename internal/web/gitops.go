@@ -656,6 +656,20 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return err
 	}
+	// The run dir is REUSED across deploys, and `git archive | tar` only adds/overwrites —
+	// it never removes a file the new commit deleted. Left alone, a file dropped in this
+	// commit lingers from the previous deploy and `COPY . .` bakes it into the image
+	// (breaking the build when it references now-removed code). Remove exactly the
+	// git-tracked files this commit deleted vs the previously-deployed one. This touches
+	// ONLY git-tracked paths, so it never disturbs Mooring-owned files (.mooring/),
+	// relative-bind data dirs, or named volumes — none are git-tracked (data-safe).
+	if prev := repo.RefSha(ctx, git.DeployedRef); prev != "" && prev != sha {
+		if n, derr := s.pruneDeletedTrackedFiles(ctx, repo, prev, sha, rd); derr != nil {
+			onLine("warning: could not reconcile deleted files: " + derr.Error())
+		} else if n > 0 {
+			onLine(fmt.Sprintf("removed %d file(s) deleted since the last deploy", n))
+		}
+	}
 	onLine("extracting " + shortSha(sha) + " → run dir")
 	if err := repo.ArchiveTo(ctx, sha, rd); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
@@ -781,7 +795,72 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	}
 	s.gitStore.SetDeployed(bg, slug, sha)
 	onLine("deployed " + shortSha(sha))
+
+	// Reclaim build cache so the generated multi-stage builds' single-use runtime layers
+	// (a unique `COPY --from=build /app /app` per deploy) don't accumulate on the host.
+	// Only when we actually built; best-effort (never fails the deploy); LRU-keeps recent
+	// cache warm. The app is already up, so this only extends the deploy log briefly.
+	if defHasBuild(def) && s.cfg.Server.BuildCacheGCOn() {
+		keep := s.cfg.Server.BuildCacheKeepSize()
+		onLine("$ docker builder prune (reclaiming build cache, keeping " + keep + " of recent)")
+		pctx, pcancel := context.WithTimeout(bg, 15*time.Minute)
+		if perr := s.runner.PruneBuildCache(pctx, keep, onLine); perr != nil {
+			onLine("build-cache prune skipped: " + perr.Error())
+		}
+		pcancel()
+	}
 	return nil
+}
+
+// pruneDeletedTrackedFiles removes from the run dir the git-tracked files present in
+// oldSha but absent from newSha — so a file deleted in a commit actually propagates (git
+// archive|tar only adds/overwrites, never deletes). It removes ONLY regular files, each
+// confined under rd, so it can never delete a bind-mounted data directory, a Mooring-owned
+// file under .mooring/, or anything outside the run dir (none of those are git-tracked).
+// Returns the number of files removed.
+func (s *Server) pruneDeletedTrackedFiles(ctx context.Context, repo *git.Repo, oldSha, newSha, rd string) (int, error) {
+	oldFiles, err := repo.LsFiles(ctx, oldSha)
+	if err != nil {
+		return 0, err
+	}
+	newFiles, err := repo.LsFiles(ctx, newSha)
+	if err != nil {
+		return 0, err
+	}
+	return removeDeletedTrackedFiles(oldFiles, newFiles, rd), nil
+}
+
+// removeDeletedTrackedFiles deletes from rd each path in oldFiles that is absent from
+// newFiles — but ONLY regular files confined under rd. Directories (a bind-mounted data
+// dir), symlinks, non-git-tracked paths (.mooring/, named volumes), and anything that
+// resolves outside rd are never removed. Split out from the git lookup so it's unit
+// testable. Returns the count removed.
+func removeDeletedTrackedFiles(oldFiles, newFiles []string, rd string) int {
+	keep := make(map[string]bool, len(newFiles))
+	for _, f := range newFiles {
+		keep[f] = true
+	}
+	removed := 0
+	for _, f := range oldFiles {
+		if keep[f] {
+			continue
+		}
+		p := filepath.Join(rd, filepath.FromSlash(f))
+		if !confinedUnder(p, rd) {
+			continue // never delete outside the run dir
+		}
+		fi, statErr := os.Lstat(p)
+		if statErr != nil {
+			continue // already gone
+		}
+		if !fi.Mode().IsRegular() {
+			continue // only plain files — never a directory (bind data) or a symlink
+		}
+		if os.Remove(p) == nil {
+			removed++
+		}
+	}
+	return removed
 }
 
 // repoComposeEnv builds the env used for BOTH §5.6 validation and the deploy

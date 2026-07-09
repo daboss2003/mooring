@@ -160,8 +160,32 @@ func (r *Runner) RunInternal(ctx context.Context, job Job, onLine func(string)) 
 }
 
 func (r *Runner) runHeld(ctx context.Context, job Job, onLine func(string)) error {
-	cmd := exec.CommandContext(ctx, r.binary, job.argv()...)
-	cmd.Dir = job.Dir
+	return r.runArgv(ctx, job.Dir, job.argv(), onLine)
+}
+
+// PruneBuildCache reclaims BuildKit build cache, keeping at most `keep` of the
+// most-recently-used cache (LRU eviction): `docker builder prune -a -f --keep-storage
+// <keep>`. It runs under the §0 write gate + the one-docker-child semaphore, exactly like
+// a deploy. `keep` is a validated size (e.g. "5GB") passed as a discrete argv element (no
+// shell). Best-effort by design — callers log the outcome and never fail a deploy on error.
+func (r *Runner) PruneBuildCache(ctx context.Context, keep string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.runArgv(ctx, "", []string{"builder", "prune", "-a", "-f", "--keep-storage", keep}, onLine)
+}
+
+// runArgv execs `docker <argv...>` in dir, streaming truncated output to onLine, with a
+// dedicated process group reaped on ctx cancel. Shared by compose jobs and maintenance
+// commands (build-cache prune). The argv is always static (no shell), keeping the
+// no-command-injection discipline.
+func (r *Runner) runArgv(ctx context.Context, dir string, argv []string, onLine func(string)) error {
+	cmd := exec.CommandContext(ctx, r.binary, argv...)
+	cmd.Dir = dir
 	cmd.Env = minimalEnv()
 	setPgid(cmd)                                        // own process group (unix)
 	cmd.Cancel = func() error { return killGroup(cmd) } // kill the group on ctx cancel

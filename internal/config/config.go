@@ -119,6 +119,18 @@ type ServerConfig struct {
 	// ImageScanInterval is how often to re-scan (default 24h; clamped to a 1h floor).
 	// Re-scanning unchanged images matters — new CVEs are disclosed daily.
 	ImageScanInterval Duration `yaml:"image_scan_interval"`
+
+	// BuildCacheKeepEnabled controls automatic reclamation of Docker/BuildKit build cache
+	// after a build-deploy. Mooring's generated multi-stage Dockerfiles emit a unique,
+	// single-use runtime layer per deploy (`COPY --from=build /app /app` + the non-root
+	// chown), so the cache grows without bound; Mooring runs `docker builder prune
+	// --keep-storage` to cap it — evicting the least-recently-used (stale) entries while
+	// keeping recent, reusable cache (e.g. the dependency-install layer) warm. ON by
+	// default (a *bool: unset = on); set false to disable — then Mooring never prunes.
+	BuildCacheKeepEnabled *bool `yaml:"build_cache_keep_enabled"`
+	// BuildCacheKeep is how much of the most-recently-used build cache to KEEP when pruning
+	// (default "5GB"). A size like "2GB"/"512MB". Smaller = less disk, colder rebuilds.
+	BuildCacheKeep string `yaml:"build_cache_keep"`
 }
 
 // VersionCheckOn reports whether the self-update check is enabled (default on).
@@ -129,6 +141,28 @@ func (s ServerConfig) VersionCheckOn() bool {
 // ImageScanOn reports whether app vulnerability scanning is enabled (default on).
 func (s ServerConfig) ImageScanOn() bool {
 	return s.ImageScanEnabled == nil || *s.ImageScanEnabled
+}
+
+// BuildCacheGCOn reports whether automatic build-cache reclamation is enabled (default on).
+func (s ServerConfig) BuildCacheGCOn() bool {
+	return s.BuildCacheKeepEnabled == nil || *s.BuildCacheKeepEnabled
+}
+
+// buildCacheKeepRe validates a `docker builder prune --keep-storage` size ("10GB",
+// "512MB", or a raw byte count) — a defensive check so a typo can't break the prune.
+// No interior whitespace: docker's size parser wants "5GB", not "5 GB", so a spaced
+// value is rejected here and falls back to the default (a working prune) rather than
+// reaching docker and erroring.
+var buildCacheKeepRe = regexp.MustCompile(`(?i)^[0-9]+(\.[0-9]+)?(b|kb|mb|gb|tb|kib|mib|gib|tib)?$`)
+
+// BuildCacheKeepSize returns the validated keep-storage size, defaulting to "5GB" when
+// unset or malformed. It is passed as a discrete argv element (never a shell string).
+func (s ServerConfig) BuildCacheKeepSize() string {
+	v := strings.TrimSpace(s.BuildCacheKeep)
+	if v == "" || !buildCacheKeepRe.MatchString(v) {
+		return "5GB"
+	}
+	return v
 }
 
 // ServerFileRoot is one named, browsable directory.

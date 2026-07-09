@@ -159,6 +159,13 @@ server:
   image_scan_enabled: false
   image_scan_interval: 24h         # how often to re-scan (default 24h)
 
+  # Automatic Docker build-cache reclamation — ON by default. After each build-deploy Mooring
+  # runs `docker builder prune --keep-storage` so the generated multi-stage builds' single-use
+  # runtime layers don't fill the disk (they can pile up to tens of GB over many deploys). It
+  # keeps the most-recently-used cache warm (e.g. your dependency-install layer).
+  build_cache_keep_enabled: false  # set false to disable (then Mooring never prunes the cache)
+  build_cache_keep: 5GB            # how much recent cache to keep (default 5GB)
+
   # Clean up old downloaded .deb files from the dashboard — off unless you set this.
   deb_cache_dir: /root/downloads
 

@@ -321,3 +321,33 @@ func TestCheckPermsRejectsNonRootOwnerUnlessDevHatch(t *testing.T) {
 		t.Errorf("dev escape hatch did not relax the owner check: %v", err)
 	}
 }
+
+func TestBuildCacheKeepSize(t *testing.T) {
+	bp := func(b bool) *bool { return &b }
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "5GB"},                  // unset → default
+		{"2GB", "2GB"},               // valid
+		{"512MB", "512MB"},           // valid
+		{"10gb", "10gb"},             // case-insensitive
+		{"1073741824", "1073741824"}, // raw bytes
+		{"5 GB", "5GB"},              // interior space rejected → default (a working prune)
+		{"lots", "5GB"},              // garbage → default
+		{"5GB; rm -rf /", "5GB"},     // never trust it → default
+	}
+	for _, c := range cases {
+		got := ServerConfig{BuildCacheKeep: c.in}.BuildCacheKeepSize()
+		if got != c.want {
+			t.Errorf("BuildCacheKeepSize(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	// Default-on semantics.
+	if !(ServerConfig{}).BuildCacheGCOn() {
+		t.Error("build-cache GC must be ON by default (unset)")
+	}
+	if (ServerConfig{BuildCacheKeepEnabled: bp(false)}).BuildCacheGCOn() {
+		t.Error("explicit false must disable build-cache GC")
+	}
+}
