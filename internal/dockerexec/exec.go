@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -89,6 +90,9 @@ type Runner struct {
 	writeAllowed bool
 	writeReason  string
 	binary       string // "docker"; overridable in tests
+
+	keepFlagOnce sync.Once // memoizes the build-cache keep-size flag name (see keepStorageFlag)
+	keepFlag     string
 }
 
 // NewRunner builds a Runner. writeAllowed/writeReason come from the §0 gate.
@@ -176,7 +180,22 @@ func (r *Runner) PruneBuildCache(ctx context.Context, keep string, onLine func(s
 		return err
 	}
 	defer r.sem.Release()
-	return r.runArgv(ctx, "", []string{"builder", "prune", "-a", "-f", "--keep-storage", keep}, onLine)
+	return r.runArgv(ctx, "", []string{"builder", "prune", "-a", "-f", r.keepStorageFlag(ctx), keep}, onLine)
+}
+
+// keepStorageFlag returns the correct "keep this much cache" flag for `docker builder
+// prune` on this host. Newer BuildKit renamed --keep-storage → --reserved-space (the old
+// name prints a deprecation warning and will be removed); older Docker only knows
+// --keep-storage. Probed once from `--help` — a daemon-less, instant CLI call — and cached.
+func (r *Runner) keepStorageFlag(ctx context.Context) string {
+	r.keepFlagOnce.Do(func() {
+		r.keepFlag = "--keep-storage" // older Docker default
+		out, err := exec.CommandContext(ctx, r.binary, "builder", "prune", "--help").CombinedOutput()
+		if err == nil && strings.Contains(string(out), "--reserved-space") {
+			r.keepFlag = "--reserved-space"
+		}
+	})
+	return r.keepFlag
 }
 
 // runArgv execs `docker <argv...>` in dir, streaming truncated output to onLine, with a
