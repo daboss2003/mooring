@@ -24,7 +24,7 @@
     <div class="queue-actions mt1">
       <button type="button" class="btn btn-sm lc-btn" data-log-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs">View logs</button>
       {{if and (not $.WriteDisabledReason) (not $.Protected)}}
-      <button type="button" class="btn btn-sm lc-btn" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart">Restart</button>
+      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart the {{.Service}} service?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart">Restart</button>
       {{if eq .Phase "CIRCUIT_OPEN"}}
       <form method="post" action="/apps/{{pathEscape .Project}}/supervisor/clear" class="inline" data-confirm="Clear the self-heal circuit for {{.Service}} and let Mooring try again?">
         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="service" value="{{.Service}}">
@@ -123,9 +123,9 @@
         <td class="mono">{{range .Counts}}{{.Name}}={{.Value}} {{end}}</td>
         <td class="queue-actions">
           {{if $.Protected}}<span class="muted">—</span>{{else}}
-          <form method="post" action="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}/queues/{{pathEscape .Name}}/pause" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">pause</button></form>
-          <form method="post" action="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}/queues/{{pathEscape .Name}}/resume" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">resume</button></form>
-          <form method="post" action="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}/queues/{{pathEscape .Name}}/retry-failed" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">retry-failed</button></form>
+          <form method="post" action="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}/queues/{{pathEscape .Name}}/pause" class="inline" data-confirm="Pause the {{.Name}} queue? Jobs stop processing until you resume it."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">pause</button></form>
+          <form method="post" action="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}/queues/{{pathEscape .Name}}/resume" class="inline" data-confirm="Resume the {{.Name}} queue?"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">resume</button></form>
+          <form method="post" action="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}/queues/{{pathEscape .Name}}/retry-failed" class="inline" data-confirm="Retry all failed jobs in the {{.Name}} queue?"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">retry-failed</button></form>
           {{end}}
         </td>
       </tr>

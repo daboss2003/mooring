@@ -160,9 +160,9 @@
         <td class="mono">{{range .Counts}}{{.Name}}={{.Value}} {{end}}</td>
         <td class="queue-actions">
           {{if not $prot}}
-          <form method="post" action="/apps/{{pathEscape $proj}}/queues/{{pathEscape .Name}}/pause" class="inline"><input type="hidden" name="csrf_token" value="{{$csrf}}"><button type="submit" class="link">pause</button></form>
-          <form method="post" action="/apps/{{pathEscape $proj}}/queues/{{pathEscape .Name}}/resume" class="inline"><input type="hidden" name="csrf_token" value="{{$csrf}}"><button type="submit" class="link">resume</button></form>
-          <form method="post" action="/apps/{{pathEscape $proj}}/queues/{{pathEscape .Name}}/retry-failed" class="inline"><input type="hidden" name="csrf_token" value="{{$csrf}}"><button type="submit" class="link">retry-failed</button></form>
+          <form method="post" action="/apps/{{pathEscape $proj}}/queues/{{pathEscape .Name}}/pause" class="inline" data-confirm="Pause the {{.Name}} queue? Jobs stop processing until you resume it."><input type="hidden" name="csrf_token" value="{{$csrf}}"><button type="submit" class="link">pause</button></form>
+          <form method="post" action="/apps/{{pathEscape $proj}}/queues/{{pathEscape .Name}}/resume" class="inline" data-confirm="Resume the {{.Name}} queue?"><input type="hidden" name="csrf_token" value="{{$csrf}}"><button type="submit" class="link">resume</button></form>
+          <form method="post" action="/apps/{{pathEscape $proj}}/queues/{{pathEscape .Name}}/retry-failed" class="inline" data-confirm="Retry all failed jobs in the {{.Name}} queue?"><input type="hidden" name="csrf_token" value="{{$csrf}}"><button type="submit" class="link">retry-failed</button></form>
           {{else}}<span class="muted">—</span>{{end}}
         </td>
       </tr>
@@ -202,7 +202,7 @@
       <td class="muted">{{.StatusText}}</td>
       <td class="queue-actions">
         <button type="button" class="link lc-btn" data-log-url="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}/logs">logs</button>
-        {{if and (not $wdr) (not $prot)}}<button type="button" class="link lc-btn" data-lc-url="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}/restart">restart</button>{{end}}
+        {{if and (not $wdr) (not $prot)}}<button type="button" class="link lc-btn" data-lc-confirm="Restart the {{.Service}} service?" data-lc-url="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}/restart">restart</button>{{end}}
       </td>
     </tr>
     {{else}}

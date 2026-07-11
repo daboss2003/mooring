@@ -27,9 +27,9 @@
   <section class="panel">
     <h2>Lifecycle</h2>
     <div class="queue-actions">
-      <button type="button" class="btn btn-sm lc-btn" data-lc-url="/apps/{{pathEscape .App.Project}}/start">Start</button>
-      <button type="button" class="btn btn-sm lc-btn" data-lc-url="/apps/{{pathEscape .App.Project}}/stop">Stop</button>
-      <button type="button" class="btn btn-sm lc-btn" data-lc-url="/apps/{{pathEscape .App.Project}}/restart">Restart</button>
+      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Start {{.App.Project}}?" data-lc-url="/apps/{{pathEscape .App.Project}}/start">Start</button>
+      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop {{.App.Project}}? All of its containers will be stopped." data-lc-url="/apps/{{pathEscape .App.Project}}/stop">Stop</button>
+      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart {{.App.Project}}?" data-lc-url="/apps/{{pathEscape .App.Project}}/restart">Restart</button>
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Redeploy {{.App.Project}}? This recreates its containers." data-lc-url="/apps/{{pathEscape .App.Project}}/redeploy">Redeploy</button>
     </div>
   </section>
