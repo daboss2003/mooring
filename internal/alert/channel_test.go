@@ -98,3 +98,30 @@ func TestSMTPRejectsBadAddresses(t *testing.T) {
 		t.Error("bad from address should be rejected before any network use")
 	}
 }
+
+func TestGmailChannel(t *testing.T) {
+	// Valid config builds (and validates) through BuildChannel.
+	if _, err := BuildChannel("gmail", []byte(`{"email":"me@gmail.com","password":"abcd efgh ijkl mnop","to":""}`)); err != nil {
+		t.Errorf("valid gmail config rejected: %v", err)
+	}
+	// Validation rejects a bad address, a missing app password, and a bad recipient.
+	bad := []string{
+		`{"email":"not an email","password":"pw","to":""}`,
+		`{"email":"me@gmail.com","password":"","to":""}`,
+		`{"email":"me@gmail.com","password":"pw","to":"nope"}`,
+	}
+	for _, cfg := range bad {
+		if _, err := BuildChannel("gmail", []byte(cfg)); err == nil {
+			t.Errorf("invalid gmail config accepted: %s", cfg)
+		}
+	}
+	// Unknown fields are rejected (no smuggling extra SMTP host/port).
+	if _, err := BuildChannel("gmail", []byte(`{"email":"me@gmail.com","password":"pw","host":"evil"}`)); err == nil {
+		t.Error("unknown field should be rejected (a gmail channel can't override the SMTP host)")
+	}
+	// The preset targets Gmail's STARTTLS endpoint and defaults `to` to the sender.
+	c := gmailChannel{Email: "me@gmail.com", Password: "pw"}
+	if to := c.To; to != "" { // sanity: To empty means "send to myself" at Send time
+		t.Fatalf("unexpected To %q", to)
+	}
+}

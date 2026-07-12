@@ -74,7 +74,8 @@
           <option value="slack">slack</option>
           <option value="discord">discord</option>
           <option value="telegram">telegram</option>
-          <option value="smtp">smtp (email)</option>
+          <option value="gmail">Gmail (easy email)</option>
+          <option value="smtp">smtp (email — any provider)</option>
         </select></label>
 
       <div class="kind-fields" data-kind="ntfy">
@@ -118,6 +119,18 @@
       <div class="kind-fields" data-kind="telegram" hidden>
         <label>Bot token <input type="password" name="bot_token" autocomplete="new-password" disabled></label>
         <label>Chat ID <input type="text" name="chat_id" autocomplete="off" disabled></label>
+      </div>
+
+      <div class="kind-fields" data-kind="gmail" hidden>
+        <p class="muted">Send alerts through your own Gmail — Mooring fills in the rest. You need a Google
+          <strong>App Password</strong> (not your normal password): turn on 2-Step Verification, then
+          <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noopener noreferrer">create an App Password</a>
+          and paste the 16-character code below. Alert volume is tiny, well under Gmail's daily send limit.</p>
+        <label>Gmail address <input type="email" name="gmail_email" autocomplete="off" disabled placeholder="you@gmail.com"></label>
+        <label>App password <span class="muted">(16 chars from Google — never your account password)</span>
+          <input type="password" name="gmail_password" autocomplete="new-password" disabled></label>
+        <label>Send alerts to <span class="muted">(optional — defaults to your own address)</span>
+          <input type="email" name="gmail_to" autocomplete="off" disabled placeholder="you@gmail.com"></label>
       </div>
 
       <div class="kind-fields" data-kind="smtp" hidden>

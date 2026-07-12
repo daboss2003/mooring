@@ -47,7 +47,8 @@ Add one or more **channels** on the **Channels** page (Alerts → Channels). An 
 
 | Channel | What you provide |
 |---|---|
-| **Email** | Your SMTP server details. Sent over TLS; messages link back to the dashboard. |
+| **Gmail** | Just your Gmail address and a Google **App Password** — Mooring fills in the rest and sends over TLS. The easy way to get email alerts (see below). |
+| **Email (SMTP)** | Any provider's SMTP server details (host, port, user, password, from, to). Sent over TLS; messages link back to the dashboard. |
 | **Webhook** | A URL. The request is signed so your receiver can verify it's really from Mooring. |
 | **Slack** | An incoming webhook URL. |
 | **Discord** | An incoming webhook URL. |
@@ -55,6 +56,22 @@ Add one or more **channels** on the **Channels** page (Alerts → Channels). An 
 | **ntfy** | A server URL, a topic, and (optionally) a token for a protected topic/server. |
 
 The **Add a channel** form shows **only the fields for the kind you pick** — choose ntfy and you'll see just the ntfy fields, choose SMTP and you'll see just the mail fields. After adding a channel, use **Send test** to confirm it works.
+
+### Email alerts through Gmail (the easy way)
+
+You don't need your own mail server — send alerts through your own Gmail account:
+
+1. On the **Channels** page → **Add a channel**, pick **Gmail**.
+2. Enter your **Gmail address** and a Google **App Password** (see below). Optionally set a different
+   recipient; leave it blank to email the alerts to yourself.
+3. **Send test** to confirm.
+
+**You must use an App Password, not your normal Gmail password** — Google blocks normal-password
+sign-in for apps. To create one: enable **2-Step Verification** on your Google account, then go to
+[myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords), generate a password,
+and paste the 16-character code into Mooring. Alert volume is tiny (a handful of messages), well under
+Gmail's daily sending limit. The App Password is stored **encrypted at rest** and never shown back;
+Mooring only ever connects to `smtp.gmail.com` over TLS with it.
 
 ### Push to your phone with ntfy
 

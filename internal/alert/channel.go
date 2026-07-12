@@ -42,6 +42,15 @@ func BuildChannel(kind string, configJSON []byte) (Channel, error) {
 		return parseChannel[webhookChannel](configJSON)
 	case "smtp":
 		return parseChannel[smtpChannel](configJSON)
+	case "gmail":
+		ch, err := parseChannel[gmailChannel](configJSON)
+		if err != nil {
+			return nil, err
+		}
+		if verr := ch.(gmailChannel).validate(); verr != nil {
+			return nil, verr
+		}
+		return ch, nil
 	case "telegram":
 		return parseChannel[telegramChannel](configJSON)
 	case "slack":
@@ -60,7 +69,7 @@ func BuildChannel(kind string, configJSON []byte) (Channel, error) {
 // ValidChannelKind reports whether kind is supported.
 func ValidChannelKind(kind string) bool {
 	switch kind {
-	case "webhook", "smtp", "telegram", "slack", "discord", "ntfy", "ntfy_managed":
+	case "webhook", "smtp", "gmail", "telegram", "slack", "discord", "ntfy", "ntfy_managed":
 		return true
 	}
 	return false
@@ -356,6 +365,49 @@ func (c smtpChannel) Send(ctx context.Context, n Notification) error {
 	}
 	// STARTTLS path (587/25) — REQUIRE TLS (never send credentials in the clear).
 	return sendStartTLS(addr, tlsCfg, auth, from.Address, []string{to.Address}, msg.Bytes())
+}
+
+// --- Gmail (a zero-config preset over SMTP) ---
+
+// gmailChannel is the easy email option: the operator supplies only their Gmail address
+// and a Google App Password, and Mooring fills in the SMTP details (smtp.gmail.com:587,
+// STARTTLS) and reuses the header-injection-safe smtpChannel sender. NOTE: Gmail SMTP
+// requires an App Password (16 chars, from a 2FA-enabled account) — a normal account
+// password is rejected by Google.
+type gmailChannel struct {
+	Email    string `json:"email"`    // the Gmail address: SMTP username AND the From
+	Password string `json:"password"` // a Google App Password (never the account password)
+	To       string `json:"to"`       // recipient; defaults to Email (send to yourself) when empty
+}
+
+func (c gmailChannel) validate() error {
+	if _, err := mail.ParseAddress(c.Email); err != nil {
+		return errors.New("alert: the Gmail address is not a valid email")
+	}
+	if strings.TrimSpace(c.Password) == "" {
+		return errors.New("alert: a Google App Password is required (a normal Gmail password will not work)")
+	}
+	if c.To != "" {
+		if _, err := mail.ParseAddress(c.To); err != nil {
+			return errors.New("alert: the recipient (to) is not a valid email")
+		}
+	}
+	return nil
+}
+
+func (c gmailChannel) Send(ctx context.Context, n Notification) error {
+	to := c.To
+	if to == "" {
+		to = c.Email // default: send the alerts to yourself
+	}
+	return smtpChannel{
+		Host:     "smtp.gmail.com",
+		Port:     587, // STARTTLS (the smtpChannel sender REQUIRES TLS)
+		Username: c.Email,
+		Password: c.Password,
+		From:     c.Email,
+		To:       to,
+	}.Send(ctx, n)
 }
 
 func sendStartTLS(addr string, tlsCfg *tls.Config, auth smtp.Auth, from string, to []string, msg []byte) error {

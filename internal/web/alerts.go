@@ -130,6 +130,9 @@ func buildChannelConfig(kind string, r *http.Request) ([]byte, bool) {
 		port, _ := strconv.Atoi(v("port"))
 		m["host"], m["port"], m["username"], m["password"], m["from"], m["to"] =
 			v("host"), port, v("username"), v("password"), v("from"), v("to")
+	case "gmail":
+		// Easy email: just the Gmail address + a Google App Password (+ optional recipient).
+		m["email"], m["password"], m["to"] = v("gmail_email"), v("gmail_password"), v("gmail_to")
 	default:
 		return nil, false
 	}
