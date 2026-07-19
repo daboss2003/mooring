@@ -134,8 +134,8 @@ footer a{color:#c7ccea} footer .links{display:flex;gap:20px;flex-wrap:wrap}
   <div class="wrap">
     <div>
       <span class="eyebrow">Self-hosted · Docker · No Kubernetes</span>
-      <h1>Ship apps to your own server, the <span class="grad">easy, secure way</span>.</h1>
-      <p class="lead">Mooring is a lightweight, security-first <strong>self-hosted PaaS</strong> and control plane for Docker. Describe a multi-service app in one YAML file — Mooring handles HTTPS, deploys, monitoring, alerts, backups and self-healing. No Swarm, no Kubernetes.</p>
+      <h1>Push to Git. Get HTTPS. <span class="grad">On your own server.</span></h1>
+      <p class="lead">Mooring is a <strong>self-hosted PaaS for Docker</strong>. You describe your app in one <code>mooring.yaml</code>; it writes the Dockerfile and the Compose, issues and renews the certs, deploys when you <code>git push</code>, and keeps an eye on the whole thing — health, alerts, backups, self-healing. No Kubernetes. No Swarm. No reverse proxy or certbot to babysit.</p>
       <div class="cta">
         <a class="btn btn-primary" href="#install">Get started →</a>
         <a class="btn btn-ghost" href="https://github.com/daboss2003/mooring">★ Star on GitHub</a>
@@ -164,16 +164,16 @@ footer a{color:#c7ccea} footer .links{display:flex;gap:20px;flex-wrap:wrap}
 <section id="features">
   <div class="wrap">
     <div class="section-head">
-      <h2>Everything a small server needs to run real apps</h2>
-      <p>Batteries included, secure by default, and no moving parts you have to babysit.</p>
+      <h2>The stuff you'd otherwise wire up by hand</h2>
+      <p>Certs, routing, deploys, monitoring, backups — set up for you, locked down by default, and out of your way.</p>
     </div>
     <div class="grid">
       <div class="feat"><div class="ico">🔒</div><h3>Automatic HTTPS</h3><p>Give an app a domain; Mooring issues and renews the certificate and routes traffic. No proxy to run, no certbot.</p></div>
-      <div class="feat"><div class="ico">🚀</div><h3>Deploy from Git</h3><p>Connect a repo and deploy on click. Mooring generates and owns the Compose file and Dockerfile — you never hand-write either.</p></div>
+      <div class="feat"><div class="ico">🚀</div><h3>Deploy from Git</h3><p>Connect a repo, hit Deploy. Mooring writes and owns the Compose file and the Dockerfile — you never touch either.</p></div>
       <div class="feat"><div class="ico">📊</div><h3>Monitoring &amp; alerts</h3><p>Live health for every app and the host, with email, webhook, Slack, Discord or Telegram alerts and quiet hours.</p></div>
       <div class="feat"><div class="ico">💾</div><h3>Backups &amp; recovery</h3><p>Encrypted snapshots of your whole setup, with a safe restore onto a fresh server.</p></div>
-      <div class="feat"><div class="ico">⚖️</div><h3>Scaling &amp; self-healing</h3><p>Conservative, opt-in automation that keeps stateless services responsive and recovers crashed ones — and pages you when it can't.</p></div>
-      <div class="feat"><div class="ico">🛡️</div><h3>Secure by design</h3><p>A read-only Docker connection, a documented threat model, and a built-in check that watches Mooring itself for security advisories.</p></div>
+      <div class="feat"><div class="ico">⚖️</div><h3>Scaling &amp; self-healing</h3><p>Opt-in and conservative by default: it keeps stateless services responsive, restarts crashed ones, and pages you when it can't cope on its own.</p></div>
+      <div class="feat"><div class="ico">🛡️</div><h3>Least privilege by default</h3><p>Mooring reaches Docker through a read-only proxy — never the raw socket. It ships with a written threat model, and checks its own version against security advisories.</p></div>
     </div>
   </div>
 </section>
