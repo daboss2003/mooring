@@ -234,10 +234,16 @@ type EdgeConfig struct {
 	// mqtt.<base_domain> at deploy time. The operator points a SINGLE wildcard DNS record
 	// (*.<base_domain> → this server) and every declared subdomain resolves. "" disables the
 	// shorthand (full hostnames still work). Must be a FQDN, no wildcards.
-	BaseDomain       string   `yaml:"base_domain"`
-	ApplyProbeWindow Duration `yaml:"apply_probe_window"`
-	L4Enabled        bool     `yaml:"l4_enabled"`      // own a managed L4 (TCP/UDP) load balancer (nginx-stream)
-	L4NginxDigest    string   `yaml:"l4_nginx_digest"` // pinned SHA-256 of the nginx binary (optional)
+	BaseDomain string `yaml:"base_domain"`
+	// DNS01, when set, issues a single *.<base_domain> WILDCARD certificate via ACME DNS-01
+	// (instead of a per-subdomain HTTP-01 cert each) — one cert for every subdomain, no
+	// per-name rate limits, and it works for names that aren't HTTP-reachable. It REQUIRES a
+	// caddy binary with your DNS provider's module compiled in (vanilla Caddy has none —
+	// build one with xcaddy). Optional; leave unset to keep per-subdomain HTTP-01.
+	DNS01            *EdgeDNS01 `yaml:"dns01,omitempty"`
+	ApplyProbeWindow Duration   `yaml:"apply_probe_window"`
+	L4Enabled        bool       `yaml:"l4_enabled"`      // own a managed L4 (TCP/UDP) load balancer (nginx-stream)
+	L4NginxDigest    string     `yaml:"l4_nginx_digest"` // pinned SHA-256 of the nginx binary (optional)
 }
 
 // EdgeCA is an additional ACME issuer — a private/internal CA (e.g. step-ca). A
@@ -250,6 +256,18 @@ type EdgeCA struct {
 	Email        string `yaml:"email"`         // optional ACME contact; falls back to acme_email
 	TrustedRoot  string `yaml:"trusted_root"`  // optional PEM file Caddy trusts for the CA's OWN https
 }
+
+// EdgeDNS01 configures the optional *.<base_domain> wildcard cert via ACME DNS-01. Provider
+// is the Caddy DNS module name (e.g. "cloudflare", "digitalocean", "route53"); APIToken is
+// the provider credential (secret-bearing — redacted, and never leaves this box except to the
+// DNS provider via the caddy child). The module must be compiled into the caddy binary.
+type EdgeDNS01 struct {
+	Provider string `yaml:"provider"`
+	APIToken string `yaml:"api_token"`
+}
+
+// dnsProviderRe constrains a Caddy DNS provider module name to a safe identifier.
+var dnsProviderRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,40}$`)
 
 // EdgeCAByName returns the configured CA with the given name.
 func (c *Config) EdgeCAByName(name string) (EdgeCA, bool) {
@@ -725,6 +743,17 @@ func (c *Config) Validate() error {
 		}
 		if bd := strings.TrimSpace(c.Edge.BaseDomain); bd != "" && (len(bd) > 253 || !edgeHostnameRe.MatchString(bd)) {
 			add("edge.base_domain %q must be a valid FQDN with no wildcards (e.g. mooring.example.com)", bd)
+		}
+		if d := c.Edge.DNS01; d != nil {
+			if strings.TrimSpace(c.Edge.BaseDomain) == "" {
+				add("edge.dns01 (wildcard cert) requires edge.base_domain")
+			}
+			if !dnsProviderRe.MatchString(strings.TrimSpace(d.Provider)) {
+				add("edge.dns01.provider %q must be a caddy DNS module name [a-z0-9._-] (e.g. cloudflare)", d.Provider)
+			}
+			if strings.TrimSpace(d.APIToken) == "" {
+				add("edge.dns01.api_token is required for the DNS-01 wildcard cert")
+			}
 		}
 	case EdgeExternal:
 		// Stronger fail-closed boot for external mode (plan §3.1): must have a

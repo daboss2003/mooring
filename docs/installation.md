@@ -176,6 +176,35 @@ admin:
 
 > **When you expose the admin dashboard, it becomes internet-reachable** — gated by your `ip_allowlist` (enforced at the edge *and* re-checked against the real client), then your password + **TOTP**. Keep `ip_allowlist` tight (never a catch-all), and enable TOTP. Mooring fronts the dashboard through the managed edge to a **dedicated internal listener** (`admin.edge_listen`, default `127.0.0.1:9001`) so your SSH-tunnel access on `bind_addr` keeps working unchanged. Exposing/unexposing needs a **restart** (listeners are fixed at boot). If you use GitHub connect, re-register your OAuth App's callback as `https://<admin hostname>/github/callback`.
 
+#### Optional: one wildcard certificate for all subdomains (ACME DNS-01)
+
+By default each declared subdomain gets its own certificate via HTTP-01. If you run many
+subdomains (or want a name that isn't HTTP-reachable), you can instead issue **one
+`*.<base_domain>` wildcard** via ACME **DNS-01** — no per-name rate limits, one cert for
+everything under `base_domain`:
+
+```yaml
+edge:
+  base_domain: mooring.example.com
+  dns01:
+    provider: cloudflare            # your DNS provider (cloudflare, route53, digitalocean, …)
+    api_token: "<dns-api-token>"    # secret — a token scoped to edit this zone
+```
+
+**Mooring installs the right Caddy plugin for you** — you don't build anything. DNS-01 needs
+your provider's DNS module compiled into Caddy, so on startup Mooring runs `caddy add-package`
+(Caddy's official mechanism: it downloads a plugin-enabled binary and swaps it in) for the
+`provider` you named. It supports every provider in the [caddy-dns](https://github.com/orgs/caddy-dns/repositories)
+family — Cloudflare, Route 53, DigitalOcean, Google Cloud DNS, Azure, Hetzner, Vultr, Linode,
+Namecheap, and more. (If the auto-install can't run — e.g. the box can't reach `caddyserver.com`
+or the `caddy` binary isn't writable by the service — Mooring logs a clear warning and the edge
+still comes up; the wildcard just won't issue until the plugin is present. Nothing is ever
+mis-issued.)
+
+With `dns01` set, subjects at/under `base_domain` are served by the one wildcard; hostnames
+outside it keep their own HTTP-01 cert. The `api_token` is stored only in the root-only
+`config.yaml` (never logged or shown in the dashboard) and passed solely to the supervised Caddy.
+
 Mooring validates this file at startup. If a required value is missing or the file permissions are too open, it stops with a clear message explaining what to fix.
 
 > Everything *else* about your apps lives in the dashboard (or an optional per-app file). This config is just the foundation.

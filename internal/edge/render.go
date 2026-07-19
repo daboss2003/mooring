@@ -63,6 +63,12 @@ type BaseConfig struct {
 	AdminHostname  string   // "" = NO admin vhost (reach the UI via SSH tunnel)
 	AdminAllowlist []string // IP-allowlist CIDRs for the admin vhost (typed, mandatory if AdminHostname set)
 	AdminUpstream  string   // the ONLY loopback upstream, identity-pinned (e.g. 127.0.0.1:9000)
+	// BaseDomain + DNS01* enable an OPTIONAL *.<BaseDomain> wildcard cert via ACME DNS-01:
+	// any default-CA subject at/under BaseDomain is served by the one wildcard (dropped from
+	// per-name HTTP-01 issuance). Empty DNS01Provider = disabled (per-subdomain HTTP-01).
+	BaseDomain    string
+	DNS01Provider string // caddy DNS module name (must be compiled into the caddy binary)
+	DNS01Token    string // provider credential (secret)
 }
 
 // dials returns the upstream host:port set for this route: the live replica pool
@@ -158,7 +164,8 @@ type CertHost struct {
 }
 
 func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error) {
-	admin := &caddyAdmin{Listen: base.AdminListen, EnforceOrigin: true, Origins: []string{"127.0.0.1", "::1", "localhost"}}
+	persistOff := false
+	admin := &caddyAdmin{Listen: base.AdminListen, EnforceOrigin: true, Origins: []string{"127.0.0.1", "::1", "localhost"}, Config: &caddyAdminConfig{Persist: &persistOff}}
 
 	var httpRoutes []caddyRoute
 	var subjects []string
@@ -269,7 +276,24 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 	// policy (its issuer directory + optional trusted roots), and everything else uses
 	// the default issuer. An unknown CA name falls back to the default (defensive — the
 	// apply layer already rejects unknown names).
-	if len(subjects) > 0 {
+	// Optional *.<base_domain> wildcard via DNS-01: any DEFAULT-CA subject at/under base_domain
+	// is served by the ONE wildcard cert, so drop it from per-name issuance (dodges HTTP-01
+	// rate limits and covers non-HTTP-reachable names). A named-CA subject or a subject outside
+	// base_domain keeps its own HTTP-01 cert. The wildcard string is Mooring-generated (never
+	// operator route input), so it never passes through the no-wildcard hostname check.
+	wildcard := ""
+	if base.DNS01Provider != "" && base.BaseDomain != "" {
+		wildcard = "*." + base.BaseDomain
+		kept := make([]string, 0, len(subjects))
+		for _, h := range subjects {
+			if subjectCA[h] == "" && coveredByWildcard(h, base.BaseDomain) {
+				continue // covered by the wildcard
+			}
+			kept = append(kept, h)
+		}
+		subjects = kept
+	}
+	if len(subjects) > 0 || wildcard != "" {
 		caByName := map[string]CA{}
 		for _, c := range base.CAs {
 			caByName[c.Name] = c
@@ -288,7 +312,7 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			}
 			groups[name] = append(groups[name], h)
 		}
-		policies := make([]caddyTLSPolicy, 0, len(order))
+		policies := make([]caddyTLSPolicy, 0, len(order)+1)
 		for _, name := range order {
 			iss := caddyIssuer{Module: "acme", CA: base.ACMECA, Email: base.ACMEEmail}
 			if name != "" {
@@ -301,15 +325,40 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			}
 			policies = append(policies, caddyTLSPolicy{Subjects: groups[name], Issuers: []caddyIssuer{iss}})
 		}
+		automate := subjects
+		if wildcard != "" {
+			// One DNS-01 policy for the wildcard (default ACME CA/email + the DNS challenge).
+			dnsIss := caddyIssuer{
+				Module: "acme", CA: base.ACMECA, Email: base.ACMEEmail,
+				Challenges: &caddyChallenges{DNS: &caddyDNSChallenge{Provider: map[string]any{
+					"name": base.DNS01Provider, "api_token": base.DNS01Token,
+				}}},
+			}
+			policies = append(policies, caddyTLSPolicy{Subjects: []string{wildcard}, Issuers: []caddyIssuer{dnsIss}})
+			automate = append(append([]string(nil), subjects...), wildcard)
+		}
 		cfg.Apps.TLS = &caddyTLS{
 			// automate makes Caddy actually obtain a cert for every subject — including
 			// cert-only ones (no proxy route references them, so auto-HTTPS wouldn't
 			// pick them up).
-			Certificates: &caddyCertificates{Automate: subjects},
+			Certificates: &caddyCertificates{Automate: automate},
 			Automation:   caddyAutomation{Policies: policies},
 		}
 	}
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// coveredByWildcard reports whether a *.base certificate covers host. A wildcard matches
+// EXACTLY one label (RFC 6125): it covers foo.base but NOT the apex `base` nor a deeper name
+// like a.b.base. So only a single-label subdomain may be dropped in favor of the wildcard;
+// the apex and multi-label names must keep their own cert (else they'd get none).
+func coveredByWildcard(host, base string) bool {
+	suffix := "." + base
+	if !strings.HasSuffix(host, suffix) {
+		return false
+	}
+	label := host[:len(host)-len(suffix)]
+	return label != "" && !strings.Contains(label, ".")
 }
 
 // xffOverwrite sets X-Forwarded-For to the real TCP peer (overwrite, not append),

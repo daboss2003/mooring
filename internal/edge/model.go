@@ -11,9 +11,18 @@ type caddyConfig struct {
 }
 
 type caddyAdmin struct {
-	Listen        string   `json:"listen"`
-	EnforceOrigin bool     `json:"enforce_origin"`
-	Origins       []string `json:"origins,omitempty"`
+	Listen        string            `json:"listen"`
+	EnforceOrigin bool              `json:"enforce_origin"`
+	Origins       []string          `json:"origins,omitempty"`
+	Config        *caddyAdminConfig `json:"config,omitempty"`
+}
+
+// caddyAdminConfig disables Caddy's config autosave. Mooring re-feeds the whole document on
+// every boot (Supervisor.InitialCfg) and re-renders it on every change, so autosave is never
+// needed — and turning it off keeps a secret-bearing config (e.g. a DNS-01 api_token) from
+// being written at rest to /var/lib/caddy/.../autosave.json beyond the 0600 root config.yaml.
+type caddyAdminConfig struct {
+	Persist *bool `json:"persist,omitempty"`
 }
 
 type caddyApps struct {
@@ -111,8 +120,23 @@ type caddyTLSPolicy struct {
 }
 
 type caddyIssuer struct {
-	Module       string   `json:"module"`
-	CA           string   `json:"ca,omitempty"`
-	Email        string   `json:"email,omitempty"`
-	TrustedRoots []string `json:"trusted_roots_pem_files,omitempty"` // for a private CA's own https
+	Module       string           `json:"module"`
+	CA           string           `json:"ca,omitempty"`
+	Email        string           `json:"email,omitempty"`
+	TrustedRoots []string         `json:"trusted_roots_pem_files,omitempty"` // for a private CA's own https
+	Challenges   *caddyChallenges `json:"challenges,omitempty"`              // set → DNS-01 (for a wildcard subject)
+}
+
+// caddyChallenges scopes an ACME issuer to a specific challenge. Mooring only ever sets DNS
+// (for the optional *.base_domain wildcard); leaving it nil keeps Caddy's default HTTP-01 +
+// TLS-ALPN-01 on :80/:443 for every ordinary subject.
+type caddyChallenges struct {
+	DNS *caddyDNSChallenge `json:"dns,omitempty"`
+}
+
+// caddyDNSChallenge carries the DNS provider module + its (secret-bearing) config, e.g.
+// {"provider":{"name":"cloudflare","api_token":"…"}}. The provider module must be COMPILED
+// INTO the caddy binary (vanilla Caddy has none — build one with xcaddy).
+type caddyDNSChallenge struct {
+	Provider map[string]any `json:"provider,omitempty"`
 }

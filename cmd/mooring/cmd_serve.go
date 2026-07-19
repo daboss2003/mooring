@@ -344,6 +344,18 @@ func cmdServe(args []string) error {
 			AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
 			AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
 			AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
+			BaseDomain:     cfg.Edge.BaseDomain,
+		}
+		if d := cfg.Edge.DNS01; d != nil { // opt-in *.<base_domain> wildcard via DNS-01
+			base.DNS01Provider, base.DNS01Token = d.Provider, d.APIToken
+			log.Info("edge: issuing a *."+cfg.Edge.BaseDomain+" wildcard cert via ACME DNS-01", "provider", d.Provider)
+			// Install the provider's Caddy DNS plugin automatically (no manual xcaddy build).
+			// Best-effort: if it can't install, the edge still comes up on the module-free boot
+			// floor and only the wildcard reconcile fails visibly.
+			if ierr := edge.EnsureDNSProvider(ctx, "caddy", d.Provider, log); ierr != nil {
+				log.Warn("edge: could not auto-install the Caddy DNS plugin — the wildcard cert won't issue until it's present",
+					"provider", d.Provider, "err", ierr.Error())
+			}
 		}
 		if ok, why := edge.Available(""); ok {
 			admin := edge.NewAdmin(base.AdminListen)
@@ -359,7 +371,13 @@ func cmdServe(args []string) error {
 				return out
 			})
 			sup := &edge.Supervisor{CaddyBin: "caddy", AdminListen: base.AdminListen, Log: log}
-			if initCfg, rerr := edge.Render(base, nil, nil); rerr == nil {
+			// Boot floor WITHOUT the DNS-01 wildcard policy: if the operator's caddy lacks the
+			// DNS provider module, it must fail the first (transactional) reconcile — not the
+			// boot — so a missing module never bricks the whole edge (:80/:443 + all HTTP-01
+			// apps + the admin vhost). The wildcard is then introduced by the first Reconcile.
+			floor := base
+			floor.DNS01Provider, floor.DNS01Token = "", ""
+			if initCfg, rerr := edge.Render(floor, nil, nil); rerr == nil {
 				sup.InitialCfg = initCfg
 			}
 			wg.Add(1)
