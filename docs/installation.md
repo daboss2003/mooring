@@ -163,7 +163,18 @@ admin:
 data_dir: "/var/lib/mooring"       # where Mooring keeps its data
 ```
 
-Set `admin.hostname` to the address you want the dashboard on, and point that hostname's DNS at your server — Mooring serves it over HTTPS, behind your IP allowlist. (Prefer not to expose it at all? Leave `admin.hostname` out and reach the dashboard over an SSH tunnel instead — see the next guide.)
+Set `admin.hostname` to the address you want the dashboard on, and point that hostname's DNS at your server — Mooring serves it over HTTPS, behind your IP allowlist. If you use the [subdomain shorthand](./definition-file.md#specedgeroutes) (`edge.base_domain`), you can instead set just `admin.subdomain: admin` and it becomes `admin.<base_domain>` — covered by the same wildcard DNS record as your apps:
+
+```yaml
+edge:
+  base_domain: mooring.example.com
+admin:
+  subdomain: admin                  # → admin.mooring.example.com (or use admin.hostname for a full name)
+```
+
+(Prefer not to expose it at all? Leave both out and reach the dashboard over an SSH tunnel instead — see the next guide.)
+
+> **When you expose the admin dashboard, it becomes internet-reachable** — gated by your `ip_allowlist` (enforced at the edge *and* re-checked against the real client), then your password + **TOTP**. Keep `ip_allowlist` tight (never a catch-all), and enable TOTP. Mooring fronts the dashboard through the managed edge to a **dedicated internal listener** (`admin.edge_listen`, default `127.0.0.1:9001`) so your SSH-tunnel access on `bind_addr` keeps working unchanged. Exposing/unexposing needs a **restart** (listeners are fixed at boot). If you use GitHub connect, re-register your OAuth App's callback as `https://<admin hostname>/github/callback`.
 
 Mooring validates this file at startup. If a required value is missing or the file permissions are too open, it stops with a clear message explaining what to fix.
 

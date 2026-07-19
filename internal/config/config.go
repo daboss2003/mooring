@@ -27,6 +27,10 @@ var edgeCANameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 // as the definition/edge layers use, so edge.base_domain is validated identically.
 var edgeHostnameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9]([a-z0-9-]{0,62}))+$`)
 
+// subdomainLabelRe is a single RFC1123 DNS label (same grammar as the definition layer),
+// used to validate admin.subdomain.
+var subdomainLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
 // DefaultPath is where the root-of-trust config lives in production.
 const DefaultPath = "/etc/mooring/config.yaml"
 
@@ -265,6 +269,43 @@ func (c *Config) HasEdgeCA(name string) bool { _, ok := c.EdgeCAByName(name); re
 type AdminConfig struct {
 	Hostname string `yaml:"hostname"`
 	Listen   string `yaml:"listen"`
+	// Subdomain is the shorthand for exposing the dashboard through the managed edge at
+	// <subdomain>.<edge.base_domain> (e.g. admin → admin.mooring.example.com). Set EITHER
+	// this (with edge.base_domain) or the full Hostname above. Empty = admin stays
+	// loopback-only (the default; reach it over an SSH tunnel).
+	Subdomain string `yaml:"subdomain"`
+	// EdgeListen is a SECOND, dedicated loopback listener the managed edge proxies the
+	// admin vhost to (default 127.0.0.1:9001). It is separate from bind_addr (the
+	// SSH-tunnel listener) precisely so the two access paths carry different trust: the
+	// edge listener REQUIRES an X-Forwarded-For from the edge and re-gates the REAL client
+	// against ip_allowlist, while the tunnel keeps peer-allowlisting. Loopback-only.
+	EdgeListen string `yaml:"edge_listen"`
+}
+
+// AdminHostnameResolved returns the public hostname the dashboard is exposed at through the
+// managed edge, or "" when it stays loopback-only. An explicit admin.hostname wins; otherwise
+// admin.subdomain is expanded against edge.base_domain.
+func (c *Config) AdminHostnameResolved() string {
+	if h := strings.TrimSpace(c.Admin.Hostname); h != "" {
+		return h
+	}
+	if sub := strings.TrimSpace(c.Admin.Subdomain); sub != "" {
+		if base := strings.TrimSpace(c.Edge.BaseDomain); base != "" {
+			return sub + "." + base
+		}
+	}
+	return ""
+}
+
+// AdminExposed reports whether the dashboard is fronted publicly by the managed edge.
+func (c *Config) AdminExposed() bool { return c.AdminHostnameResolved() != "" }
+
+// AdminEdgeListen is the second loopback listener the edge dials for the admin vhost.
+func (c *Config) AdminEdgeListen() string {
+	if l := strings.TrimSpace(c.Admin.EdgeListen); l != "" {
+		return l
+	}
+	return "127.0.0.1:9001"
 }
 
 // DockerConfig points at the read-only docker-socket-proxy (plan §3). Mooring
@@ -723,6 +764,43 @@ func (c *Config) Validate() error {
 	// --- admin.listen, when set, must never be routable ---
 	if c.Admin.Listen != "" && !adminListenSafe(c.Admin.Listen) {
 		add("admin.listen: must be a unix socket (unix//...) or 127.0.0.1:2019, never routable; got %q", c.Admin.Listen)
+	}
+
+	// --- exposing the admin dashboard through the managed edge (fail-closed) ---
+	if c.Admin.Subdomain != "" && c.Admin.Hostname != "" {
+		add("admin: set admin.hostname OR admin.subdomain, not both")
+	}
+	if c.Admin.Subdomain != "" && !subdomainLabelRe.MatchString(c.Admin.Subdomain) {
+		add("admin.subdomain %q must be a single DNS label [a-z0-9-] (it becomes <subdomain>.<edge.base_domain>)", c.Admin.Subdomain)
+	}
+	if c.Admin.Subdomain != "" && strings.TrimSpace(c.Edge.BaseDomain) == "" {
+		add("admin.subdomain needs edge.base_domain set")
+	}
+	if c.AdminExposed() {
+		if c.Edge.Mode != EdgeManaged {
+			add("exposing the admin dashboard (admin.hostname/admin.subdomain) requires edge.mode: managed")
+		}
+		h := c.AdminHostnameResolved()
+		if len(h) > 253 || !edgeHostnameRe.MatchString(h) {
+			add("admin hostname %q is not a valid FQDN", h)
+		}
+		if h != "" && h == strings.TrimSpace(c.Edge.BaseDomain) {
+			add("admin must be a subdomain (e.g. admin.%s), not the base_domain apex — apex HSTS would pin every app subdomain", c.Edge.BaseDomain)
+		}
+		if !isLoopbackBind(c.AdminEdgeListen()) {
+			add("admin.edge_listen %q must be loopback (127.0.0.1:PORT), never routable", c.AdminEdgeListen())
+		}
+		if c.AdminEdgeListen() == strings.TrimSpace(c.BindAddr) {
+			add("admin.edge_listen must differ from bind_addr (%s) — they are two separate listeners", c.BindAddr)
+		}
+		// The IP allowlist becomes the edge's public gate for the admin vhost — a
+		// catch-all would put the login on the open internet (behind password+TOTP only).
+		for _, p := range c.parsedAllowlist {
+			if p.Bits() == 0 {
+				add("admin exposure with a catch-all ip_allowlist (%s) puts the login on the open internet — restrict ip_allowlist to your networks", p)
+				break
+			}
+		}
 	}
 
 	// --- cookie model coherence (plan §5.3) ---

@@ -84,16 +84,19 @@ func (s *RouteStore) Save(ctx context.Context, r Route) error {
 	return err
 }
 
-// HostnameOwner reports which OTHER app already claims hostname (any path prefix), so a
-// caller can reject a collision with a clear "already taken" message before the
-// UNIQUE(hostname, path_prefix) constraint would trip with a cryptic DB error. Matching is
-// case-insensitive; exceptProject (the app being deployed) is excluded so a redeploy of the
-// same app never collides with itself. Returns ("", false, nil) when the name is free.
-func (s *RouteStore) HostnameOwner(ctx context.Context, hostname, exceptProject string) (string, bool, error) {
+// HostnameOwner reports which OTHER app already claims (hostname, pathPrefix), so a caller
+// can reject a collision with a clear "already taken" message before the
+// UNIQUE(hostname, path_prefix) constraint would trip with a cryptic DB error. It matches the
+// constraint EXACTLY — same hostname AND same path prefix — so two apps legitimately sharing
+// a hostname on different path prefixes are NOT falsely rejected. Matching is
+// case-insensitive on the hostname; exceptProject (the app being deployed) is excluded so a
+// redeploy never collides with itself. Returns ("", false, nil) when the pair is free.
+func (s *RouteStore) HostnameOwner(ctx context.Context, hostname, pathPrefix, exceptProject string) (string, bool, error) {
 	hostname = strings.ToLower(strings.TrimSpace(hostname))
 	var owner string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT app_id FROM app_routes WHERE hostname = ? AND app_id <> ? LIMIT 1`, hostname, exceptProject).Scan(&owner)
+		`SELECT app_id FROM app_routes WHERE hostname = ? AND path_prefix = ? AND app_id <> ? LIMIT 1`,
+		hostname, pathPrefix, exceptProject).Scan(&owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}

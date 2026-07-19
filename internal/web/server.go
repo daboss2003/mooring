@@ -534,32 +534,62 @@ func (s *Server) Handler() http.Handler {
 	return h
 }
 
-// Run starts the loopback HTTP server and blocks until ctx is cancelled.
+// Run starts the loopback admin HTTP server (the SSH-tunnel path) and blocks until ctx is
+// cancelled. When the admin is exposed through the managed edge, it ALSO starts a second
+// dedicated loopback listener (admin.edge_listen) that the edge proxies to: requests on it
+// are marked fromEdge, so the allowlist middleware requires an X-Forwarded-For and gates the
+// REAL client — the two paths thus carry different trust without a config contradiction.
 func (s *Server) Run(ctx context.Context) error {
-	srv := &http.Server{
-		Addr:              s.cfg.BindAddr,
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
-	}
-	errCh := make(chan error, 1)
-	go func() {
-		err := srv.ListenAndServe()
-		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+	handler := s.Handler()
+	newSrv := func(addr string, h http.Handler) *http.Server {
+		return &http.Server{
+			Addr:              addr,
+			Handler:           h,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			WriteTimeout:      60 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    1 << 20,
 		}
-	}()
+	}
+	srvs := []*http.Server{newSrv(s.cfg.BindAddr, handler)}
+	if s.cfg.AdminExposed() {
+		// The edge listener wraps the SAME pipeline but stamps fromEdge FIRST (before the
+		// allowlist middleware runs), forcing the XFF-required branch for this path only.
+		edgeHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handler.ServeHTTP(w, r.WithContext(withFromEdge(r.Context())))
+		})
+		srvs = append(srvs, newSrv(s.cfg.AdminEdgeListen(), edgeHandler))
+		s.log.Warn("admin dashboard is EXPOSED through the managed edge — internet-reachable, gated by ip_allowlist + password + TOTP",
+			"hostname", s.cfg.AdminHostnameResolved(), "edge_listen", s.cfg.AdminEdgeListen())
+	}
+	errCh := make(chan error, len(srvs))
+	for _, srv := range srvs {
+		srv := srv
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- err
+			}
+		}()
+	}
 	select {
 	case <-ctx.Done():
-		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		return srv.Shutdown(shutCtx)
 	case err := <-errCh:
+		// One listener failed (e.g. address in use) — tear the other(s) down too, then
+		// return the error so boot fails cleanly instead of leaving a half-up server.
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		for _, srv := range srvs {
+			_ = srv.Shutdown(shutCtx)
+		}
+		cancel()
 		return err
 	}
+	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, srv := range srvs {
+		_ = srv.Shutdown(shutCtx)
+	}
+	return nil
 }
 
 // --- cookie helpers (plan §5.3) ---

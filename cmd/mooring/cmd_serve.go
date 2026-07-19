@@ -299,8 +299,8 @@ func cmdServe(args []string) error {
 		// The "open in dashboard" link in notifications is derived from admin.hostname
 		// (we already know where the dashboard lives) — no separate admin_url.
 		adminURL := ""
-		if cfg.Admin.Hostname != "" {
-			adminURL = "https://" + cfg.Admin.Hostname
+		if h := cfg.AdminHostnameResolved(); h != "" {
+			adminURL = "https://" + h
 		}
 		eng := alertengine.New(alertStore, mon.Snapshot, alertengine.Config{
 			EvalInterval:      cfg.Alerting.EvalInterval.D(),
@@ -341,9 +341,9 @@ func cmdServe(args []string) error {
 			ACMEEmail:      cfg.Edge.ACMEEmail,
 			ACMECA:         cfg.Edge.ACMECA,
 			CAs:            edgeCAs(cfg),
-			AdminHostname:  cfg.Admin.Hostname,
-			AdminAllowlist: cfg.IPAllowlist,
-			AdminUpstream:  cfg.BindAddr,
+			AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
+			AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
+			AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
 		}
 		if ok, why := edge.Available(""); ok {
 			admin := edge.NewAdmin(base.AdminListen)

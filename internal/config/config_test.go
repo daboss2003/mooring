@@ -351,3 +351,33 @@ func TestBuildCacheKeepSize(t *testing.T) {
 		t.Error("explicit false must disable build-cache GC")
 	}
 }
+
+func TestAdminHostnameResolved(t *testing.T) {
+	// explicit hostname wins
+	c := &Config{Admin: AdminConfig{Hostname: "dash.example.com"}, Edge: EdgeConfig{BaseDomain: "mooring.example.com"}}
+	if got := c.AdminHostnameResolved(); got != "dash.example.com" {
+		t.Errorf("hostname: got %q", got)
+	}
+	// subdomain expands against base_domain
+	c2 := &Config{Admin: AdminConfig{Subdomain: "admin"}, Edge: EdgeConfig{BaseDomain: "mooring.example.com"}}
+	if got := c2.AdminHostnameResolved(); got != "admin.mooring.example.com" {
+		t.Errorf("subdomain: got %q", got)
+	}
+	if !c2.AdminExposed() {
+		t.Error("admin.subdomain should count as exposed")
+	}
+	// subdomain with NO base_domain → not resolved (not exposed)
+	c3 := &Config{Admin: AdminConfig{Subdomain: "admin"}}
+	if c3.AdminHostnameResolved() != "" || c3.AdminExposed() {
+		t.Error("subdomain without base_domain must not resolve/expose")
+	}
+	// nothing set → loopback only
+	c4 := &Config{}
+	if c4.AdminExposed() {
+		t.Error("default must be loopback-only (not exposed)")
+	}
+	// edge listen default
+	if c4.AdminEdgeListen() != "127.0.0.1:9001" {
+		t.Errorf("default edge_listen: got %q", c4.AdminEdgeListen())
+	}
+}

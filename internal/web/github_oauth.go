@@ -43,8 +43,8 @@ func (s *Server) ghStateCookieName() string { return s.cfg.Cookie.Prefix + "ghst
 // over the loopback tunnel it's http://<host> (a secure context for the browser).
 func (s *Server) githubRedirectURI(r *http.Request) string {
 	host, scheme := r.Host, "http"
-	if s.cfg.Admin.Hostname != "" {
-		host, scheme = s.cfg.Admin.Hostname, "https"
+	if h := s.cfg.AdminHostnameResolved(); h != "" {
+		host, scheme = h, "https"
 	} else if r.TLS != nil {
 		scheme = "https"
 	}

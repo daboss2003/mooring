@@ -40,7 +40,12 @@ func (s *Server) allowlistMiddleware(next http.Handler) http.Handler {
 		sec := s.security()
 		client := peer
 
-		if sec.trustProxy && prefixesContain(sec.trustedProxies, peer) {
+		// A request on the dedicated managed-edge listener is ALWAYS behind our own
+		// supervised Caddy (a loopback peer): require the XFF and gate the real client,
+		// regardless of the global trust_proxy config (the tunnel listener keeps its own
+		// peer-allowlisting). This is what lets the two access paths coexist safely.
+		trusted := (sec.trustProxy && prefixesContain(sec.trustedProxies, peer)) || fromEdge(r.Context())
+		if trusted {
 			// The peer IS a trusted edge: REQUIRE exactly one valid overwritten
 			// XFF value. Missing, malformed, or an appended chain fails closed
 			// EXPLICITLY (deny) — we do not fall back to allowlisting the peer, so

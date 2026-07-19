@@ -260,7 +260,7 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 			// Reject a hostname already claimed by ANOTHER app with a clear message (the
 			// UNIQUE(hostname, path_prefix) constraint is the race-safe backstop; this is
 			// the friendly, specific error the operator sees — "pick a different one").
-			if owner, taken, oerr := s.edgeRoutes.HostnameOwner(ctx, host, project); oerr == nil && taken {
+			if owner, taken, oerr := s.edgeRoutes.HostnameOwner(ctx, host, r.PathPrefix, project); oerr == nil && taken {
 				return fmt.Errorf("hostname %q is already in use by app %q — pick a different one", host, owner)
 			}
 			// A route may opt into a private CA by name; it MUST be defined in the

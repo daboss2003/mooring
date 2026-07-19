@@ -14,7 +14,22 @@ const (
 	sessionKey
 	csrfTokenKey
 	tokenIDKey
+	fromEdgeKey
 )
+
+// withFromEdge marks a request as arriving on the dedicated managed-edge listener (Caddy
+// dialing our loopback admin upstream). The allowlist middleware then REQUIRES a single
+// X-Forwarded-For and gates the real client from it — the edge is a trusted proxy by
+// construction here, so this needs no trusted_proxies config entry.
+func withFromEdge(ctx context.Context) context.Context {
+	return context.WithValue(ctx, fromEdgeKey, true)
+}
+
+// fromEdge reports whether the request came in on the managed-edge listener.
+func fromEdge(ctx context.Context) bool {
+	v, _ := ctx.Value(fromEdgeKey).(bool)
+	return v
+}
 
 func withClientIP(ctx context.Context, ip netip.Addr) context.Context {
 	return context.WithValue(ctx, clientIPKey, ip)
