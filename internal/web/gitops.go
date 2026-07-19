@@ -622,6 +622,15 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	if scaffolded {
 		onLine("no mooring file in the repo — using a generated default")
 	}
+	// Resolve every `subdomain:` shorthand to a full <subdomain>.<edge.base_domain> hostname
+	// IN PLACE, ONCE, before anything reads it — so compose bind mounts, cert issue/wait/sync,
+	// routes, and collision checks all see the final FQDN (there is a single expansion point).
+	// The DNS advisory runs first, while the subdomains are still present.
+	s.adviseSubdomainDNS(ctx, def, onLine)
+	if err := s.expandSubdomains(def); err != nil {
+		s.gitStore.SetState(bg, slug, "update_blocked")
+		return err
+	}
 	composeBytes, gerr := definition.ComposeBytes(def)
 	if gerr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")

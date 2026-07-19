@@ -372,6 +372,24 @@ edge:
 
 > A cert-only hostname (the edge issues and renews the certificate but proxies no traffic) is **not** a route — declare it with [`cert_bindings`](#speccert_bindings) on the service that consumes the cert.
 
+> **Subdomain shorthand — one DNS record for everything.** Set a namespace root once in
+> `config.yaml` (`edge.base_domain: mooring.example.com` — the label is yours; use
+> `myserver.example.com`, or even the bare `example.com`). Then a route or `cert_binding` can
+> give **`subdomain: mqtt`** instead of a full `hostname:`, and Mooring expands it to
+> `mqtt.mooring.example.com`. Point a **single wildcard DNS record** at your server
+> (`*.mooring.example.com  A  <server IP>`) and every declared subdomain resolves — no per-app
+> DNS. `subdomain:` and `hostname:` are mutually exclusive (use exactly one); a `subdomain`
+> must be a single DNS label (`[a-z0-9-]`, no dots). Undeclared names still get **no** cert and
+> **no** route, so the wildcard record exposes nothing extra.
+>
+> ```yaml
+> edge:
+>   routes:
+>     - subdomain: api          # → api.<edge.base_domain>
+>       service: api
+>       port: 3000
+> ```
+
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `hostname` | string | required | The public vhost. Subject to the §6.2 conflict gate: it may not shadow a managed hostname, the admin vhost, a cert-only hostname, or an auto-scaled pool. |

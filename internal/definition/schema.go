@@ -36,7 +36,33 @@ var (
 	tokenKeyRe   = regexp.MustCompile(`^[A-Za-z0-9_-]+$`) // {{hm.KEY}} binding key grammar
 	hostnameRe   = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9]([a-z0-9-]{0,62}))+$`)
 	edgeCANameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`) // a named CA from config.yaml edge.cas
+	// subdomainLabelRe is a single RFC1123 DNS label (1-63 chars, lowercase alnum + hyphen,
+	// no leading/trailing hyphen). A route/cert_binding may give `subdomain: mqtt` instead
+	// of a full hostname; Mooring expands it to <label>.<edge.base_domain> at deploy time.
+	subdomainLabelRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 )
+
+// validateHostOrSubdomain enforces that a route/cert_binding declares EXACTLY ONE of a full
+// hostname (an FQDN, no wildcards) or a subdomain label (expanded to
+// <subdomain>.<edge.base_domain> at deploy time, since base_domain lives in the operator's
+// config.yaml, not the app repo). `what` tags the error.
+func validateHostOrSubdomain(what, hostname, subdomain string) error {
+	switch {
+	case hostname == "" && subdomain == "":
+		return fmt.Errorf("%s needs a hostname or a subdomain", what)
+	case hostname != "" && subdomain != "":
+		return fmt.Errorf("%s sets both hostname and subdomain — use exactly one", what)
+	case subdomain != "":
+		if !subdomainLabelRe.MatchString(subdomain) {
+			return fmt.Errorf("%s subdomain %q must be a single DNS label [a-z0-9-] (it becomes <subdomain>.<edge.base_domain>)", what, subdomain)
+		}
+	default: // hostname set
+		if len(hostname) > 253 || !hostnameRe.MatchString(hostname) {
+			return fmt.Errorf("%s hostname %q is invalid (FQDN, no wildcards)", what, hostname)
+		}
+	}
+	return nil
+}
 
 // buildLanguages are the recognized build languages. "auto" (the default) detects
 // the stack from the repo; "generic" wraps the operator's own base + commands.
@@ -283,9 +309,10 @@ func (b *Binding) UnmarshalYAML(n *yaml.Node) error {
 // service when the edge renews the leaf), so a renewed cert is picked up without a
 // manual redeploy.
 type CertBinding struct {
-	Hostname string `yaml:"hostname"`
-	Mount    string `yaml:"mount"`
-	CA       string `yaml:"ca,omitempty"` // "" = default issuer; else a named CA from config.yaml edge.cas
+	Hostname  string `yaml:"hostname"`
+	Subdomain string `yaml:"subdomain,omitempty"` // XOR hostname: expands to <subdomain>.<edge.base_domain>
+	Mount     string `yaml:"mount"`
+	CA        string `yaml:"ca,omitempty"` // "" = default issuer; else a named CA from config.yaml edge.cas
 }
 
 // Secret declares a name (+ optional generate hint) — NEVER a value.
@@ -317,6 +344,7 @@ type L4Route struct {
 // Route is one managed edge vhost. Upstream is a SELECTOR — "service:port".
 type Route struct {
 	Hostname        string `yaml:"hostname"`
+	Subdomain       string `yaml:"subdomain,omitempty"` // XOR hostname: expands to <subdomain>.<edge.base_domain>
 	Service         string `yaml:"service"`
 	Port            int    `yaml:"port"`
 	PathPrefix      string `yaml:"path_prefix"`
@@ -876,8 +904,8 @@ func validateBindingSource(svc, key string, b Binding, declaredSecrets, certHost
 }
 
 func validateCertBinding(svc string, cb CertBinding) error {
-	if len(cb.Hostname) > 253 || !hostnameRe.MatchString(cb.Hostname) {
-		return fmt.Errorf("service %q cert_bindings hostname %q is invalid (FQDN, no wildcards)", svc, cb.Hostname)
+	if err := validateHostOrSubdomain(fmt.Sprintf("service %q cert_bindings", svc), cb.Hostname, cb.Subdomain); err != nil {
+		return err
 	}
 	if err := mountPath(cb.Mount); err != nil {
 		return fmt.Errorf("service %q cert_bindings mount: %w", svc, err)
@@ -939,24 +967,27 @@ func (s *Spec) validateEdge() error {
 		declared[n] = true
 	}
 	for _, r := range s.Edge.Routes {
-		h := r.Hostname
-		if len(h) > 253 || !hostnameRe.MatchString(h) {
-			return fmt.Errorf("edge route hostname %q is invalid (FQDN, no wildcards)", h)
+		id := r.Hostname
+		if id == "" {
+			id = r.Subdomain
+		}
+		if err := validateHostOrSubdomain("edge route "+id, r.Hostname, r.Subdomain); err != nil {
+			return err
 		}
 		if !svcRe.MatchString(r.Service) {
-			return fmt.Errorf("edge route %q must name a valid service (upstream is a selector, never a literal dial target)", h)
+			return fmt.Errorf("edge route %q must name a valid service (upstream is a selector, never a literal dial target)", id)
 		}
 		if !declared[r.Service] {
-			return fmt.Errorf("edge route %q targets unknown service %q", h, r.Service)
+			return fmt.Errorf("edge route %q targets unknown service %q", id, r.Service)
 		}
 		if r.Port != 0 && controlPort(r.Port) {
-			return fmt.Errorf("edge route %q port %d is a reserved control-plane port", h, r.Port)
+			return fmt.Errorf("edge route %q port %d is a reserved control-plane port", id, r.Port)
 		}
 		if r.UpstreamScheme != "" && r.UpstreamScheme != "http" && r.UpstreamScheme != "https" {
-			return fmt.Errorf("edge route %q upstream_scheme %q must be http or https", h, r.UpstreamScheme)
+			return fmt.Errorf("edge route %q upstream_scheme %q must be http or https", id, r.UpstreamScheme)
 		}
 		if r.CA != "" && !edgeCANameRe.MatchString(r.CA) {
-			return fmt.Errorf("edge route %q ca %q must match [a-z][a-z0-9-]{0,30} (a CA defined in config.yaml edge.cas)", h, r.CA)
+			return fmt.Errorf("edge route %q ca %q must match [a-z][a-z0-9-]{0,30} (a CA defined in config.yaml edge.cas)", id, r.CA)
 		}
 	}
 	// L4 (TCP/UDP) routes: the LB owns each listen port, replicas stay internal.

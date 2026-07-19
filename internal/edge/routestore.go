@@ -2,6 +2,8 @@ package edge
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"strings"
 	"time"
 
@@ -80,6 +82,25 @@ func (s *RouteStore) Save(ctx context.Context, r Route) error {
 		r.AppID, r.Hostname, r.Upstream, r.UpstreamScheme, r.PathPrefix,
 		b2i(r.RedirectHTTP), b2i(r.HSTS), b2i(r.SecurityHeaders), b2i(r.Enabled), r.CA, r.id)
 	return err
+}
+
+// HostnameOwner reports which OTHER app already claims hostname (any path prefix), so a
+// caller can reject a collision with a clear "already taken" message before the
+// UNIQUE(hostname, path_prefix) constraint would trip with a cryptic DB error. Matching is
+// case-insensitive; exceptProject (the app being deployed) is excluded so a redeploy of the
+// same app never collides with itself. Returns ("", false, nil) when the name is free.
+func (s *RouteStore) HostnameOwner(ctx context.Context, hostname, exceptProject string) (string, bool, error) {
+	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	var owner string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT app_id FROM app_routes WHERE hostname = ? AND app_id <> ? LIMIT 1`, hostname, exceptProject).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return owner, true, nil
 }
 
 // List returns all routes (for rendering + the UI).

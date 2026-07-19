@@ -23,6 +23,10 @@ import (
 // edgeCANameRe constrains a named edge CA so it's a safe, referenceable identifier.
 var edgeCANameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
 
+// edgeHostnameRe validates a full DNS name (FQDN, ≥2 labels, no wildcards) — same grammar
+// as the definition/edge layers use, so edge.base_domain is validated identically.
+var edgeHostnameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,62})(\.[a-z0-9]([a-z0-9-]{0,62}))+$`)
+
 // DefaultPath is where the root-of-trust config lives in production.
 const DefaultPath = "/etc/mooring/config.yaml"
 
@@ -217,10 +221,16 @@ type AuthConfig struct {
 
 // EdgeConfig configures the managed edge (plan §3.1, §6).
 type EdgeConfig struct {
-	Mode             EdgeMode `yaml:"mode"`
-	ACMEEmail        string   `yaml:"acme_email"`
-	ACMECA           string   `yaml:"acme_ca"`
-	CAs              []EdgeCA `yaml:"cas"` // extra named issuers (private CAs) routes/cert-bindings can opt into by name
+	Mode      EdgeMode `yaml:"mode"`
+	ACMEEmail string   `yaml:"acme_email"`
+	ACMECA    string   `yaml:"acme_ca"`
+	CAs       []EdgeCA `yaml:"cas"` // extra named issuers (private CAs) routes/cert-bindings can opt into by name
+	// BaseDomain is the namespace root for the subdomain shorthand: a route or cert_binding
+	// that sets `subdomain: mqtt` (instead of a full hostname) is expanded to
+	// mqtt.<base_domain> at deploy time. The operator points a SINGLE wildcard DNS record
+	// (*.<base_domain> → this server) and every declared subdomain resolves. "" disables the
+	// shorthand (full hostnames still work). Must be a FQDN, no wildcards.
+	BaseDomain       string   `yaml:"base_domain"`
 	ApplyProbeWindow Duration `yaml:"apply_probe_window"`
 	L4Enabled        bool     `yaml:"l4_enabled"`      // own a managed L4 (TCP/UDP) load balancer (nginx-stream)
 	L4NginxDigest    string   `yaml:"l4_nginx_digest"` // pinned SHA-256 of the nginx binary (optional)
@@ -671,6 +681,9 @@ func (c *Config) Validate() error {
 		}
 		if strings.TrimSpace(c.Edge.ACMECA) == "" {
 			add("edge.acme_ca: required in managed mode (pin a single ACME issuer)")
+		}
+		if bd := strings.TrimSpace(c.Edge.BaseDomain); bd != "" && (len(bd) > 253 || !edgeHostnameRe.MatchString(bd)) {
+			add("edge.base_domain %q must be a valid FQDN with no wildcards (e.g. mooring.example.com)", bd)
 		}
 	case EdgeExternal:
 		// Stronger fail-closed boot for external mode (plan §3.1): must have a

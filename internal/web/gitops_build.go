@@ -482,6 +482,7 @@ func (s *Server) registerCertBindings(ctx context.Context, project string, def *
 	any := false
 	for _, name := range sortedServiceNames(def) {
 		for _, cb := range def.Spec.Compose.Services[name].CertBindings {
+			// cb.Hostname is already the final FQDN (any `subdomain:` was expanded upstream).
 			err := s.cfgStore.SaveCertBinding(ctx, project, cfgstore.CertBinding{
 				BindingName: certBindingKey(name, cb.Hostname),
 				Hostname:    cb.Hostname,

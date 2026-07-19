@@ -3,8 +3,10 @@ package web
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/definition"
@@ -165,6 +167,83 @@ func selfHealPolicy(sh *definition.SelfHealing) selfheal.Policy {
 // A reconcile failure is best-effort/logged (matching cert_bindings): the routes are
 // persisted and a later reconcile or edge restart picks them up, so a transient edge
 // hiccup can't block an otherwise-good apply.
+// expandSubdomains resolves every `subdomain:` shorthand on the definition's edge routes and
+// cert_bindings into a full <subdomain>.<edge.base_domain> hostname IN PLACE, then clears the
+// Subdomain field. This is the SINGLE expansion point: after it, every downstream consumer
+// (compose bind mounts, cert issue/wait/sync, routes, collision checks, the re-validated
+// canonical) reads the final FQDN from .Hostname and none has to know about subdomains. It
+// errors if a subdomain is used but edge.base_domain isn't configured. The schema already
+// validated the label and the hostname/subdomain XOR.
+func (s *Server) expandSubdomains(def *definition.Definition) error {
+	base := strings.TrimSpace(s.cfg.Edge.BaseDomain)
+	need := func(sub string) error {
+		return fmt.Errorf("subdomain %q needs edge.base_domain set in config.yaml (e.g. base_domain: mooring.example.com)", sub)
+	}
+	for i := range def.Spec.Edge.Routes {
+		if sub := def.Spec.Edge.Routes[i].Subdomain; sub != "" {
+			if base == "" {
+				return need(sub)
+			}
+			def.Spec.Edge.Routes[i].Hostname = sub + "." + base
+			def.Spec.Edge.Routes[i].Subdomain = ""
+		}
+	}
+	// Services is a map of structs, but CertBindings is a slice whose backing array is shared
+	// with the stored Service, so mutating its elements in place updates the definition.
+	for name := range def.Spec.Compose.Services {
+		cbs := def.Spec.Compose.Services[name].CertBindings
+		for i := range cbs {
+			if sub := cbs[i].Subdomain; sub != "" {
+				if base == "" {
+					return need(sub)
+				}
+				cbs[i].Hostname = sub + "." + base
+				cbs[i].Subdomain = ""
+			}
+		}
+	}
+	return nil
+}
+
+// defUsesSubdomain reports whether any edge route or cert_binding uses the subdomain
+// shorthand (vs a literal hostname).
+func defUsesSubdomain(def *definition.Definition) bool {
+	for _, r := range def.Spec.Edge.Routes {
+		if r.Subdomain != "" {
+			return true
+		}
+	}
+	for _, svc := range def.Spec.Compose.Services {
+		for _, cb := range svc.CertBindings {
+			if cb.Subdomain != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// adviseSubdomainDNS surfaces — once per deploy that uses the subdomain shorthand — the
+// single wildcard DNS record the operator needs, plus a best-effort check that it already
+// resolves. Purely advisory (never blocks): ACME issuance is the real gate, this just gives
+// a clearer heads-up than a cert that silently fails to issue. The lookup is a plain DNS
+// resolve of a fixed probe label (no attacker-controlled dial → no SSRF surface).
+func (s *Server) adviseSubdomainDNS(ctx context.Context, def *definition.Definition, onLine func(string)) {
+	base := strings.TrimSpace(s.cfg.Edge.BaseDomain)
+	if base == "" || onLine == nil || !defUsesSubdomain(def) {
+		return
+	}
+	onLine("subdomains resolve via one wildcard DNS record: *." + base + "  A/AAAA → this server's public IP")
+	probe := "mooring-dns-check." + base
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if addrs, err := net.DefaultResolver.LookupHost(cctx, probe); err != nil || len(addrs) == 0 {
+		onLine("  ⚠ the wildcard record isn't resolving yet (" + probe + " → no answer) — add it, or certs can't issue")
+	} else {
+		onLine("  ✓ wildcard resolves (" + strings.Join(addrs, ", ") + ")")
+	}
+}
+
 func (s *Server) applyRoutes(ctx context.Context, project string, def *definition.Definition) error {
 	if s.edgeRoutes != nil {
 		routes := make([]edge.Route, 0, len(def.Spec.Edge.Routes))
@@ -177,13 +256,20 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 			if scheme == "" {
 				scheme = "http"
 			}
+			host := r.Hostname // subdomains were already expanded to a full FQDN upstream
+			// Reject a hostname already claimed by ANOTHER app with a clear message (the
+			// UNIQUE(hostname, path_prefix) constraint is the race-safe backstop; this is
+			// the friendly, specific error the operator sees — "pick a different one").
+			if owner, taken, oerr := s.edgeRoutes.HostnameOwner(ctx, host, project); oerr == nil && taken {
+				return fmt.Errorf("hostname %q is already in use by app %q — pick a different one", host, owner)
+			}
 			// A route may opt into a private CA by name; it MUST be defined in the
 			// root-of-trust config (an app repo can't introduce a trusted CA).
 			if r.CA != "" && !s.cfg.HasEdgeCA(r.CA) {
-				return fmt.Errorf("edge route %q references unknown CA %q — define it in config.yaml edge.cas", r.Hostname, r.CA)
+				return fmt.Errorf("edge route %q references unknown CA %q — define it in config.yaml edge.cas", host, r.CA)
 			}
 			routes = append(routes, edge.Route{
-				Hostname:        r.Hostname,
+				Hostname:        host,
 				Upstream:        r.Service + ":" + strconv.Itoa(port), // selector, resolved at apply
 				UpstreamScheme:  scheme,
 				PathPrefix:      r.PathPrefix,

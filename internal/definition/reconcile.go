@@ -161,8 +161,16 @@ func Validate(d *Definition, runDir string, env compose.Env, protectedPaths []st
 		if scheme == "" {
 			scheme = "http"
 		}
+		// A subdomain-only route has no literal hostname here (base_domain lives in the
+		// operator's config, not this repo); its label was already validated by
+		// validateEdge. Validate the route SHAPE with a syntactically-valid placeholder —
+		// the real FQDN <subdomain>.<edge.base_domain> is formed and re-validated at deploy.
+		host := r.Hostname
+		if host == "" && r.Subdomain != "" {
+			host = r.Subdomain + ".subdomain.invalid"
+		}
 		er := edge.Route{
-			Hostname:        r.Hostname,
+			Hostname:        host,
 			Upstream:        r.Service + ":" + strconv.Itoa(port), // selector, resolved to the container at apply
 			UpstreamScheme:  scheme,
 			PathPrefix:      r.PathPrefix,
@@ -172,7 +180,7 @@ func Validate(d *Definition, runDir string, env compose.Env, protectedPaths []st
 			Enabled:         true,
 		}
 		if err := edge.ValidateRoute(er); err != nil {
-			return fmt.Errorf("§6.2 edge route %q: %w", r.Hostname, err)
+			return fmt.Errorf("§6.2 edge route %q: %w", host, err)
 		}
 	}
 	return nil
