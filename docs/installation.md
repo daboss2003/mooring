@@ -248,7 +248,7 @@ That's it. **You won't run any Docker commands** — Mooring sets up everything 
 | You changed… | Apply with |
 |---|---|
 | Who can reach the dashboard (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), your login (`auth.username`, `auth.password_hash`, `auth.totp_secret`), or log retention (`retention.*`) | **`sudo systemctl reload mooring`** — hot-applied, no downtime |
-| **Anything else** — the master `encryption_key`, `bind_addr`, `edge.*` (incl. `l4_enabled`), `admin.hostname`, `github.*`, `alerting.*`, `session.*`, `cookie.*`, `docker.*`, `protected_projects`, … | **`sudo systemctl restart mooring`** |
+| **Anything else** — the master `encryption_key`, `bind_addr`, `edge.*` (incl. `base_domain`, `dns01`, `l4_enabled`), `admin.*` (incl. `subdomain`, `edge_listen`), `github.*`, `alerting.*`, `session.*`, `cookie.*`, `docker.*`, `protected_projects`, … | **`sudo systemctl restart mooring`** |
 
 The rule of thumb: only the **allowlist + login + retention** are hot-reloadable; **everything else is read once at boot and needs a restart**. A reload that touches a restart-only setting will *silently do nothing* — so when in doubt, `restart` (it briefly drops the dashboard connection; your apps keep running).
 

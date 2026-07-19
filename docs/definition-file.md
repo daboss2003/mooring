@@ -347,7 +347,8 @@ services:
 
 | Field | Notes |
 |---|---|
-| `hostname` | the FQDN Mooring issues/renews the cert for. |
+| `hostname` | the FQDN Mooring issues/renews the cert for. **Or** use `subdomain` (below). |
+| `subdomain` | **Instead of `hostname`** (exactly one): a single DNS label expanded to `<subdomain>.<edge.base_domain>` (needs `edge.base_domain` in `config.yaml`). Same [subdomain shorthand](#specedgeroutes) as edge routes. |
 | `mount` | absolute container path the cert directory is mounted at. |
 | `ca` | optional — name of a **private CA** (defined in `config.yaml` [`edge.cas`](#using-a-private-ca)) to issue this cert from, instead of the default `edge.acme_ca`. An undefined name fails the deploy. Omit it for the default CA. Ideal for an internal MQTT/DB host issued by your own CA. |
 
@@ -392,7 +393,8 @@ edge:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `hostname` | string | required | The public vhost. Subject to the §6.2 conflict gate: it may not shadow a managed hostname, the admin vhost, a cert-only hostname, or an auto-scaled pool. |
+| `hostname` | string | required *(or `subdomain`)* | The public vhost (a full FQDN). Subject to the §6.2 conflict gate: it may not shadow a managed hostname, the admin vhost, a cert-only hostname, or an auto-scaled pool. |
+| `subdomain` | string | — | **Instead of `hostname`** (exactly one of the two): a single DNS label expanded to `<subdomain>.<edge.base_domain>`. Needs `edge.base_domain` set in `config.yaml`. See [Subdomain shorthand](#specedgeroutes) above. |
 | `service` | string | required (proxy routes) | The service **in this app's compose** to route to — resolved against this app's discovered containers, never a literal host:port. Cross-project names are rejected; the pinned-dialer + egress-firewall refuse any resolution to a control-plane port (`9000/2019/2375`), loopback, or metadata. |
 | `port` | int | required (proxy routes) | The service's internal container port to forward to. |
 | `upstream_scheme` | `http` \| `https` | `http` | How the edge dials the upstream (use `https` only if the container itself terminates TLS). |
