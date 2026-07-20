@@ -116,7 +116,9 @@ func extractRoutesFromFile(f *ast.File, fset *token.FileSet) []routeReg {
 		ast.Inspect(call.Args[1], func(m ast.Node) bool {
 			if s, ok := m.(*ast.SelectorExpr); ok {
 				switch s.Sel.Name {
-				case "requireAuth":
+				case "requireAuth", "requirePerm":
+					// requirePerm wraps requireAuth (session gate) and additionally enforces
+					// the acting user's role — so it satisfies the authentication requirement.
 					r.hasAuth = true
 				case "requireCSRF":
 					r.hasCSRF = true

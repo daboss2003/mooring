@@ -182,7 +182,7 @@ func (s *Server) handleApp(w http.ResponseWriter, r *http.Request) {
 		App:                 app,
 		Snap:                snap,
 		Protected:           s.cfg.IsProtectedProject(project),
-		TOTPEnabled:         s.security().totpSecret != "",
+		TOTPEnabled:         s.security().totpEnabled(sessionUser(r)),
 		WriteDisabledReason: s.writeDisabledReason(),
 		Supervisor:          s.supervisorStates(project),
 		Scaling:             s.scalingDesired(project),

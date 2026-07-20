@@ -153,6 +153,13 @@ auth:
   password_hash: "<paste from hash-password>"
   # totp_secret: "<paste from gen-totp>"   # optional two-factor
 
+# Optional: additional operators with roles (leave out for a single-user setup).
+# users:
+#   - username: "alice"
+#     password_hash: "<paste from hash-password>"
+#     totp_secret: "<paste from gen-totp>"   # optional
+#     role: deployer                         # owner | deployer | viewer
+
 edge:
   mode: "managed"                   # Mooring runs the web server + HTTPS for you
   acme_email: "you@example.com"     # used by Let's Encrypt for your certificates
@@ -173,6 +180,18 @@ admin:
 ```
 
 (Prefer not to expose it at all? Leave both out and reach the dashboard over an SSH tunnel instead — see the next guide.)
+
+### Team members and roles
+
+The `auth:` block is your primary operator — always an **owner**. To let others in, add a `users:` list; each entry is minted the same way (`mooring hash-password`, and optionally `mooring gen-totp`) and given a **role**:
+
+| Role | Can |
+|---|---|
+| **owner** | Everything — deploy, plus all admin actions: delete apps, reveal secrets, run setup scripts, manage backups, connect repos/GitHub, rotate tokens, reclaim disk. |
+| **deployer** | Deploy, roll back, start/stop/restart, and edit an app's env, config files, and scaling. **Not** the admin actions above. |
+| **viewer** | Read-only — see apps, logs, metrics, events, and status. No changes. |
+
+Roles are enforced on the server for every action (a viewer who tries a deploy gets a clear "forbidden"), and each user has their own password and 2FA. Changing, adding, or removing any user logs everyone out (they log back in) — so a removed operator's sessions end immediately. There's no self-service UI: like every other secret, users live in the root-owned config file, and a `systemctl reload mooring` picks up a change.
 
 > **When you expose the admin dashboard, it becomes internet-reachable** — gated by your `ip_allowlist` (enforced at the edge *and* re-checked against the real client), then your password + **TOTP**. Keep `ip_allowlist` tight (never a catch-all), and enable TOTP. Mooring fronts the dashboard through the managed edge to a **dedicated internal listener** (`admin.edge_listen`, default `127.0.0.1:9001`) so your SSH-tunnel access on `bind_addr` keeps working unchanged. Exposing/unexposing needs a **restart** (listeners are fixed at boot). If you use GitHub connect, re-register your OAuth App's callback as `https://<admin hostname>/github/callback`.
 

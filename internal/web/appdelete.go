@@ -61,8 +61,8 @@ func (s *Server) handleAppDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	// Password first; TOTP only checked when the password matched (&&-short-circuit) so a
 	// wrong password can't burn the single-use TOTP watermark.
-	reauthOK := s.verifyOperatorPassword(r.Context(), r.PostFormValue("password")) &&
-		s.verifyTOTPOnce(r.Context(), r.PostFormValue("totp"))
+	reauthOK := s.verifyOperatorPassword(r.Context(), actor, r.PostFormValue("password")) &&
+		s.verifyTOTPOnce(r.Context(), actor, r.PostFormValue("totp"))
 	if !reauthOK {
 		s.recordFailure(r.Context(), peer, actor)
 		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "app_delete", Target: slug, Outcome: audit.Deny, Level: audit.Security, Detail: "re-auth failed"})
@@ -108,11 +108,15 @@ func (s *Server) appExists(slug string) bool {
 
 // verifyOperatorPassword checks a re-entered password against the configured hash,
 // behind the same bounded argon2id gate login uses (so it can't be used to OOM a box).
-func (s *Server) verifyOperatorPassword(ctx context.Context, password string) bool {
+func (s *Server) verifyOperatorPassword(ctx context.Context, username, password string) bool {
 	if password == "" {
 		return false
 	}
 	sec := s.security()
+	u, ok := sec.user(username)
+	if !ok {
+		return false
+	}
 	select {
 	case s.verifySem <- struct{}{}:
 	case <-time.After(2 * time.Second):
@@ -120,9 +124,9 @@ func (s *Server) verifyOperatorPassword(ctx context.Context, password string) bo
 	case <-ctx.Done():
 		return false
 	}
-	ok, _ := crypto.VerifyPassword(sec.passwordHash, []byte(password))
+	pwOK, _ := crypto.VerifyPassword(u.passwordHash, []byte(password))
 	<-s.verifySem
-	return ok
+	return pwOK
 }
 
 // teardownApp removes EVERYTHING an app owns. It returns (gateErr, errs):

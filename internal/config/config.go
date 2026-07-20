@@ -63,8 +63,9 @@ type Config struct {
 	TrustProxy     bool     `yaml:"trust_proxy"`
 	TrustedProxies []string `yaml:"trusted_proxies"`
 
-	Auth    AuthConfig    `yaml:"auth"`
-	Edge    EdgeConfig    `yaml:"edge"`
+	Auth       AuthConfig   `yaml:"auth"`
+	ExtraUsers []UserConfig `yaml:"users"` // additional operators beyond the auth owner (RBAC)
+	Edge       EdgeConfig   `yaml:"edge"`
 	Admin   AdminConfig   `yaml:"admin"`
 	Session SessionConfig `yaml:"session"`
 	Cookie  CookieConfig  `yaml:"cookie"`
@@ -308,11 +309,66 @@ func (c *Config) IsProtectedProject(project string) bool {
 	return false
 }
 
-// AuthConfig holds the single operator's credentials.
+// AuthConfig holds the PRIMARY operator's credentials — always an owner. Additional operators
+// go in the top-level `users:` list (see UserConfig). With no `users:`, Mooring is single-user
+// exactly as before.
 type AuthConfig struct {
 	Username     string `yaml:"username"`
 	PasswordHash string `yaml:"password_hash"`
 	TOTPSecret   string `yaml:"totp_secret"`
+}
+
+// Role is an operator's authorization tier. owner does everything (deploy + all Tier-1:
+// keys/reveal/setup/delete/tokens/trust); deployer can deploy, roll back, and edit an app's
+// env/config/scaling; viewer is read-only.
+type Role string
+
+const (
+	RoleOwner    Role = "owner"
+	RoleDeployer Role = "deployer"
+	RoleViewer   Role = "viewer"
+)
+
+func validRole(r Role) bool { return r == RoleOwner || r == RoleDeployer || r == RoleViewer }
+
+// Can reports whether a role is permitted a capability tier: "view" (all roles), "deploy"
+// (deployer + owner), or "admin" (owner only). Fail-closed on an unknown tier.
+func (r Role) Can(perm string) bool {
+	switch perm {
+	case "view":
+		return r == RoleViewer || r == RoleDeployer || r == RoleOwner
+	case "deploy":
+		return r == RoleDeployer || r == RoleOwner
+	case "admin":
+		return r == RoleOwner
+	}
+	return false
+}
+
+// UserConfig is one ADDITIONAL operator (beyond the `auth:` owner). Credentials are minted the
+// same way (`mooring hash-password` / `mooring gen-totp`) and pasted under `users:`.
+type UserConfig struct {
+	Username     string `yaml:"username"`
+	PasswordHash string `yaml:"password_hash"`
+	TOTPSecret   string `yaml:"totp_secret"`
+	Role         Role   `yaml:"role"`
+}
+
+// User is a resolved operator identity (the auth owner + each `users:` entry).
+type User struct {
+	Username     string
+	PasswordHash string
+	TOTPSecret   string
+	Role         Role
+}
+
+// Users returns every operator: the `auth:` block as an OWNER first, then the `users:` entries.
+func (c *Config) Users() []User {
+	out := []User{{Username: c.Auth.Username, PasswordHash: c.Auth.PasswordHash, TOTPSecret: c.Auth.TOTPSecret, Role: RoleOwner}}
+	for _, u := range c.ExtraUsers {
+		out = append(out, User{Username: u.Username, PasswordHash: u.PasswordHash, TOTPSecret: u.TOTPSecret, Role: u.Role})
+	}
+	return out
 }
 
 // EdgeConfig configures the managed edge (plan §3.1, §6).
@@ -817,6 +873,30 @@ func (c *Config) Validate() error {
 	}
 	if c.Auth.TOTPSecret != "" && !validBase32(c.Auth.TOTPSecret) {
 		add("auth.totp_secret: not valid base32 (run `mooring gen-totp`)")
+	}
+
+	// --- additional users (RBAC) ---
+	seenUser := map[string]bool{c.Auth.Username: true}
+	for i, u := range c.ExtraUsers {
+		if u.Username == "" {
+			add("users[%d].username: required", i)
+			continue
+		}
+		if seenUser[u.Username] {
+			add("users[%d]: duplicate username %q (already the auth owner or another user)", i, u.Username)
+		}
+		seenUser[u.Username] = true
+		if u.PasswordHash == "" {
+			add("users[%d] (%s): password_hash required (run `mooring hash-password`)", i, u.Username)
+		} else if _, _, _, err := crypto.ParseArgon2(u.PasswordHash); err != nil {
+			add("users[%d] (%s).password_hash: %v", i, u.Username, err)
+		}
+		if u.TOTPSecret != "" && !validBase32(u.TOTPSecret) {
+			add("users[%d] (%s).totp_secret: not valid base32", i, u.Username)
+		}
+		if !validRole(u.Role) {
+			add("users[%d] (%s).role: must be owner, deployer, or viewer", i, u.Username)
+		}
 	}
 
 	// --- bind address: admin UI binds loopback only (plan §3) ---

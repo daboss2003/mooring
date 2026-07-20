@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,14 +55,18 @@ const maxConcurrentLogStreams = 8
 // secState is the slice of config that SIGHUP can hot-reload (plan §5.1:
 // allowlist + auth, never keys/bind). It is swapped atomically so the request
 // hot path never races a reload.
+type userSec struct {
+	passwordHash string
+	totpSecret   string
+	role         config.Role
+}
+
 type secState struct {
 	trustProxy     bool
 	allowlist      []netip.Prefix
 	trustedProxies []netip.Prefix
-	username       string
-	passwordHash   string
-	totpSecret     string
-	dummyHash      string
+	users          map[string]userSec // username → credentials + role (the auth owner + `users:`)
+	dummyHash      string             // equal-cost argon2 hash for a username miss (timing parity)
 	// tokenCIDRUnion is the precomputed union of every ACTIVE API token's CIDR set.
 	// The IP gate checks the unspoofable peer against this BEFORE any bearer is
 	// parsed (so a token id is never an enumeration oracle and an unknown bearer
@@ -266,16 +271,41 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 // TOTP secret). When it changes, every existing session is revoked.
 const authEpochKey = "auth_epoch"
 
-// authFingerprint is a one-way hash of the auth-relevant config. It never exposes the
-// secrets (sha256, and the password is already a hash); it only needs to CHANGE when
-// any of them change.
+// user / role / totpEnabled resolve one operator from the request-time snapshot.
+func (sec *secState) user(username string) (userSec, bool) {
+	u, ok := sec.users[username]
+	return u, ok
+}
+func (sec *secState) role(username string) (config.Role, bool) {
+	u, ok := sec.users[username]
+	if !ok {
+		return "", false
+	}
+	return u.role, true
+}
+func (sec *secState) totpEnabled(username string) bool {
+	u, ok := sec.users[username]
+	return ok && u.totpSecret != ""
+}
+
+// authFingerprint is a one-way hash of the auth-relevant config across ALL users. It never
+// exposes secrets (sha256, and passwords are already hashes); it only needs to CHANGE when any
+// user is added, removed, or has their password/TOTP/role changed — so adding/removing a user
+// or rotating a credential revokes existing sessions (fail-closed).
 func authFingerprint(sec *secState) string {
 	h := sha256.New()
-	h.Write([]byte(sec.username))
-	h.Write([]byte{0})
-	h.Write([]byte(sec.passwordHash))
-	h.Write([]byte{0})
-	h.Write([]byte(sec.totpSecret))
+	names := make([]string, 0, len(sec.users))
+	for n := range sec.users {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		u := sec.users[n]
+		for _, part := range []string{n, u.passwordHash, u.totpSecret, string(u.role)} {
+			h.Write([]byte(part))
+			h.Write([]byte{0})
+		}
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -314,23 +344,29 @@ func (s *Server) activeTokenUnion(ctx context.Context) []netip.Prefix {
 }
 
 func buildSecState(cfg *config.Config) (*secState, error) {
-	// Precompute a dummy argon2id hash with the SAME params as the operator's
-	// real hash, so a username miss runs an equal-cost verify (timing parity).
-	params, _, _, err := crypto.ParseArgon2(cfg.Auth.PasswordHash)
-	if err != nil {
-		return nil, fmt.Errorf("web: parse password hash: %w", err)
-	}
-	dummy, err := crypto.HashPassword([]byte("\x00mooring-dummy"), params)
-	if err != nil {
-		return nil, fmt.Errorf("web: build dummy hash: %w", err)
+	users := map[string]userSec{}
+	var dummy string
+	for _, u := range cfg.Users() {
+		params, _, _, err := crypto.ParseArgon2(u.PasswordHash)
+		if err != nil {
+			return nil, fmt.Errorf("web: parse password hash for %q: %w", u.Username, err)
+		}
+		if dummy == "" {
+			// One dummy argon2id hash (owner's params) so a username miss runs an equal-cost
+			// verify — timing never reveals which usernames exist.
+			d, derr := crypto.HashPassword([]byte("\x00mooring-dummy"), params)
+			if derr != nil {
+				return nil, fmt.Errorf("web: build dummy hash: %w", derr)
+			}
+			dummy = d
+		}
+		users[u.Username] = userSec{passwordHash: u.PasswordHash, totpSecret: u.TOTPSecret, role: u.Role}
 	}
 	return &secState{
 		trustProxy:     cfg.TrustProxy,
 		allowlist:      cfg.Allowlist(),
 		trustedProxies: cfg.TrustedProxyPrefixes(),
-		username:       cfg.Auth.Username,
-		passwordHash:   cfg.Auth.PasswordHash,
-		totpSecret:     cfg.Auth.TOTPSecret,
+		users:          users,
 		dummyHash:      dummy,
 	}, nil
 }
@@ -360,7 +396,7 @@ func (s *Server) Reload(ctx context.Context) error {
 	// but I'm still in" trap. Same fingerprint mechanism as startup, so it holds via
 	// reload OR restart.
 	s.reconcileAuthEpoch(ctx)
-	s.log.Info("config reloaded", "two_factor_totp", sec.totpSecret != "")
+	s.log.Info("config reloaded", "users", len(sec.users), "owner_2fa", sec.totpEnabled(cfg.Auth.Username))
 	_ = s.audit.Log(ctx, audit.Event{
 		Action: "config_reload", Outcome: audit.OK, Level: audit.Security,
 		Detail: "allowlist + auth + token CIDR-union reloaded",
@@ -397,8 +433,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /server", s.requireAuth(s.withCSRFToken(s.handleServer)))
 	mux.HandleFunc("GET /partials/server", s.requireAuth(s.handleServerPartial))
 	mux.HandleFunc("GET /server/files", s.requireAuth(s.withCSRFToken(s.handleServerFiles)))
-	mux.HandleFunc("POST /server/debs/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleDebDelete))))
-	mux.HandleFunc("POST /server/reclaim-disk", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleReclaimDisk))))
+	mux.HandleFunc("POST /server/debs/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleDebDelete))))
+	mux.HandleFunc("POST /server/reclaim-disk", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleReclaimDisk))))
 	mux.HandleFunc("GET /apps", s.requireAuth(s.withCSRFToken(s.handleAppsList)))
 	// Host metric series for the live dashboard charts (read plane; cookie-authed).
 	mux.HandleFunc("GET /partials/metrics.json", s.requireAuth(s.handleMetricsHistory))
@@ -415,83 +451,83 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /apps/{project}", s.requireAuth(s.withCSRFToken(s.handleApp)))
 	// Permanent app delete: full teardown (stop+remove containers/volumes, run dir, repo,
 	// and all per-app state). Re-authenticates with the operator password in the handler.
-	mux.HandleFunc("POST /apps/{project}/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAppDelete))))
+	mux.HandleFunc("POST /apps/{project}/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleAppDelete))))
 	mux.HandleFunc("GET /partials/app/{project}", s.requireAuth(s.withCSRFToken(s.handleAppPartial)))
 	// App Ops Interface (M3): config form + server-side-proxied queue actions.
 	mux.HandleFunc("GET /apps/{project}/ops-config", s.requireAuth(s.withCSRFToken(s.handleOpsConfigGet)))
-	mux.HandleFunc("POST /apps/{project}/ops-config", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleOpsConfigPost))))
-	mux.HandleFunc("POST /apps/{project}/queues/{queue}/{action}", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleQueueAction))))
+	mux.HandleFunc("POST /apps/{project}/ops-config", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleOpsConfigPost))))
+	mux.HandleFunc("POST /apps/{project}/queues/{queue}/{action}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleQueueAction))))
 	// Lifecycle (M4 write plane): whole-project + per-service. Literal sub-routes
 	// (ops-config, queues) are more specific and take precedence over {action}.
-	mux.HandleFunc("POST /apps/{project}/{action}", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAppAction))))
-	mux.HandleFunc("POST /apps/{project}/services/{service}/{action}", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleServiceAction))))
-	mux.HandleFunc("POST /apps/{project}/supervisor/clear", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleSupervisorClear))))
-	mux.HandleFunc("POST /apps/{project}/scaling", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleScalingSave))))
+	mux.HandleFunc("POST /apps/{project}/{action}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAppAction))))
+	mux.HandleFunc("POST /apps/{project}/services/{service}/{action}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleServiceAction))))
+	mux.HandleFunc("POST /apps/{project}/supervisor/clear", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleSupervisorClear))))
+	mux.HandleFunc("POST /apps/{project}/scaling", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleScalingSave))))
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs", s.requireAuth(s.handleServiceLogs))
 	// withCSRFToken so the live-polled ops fragment carries a CSRF token for its
 	// per-service queue-action forms (re-injected on every poll, never stale).
 	mux.HandleFunc("GET /partials/service/{project}/{service}/ops", s.requireAuth(s.withCSRFToken(s.handleServiceOpsPartial)))
 	// Per-service queue actions: routed to THIS service's own ops endpoint (not the
 	// project-level target). More specific than /services/{service}/{action}.
-	mux.HandleFunc("POST /apps/{project}/services/{service}/queues/{queue}/{action}", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleServiceQueueAction))))
+	mux.HandleFunc("POST /apps/{project}/services/{service}/queues/{queue}/{action}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleServiceQueueAction))))
 	mux.HandleFunc("GET /apps/{project}/services/{service}", s.requireAuth(s.withCSRFToken(s.handleServiceGet)))
 	// Env settings (M5): literals + write-only secrets, masked reveal, history.
 	mux.HandleFunc("GET /apps/{project}/env", s.requireAuth(s.withCSRFToken(s.handleEnvGet)))
-	mux.HandleFunc("POST /apps/{project}/env", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleEnvSaveLiterals))))
-	mux.HandleFunc("POST /apps/{project}/env/literal", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleEnvAddLiteral))))
-	mux.HandleFunc("POST /apps/{project}/env/literal/remove", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleEnvRemoveLiteral))))
-	mux.HandleFunc("POST /apps/{project}/env/import", capBody(512<<10, s.requireAuth(s.requireCSRF(s.handleEnvImport))))
-	mux.HandleFunc("POST /apps/{project}/env/secret", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleEnvSetSecret))))
-	mux.HandleFunc("POST /apps/{project}/env/secret/remove", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleEnvRemoveSecret))))
-	mux.HandleFunc("POST /apps/{project}/env/reveal", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleEnvReveal))))
-	mux.HandleFunc("POST /apps/{project}/env/rollback", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleEnvRollback))))
+	mux.HandleFunc("POST /apps/{project}/env", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleEnvSaveLiterals))))
+	mux.HandleFunc("POST /apps/{project}/env/literal", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleEnvAddLiteral))))
+	mux.HandleFunc("POST /apps/{project}/env/literal/remove", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleEnvRemoveLiteral))))
+	mux.HandleFunc("POST /apps/{project}/env/import", capBody(512<<10, s.requirePerm("deploy", s.requireCSRF(s.handleEnvImport))))
+	mux.HandleFunc("POST /apps/{project}/env/secret", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleEnvSetSecret))))
+	mux.HandleFunc("POST /apps/{project}/env/secret/remove", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleEnvRemoveSecret))))
+	mux.HandleFunc("POST /apps/{project}/env/reveal", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleEnvReveal))))
+	mux.HandleFunc("POST /apps/{project}/env/rollback", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleEnvRollback))))
 	// Managed config files + cert bindings (M5b).
 	mux.HandleFunc("GET /apps/{project}/config-files", s.requireAuth(s.withCSRFToken(s.handleConfigFilesGet)))
-	mux.HandleFunc("POST /apps/{project}/config-files", capBody(256<<10, s.requireAuth(s.requireCSRF(s.handleConfigFileSave))))
-	mux.HandleFunc("POST /apps/{project}/config-files/preview", capBody(256<<10, s.requireAuth(s.requireCSRF(s.handleConfigFilePreview))))
-	mux.HandleFunc("POST /apps/{project}/config-files/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleConfigFileDelete))))
-	mux.HandleFunc("POST /apps/{project}/config-files/migrate", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleConfigFileMigrate))))
-	mux.HandleFunc("POST /apps/{project}/cert-bindings", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleCertBindingSave))))
-	mux.HandleFunc("POST /apps/{project}/cert-bindings/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleCertBindingDelete))))
+	mux.HandleFunc("POST /apps/{project}/config-files", capBody(256<<10, s.requirePerm("deploy", s.requireCSRF(s.handleConfigFileSave))))
+	mux.HandleFunc("POST /apps/{project}/config-files/preview", capBody(256<<10, s.requirePerm("deploy", s.requireCSRF(s.handleConfigFilePreview))))
+	mux.HandleFunc("POST /apps/{project}/config-files/delete", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleConfigFileDelete))))
+	mux.HandleFunc("POST /apps/{project}/config-files/migrate", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleConfigFileMigrate))))
+	mux.HandleFunc("POST /apps/{project}/cert-bindings", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleCertBindingSave))))
+	mux.HandleFunc("POST /apps/{project}/cert-bindings/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleCertBindingDelete))))
 	// App provisioning wizard (M8, modes 1 & 2). validate is a dry preview;
 	// commit/deploy are §0-gated write-plane actions.
 	// "New app" is now the repo-connect flow: GET /apps/new redirects to /git/new (the
 	// single-service provision FORM was retired — a repo's mooring.yaml is the source of
 	// truth). The deploy/delete lifecycle routes stay for any legacy provisioned apps.
 	mux.HandleFunc("GET /apps/new", s.requireAuth(s.handleProvisionNew))
-	mux.HandleFunc("POST /apps/{project}/provision-deploy", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleProvisionDeploy))))
-	mux.HandleFunc("POST /apps/{project}/provision-delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleProvisionDelete))))
+	mux.HandleFunc("POST /apps/{project}/provision-deploy", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleProvisionDeploy))))
+	mux.HandleFunc("POST /apps/{project}/provision-delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleProvisionDelete))))
 	// Setup-script sandbox (M9, Mode 3 — OFF by default, hard-gated). The run is
 	// confirm-token-gated and fail-closed; it never runs from an auto path.
 	mux.HandleFunc("GET /apps/{project}/setup", s.requireAuth(s.withCSRFToken(s.handleSetupGet)))
-	mux.HandleFunc("POST /apps/{project}/setup/sync", capBody(1<<20, s.requireAuth(s.requireCSRF(s.handleSetupSync))))
-	mux.HandleFunc("POST /apps/{project}/setup/run", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleSetupRun))))
-	mux.HandleFunc("POST /apps/{project}/setup/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleSetupDelete))))
+	mux.HandleFunc("POST /apps/{project}/setup/sync", capBody(1<<20, s.requirePerm("admin", s.requireCSRF(s.handleSetupSync))))
+	mux.HandleFunc("POST /apps/{project}/setup/run", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSetupRun))))
+	mux.HandleFunc("POST /apps/{project}/setup/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSetupDelete))))
 	// Repo-path GitOps (M6).
 	mux.HandleFunc("GET /git/new", s.requireAuth(s.withCSRFToken(s.handleGitNew)))
 	// Connect-new runs repo discovery (mooring.yaml + variants → one app each); the
 	// chooser posts the picked file back to /git/choose. Editing an EXISTING app's repo
 	// config stays on /apps/{project}/git (handleGitSave) — no discovery, slug fixed.
-	mux.HandleFunc("POST /git", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleGitConnect))))
-	mux.HandleFunc("POST /git/choose", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleGitChoose))))
+	mux.HandleFunc("POST /git", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitConnect))))
+	mux.HandleFunc("POST /git/choose", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitChoose))))
 	// Add a mooring.*.yaml found in a connected repo (but not yet deployed) as its own app.
-	mux.HandleFunc("POST /git/add-definition", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAddDefinition))))
+	mux.HandleFunc("POST /git/add-definition", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleAddDefinition))))
 	mux.HandleFunc("GET /apps/{project}/git", s.requireAuth(s.withCSRFToken(s.handleGitGet)))
-	mux.HandleFunc("POST /apps/{project}/git", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleGitSave))))
-	mux.HandleFunc("POST /apps/{project}/git/fetch", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitFetch))))
-	mux.HandleFunc("POST /apps/{project}/git/deploy", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitDeploy))))
-	mux.HandleFunc("POST /apps/{project}/versions/{id}/rollback", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleVersionRollback))))
-	mux.HandleFunc("POST /apps/{project}/versions/{id}/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleVersionDelete))))
-	mux.HandleFunc("POST /apps/{project}/git/webhook-rotate", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitWebhookRotate))))
+	mux.HandleFunc("POST /apps/{project}/git", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitSave))))
+	mux.HandleFunc("POST /apps/{project}/git/fetch", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleGitFetch))))
+	mux.HandleFunc("POST /apps/{project}/git/deploy", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleGitDeploy))))
+	mux.HandleFunc("POST /apps/{project}/versions/{id}/rollback", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleVersionRollback))))
+	mux.HandleFunc("POST /apps/{project}/versions/{id}/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleVersionDelete))))
+	mux.HandleFunc("POST /apps/{project}/git/webhook-rotate", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitWebhookRotate))))
 	// Connect with GitHub (M20): OAuth web flow → repo picker → auto deploy-key.
 	// The callback is a cross-site navigation back from github.com, so the Strict
 	// session cookie isn't sent — it is authenticated by the single-use Lax OAuth
 	// state cookie instead (set only by the authenticated+CSRF'd connect action).
-	mux.HandleFunc("POST /github/connect", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitHubConnect))))
+	mux.HandleFunc("POST /github/connect", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitHubConnect))))
 	mux.HandleFunc("GET /github/callback", s.handleGitHubCallback)
 	mux.HandleFunc("GET /github/repos", s.requireAuth(s.withCSRFToken(s.handleGitHubRepos)))
-	mux.HandleFunc("POST /github/connect-repo", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleGitHubConnectRepo))))
-	mux.HandleFunc("POST /github/disconnect", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitHubDisconnect))))
+	mux.HandleFunc("POST /github/connect-repo", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitHubConnectRepo))))
+	mux.HandleFunc("POST /github/disconnect", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitHubDisconnect))))
 	// Managed edge (M11): per-app public routes (Caddy/ACME). The whole config is
 	// re-rendered + pushed on every change; the operator never edits Caddy.
 	mux.HandleFunc("GET /edge", s.requireAuth(s.withCSRFToken(s.handleEdge)))
@@ -501,24 +537,24 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /alerts", s.requireAuth(s.withCSRFToken(s.handleAlerts)))
 	mux.HandleFunc("GET /alerts/channels", s.requireAuth(s.withCSRFToken(s.handleChannelsPage)))
 	mux.HandleFunc("GET /alerts/rules", s.requireAuth(s.withCSRFToken(s.handleRulesPage)))
-	mux.HandleFunc("POST /alerts/channels", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleAlertChannelSave))))
-	mux.HandleFunc("POST /alerts/channels/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAlertChannelDelete))))
-	mux.HandleFunc("POST /alerts/channels/test", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAlertChannelTest))))
-	mux.HandleFunc("POST /alerts/rules", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleAlertRuleSave))))
-	mux.HandleFunc("POST /alerts/rules/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAlertRuleDelete))))
-	mux.HandleFunc("POST /alerts/ack", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAlertAck))))
-	mux.HandleFunc("POST /alerts/silence", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAlertSilence))))
+	mux.HandleFunc("POST /alerts/channels", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleAlertChannelSave))))
+	mux.HandleFunc("POST /alerts/channels/delete", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAlertChannelDelete))))
+	mux.HandleFunc("POST /alerts/channels/test", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAlertChannelTest))))
+	mux.HandleFunc("POST /alerts/rules", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleAlertRuleSave))))
+	mux.HandleFunc("POST /alerts/rules/delete", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAlertRuleDelete))))
+	mux.HandleFunc("POST /alerts/ack", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAlertAck))))
+	mux.HandleFunc("POST /alerts/silence", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAlertSilence))))
 	mux.HandleFunc("GET /events", s.requireAuth(s.withCSRFToken(s.handleEvents)))
 	// Operator UI prefs (M7): persisted tile order. UI-only, never Tier-1.
-	mux.HandleFunc("POST /settings/tile-order", capBody(64<<10, s.requireAuth(s.requireCSRF(s.handleTileOrder))))
+	mux.HandleFunc("POST /settings/tile-order", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleTileOrder))))
 	// API tokens (M19): read-only view + revoke. Minting stays CLI-only by design.
 	mux.HandleFunc("GET /settings/api-tokens", s.requireAuth(s.withCSRFToken(s.handleAPITokens)))
-	mux.HandleFunc("POST /settings/api-tokens/revoke", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleAPITokenRevoke))))
+	mux.HandleFunc("POST /settings/api-tokens/revoke", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleAPITokenRevoke))))
 	// Backups: encrypted Mooring-state snapshots — view, create, download, delete.
 	mux.HandleFunc("GET /settings/backups", s.requireAuth(s.withCSRFToken(s.handleBackups)))
-	mux.HandleFunc("GET /settings/backups/download", s.requireAuth(s.handleBackupDownload))
-	mux.HandleFunc("POST /settings/backups/create", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleBackupCreate))))
-	mux.HandleFunc("POST /settings/backups/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleBackupDelete))))
+	mux.HandleFunc("GET /settings/backups/download", s.requirePerm("admin", s.handleBackupDownload))
+	mux.HandleFunc("POST /settings/backups/create", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleBackupCreate))))
+	mux.HandleFunc("POST /settings/backups/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleBackupDelete))))
 
 	// Scoped machine API (M19, plan §17.1): bearer-ONLY, cookie-REJECTING,
 	// CSRF-EXEMPT (no ambient credential to abuse). requireToken is the sole gate —

@@ -171,7 +171,7 @@ func (s *Server) fileBrowser() *serverinfo.FileBrowser {
 func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 	v := s.buildServerLive()
 	v.Version = s.version
-	v.TOTPEnabled = s.security().totpSecret != ""
+	v.TOTPEnabled = s.security().totpEnabled(sessionUser(r))
 	v.DebCacheDir = s.cfg.Server.DebCacheDir
 	if debs, err := serverinfo.ListDebs(s.cfg.Server.DebCacheDir, s.version); err == nil {
 		v.Debs = debs
@@ -289,8 +289,8 @@ func (s *Server) handleDebDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many attempts — try again later", http.StatusTooManyRequests)
 		return
 	}
-	reauthOK := s.verifyOperatorPassword(r.Context(), r.PostFormValue("password")) &&
-		s.verifyTOTPOnce(r.Context(), r.PostFormValue("totp"))
+	reauthOK := s.verifyOperatorPassword(r.Context(), actor, r.PostFormValue("password")) &&
+		s.verifyTOTPOnce(r.Context(), actor, r.PostFormValue("totp"))
 	if !reauthOK {
 		s.recordFailure(r.Context(), peer, actor)
 		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "deb_delete", Target: name, Outcome: audit.Deny, Level: audit.Security, Detail: "re-auth failed"})
