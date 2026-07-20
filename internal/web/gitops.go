@@ -201,6 +201,7 @@ type gitView struct {
 	LastFetchError      string
 	Diff                *gitDiffView
 	WriteDisabledReason string
+	Versions            []definition.VersionMeta // deploy/edit history; rows with a Commit are rollback targets
 }
 
 func shortSha(s string) string {
@@ -308,6 +309,9 @@ func (s *Server) handleGitGet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		gv.Diff = s.buildDiff(r.Context(), project, cfg)
+		if s.defStore != nil {
+			gv.Versions, _ = s.defStore.List(project) // newest first; rows with a Commit are rollback targets
+		}
 	}
 	s.render(w, r, "git.html", tmplData{
 		Title:     "Repository — " + project,
@@ -527,17 +531,31 @@ func (s *Server) handleGitDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Stream on a BACKGROUND context (not the request context) so navigating away can't
+	// cancel a build mid-flight; the single-flight gate (held until the goroutine finishes)
+	// blocks a duplicate restart. Progress is streamed best-effort.
+	s.streamDeploy(w, fmt.Sprintf("$ deploy %s @ %s", project, shortSha(sha)), func(bg context.Context, emit func(string)) {
+		if err := s.deployRepoApp(bg, cfg, sha, "manual", actor, false, emit); err != nil {
+			emit(fmt.Sprintf("\n[failed: %v]", err))
+			_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "git_deploy", Target: project + "@" + shortSha(sha), Outcome: audit.Error, Level: audit.Security, Detail: err.Error()})
+			return
+		}
+		emit("\n[done]")
+		_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "git_deploy", Target: project + "@" + shortSha(sha), Outcome: audit.OK, Level: audit.Security})
+	})
+}
+
+// streamDeploy runs a write-plane deploy/rollback in a background goroutine and streams its
+// output to the client best-effort. The CALLER must already hold the s.gitDeploy single-flight
+// semaphore — streamDeploy releases it when the work finishes. The work runs on a background
+// context (a client disconnect never cancels a build); auditing is the work function's job.
+func (s *Server) streamDeploy(w http.ResponseWriter, opening string, run func(bg context.Context, emit func(string))) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no")
 	clearWriteDeadline(w) // deploy stream can run minutes (build + ACME) — exempt from WriteTimeout
 	flusher, _ := w.(http.Flusher)
 
-	// Run the deploy on a BACKGROUND context in a goroutine — NOT the request context.
-	// Previously the deploy ran on r.Context(), so navigating away or any connection
-	// blip cancelled it mid-build and a re-trigger restarted from scratch. Now it runs
-	// to completion regardless of the client; we stream progress best-effort, and the
-	// single-flight gate (held until the goroutine finishes) blocks a duplicate restart.
 	lines := make(chan string, 512)
 	go func() {
 		defer s.gitDeploy.Release()
@@ -550,19 +568,14 @@ func (s *Server) handleGitDeploy(w http.ResponseWriter, r *http.Request) {
 			default: // client gone / slow — drop rather than block the deploy
 			}
 		}
-		emit(fmt.Sprintf("$ deploy %s @ %s", project, shortSha(sha)))
-		if err := s.deployRepoApp(bg, cfg, sha, "manual", actor, emit); err != nil {
-			emit(fmt.Sprintf("\n[failed: %v]", err))
-			_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "git_deploy", Target: project + "@" + shortSha(sha), Outcome: audit.Error, Level: audit.Security, Detail: err.Error()})
-			return
+		if opening != "" {
+			emit(opening)
 		}
-		emit("\n[done]")
-		_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "git_deploy", Target: project + "@" + shortSha(sha), Outcome: audit.OK, Level: audit.Security})
+		run(bg, emit)
 	}()
 
-	// Stream to the client until the deploy finishes (lines closed) or the client
-	// disconnects (write error). On disconnect we just stop reading — the goroutine
-	// above keeps deploying in the background.
+	// Stream until the work finishes (lines closed) or the client disconnects (write error).
+	// On disconnect we just stop reading — the goroutine above keeps running in the background.
 	for line := range lines {
 		if _, werr := fmt.Fprintln(w, line); werr != nil {
 			break
@@ -571,6 +584,62 @@ func (s *Server) handleGitDeploy(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// handleVersionRollback redeploys the git commit behind a chosen prior definition version — a
+// one-click "roll back to this deploy". It re-runs the FULL deploy pipeline against that older
+// commit (build services rebuild; pull-image services reuse their pinned image), so a rollback
+// is the same sha-pinned promotion path as a forward deploy, just aimed backward. Only versions
+// with a recorded commit (past git deploys) are rollback targets; a dashboard-config version has
+// no commit and is rejected. Gated like a normal deploy (auth + CSRF); the version id is scoped
+// to the app so a cross-app id can never resolve.
+func (s *Server) handleVersionRollback(w http.ResponseWriter, r *http.Request) {
+	if s.gitStore == nil || s.runner == nil || s.defStore == nil {
+		http.Error(w, "write plane unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	project := r.PathValue("project")
+	actor := sessionUser(r)
+	peer := ClientIP(r.Context()).String()
+	if s.cfg.IsProtectedProject(project) {
+		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "version_rollback", Target: project, Outcome: audit.Deny, Level: audit.Security, Detail: "protected project"})
+		http.Error(w, "protected project", http.StatusForbidden)
+		return
+	}
+	if ok, reason := s.runner.WriteAllowed(); !ok {
+		http.Error(w, reason, http.StatusForbidden)
+		return
+	}
+	id, perr := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if perr != nil || id <= 0 {
+		http.Error(w, "invalid version id", http.StatusBadRequest)
+		return
+	}
+	cfg, ok, err := s.gitStore.Get(project)
+	if err != nil || !ok {
+		http.Error(w, "repository not configured", http.StatusNotFound)
+		return
+	}
+	commit, cerr := s.defStore.CommitForVersion(project, id)
+	if cerr != nil || !isFullSha40(commit) {
+		http.Error(w, "this version has no recorded commit — only past git deploys can be rolled back", http.StatusBadRequest)
+		return
+	}
+
+	if !s.gitDeploy.TryAcquire() {
+		http.Error(w, "a deploy is already in progress — it continues in the background even if you leave this page; refresh the app to see the result", http.StatusConflict)
+		return
+	}
+
+	s.streamDeploy(w, fmt.Sprintf("$ rollback %s → %s", project, shortSha(commit)), func(bg context.Context, emit func(string)) {
+		if err := s.deployRepoApp(bg, cfg, commit, "rollback", actor, true, emit); err != nil {
+			emit(fmt.Sprintf("\n[failed: %v]", err))
+			_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "version_rollback", Target: project + "@" + shortSha(commit), Outcome: audit.Error, Level: audit.Security, Detail: err.Error()})
+			return
+		}
+		emit("\n[done]")
+		_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "version_rollback", Target: project + "@" + shortSha(commit), Outcome: audit.OK, Level: audit.Security})
+	})
 }
 
 // deployRepoApp promotes ONE reviewed commit sha. The CALLER must hold the
@@ -584,7 +653,7 @@ func (s *Server) handleGitDeploy(w http.ResponseWriter, r *http.Request) {
 //  4. materialize managed config files + the 0600 env-file (M5/M5b).
 //  5. `docker compose up -d` under the gate + one-docker-child semaphore (M4).
 //  6. pin deployed_commit (ref + DB) so gc never prunes it (rollback stays valid).
-func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, source, actor string, onLine func(string)) error {
+func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, source, actor string, rollback bool, onLine func(string)) error {
 	bg := context.Background() // FSM/DB writes persist even if the client disconnects
 	slug := cfg.Project
 	rd := filepath.Clean(s.appRunDir(slug))
@@ -592,7 +661,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		return fmt.Errorf("app run directory %q is unsafe; refusing to deploy", rd)
 	}
 	if !isFullSha40(sha) {
-		return errors.New("a full staged commit sha is required")
+		return errors.New("a full commit sha is required")
 	}
 
 	repo, err := git.Open(s.gitObjectDir(slug))
@@ -600,14 +669,20 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		return fmt.Errorf("open object store: %w", err)
 	}
 
-	// (1) sha-pin: DB + ref + a real commit object must all agree on `sha`.
-	stagedNow := repo.RefSha(ctx, git.StagedRef)
-	if stagedNow != sha || cfg.StagedCommit != sha {
-		s.gitStore.SetState(bg, slug, "update_blocked")
-		return errors.New("the staged commit moved since it was reviewed; fetch and re-review before deploying")
+	// (1) sha-pin. A normal deploy promotes exactly the reviewed staged commit: the staged
+	// ref + DB must STILL agree on `sha` (a concurrent fetch that moved it aborts — re-review
+	// required). A ROLLBACK deliberately targets an OLDER commit that is (by definition) not
+	// the staged one, so it skips that equality check — but STILL requires the commit object
+	// to resolve, so a pruned/garbage sha can never deploy.
+	if !rollback {
+		stagedNow := repo.RefSha(ctx, git.StagedRef)
+		if stagedNow != sha || cfg.StagedCommit != sha {
+			s.gitStore.SetState(bg, slug, "update_blocked")
+			return errors.New("the staged commit moved since it was reviewed; fetch and re-review before deploying")
+		}
 	}
 	if _, err := repo.ResolveRef(ctx, sha); err != nil {
-		return fmt.Errorf("staged commit not found: %w", err)
+		return fmt.Errorf("commit not found: %w", err)
 	}
 
 	// (2) Mooring OWNS the compose: read the repo's mooring.yaml at the pinned
@@ -793,7 +868,11 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// The repo's mooring.yaml is the source of truth: record it as the canonical and
 	// reconcile every projection (edge/L4 routes, scaling) from it. This also clears
 	// any prior dashboard drift, since the canonical is now the freshly-deployed file.
-	if err := s.applyDefinition(ctx, slug, def, "git deploy: "+shortSha(sha)); err != nil {
+	note := "git deploy: " + shortSha(sha)
+	if rollback {
+		note = "rollback to " + shortSha(sha)
+	}
+	if err := s.applyDefinition(ctx, slug, def, note, sha); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return fmt.Errorf("apply definition: %w", err)
 	}
@@ -992,7 +1071,7 @@ func (s *Server) fetchAndMaybeDeploy(ctx context.Context, project, actor string)
 	if ok, _ := s.runner.WriteAllowed(); !ok {
 		return
 	}
-	if err := s.deployRepoApp(ctx, fresh, staged, actor, actor, func(line string) {
+	if err := s.deployRepoApp(ctx, fresh, staged, actor, actor, false, func(line string) {
 		s.log.Info("git auto-deploy", "project", project, "via", actor, "line", line)
 	}); err != nil {
 		s.log.Warn("git auto-deploy failed", "project", project, "via", actor)

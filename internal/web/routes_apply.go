@@ -53,8 +53,9 @@ func (s *Server) handleDefinitionYAML(w http.ResponseWriter, r *http.Request) {
 // pieces that stay editable (config files, cert bindings, scaling, ops). It re-validates
 // the definition (the same gate a committed file gets), stores it as a new version, then
 // applies the projections (edge/L4 routes, scaling, self-healing, ops). note records the
-// writer (e.g. "git deploy: <sha>" / "dashboard: scaling api").
-func (s *Server) applyDefinition(ctx context.Context, project string, def *definition.Definition, note string) error {
+// writer (e.g. "git deploy: <sha>" / "dashboard: scaling api"); commit is the git sha this
+// version was deployed from ("" for dashboard edits — those are not rollback targets).
+func (s *Server) applyDefinition(ctx context.Context, project string, def *definition.Definition, note, commit string) error {
 	if s.defStore != nil {
 		canon, err := definition.Canonical(def)
 		if err != nil {
@@ -63,7 +64,7 @@ func (s *Server) applyDefinition(ctx context.Context, project string, def *defin
 		if _, err := definition.Parse(canon); err != nil { // re-validate before it becomes the truth
 			return fmt.Errorf("invalid definition: %w", err)
 		}
-		if _, err := s.defStore.SaveCanonical(ctx, def, note); err != nil {
+		if _, err := s.defStore.SaveCanonical(ctx, def, note, commit); err != nil {
 			return fmt.Errorf("save canonical: %w", err)
 		}
 	}

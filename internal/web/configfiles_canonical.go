@@ -198,7 +198,7 @@ func (s *Server) saveCanonicalConfigFile(w http.ResponseWriter, r *http.Request,
 		Template: r.PostFormValue("template"), Mount: mount, Bindings: bindings,
 	})
 	def.Spec.Compose.Services[service] = svc
-	if err := s.applyDefinition(r.Context(), project, def, "dashboard: config-file "+service+" "+mount); err != nil {
+	if err := s.applyDefinition(r.Context(), project, def, "dashboard: config-file "+service+" "+mount, ""); err != nil {
 		http.Error(w, "config file rejected: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
@@ -216,7 +216,7 @@ func (s *Server) deleteCanonicalConfigFile(w http.ResponseWriter, r *http.Reques
 	}
 	svc.ConfigFiles = removeConfigFileByMount(svc.ConfigFiles, mount)
 	def.Spec.Compose.Services[service] = svc
-	if err := s.applyDefinition(r.Context(), project, def, "dashboard: config-file delete "+service+" "+mount); err != nil {
+	if err := s.applyDefinition(r.Context(), project, def, "dashboard: config-file delete "+service+" "+mount, ""); err != nil {
 		http.Error(w, "delete rejected: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
@@ -237,7 +237,7 @@ func (s *Server) saveCanonicalCertBinding(w http.ResponseWriter, r *http.Request
 	}
 	svc.CertBindings = upsertCertBindingByHost(svc.CertBindings, definition.CertBinding{Hostname: hostname, Mount: mount})
 	def.Spec.Compose.Services[service] = svc
-	if err := s.applyDefinition(r.Context(), project, def, "dashboard: cert-binding "+service+" "+hostname); err != nil {
+	if err := s.applyDefinition(r.Context(), project, def, "dashboard: cert-binding "+service+" "+hostname, ""); err != nil {
 		http.Error(w, "cert binding rejected: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
@@ -255,7 +255,7 @@ func (s *Server) deleteCanonicalCertBinding(w http.ResponseWriter, r *http.Reque
 	}
 	svc.CertBindings = removeCertBindingByHost(svc.CertBindings, hostname)
 	def.Spec.Compose.Services[service] = svc
-	if err := s.applyDefinition(r.Context(), project, def, "dashboard: cert-binding delete "+service+" "+hostname); err != nil {
+	if err := s.applyDefinition(r.Context(), project, def, "dashboard: cert-binding delete "+service+" "+hostname, ""); err != nil {
 		http.Error(w, "delete rejected: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
@@ -319,7 +319,7 @@ func (s *Server) handleConfigFileMigrate(w http.ResponseWriter, r *http.Request)
 		Template: legacy.template, Mount: mount, Bindings: bindings,
 	})
 	def.Spec.Compose.Services[service] = svc
-	if err := s.applyDefinition(r.Context(), project, def, "dashboard: migrate config-file "+name+" → "+service+mount); err != nil {
+	if err := s.applyDefinition(r.Context(), project, def, "dashboard: migrate config-file "+name+" → "+service+mount, ""); err != nil {
 		http.Error(w, "migration rejected (legacy file kept): "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}

@@ -103,6 +103,28 @@
 
   <pre id="deploy-output" class="stream" hidden></pre>
 
+  {{$proj := .Project}}
+  {{if .Versions}}
+  <section class="panel">
+    <h2>Deploy history <span class="muted">(roll back to a previous version)</span></h2>
+    <p class="muted">Rolling back re-checks out and redeploys that commit — <strong>build services rebuild</strong>;
+      pull-image services reuse their pinned image. Progress streams above.</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>When</th><th>Commit</th><th>Change</th><th></th></tr></thead>
+      <tbody>
+        {{range .Versions}}
+        <tr>
+          <td class="mono">{{template "ts" .CreatedAt}}</td>
+          <td class="mono">{{if .Commit}}{{shortSha .Commit}}{{else}}—{{end}}</td>
+          <td>{{.Note}}</td>
+          <td>{{if .Commit}}<button type="button" class="btn btn-sm btn-ghost lc-btn" data-lc-confirm="Roll back {{$proj}} to {{shortSha .Commit}}? This recreates its containers." data-lc-url="/apps/{{pathEscape $proj}}/versions/{{.ID}}/rollback">Roll back to this</button>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+  </section>
+  {{end}}
+
   <section class="panel">
     <h2>Webhook <span class="muted">(trigger-only; never reads the payload)</span></h2>
     {{if .WebhookToken}}

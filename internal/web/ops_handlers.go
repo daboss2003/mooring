@@ -109,7 +109,7 @@ func (s *Server) opsWriteBack(r *http.Request, project string) {
 		s.log.Warn("ops write-back: canonical re-validation failed (ops config applied)", "project", project, "err", perr)
 		return
 	}
-	if _, serr := s.defStore.SaveCanonical(r.Context(), def, "dashboard: ops_interface"); serr != nil {
+	if _, serr := s.defStore.SaveCanonical(r.Context(), def, "dashboard: ops_interface", ""); serr != nil {
 		s.log.Warn("ops write-back: could not save canonical (ops config applied)", "project", project, "err", serr)
 	}
 }

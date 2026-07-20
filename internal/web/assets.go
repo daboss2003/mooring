@@ -27,6 +27,8 @@ var templateFuncs = template.FuncMap{
 	// URL path segment (review #3/#10): '/' '?' '#' etc. become %-encoded so the
 	// {project} route matches and r.PathValue decodes back to the exact value.
 	"pathEscape": url.PathEscape,
+	// shortSha abbreviates a git commit sha for display (numeric-hex only, always safe).
+	"shortSha": shortSha,
 	// unixTS renders a unix timestamp's UTC display text; the "ts" template wraps it
 	// in a <time data-ts> element app.js localises to the viewer's timezone.
 	"unixTS": unixTS,

@@ -25,14 +25,14 @@ func TestStoreRoundTripAndCurrent(t *testing.T) {
 	if got, err := s.Current("shop"); err != nil || got != nil {
 		t.Fatalf("no version yet should be (nil,nil), got %v %v", got, err)
 	}
-	id1, err := s.SaveCanonical(ctx, d, "first")
+	id1, err := s.SaveCanonical(ctx, d, "first", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	// A second version becomes the live canonical.
 	d2 := base()
 	d2.Spec.Scaling = []Scaling{{Service: "web", Max: 4}}
-	if _, err := s.SaveCanonical(ctx, d2, "second"); err != nil {
+	if _, err := s.SaveCanonical(ctx, d2, "second", ""); err != nil {
 		t.Fatal(err)
 	}
 	cur, err := s.Current("shop")
@@ -49,10 +49,77 @@ func TestStoreRoundTripAndCurrent(t *testing.T) {
 	}
 }
 
+// A git-deploy version records the commit it shipped (a rollback target); a dashboard edit
+// records none. CommitForVersion is slug-scoped so a cross-app id never resolves.
+func TestStoreCommitProvenance(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	gitID, err := s.SaveCanonical(ctx, base(), "git deploy: 012345678901", sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dashID, err := s.SaveCanonical(ctx, base(), "dashboard: scaling web", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c, err := s.CommitForVersion("shop", gitID); err != nil || c != sha {
+		t.Fatalf("CommitForVersion(git) = %q,%v; want %q", c, err, sha)
+	}
+	if c, err := s.CommitForVersion("shop", dashID); err != nil || c != "" {
+		t.Fatalf("CommitForVersion(dashboard) = %q,%v; want empty (not a rollback target)", c, err)
+	}
+	// Slug-scoped: the git version's id must not resolve under a different slug.
+	if c, _ := s.CommitForVersion("other", gitID); c != "" {
+		t.Fatalf("cross-slug CommitForVersion must not resolve, got %q", c)
+	}
+	// List surfaces the commit on the history row.
+	vs, err := s.List("shop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, v := range vs {
+		if v.ID == gitID {
+			found = true
+			if v.Commit != sha {
+				t.Errorf("List row commit = %q; want %q", v.Commit, sha)
+			}
+		}
+	}
+	if !found {
+		t.Error("git-deploy version missing from List")
+	}
+}
+
+// The rollback sha is bound into the row MAC: tampering commit_sha alone (a DB-write attacker
+// repointing a version to an unreviewed commit) must be caught fail-closed, since the rollback
+// path skips the git-ref staged cross-check.
+func TestStoreCommitTamperRejected(t *testing.T) {
+	s, db := testStore(t)
+	ctx := context.Background()
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	id, err := s.SaveCanonical(ctx, base(), "git deploy", sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee0"
+	if _, err := db.Exec(`UPDATE definition_versions SET commit_sha=? WHERE id=?`, evil, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CommitForVersion("shop", id); err != ErrTampered {
+		t.Fatalf("tampered commit_sha must surface ErrTampered, got %v", err)
+	}
+	// Current/Version over the same tampered row must also fail closed.
+	if _, err := s.Version("shop", id); err != ErrTampered {
+		t.Fatalf("Version over a commit-tampered row must be ErrTampered, got %v", err)
+	}
+}
+
 func TestStoreHMACTamperRejected(t *testing.T) {
 	s, db := testStore(t)
 	ctx := context.Background()
-	if _, err := s.SaveCanonical(ctx, base(), ""); err != nil {
+	if _, err := s.SaveCanonical(ctx, base(), "", ""); err != nil {
 		t.Fatal(err)
 	}
 	// Tamper the stored YAML — the HMAC must catch it (a DB tamper can't be loaded).

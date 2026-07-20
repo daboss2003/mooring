@@ -99,7 +99,7 @@ func (s *Server) handleScalingSave(w http.ResponseWriter, r *http.Request) {
 	if s.defStore != nil {
 		if def, derr := s.defStore.Current(project); derr == nil && def != nil {
 			def.Spec.Scaling = upsertScaling(def.Spec.Scaling, scalingFromForm(service, enabled, r))
-			if err := s.applyDefinition(r.Context(), project, def, "dashboard: scaling "+service); err != nil {
+			if err := s.applyDefinition(r.Context(), project, def, "dashboard: scaling "+service, ""); err != nil {
 				http.Error(w, "scaling policy rejected: "+err.Error(), http.StatusUnprocessableEntity)
 				return
 			}

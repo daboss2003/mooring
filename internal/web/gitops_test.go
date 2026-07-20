@@ -125,9 +125,36 @@ func TestDeployRejectsMovedStagedSha(t *testing.T) {
 
 	// Ask to deploy a DIFFERENT (well-formed) sha than the one staged.
 	other := "0123456789abcdef0123456789abcdef01234567"
-	err := e.srv.deployRepoApp(context.Background(), cfg, other, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, other, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "moved") {
 		t.Fatalf("expected staged-moved rejection, got %v", err)
+	}
+}
+
+// A ROLLBACK targets an OLDER commit that is deliberately not the staged one, so it must
+// SKIP the staged-equality guard — but it still requires the commit object to resolve, so a
+// pruned/bogus sha can never deploy. Contrast with TestDeployRejectsMovedStagedSha above.
+func TestRollbackSkipsStagedGuardButRequiresCommit(t *testing.T) {
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	slug := "shop"
+	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), repoMooringYAML)
+	cfg := configureRepo(t, e, slug, sha)
+
+	// A well-formed sha that is NOT staged and does not exist in the object store.
+	other := "0123456789abcdef0123456789abcdef01234567"
+
+	// Normal deploy (rollback=false) of a non-staged sha: rejected by the staged-moved guard.
+	if err := e.srv.deployRepoApp(context.Background(), cfg, other, "manual", "operator", false, func(string) {}); err == nil || !strings.Contains(err.Error(), "moved") {
+		t.Fatalf("normal deploy of a non-staged sha must be rejected as moved, got %v", err)
+	}
+	// Rollback (rollback=true): skips the staged guard, so it fails LATER at commit resolution
+	// (never with "moved").
+	err := e.srv.deployRepoApp(context.Background(), cfg, other, "rollback", "operator", true, func(string) {})
+	if err == nil || strings.Contains(err.Error(), "moved") {
+		t.Fatalf("rollback must skip the staged guard (not reject as moved), got %v", err)
+	}
+	if !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("rollback of a non-existent commit should fail at commit resolution, got %v", err)
 	}
 }
 
@@ -145,7 +172,7 @@ func TestDeployIgnoresRepoComposeUsesMooringYAML(t *testing.T) {
 	})
 	cfg := configureRepo(t, e, slug, sha)
 
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "up failed") {
 		t.Fatalf("expected up to fail (write plane disabled) AFTER generation, got %v", err)
 	}
@@ -172,7 +199,7 @@ func TestDeployArchivesBeforeUp(t *testing.T) {
 	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), repoMooringYAML)
 	cfg := configureRepo(t, e, slug, sha)
 
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "up failed") {
 		t.Fatalf("expected up to fail (write plane disabled), got %v", err)
 	}
@@ -197,7 +224,7 @@ func TestDeployBuildServiceGeneratesDockerfile(t *testing.T) {
 		"main.go":      "package main\nfunc main(){}\n",
 	})
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "up failed") {
 		t.Fatalf("expected up to fail (write disabled) after generation, got %v", err)
 	}
@@ -238,7 +265,7 @@ func TestDeployReadsConfiguredMooringVariant(t *testing.T) {
 	e.srv.gitStore.SetFetchResult(context.Background(), slug, sha, 1, "update_available")
 	cfg, _, _ := e.srv.gitStore.Get(slug)
 
-	_ = e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	_ = e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	cmp, rerr := os.ReadFile(filepath.Join(e.srv.appRunDir(slug), "docker-compose.yml"))
 	if rerr != nil {
 		t.Fatalf("generated compose missing: %v", rerr)
@@ -268,7 +295,7 @@ func TestDeployMissingVariantFailsClosed(t *testing.T) {
 	e.srv.gitStore.SetFetchResult(context.Background(), slug, sha, 1, "update_available")
 	cfg, _, _ := e.srv.gitStore.Get(slug)
 
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("expected a fail-closed 'missing' error for the absent variant, got %v", err)
 	}
@@ -292,7 +319,7 @@ func TestDeployMergesRepoDockerignore(t *testing.T) {
 		".dockerignore": "node_modules\n*.log\n", // the operator's own entries
 	})
 	cfg := configureRepo(t, e, slug, sha)
-	_ = e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	_ = e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	di, err := os.ReadFile(filepath.Join(e.srv.appRunDir(slug), ".dockerignore"))
 	if err != nil {
 		t.Fatal(err)
@@ -346,7 +373,7 @@ func TestDeployScaffoldsWhenNoMooringYAML(t *testing.T) {
 		"main.go": "package main\nfunc main(){}\n",
 	})
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "up failed") {
 		t.Fatalf("expected scaffold→generate→up-fail, got %v", err)
 	}
@@ -365,7 +392,7 @@ func TestDeployCreatesBindDirs(t *testing.T) {
 	yaml := "apiVersion: mooring/v1\nkind: App\nmetadata: {slug: app}\nspec:\n  compose:\n    source: generated\n    services:\n      web:\n        image: nginx:1.27\n        volumes:\n          - {source: appdata, target: /var/lib/app}\n"
 	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), yaml)
 	cfg := configureRepo(t, e, slug, sha)
-	_ = e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	_ = e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	info, err := os.Stat(filepath.Join(e.srv.appRunDir(slug), "appdata"))
 	if err != nil || !info.IsDir() {
 		t.Errorf("bind source dir not pre-created: %v", err)
@@ -420,7 +447,7 @@ func TestDeployMaterializesConfigAndSecretFiles(t *testing.T) {
 		"conf/app.conf": "marker-config\n",
 	})
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "up failed") {
 		t.Fatalf("expected up to fail (write disabled) AFTER materialization, got %v", err)
 	}
@@ -472,7 +499,7 @@ spec:
 `
 	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), yaml)
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "up failed") {
 		t.Fatalf("expected up to fail (write disabled) after rendering, got %v", err)
 	}
@@ -506,7 +533,7 @@ func TestDeploySyncsCertBinding(t *testing.T) {
 		"        cert_bindings:\n          - {hostname: mqtt.example.com, mount: /etc/certs}\n"
 	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), yaml)
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "up failed") {
 		t.Fatalf("expected up to fail (write disabled) AFTER cert sync, got %v", err)
 	}
@@ -547,7 +574,7 @@ func TestDeployCertBindingBlocksUntilIssued(t *testing.T) {
 		"        cert_bindings:\n          - {hostname: mqtt.example.com, mount: /etc/certs}\n"
 	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), yaml)
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "did not issue the TLS cert") {
 		t.Fatalf("a not-yet-issued cert_binding must block the deploy after the wait, got %v", err)
 	}
@@ -587,7 +614,7 @@ func TestDeploySecretFileWithoutValueBlocks(t *testing.T) {
 		"        secret_files: [jwt]\n  secrets: [{name: jwt}]\n"
 	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), yaml)
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "set it before deploying") {
 		t.Fatalf("a secret_files ref with no value must block the deploy, got %v", err)
 	}
@@ -599,7 +626,7 @@ func TestDeployRejectsUndetectableRepoWithoutMooringYAML(t *testing.T) {
 	slug := "shop"
 	sha := gitObjStoreFixtureFiles(t, e.srv.gitObjectDir(slug), map[string]string{"README.md": "hi\n"})
 	cfg := configureRepo(t, e, slug, sha)
-	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", func(string) {})
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
 	if err == nil || !strings.Contains(err.Error(), "mooring.yaml") {
 		t.Fatalf("an undetectable repo without mooring.yaml must be rejected with guidance, got %v", err)
 	}
