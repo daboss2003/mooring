@@ -30,6 +30,10 @@ type composeService struct {
 	MemReservation  string          `yaml:"mem_reservation,omitempty"`
 	StopGracePeriod string          `yaml:"stop_grace_period,omitempty"`
 	Ulimits         *composeUlimits `yaml:"ulimits,omitempty"`
+	// Profiles gates a service out of the default `up` (compose only starts a profiled service
+	// when its profile is enabled or via `compose run`). Mooring uses it for scheduled-only
+	// (cron) services so they exist in the compose but never run as long-lived containers.
+	Profiles []string `yaml:"profiles,omitempty"`
 }
 
 // composeUlimits / composeNofile render docker-compose's
@@ -54,6 +58,11 @@ type composeHealth struct {
 	Test []string `yaml:"test"`
 }
 
+// scheduledProfile is the compose profile Mooring puts on scheduled-only (cron) services so
+// `up` never starts them; `compose run <service>` still runs one on demand (run enables the
+// service's profile automatically).
+const scheduledProfile = "mooring-scheduled"
+
 // nullYAML marshals to an empty mapping value (the `volname:` named-volume form).
 type nullYAML struct{}
 
@@ -71,6 +80,9 @@ func Generate(spec Spec) ([]byte, error) {
 
 	for _, svc := range spec.Services {
 		cs := composeService{Restart: svc.Restart, DependsOn: svc.DependsOn, MemLimit: svc.MemLimit, MemReservation: svc.MemReservation, StopGracePeriod: svc.StopGracePeriod}
+		if svc.Scheduled {
+			cs.Profiles = []string{scheduledProfile} // present in compose, NOT started by `up`
+		}
 		if svc.Ulimits != nil && svc.Ulimits.Nofile != nil {
 			cs.Ulimits = &composeUlimits{Nofile: &composeNofile{Soft: svc.Ulimits.Nofile.Soft, Hard: svc.Ulimits.Nofile.Hard}}
 		}

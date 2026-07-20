@@ -78,6 +78,10 @@ type Service struct {
 	// Ulimits are per-container limits (currently only nofile). Validated in the
 	// definition layer; allow-listed in compose (§5.6). nil omits the compose key.
 	Ulimits *Ulimits `json:"ulimits,omitempty"`
+	// Scheduled marks a SCHEDULED-ONLY service (referenced by a scheduled_task): the generator
+	// gives it a compose profile so `up` never starts it; Mooring runs it on its interval via
+	// `compose run --rm`. Not a security-relevant field (no compose privilege), just placement.
+	Scheduled bool `json:"scheduled,omitempty"`
 }
 
 // Ulimits / NofileLimit mirror the definition types for compose `ulimits.nofile`.

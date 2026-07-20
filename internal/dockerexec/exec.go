@@ -347,6 +347,30 @@ func (r *Runner) PruneImagesHeld(ctx context.Context, onLine func(string)) error
 	return r.runArgv(ctx, "", []string{"image", "prune", "-f"}, onLine)
 }
 
+// ReapOneOffHeld force-removes any orphaned ONE-SHOT (`compose run`) containers of a project —
+// the leftovers a KILLED `run --rm` CLI (timeout/shutdown) couldn't remove itself. Best-effort:
+// all errors are ignored. The CALLER must hold the one-docker-child semaphore (the cron
+// scheduler, which runs one task at a time, so no live one-shot is being reaped).
+func (r *Runner) ReapOneOffHeld(ctx context.Context, project string) {
+	if !r.writeAllowed || project == "" {
+		return
+	}
+	var out strings.Builder
+	_ = r.runStreamHeld(ctx, []string{"ps", "-aq", "--no-trunc",
+		"--filter", "label=com.docker.compose.project=" + project,
+		"--filter", "label=com.docker.compose.oneoff=True"}, &out, nil)
+	var ids []string
+	for _, line := range strings.Split(out.String(), "\n") {
+		if id := strings.TrimSpace(line); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	_ = r.runArgv(ctx, "", append([]string{"rm", "-f"}, ids...), nil)
+}
+
 // keepStorageFlag returns the correct "keep this much cache" flag for `docker builder
 // prune` on this host. Newer BuildKit renamed --keep-storage → --reserved-space (the old
 // name prints a deprecation warning and will be removed); older Docker only knows

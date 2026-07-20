@@ -211,6 +211,9 @@ func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) 
 	if s.scaling != nil {
 		add("scaling", s.scaling.DeleteApp(ctx, slug))
 	}
+	if s.cronStore != nil {
+		add("scheduled tasks", s.cronStore.DeleteApp(ctx, slug))
+	}
 	if s.selfHeal != nil {
 		add("self-healing", s.selfHeal.DeleteApp(ctx, slug))
 	}

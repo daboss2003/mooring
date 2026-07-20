@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/daboss2003/mooring/internal/ops"
 	"github.com/daboss2003/mooring/internal/opsclient"
@@ -31,6 +32,7 @@ const APIVersion = "mooring/v1"
 var (
 	slugRe       = regexp.MustCompile(`^[a-z][a-z0-9-]{1,30}$`)
 	svcRe        = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
+	taskNameRe   = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}$`)
 	secretRe     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 	envKeyRe     = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 	tokenKeyRe   = regexp.MustCompile(`^[A-Za-z0-9_-]+$`) // {{hm.KEY}} binding key grammar
@@ -96,6 +98,12 @@ type Spec struct {
 	Scaling      []Scaling     `yaml:"scaling,omitempty"` // one policy per service (auto-scale several services in one app)
 	SelfHealing  *SelfHealing  `yaml:"self_healing,omitempty"`
 	OpsInterface *OpsInterface `yaml:"ops_interface,omitempty"`
+
+	// ScheduledTasks run a declared service's command on an interval (cron jobs). The
+	// referenced service becomes SCHEDULED-ONLY: it is generated into the compose but not
+	// started by `up` (a profile) — Mooring runs it as a fresh one-shot `compose run --rm`
+	// container on each tick. No exec into a running container; no shell.
+	ScheduledTasks []ScheduledTask `yaml:"scheduled_tasks,omitempty"`
 	Git          *Git          `yaml:"git,omitempty"`
 	Setup        *Setup        `yaml:"setup,omitempty"`
 }
@@ -372,6 +380,92 @@ type Scaling struct {
 	CooldownDownSecs   int     `yaml:"cooldown_down_secs,omitempty"` // min seconds between scale-downs (default 300; >= up)
 }
 
+// ScheduledTask runs one declared service's command on a fixed interval. The service's
+// `command:` IS the job; the service is generated into the compose but profiled so `up` never
+// starts it — Mooring runs `docker compose run --rm --no-deps <service>` each tick (a fresh
+// one-shot container that self-removes; never an exec into a running container).
+type ScheduledTask struct {
+	Name    string `yaml:"name"`
+	Service string `yaml:"service"`
+	Every   string `yaml:"every"` // interval (e.g. "24h", "15m"); floored at 1m
+}
+
+// validateScheduledTasks checks each task names a valid, declared service, has a unique name,
+// a sane interval, and that a scheduled (one-shot) service is not ALSO an auto-scaling target
+// (a profiled one-shot can't scale).
+func (s *Spec) validateScheduledTasks() error {
+	declared := map[string]bool{}
+	for n := range s.Compose.Services {
+		declared[n] = true
+	}
+	scaled := map[string]bool{}
+	for _, sc := range s.Scaling {
+		scaled[sc.Service] = true
+	}
+	// A scheduled service is profiled out of `up`, so it must not be anything the app relies
+	// on being UP: an edge/L4 route target (the route would 502) or another service's
+	// depends_on (the dependent's `up` would break). Collect those to reject.
+	routed := map[string]bool{}
+	for _, r := range s.Edge.Routes {
+		routed[r.Service] = true
+	}
+	for _, r := range s.Edge.L4Routes {
+		routed[r.Service] = true
+	}
+	dependedOn := map[string]bool{}
+	for _, svc := range s.Compose.Services {
+		for _, dep := range svc.DependsOn {
+			dependedOn[dep] = true
+		}
+	}
+	names := map[string]bool{}
+	for _, t := range s.ScheduledTasks {
+		if !taskNameRe.MatchString(t.Name) {
+			return fmt.Errorf("scheduled_task name %q must match [a-z0-9][a-z0-9-]{0,38}", t.Name)
+		}
+		if names[t.Name] {
+			return fmt.Errorf("scheduled_task name %q declared twice", t.Name)
+		}
+		names[t.Name] = true
+		if !svcRe.MatchString(t.Service) {
+			return fmt.Errorf("scheduled_task %q must name a valid service", t.Name)
+		}
+		if !declared[t.Service] {
+			return fmt.Errorf("scheduled_task %q targets unknown service %q", t.Name, t.Service)
+		}
+		if scaled[t.Service] {
+			return fmt.Errorf("scheduled_task %q: service %q is an auto-scaling target and cannot also be a scheduled one-shot", t.Name, t.Service)
+		}
+		// A scheduled service is profiled out of `up`, so it must not be a long-running SERVER:
+		// a service that publishes a port would silently stop serving once scheduled. Reject it
+		// (declare a separate one-shot service for the job).
+		if svc, ok := s.Compose.Services[t.Service]; ok && len(svc.Ports) > 0 {
+			return fmt.Errorf("scheduled_task %q: service %q publishes ports (it's a server) — a scheduled one-shot can't serve; use a separate service for the job", t.Name, t.Service)
+		}
+		if routed[t.Service] {
+			return fmt.Errorf("scheduled_task %q: service %q is an edge/L4 route target (a server) — a scheduled one-shot can't serve; use a separate service for the job", t.Name, t.Service)
+		}
+		if dependedOn[t.Service] {
+			return fmt.Errorf("scheduled_task %q: service %q is a depends_on target — scheduling it would break the dependent service's startup; use a separate service for the job", t.Name, t.Service)
+		}
+		d, err := time.ParseDuration(t.Every)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("scheduled_task %q: every %q is not a valid positive duration (e.g. 24h, 15m)", t.Name, t.Every)
+		}
+	}
+	return nil
+}
+
+// ScheduledServiceSet returns the set of service names that are scheduled-only (referenced by
+// a scheduled_task) — the generator profiles these so `up` never starts them.
+func (s *Spec) ScheduledServiceSet() map[string]bool {
+	out := map[string]bool{}
+	for _, t := range s.ScheduledTasks {
+		out[t.Service] = true
+	}
+	return out
+}
+
 // SelfHealing tunes this app's self-healing supervisor (§8.5). Mooring supervises
 // every service with a conservative built-in default; this block overrides the ladder
 // tunables for ONE app. Omitted fields keep the built-in default; an omitted block
@@ -478,6 +572,9 @@ func (s *Spec) validate() error {
 		return err
 	}
 	if err := s.validateScaling(); err != nil {
+		return err
+	}
+	if err := s.validateScheduledTasks(); err != nil {
 		return err
 	}
 	if err := s.validateSelfHealing(); err != nil {

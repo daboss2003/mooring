@@ -23,6 +23,7 @@ import (
 	"github.com/daboss2003/mooring/internal/backupstore"
 	"github.com/daboss2003/mooring/internal/cfgstore"
 	"github.com/daboss2003/mooring/internal/config"
+	"github.com/daboss2003/mooring/internal/cronstore"
 	"github.com/daboss2003/mooring/internal/definition"
 	"github.com/daboss2003/mooring/internal/diskgc"
 	"github.com/daboss2003/mooring/internal/docker"
@@ -359,6 +360,7 @@ func cmdServe(args []string) error {
 	selfHealStore := selfheal.NewStore(db)
 	scalingStore := scale.NewStore(db)
 	apiTokenStore := apitoken.NewStore(db)
+	cronStore := cronstore.New(db)
 	// Encrypted Mooring-state backups (master key reused as the AES-256 key; restore
 	// needs the same key, which the operator already backs up out-of-band).
 	var backupStore *backupstore.Store
@@ -549,6 +551,7 @@ func cmdServe(args []string) error {
 		SelfHeal:    selfHealStore,
 		Scaling:     scalingStore,
 		DockerSem:   dockerSem,
+		CronStore:   cronStore,
 		APITokens:   apiTokenStore,
 		Backups:     backupStore,
 	})
@@ -674,6 +677,11 @@ func cmdServe(args []string) error {
 	// the operator deploys with a click). Joined before db.Close.
 	wg.Add(1)
 	go func() { defer wg.Done(); srv.RunGitPoller(ctx, cfg.Git.PollIntervalD()) }()
+
+	// Scheduled-task (cron) loop: runs each app's scheduled_tasks on their intervals as
+	// one-shot `compose run --rm` containers. No-op for apps with no scheduled_tasks.
+	wg.Add(1)
+	go func() { defer wg.Done(); srv.RunCron(ctx) }()
 
 	// Cert-renewal watcher: when the managed edge renews a leaf, re-sync each app's
 	// cert_bindings + recreate the affected TLS services so they pick it up WITHOUT a

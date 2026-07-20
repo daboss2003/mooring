@@ -506,6 +506,31 @@ A deploy persists each policy (unset thresholds default to 80/40, with a positiv
 
 > Authoring `scaling` for a stateful service is not a knob you can force — it is rejected at candidacy. Brokers/DBs are precisely the `config_files` / `cert_binding` apps of §7.4, not scaling candidates. See [Auto-scaling](./scaling-and-self-healing.md).
 
+### `spec.scheduled_tasks` (cron jobs)
+
+Run a service's command on an interval — a nightly database cleanup, a periodic report, a cache warm. Each task points at a **declared service whose `command:` is the job**. That service becomes **scheduled-only**: Mooring generates it into the compose but gives it a profile so `up` never starts it as a long-running container. On each interval Mooring runs it as a **fresh one-shot** `docker compose run --rm` container that removes itself when the command exits — never an exec into a running container, and never a shell. The one-shot gets the app's environment, secrets, and network, so it can reach the app's database by service name.
+
+```yaml
+spec:
+  compose:
+    services:
+      web:
+        image: ghcr.io/acme/web:1.4
+      cleanup:                       # a scheduled-only service (not started by `up`)
+        image: ghcr.io/acme/web:1.4  # usually the app's own image, to run its code
+        command: ["python", "manage.py", "cleanup"]
+  scheduled_tasks:
+    - name: nightly-cleanup
+      service: cleanup
+      every: 24h                     # interval (e.g. 24h, 15m, 1h30m); floored at 1m
+```
+
+Notes:
+
+- The task's **command is the service's `command:`** (a fresh container runs it), so give the scheduled service the exact command you want to run.
+- A scheduled service **can't also be an auto-scaling target** (a one-shot doesn't scale) — that's rejected at validation.
+- Runs ride the same one-docker-child slot as deploys and **skip** (retry next interval) when a deploy is in progress, so a task never delays a deploy. A failed task raises an alert; the last run is remembered across restarts (a restart doesn't re-fire everything).
+
 ### `spec.self_healing`
 
 Per-app tuning of the self-healing supervisor (§8.5). Every service is supervised with a conservative built-in default; this block overrides the ladder tunables for **this app**. **Every field is optional** — an omitted field keeps the built-in default, and an omitted block leaves the app entirely on the default. All durations are seconds.

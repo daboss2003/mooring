@@ -25,6 +25,7 @@ import (
 	"github.com/daboss2003/mooring/internal/backupstore"
 	"github.com/daboss2003/mooring/internal/cfgstore"
 	"github.com/daboss2003/mooring/internal/config"
+	"github.com/daboss2003/mooring/internal/cronstore"
 	"github.com/daboss2003/mooring/internal/crypto"
 	"github.com/daboss2003/mooring/internal/definition"
 	"github.com/daboss2003/mooring/internal/docker"
@@ -117,6 +118,7 @@ type Deps struct {
 	DockerSem   *dockerexec.Semaphore       // global one-docker-child semaphore (shared with Runner)
 	APITokens   *apitoken.Store             // scoped read/deploy API tokens (M19; may be nil → /api/v1 disabled)
 	Backups     *backupstore.Store          // encrypted Mooring-state backups (may be nil)
+	CronStore   *cronstore.Store            // scheduled-task last-run bookkeeping (may be nil → cron disabled)
 }
 
 // Server holds everything the request pipeline needs. Construct with New.
@@ -144,6 +146,7 @@ type Server struct {
 	provStore      *provstore.Store              // provisioned apps (modes 1/2; may be nil)
 	setupStore     *setupstore.Store             // setup scripts (Mode 3; may be nil)
 	alertStore     *alertstore.Store             // alerting channels/rules/state (may be nil)
+	cronStore      *cronstore.Store              // scheduled-task last-run bookkeeping (may be nil)
 	edgeRoutes     *edge.RouteStore              // managed-edge routes (may be nil)
 	edgeRecon      *edge.Reconciler              // edge config reconciler (nil when edge unowned)
 	edgeReason     string                        // why the edge isn't owned (banner)
@@ -209,6 +212,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		provStore:     d.ProvStore,
 		setupStore:    d.SetupStore,
 		alertStore:    d.AlertStore,
+		cronStore:     d.CronStore,
 		edgeRoutes:    d.EdgeRoutes,
 		edgeRecon:     d.EdgeRecon,
 		l4Routes:      d.L4Routes,

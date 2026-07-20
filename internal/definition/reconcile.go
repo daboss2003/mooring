@@ -53,13 +53,15 @@ func validDuration(field, v string) error {
 // service can never publish a port (Publish stays false).
 func toProvisionSpec(d *Definition) provision.Spec {
 	ps := provision.Spec{Slug: d.Metadata.Slug}
+	scheduled := d.Spec.ScheduledServiceSet()
 	for _, name := range d.Spec.serviceNames() { // sorted → deterministic compose
 		svc := d.Spec.Compose.Services[name]
 		s := provision.Service{
 			Name:    name,
 			Command: svc.Command, Healthcheck: svc.Healthcheck, Restart: svc.Restart, DependsOn: svc.DependsOn,
 			MemLimit: svc.MemLimit, MemReservation: svc.MemReservation, StopGracePeriod: svc.StopGracePeriod,
-			Ulimits: toProvisionUlimits(svc.Ulimits),
+			Ulimits:   toProvisionUlimits(svc.Ulimits),
+			Scheduled: scheduled[name],
 		}
 		if svc.Build != nil {
 			// Mooring generates the Dockerfile into the run dir at deploy; the compose
