@@ -158,6 +158,57 @@ func TestProduceRoundTrip(t *testing.T) {
 	}
 }
 
+type fakeStdinRunner struct{ got []byte }
+
+func (f *fakeStdinRunner) RunStreamStdinHeld(ctx context.Context, argv []string, stdin io.Reader, onLine func(string)) error {
+	b, err := io.ReadAll(stdin)
+	f.got = b
+	return err
+}
+
+// The full round-trip: Produce a volume snapshot, then RestoreVolume — the tar stream handed
+// to the restore sidecar equals the exact bytes the producer emitted.
+func TestProduceRestoreRoundTrip(t *testing.T) {
+	tarBytes := bytes.Repeat([]byte("volume-file-contents;"), 300)
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	var sink bytes.Buffer
+	if _, err := Produce(context.Background(), &fakeRunner{stdout: tarBytes}, Spec{Kind: KindVolume, Volume: "v", Image: "b"}, key, &sink, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rr := &fakeStdinRunner{}
+	if err := RestoreVolume(context.Background(), rr, "v", "b", key, bytes.NewReader(sink.Bytes()), t.TempDir(), nil); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if !bytes.Equal(rr.got, tarBytes) {
+		t.Errorf("restored tar stream mismatch: got %d bytes, want %d", len(rr.got), len(tarBytes))
+	}
+}
+
+// A tampered/corrupt .mbk must fail restore (AES-256-GCM is authenticated) BEFORE the tar
+// sidecar touches the volume. Uses a MULTI-CHUNK payload (> the 64 KiB stream chunk) and
+// corrupts a byte PAST the first chunk — the case where a naive decrypt→tar pipe would have
+// already extracted the leading chunks. With verify-to-temp-first, the sidecar never runs.
+func TestRestoreRejectsTamperedMultiChunkArchive(t *testing.T) {
+	key := make([]byte, 32)
+	big := bytes.Repeat([]byte("A"), 300*1024) // ~300 KiB → several 64 KiB chunks
+	var sink bytes.Buffer
+	if _, err := Produce(context.Background(), &fakeRunner{stdout: big}, Spec{Kind: KindVolume, Volume: "v", Image: "b"}, key, &sink, Options{NoGzip: true}); err != nil {
+		t.Fatal(err)
+	}
+	bad := sink.Bytes()
+	bad[len(bad)-64] ^= 0xff // corrupt a byte in a LATER chunk, not the first
+	rr := &fakeStdinRunner{}
+	if err := RestoreVolume(context.Background(), rr, "v", "b", key, bytes.NewReader(bad), t.TempDir(), nil); err == nil {
+		t.Fatal("a tampered multi-chunk archive must fail restore")
+	}
+	if len(rr.got) != 0 {
+		t.Errorf("the tar sidecar must NOT receive any bytes from a corrupt archive; got %d", len(rr.got))
+	}
+}
+
 // A producer (sidecar) failure must fail Produce — a partial dump can never become a valid
 // backup.
 func TestProduceProducerErrorFails(t *testing.T) {

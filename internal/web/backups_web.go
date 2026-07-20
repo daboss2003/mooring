@@ -16,10 +16,13 @@ import (
 // key, so it's safe to keep or move off-box; restoring needs that same key.
 
 type backupRow struct {
-	ID   string
-	When int64 // unix seconds; the "ts" template renders it localised
-	Size string
-	SHA  string
+	ID       string
+	When     int64 // unix seconds; the "ts" template renders it localised
+	Size     string
+	SHA      string
+	Kind     string // "mooring-state" | "volume" | "postgres" | "mysql"
+	Scope    string // "Mooring state" or "<app> / <volume>"
+	Location string // "local" | "local+s3"
 }
 
 func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
@@ -44,11 +47,23 @@ func (s *Server) handleBackups(w http.ResponseWriter, r *http.Request) {
 		if len(sha) > 12 {
 			sha = sha[:12]
 		}
+		scope := "Mooring state"
+		if rc.Project != "" {
+			scope = rc.Project
+			if rc.Target != "" {
+				scope += " / " + rc.Target
+			}
+		}
+		loc := rc.Location
+		if loc == "" {
+			loc = "local"
+		}
 		data.BackupRows = append(data.BackupRows, backupRow{
 			ID:   rc.ID,
 			When: rc.CreatedAt,
 			Size: humanBytes(uint64(rc.SizeBytes)),
 			SHA:  sha,
+			Kind: rc.Kind, Scope: scope, Location: loc,
 		})
 	}
 	s.render(w, r, "backups.html", data)

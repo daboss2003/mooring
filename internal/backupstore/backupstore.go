@@ -220,7 +220,10 @@ func (s *Store) BackedUpVolumes(ctx context.Context) (map[string]bool, error) {
 // dir (the stored file name is always a generated <id>.mbk, never user input).
 func (s *Store) FilePath(r Record) string { return filepath.Join(s.dir, filepath.Base(r.File)) }
 
-// Delete removes the archive file and the catalog row.
+// Delete removes the archive file and the catalog row, and keeps backup_inventory truthful.
+// NOTE: for a volume snapshot that was also uploaded off-box (Location contains "s3"), the
+// REMOTE object is not removed here (this store has no uploader) — scheduled retention prunes
+// S3 copies; a manual delete of an app-data backup leaves its S3 copy for now.
 func (s *Store) Delete(ctx context.Context, id string) error {
 	rec, ok, err := s.Get(ctx, id)
 	if err != nil {
@@ -230,8 +233,25 @@ func (s *Store) Delete(ctx context.Context, id string) error {
 		return nil
 	}
 	_ = os.Remove(s.FilePath(rec))
-	_, err = s.db.ExecContext(ctx, `DELETE FROM backups WHERE id=?`, id)
-	return err
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM backups WHERE id=?`, id); err != nil {
+		return err
+	}
+	// If this was a volume snapshot, repoint backup_inventory for that volume to the newest
+	// SURVIVING snapshot (or drop the row if none remain) — so BackedUpVolumes, which feeds the
+	// prune denylist, never claims a volume is backed up after its last snapshot was deleted.
+	if rec.Kind == "volume" && rec.Target != "" {
+		var newID string
+		var newAt int64
+		e := s.db.QueryRowContext(ctx,
+			`SELECT id, created_at FROM backups WHERE kind='volume' AND project=? AND target=? ORDER BY created_at DESC, id DESC LIMIT 1`,
+			rec.Project, rec.Target).Scan(&newID, &newAt)
+		if errors.Is(e, sql.ErrNoRows) {
+			_, _ = s.db.ExecContext(ctx, `DELETE FROM backup_inventory WHERE volume=?`, rec.Target)
+		} else if e == nil {
+			_, _ = s.db.ExecContext(ctx, `UPDATE backup_inventory SET backup_id=?, updated_at=? WHERE volume=?`, newID, newAt, rec.Target)
+		}
+	}
+	return nil
 }
 
 func fileSizeSHA(path string) (int64, string, error) {

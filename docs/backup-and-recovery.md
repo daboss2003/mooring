@@ -39,12 +39,40 @@ Your apps' definitions and settings are back; redeploy them and Mooring rebuilds
 
 ## Backing up your apps' data
 
-Mooring's own backup brings back *configuration*, but not the data **inside** your apps — a database's contents, a volume of uploaded files. Those live in Docker volumes and need their own snapshots.
+Mooring's own backup brings back *configuration*, but not the data **inside** your apps — a database's contents, a volume of uploaded files. Those live in Docker volumes. Turn on scheduled, encrypted snapshots of them in `config.yaml`:
 
-> **Status:** an in-dashboard flow for per-app data-volume backups is on the roadmap. For now, snapshot an app's volumes with your usual Docker volume-backup method, and rely on Mooring's own backup (above) for everything else.
+```yaml
+backups:
+  enabled: true
+  schedule: 24h        # how often (default 24h; 1h floor)
+  retention: 7         # keep the newest N snapshots per volume
+  # optional: also ship each snapshot off-box to any S3-compatible store
+  s3:
+    bucket: my-mooring-backups
+    endpoint: s3.us-east-1.amazonaws.com   # or a MinIO / R2 / B2 endpoint
+    region: us-east-1
+    access_key_id: "…"
+    secret_access_key: "…"
+    prefix: "mooring/"                       # optional key prefix
+```
 
-Worth remembering either way:
+Once enabled, Mooring discovers every app's Docker **data volumes** and, on the schedule, snapshots each one: a read-only `tar` of the volume streamed through **gzip + AES-256-GCM** into a `.mbk` file under `<data_dir>/backups/`, kept to your retention count, and — when `s3` is set — uploaded off-box too. It rides the same one-docker-child slot as deploys and *skips* (never queues) when a deploy is running, so backups never slow a deploy. A failed backup raises an alert. The snapshots appear on the **Backups** page alongside your Mooring-state backups.
 
-- **A definition file recreates the app, not its data.** Redeploying gives you a fresh, empty volume — so a database needs its own backup.
-- **Keep backups off the server** where you can, so losing the box doesn't lose the backups too.
+Credentials for S3 live only in `config.yaml` (root-owned, `0600`) — never in an app repo — so a repository can never name an exfiltration bucket or hold your keys.
+
+### Restoring an app's data volume
+
+Restoring **overwrites** the live volume, so — like the Mooring-state restore — it's a deliberate CLI step. Stop the app's containers first, then restore a snapshot by its id (from the Backups page):
+
+```
+mooring restore-volume --backup <id> --force
+```
+
+Mooring decrypts the snapshot (a wrong key or a tampered/corrupt file fails *before* anything is written — the archive is authenticated), gunzips it, and extracts it into the volume via a throwaway container. Start the app again from the dashboard afterward.
+
+Worth remembering:
+
+- **A definition file recreates the app, not its data.** Redeploying gives you a fresh, empty volume — so a database still needs these snapshots.
+- **Keep backups off the server** (use the `s3` destination) so losing the box doesn't lose the backups too.
 - **Test a restore occasionally.** A backup you've never restored is a hope, not a plan.
+- **A volume snapshot is crash-consistent.** For a busy database it's usually fine, but the cleanest possible dump is a logical one (`pg_dump`) — per-service logical DB dumps are the next refinement on top of this.

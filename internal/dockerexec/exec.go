@@ -248,6 +248,65 @@ func (r *Runner) runStreamHeld(ctx context.Context, argv []string, stdout io.Wri
 	return waitErr
 }
 
+// RunStreamStdin execs `docker <argv...>` feeding `stdin` to the child's STDIN (e.g. a
+// decrypted+gunzipped tar stream piped into a `docker run -i … tar -x` restore sidecar),
+// while stdout+stderr are line-truncated to onLine. Static argv only (Mooring-authored); runs
+// under the §0 write gate + the one-docker-child semaphore and reaps the process group on ctx
+// cancel. The counterpart of RunStream for the RESTORE direction.
+func (r *Runner) RunStreamStdin(ctx context.Context, argv []string, stdin io.Reader, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.runStreamStdinHeld(ctx, argv, stdin, onLine)
+}
+
+// RunStreamStdinHeld is RunStreamStdin for a caller that ALREADY HOLDS the semaphore.
+func (r *Runner) RunStreamStdinHeld(ctx context.Context, argv []string, stdin io.Reader, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	return r.runStreamStdinHeld(ctx, argv, stdin, onLine)
+}
+
+func (r *Runner) runStreamStdinHeld(ctx context.Context, argv []string, stdin io.Reader, onLine func(string)) error {
+	cmd := exec.CommandContext(ctx, r.binary, argv...)
+	cmd.Env = minimalEnv()
+	setPgid(cmd)
+	cmd.Cancel = func() error { return killGroup(cmd) }
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Stdin = stdin
+
+	pr, pw := io.Pipe()
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return err
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reader := bufio.NewReaderSize(pr, maxLineBytes)
+		for {
+			line, err := readLineTruncated(reader)
+			if line != "" && onLine != nil {
+				onLine(line)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	waitErr := cmd.Wait()
+	pw.Close()
+	<-done
+	return waitErr
+}
+
 // keepStorageFlag returns the correct "keep this much cache" flag for `docker builder
 // prune` on this host. Newer BuildKit renamed --keep-storage → --reserved-space (the old
 // name prints a deprecation warning and will be removed); older Docker only knows

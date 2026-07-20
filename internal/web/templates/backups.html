@@ -2,7 +2,7 @@
 {{template "nav" .}}
 <main class="wrap">
   <h1>Backups</h1>
-  <p class="muted">Encrypted snapshots of your whole Mooring setup — every app's config, definitions, edge routes, and (already-encrypted) secrets. Use one to recover onto a fresh server.</p>
+  <p class="muted">Encrypted snapshots. <strong>Mooring state</strong> — every app's config, definitions, edge routes, and (already-encrypted) secrets — for recovering onto a fresh server. And, when <code>backups</code> is enabled in <code>config.yaml</code>, scheduled snapshots of each app's <strong>data volumes</strong> (kept to a retention count, optionally shipped off-box to S3).</p>
   {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
 
   <section class="panel">
@@ -10,7 +10,7 @@
       {{if .BackupEnabled}}
       <form method="post" action="/settings/backups/create" class="inline">
         <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
-        <button type="submit" class="btn btn-sm btn-primary">Back up now</button>
+        <button type="submit" class="btn btn-sm btn-primary">Back up state now</button>
       </form>
       {{end}}
     </h2>
@@ -19,12 +19,14 @@
     <p class="muted">Backups are unavailable (no encryption key configured).</p>
     {{else if .BackupRows}}
     <div class="table-scroll"><table class="grid">
-      <thead><tr><th>Created</th><th>Size</th><th>Checksum</th><th></th></tr></thead>
+      <thead><tr><th>Created</th><th>What</th><th>Size</th><th>Where</th><th>Checksum</th><th></th></tr></thead>
       <tbody>
         {{range .BackupRows}}
         <tr>
           <td class="mono">{{template "ts" .When}}</td>
+          <td>{{.Scope}}</td>
           <td class="mono">{{.Size}}</td>
+          <td class="mono small">{{.Location}}</td>
           <td class="mono small">{{.SHA}}…</td>
           <td class="queue-actions">
             <a href="/settings/backups/download?id={{.ID}}">download</a>
@@ -45,9 +47,12 @@
 
   <section class="panel">
     <h2>Restoring</h2>
-    <p class="muted">A backup is encrypted with your master key, so it's safe to download and store off-site — restoring needs that same key. To recover onto a fresh server: install Mooring with the same <code>encryption_key</code>, then restore the snapshot with the CLI:</p>
+    <p class="muted">A backup is encrypted with your master key, so it's safe to download and store off-site — restoring needs that same key.</p>
+    <p class="muted"><strong>Mooring state</strong> — to recover onto a fresh server, install Mooring with the same <code>encryption_key</code>, then:</p>
     <pre class="mono">mooring restore --from mooring-backup-&lt;id&gt;.mbk</pre>
-    <p class="muted small">Restoring replaces Mooring's database, so it's a deliberate CLI step rather than a dashboard button. Your apps' own data volumes are backed up separately (see the docs).</p>
+    <p class="muted"><strong>An app data volume</strong> — stop the app's containers first, then restore the snapshot into its volume by id:</p>
+    <pre class="mono">mooring restore-volume --backup &lt;id&gt; --force</pre>
+    <p class="muted small">Restoring overwrites live data, so it's a deliberate CLI step (with <code>--force</code>) rather than a one-click button.</p>
   </section>
 </main>
 {{template "bottom" .}}

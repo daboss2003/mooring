@@ -257,6 +257,69 @@ func (c *countingSHA) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// StdinRunner runs a static-argv docker command feeding stdin to the child (satisfied by
+// dockerexec.Runner.RunStreamStdinHeld); the caller holds the one-docker-child semaphore.
+type StdinRunner interface {
+	RunStreamStdinHeld(ctx context.Context, argv []string, stdin io.Reader, onLine func(string)) error
+}
+
+// RestoreVolume restores a volume snapshot IN PLACE: it overwrites the volume's contents with
+// the snapshot. DESTRUCTIVE — the caller MUST stop every container using the volume first and
+// gate the action.
+//
+// The archive is decrypted+AUTHENTICATED IN FULL to a transient 0600 file (under tmpDir)
+// BEFORE the tar sidecar touches the volume. This matters because backup.Decrypt is a chunked
+// stream: were we to pipe it straight into `tar`, a corrupt/truncated archive past the first
+// 64 KiB chunk would already have extracted the leading chunks into the live volume before the
+// defect surfaced. Verifying the whole archive first makes "a bad archive never clobbers the
+// volume" actually true. Only then is the verified plaintext gunzipped into a throwaway
+// `docker run -i --rm -v <volume>:/data <image> tar -x -C /data` sidecar.
+func RestoreVolume(ctx context.Context, r StdinRunner, volume, image string, key []byte, src io.Reader, tmpDir string, onLine func(string)) error {
+	if volume == "" || image == "" {
+		return fmt.Errorf("appbackup: restore needs volume and image")
+	}
+	if tmpDir == "" {
+		return fmt.Errorf("appbackup: restore needs a tmpDir for the verified plaintext")
+	}
+	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+		return err
+	}
+	// 1. Decrypt + authenticate the ENTIRE archive to a 0600 temp file first (fail-closed:
+	//    a wrong key or a tampered/corrupt/truncated .mbk errors here, before any write to
+	//    the volume). The plaintext is still gzip-compressed, so this is not the raw volume.
+	tf, err := os.CreateTemp(tmpDir, ".restore-*")
+	if err != nil {
+		return err
+	}
+	tfPath := tf.Name()
+	defer os.Remove(tfPath)
+	if err := tf.Chmod(0o600); err != nil {
+		tf.Close()
+		return err
+	}
+	if err := backup.Decrypt(tf, src, key); err != nil {
+		tf.Close()
+		return fmt.Errorf("appbackup: decrypt archive (wrong master key, or corrupt/tampered backup — the volume was NOT touched): %w", err)
+	}
+	if _, err := tf.Seek(0, io.SeekStart); err != nil {
+		tf.Close()
+		return err
+	}
+	// 2. Gunzip the VERIFIED plaintext into the tar sidecar's stdin.
+	gz, err := gzip.NewReader(tf)
+	if err != nil {
+		tf.Close()
+		return fmt.Errorf("appbackup: restore gunzip: %w", err)
+	}
+	argv := []string{"run", "--rm", "-i", "--network", "none", "-v", volume + ":/data", image, "tar", "-x", "-C", "/data"}
+	err = r.RunStreamStdinHeld(ctx, argv, gz, onLine)
+	tf.Close()
+	if err != nil {
+		return fmt.Errorf("appbackup: restore extract: %w", err)
+	}
+	return nil
+}
+
 // LocalFile opens a 0600 ciphertext sink under dir/<id>.mbk, returning the file and its path.
 // The caller writes the Produce result into it and catalogues it.
 func LocalFile(dir, id string) (*os.File, string, error) {

@@ -145,20 +145,26 @@ func (r *Runner) backupVolume(ctx context.Context, project, volume string) {
 	if !r.sem.TryAcquire() {
 		return // busy (a deploy is running) — retry next cycle
 	}
-	defer r.sem.Release()
-
+	// Hold the one-docker-child slot ONLY for the produce (the tar sidecar). Release it BEFORE
+	// the S3 upload + catalog + retention prune — those are network/DB ops, not docker
+	// children, and a slow multi-GB off-box upload holding the slot would stall a deploy and
+	// make self-heal/auto-scale skip remediation for the whole upload window.
 	id, err := r.cat.NewID()
 	if err != nil {
+		r.sem.Release()
 		return
 	}
 	f, path, err := appbackup.LocalFile(r.cat.Dir(), id)
 	if err != nil {
+		r.sem.Release()
 		r.logWarn("backup: open sink", project, err)
 		return
 	}
 	spec := appbackup.Spec{Kind: appbackup.KindVolume, Volume: volume, Image: r.cfg.HelperImage}
 	res, perr := appbackup.Produce(ctx, r.run, spec, r.cfg.Key, f, appbackup.Options{EnvFileDir: r.cfg.EnvFileDir, OnErr: nil})
 	cerr := f.Close()
+	r.sem.Release() // docker phase done — everything below runs UNLOCKED
+
 	if perr != nil || cerr != nil {
 		_ = os.Remove(path)
 		e := perr

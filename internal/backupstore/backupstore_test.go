@@ -129,3 +129,42 @@ func TestUnavailableWithoutKey(t *testing.T) {
 		t.Error("create must fail without a valid key")
 	}
 }
+
+// Deleting a volume snapshot keeps backup_inventory truthful: it repoints to the newest
+// surviving snapshot, and drops the row entirely when none remain (else the prune denylist
+// could treat a volume with no backups as safe to delete → data loss).
+func TestDeleteKeepsInventoryTruthful(t *testing.T) {
+	s, _, _ := newStore(t)
+	ctx := context.Background()
+	mk := func(t *testing.T, at int64) string {
+		id, err := s.NewID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := Record{ID: id, CreatedAt: at, SizeBytes: 1, File: id + ".mbk", SHA256: "x", Kind: "volume", Project: "shop", Target: "shop_data", Location: "local"}
+		if err := s.Catalog(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	older := mk(t, 100)
+	newer := mk(t, 200)
+	// Inventory tracks the newest.
+	if v, _ := s.BackedUpVolumes(ctx); !v["shop_data"] {
+		t.Fatal("volume should be inventoried")
+	}
+	// Delete the newest → inventory must repoint to the older (still backed up).
+	if err := s.Delete(ctx, newer); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.BackedUpVolumes(ctx); !v["shop_data"] {
+		t.Fatal("after deleting newest, the older snapshot still backs up the volume")
+	}
+	// Delete the last one → inventory row must be gone (no snapshot backs the volume).
+	if err := s.Delete(ctx, older); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.BackedUpVolumes(ctx); v["shop_data"] {
+		t.Fatal("with no snapshots left, the volume must NOT be reported as backed up")
+	}
+}

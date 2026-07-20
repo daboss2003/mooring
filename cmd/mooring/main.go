@@ -77,6 +77,8 @@ func main() {
 		err = cmdToken(args)
 	case "restore":
 		err = cmdRestore(args)
+	case "restore-volume":
+		err = cmdRestoreVolume(args)
 	case "gen-key":
 		err = cmdGenKey(args)
 	case "hash-password":
