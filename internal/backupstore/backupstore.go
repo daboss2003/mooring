@@ -33,8 +33,11 @@ type Record struct {
 	SizeBytes int64
 	File      string
 	SHA256    string
-	Kind      string
+	Kind      string // "mooring-state" | "postgres" | "mysql" | "volume"
 	Note      string
+	Project   string // app slug ("" for mooring-state)
+	Target    string // service (db dump) or volume name ("" for mooring-state)
+	Location  string // "local" | "s3" | "local+s3"
 }
 
 // Store creates, lists, and deletes encrypted state backups.
@@ -106,7 +109,7 @@ func (s *Store) Create(ctx context.Context, now time.Time) (Record, error) {
 		os.Remove(final)
 		return Record{}, err
 	}
-	rec := Record{ID: id, CreatedAt: now.Unix(), SizeBytes: size, File: id + ".mbk", SHA256: sum, Kind: "mooring-state"}
+	rec := Record{ID: id, CreatedAt: now.Unix(), SizeBytes: size, File: id + ".mbk", SHA256: sum, Kind: "mooring-state", Location: "local"}
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO backups(id, created_at, size_bytes, file, sha256, kind, note) VALUES(?, ?, ?, ?, ?, ?, '')`,
 		rec.ID, rec.CreatedAt, rec.SizeBytes, rec.File, rec.SHA256, rec.Kind); err != nil {
@@ -116,18 +119,25 @@ func (s *Store) Create(ctx context.Context, now time.Time) (Record, error) {
 	return rec, nil
 }
 
+const backupCols = `id, created_at, size_bytes, file, sha256, kind, note, project, target, location`
+
+func scanRecord(sc interface{ Scan(...any) error }) (Record, error) {
+	var r Record
+	err := sc.Scan(&r.ID, &r.CreatedAt, &r.SizeBytes, &r.File, &r.SHA256, &r.Kind, &r.Note, &r.Project, &r.Target, &r.Location)
+	return r, err
+}
+
 // List returns catalogued backups, newest first.
 func (s *Store) List(ctx context.Context) ([]Record, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, created_at, size_bytes, file, sha256, kind, note FROM backups ORDER BY created_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+backupCols+` FROM backups ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Record
 	for rows.Next() {
-		var r Record
-		if err := rows.Scan(&r.ID, &r.CreatedAt, &r.SizeBytes, &r.File, &r.SHA256, &r.Kind, &r.Note); err != nil {
+		r, err := scanRecord(rows)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -140,10 +150,7 @@ func (s *Store) Get(ctx context.Context, id string) (Record, bool, error) {
 	if !idRe.MatchString(id) {
 		return Record{}, false, nil
 	}
-	var r Record
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, created_at, size_bytes, file, sha256, kind, note FROM backups WHERE id=?`, id).
-		Scan(&r.ID, &r.CreatedAt, &r.SizeBytes, &r.File, &r.SHA256, &r.Kind, &r.Note)
+	r, err := scanRecord(s.db.QueryRowContext(ctx, `SELECT `+backupCols+` FROM backups WHERE id=?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Record{}, false, nil
 	}
@@ -151,6 +158,62 @@ func (s *Store) Get(ctx context.Context, id string) (Record, bool, error) {
 		return Record{}, false, err
 	}
 	return r, true, nil
+}
+
+// Dir returns the backups directory (0700). The app-data backup engine writes its
+// externally-produced .mbk here (see appbackup.LocalFile) and then calls Catalog.
+func (s *Store) Dir() string { return s.dir }
+
+// NewID allocates a fresh 24-hex backup id.
+func (s *Store) NewID() (string, error) { return randHex(12) }
+
+// Catalog records an already-produced+encrypted backup file (an app-data snapshot from the
+// appbackup engine). The file must already exist under Dir() as <rec.ID>.mbk; rec carries the
+// size/sha the engine computed while streaming. For a volume backup it also updates
+// backup_inventory so the prune denylist knows the volume is backed up.
+func (s *Store) Catalog(ctx context.Context, rec Record) error {
+	if !s.Available() {
+		return errors.New("backupstore: not available")
+	}
+	if !idRe.MatchString(rec.ID) {
+		return fmt.Errorf("backupstore: bad backup id %q", rec.ID)
+	}
+	if rec.Location == "" {
+		rec.Location = "local"
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO backups(`+backupCols+`) VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		rec.ID, rec.CreatedAt, rec.SizeBytes, rec.File, rec.SHA256, rec.Kind, rec.Note, rec.Project, rec.Target, rec.Location); err != nil {
+		return err
+	}
+	if rec.Kind == "volume" && rec.Target != "" {
+		if _, err := s.db.ExecContext(ctx,
+			`INSERT INTO backup_inventory(volume, backup_id, updated_at) VALUES(?,?,?)
+			 ON CONFLICT(volume) DO UPDATE SET backup_id=excluded.backup_id, updated_at=excluded.updated_at`,
+			rec.Target, rec.ID, rec.CreatedAt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// BackedUpVolumes returns the set of docker volumes that have a recorded backup (feeds
+// backup.LiveState.BackedUpVolumes so PruneVolumeSafe won't drop an un-backed-up sole volume).
+func (s *Store) BackedUpVolumes(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT volume FROM backup_inventory`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out[v] = true
+	}
+	return out, rows.Err()
 }
 
 // FilePath returns the absolute path of a record's archive, confined to the backups

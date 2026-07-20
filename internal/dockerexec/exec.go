@@ -183,6 +183,71 @@ func (r *Runner) PruneBuildCache(ctx context.Context, keep string, onLine func(s
 	return r.runArgv(ctx, "", []string{"builder", "prune", "-a", "-f", r.keepStorageFlag(ctx), keep}, onLine)
 }
 
+// RunStream execs `docker <argv...>` and streams its RAW stdout bytes to `stdout` (an
+// io.Writer — e.g. the tar→gzip→encrypt backup pipeline), while stderr is line-truncated to
+// onErrLine for logging. Unlike Run, stdout is NOT line-buffered or merged with stderr, so a
+// binary dump/tar stream passes through byte-for-byte. Static argv only (Mooring-authored,
+// never operator input); it runs under the §0 write gate + the one-docker-child semaphore and
+// reaps the process group on ctx cancel. Used for backup SIDECARS (`docker run --rm … pg_dump`
+// / `… tar`) — a fresh one-shot container, never an exec into a running one.
+func (r *Runner) RunStream(ctx context.Context, argv []string, stdout io.Writer, onErrLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.runStreamHeld(ctx, argv, stdout, onErrLine)
+}
+
+// RunStreamHeld is RunStream for a caller that ALREADY HOLDS the one-docker-child semaphore
+// (the backup scheduler, which TryAcquires so it never queues a docker child). It must not be
+// called without holding the semaphore.
+func (r *Runner) RunStreamHeld(ctx context.Context, argv []string, stdout io.Writer, onErrLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	return r.runStreamHeld(ctx, argv, stdout, onErrLine)
+}
+
+func (r *Runner) runStreamHeld(ctx context.Context, argv []string, stdout io.Writer, onErrLine func(string)) error {
+	cmd := exec.CommandContext(ctx, r.binary, argv...)
+	cmd.Env = minimalEnv()
+	setPgid(cmd)                                        // own process group (unix)
+	cmd.Cancel = func() error { return killGroup(cmd) } // kill the group on ctx cancel
+	cmd.WaitDelay = 5 * time.Second
+
+	cmd.Stdout = stdout // raw bytes straight to the sink (no truncation, no line-buffering)
+	pr, pw := io.Pipe()
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pw.Close()
+		return err
+	}
+	// Drain stderr line-by-line with truncation, off the command goroutine.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reader := bufio.NewReaderSize(pr, maxLineBytes)
+		for {
+			line, err := readLineTruncated(reader)
+			if line != "" && onErrLine != nil {
+				onErrLine(line)
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	waitErr := cmd.Wait()
+	pw.Close() // unblock the stderr reader
+	<-done
+	return waitErr
+}
+
 // keepStorageFlag returns the correct "keep this much cache" flag for `docker builder
 // prune` on this host. Newer BuildKit renamed --keep-storage → --reserved-space (the old
 // name prints a deprecation warning and will be removed); older Docker only knows

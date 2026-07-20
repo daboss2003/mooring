@@ -79,6 +79,7 @@ type Config struct {
 	Retention         RetentionConfig `yaml:"retention"`
 	Alerting          AlertingConfig  `yaml:"alerting"`
 	Server            ServerConfig    `yaml:"server"`
+	Backups           BackupConfig    `yaml:"backups"`
 
 	DataDir string `yaml:"data_dir"`
 
@@ -149,6 +150,64 @@ func (s ServerConfig) VersionCheckOn() bool {
 // ImageScanOn reports whether app vulnerability scanning is enabled (default on).
 func (s ServerConfig) ImageScanOn() bool {
 	return s.ImageScanEnabled == nil || *s.ImageScanEnabled
+}
+
+// BackupConfig configures scheduled, encrypted app-data backups (OPT-IN, default off). When
+// Enabled, the scheduler snapshots every app's data volumes on Schedule (encrypted with the
+// master key), keeps Retention snapshots per target, and — if S3 is set — also uploads each
+// snapshot off-box. Credentials live HERE (operator config, the root of trust), never in an
+// app repo, so a repo can never name an exfil bucket or hold keys.
+type BackupConfig struct {
+	Enabled     bool      `yaml:"enabled"`
+	Schedule    Duration  `yaml:"schedule"`     // default 24h; clamped to a 1h floor
+	Retention   int       `yaml:"retention"`    // keep N most-recent per target; default 7
+	HelperImage string    `yaml:"helper_image"` // image with `tar` for volume snapshots; default below
+	S3          *BackupS3 `yaml:"s3,omitempty"` // optional off-box destination
+}
+
+// BackupS3 is the optional off-box object-store destination for backups (S3/MinIO/R2/B2).
+type BackupS3 struct {
+	Bucket          string `yaml:"bucket"`
+	Endpoint        string `yaml:"endpoint"` // host[:port], e.g. s3.us-east-1.amazonaws.com
+	Region          string `yaml:"region"`
+	AccessKeyID     string `yaml:"access_key_id"`
+	SecretAccessKey string `yaml:"secret_access_key"`
+	Prefix          string `yaml:"prefix"`     // optional key prefix, e.g. "mooring/"
+	PathStyle       *bool  `yaml:"path_style"` // default true (S3-compatible endpoints)
+	Insecure        bool   `yaml:"insecure"`   // allow http:// (private MinIO); default https
+}
+
+const defaultBackupHelperImage = "busybox:1.36"
+
+// BackupsOn reports whether scheduled app-data backups are enabled (default off).
+func (c *Config) BackupsOn() bool { return c.Backups.Enabled }
+
+// BackupSchedule is the interval between backup runs (default 24h, 1h floor).
+func (c *Config) BackupSchedule() time.Duration {
+	d := time.Duration(c.Backups.Schedule)
+	if d <= 0 {
+		d = 24 * time.Hour
+	}
+	if d < time.Hour {
+		d = time.Hour
+	}
+	return d
+}
+
+// BackupRetention is how many snapshots to keep per target (default 7, min 1).
+func (c *Config) BackupRetention() int {
+	if c.Backups.Retention <= 0 {
+		return 7
+	}
+	return c.Backups.Retention
+}
+
+// BackupHelperImage is the image (with tar) used for volume snapshots/restores.
+func (c *Config) BackupHelperImage() string {
+	if strings.TrimSpace(c.Backups.HelperImage) != "" {
+		return c.Backups.HelperImage
+	}
+	return defaultBackupHelperImage
 }
 
 // BuildCacheGCOn reports whether automatic build-cache reclamation is enabled (default on).
@@ -900,6 +959,27 @@ func (c *Config) Validate() error {
 	// --- Server tab (read-only host inspection + .deb cleanup) ---
 	if err := c.validateServer(); err != nil {
 		add("%v", err)
+	}
+
+	// --- Scheduled app-data backups (opt-in) ---
+	if c.Backups.Enabled {
+		if len(c.EncryptionKey) == 0 {
+			add("backups.enabled requires encryption_key (snapshots are AES-256 encrypted)")
+		}
+		if s := c.Backups.S3; s != nil {
+			if strings.TrimSpace(s.Bucket) == "" {
+				add("backups.s3.bucket is required when backups.s3 is set")
+			}
+			if strings.TrimSpace(s.Region) == "" {
+				add("backups.s3.region is required when backups.s3 is set")
+			}
+			if strings.TrimSpace(s.Endpoint) == "" {
+				add("backups.s3.endpoint is required when backups.s3 is set (e.g. s3.us-east-1.amazonaws.com)")
+			}
+			if strings.TrimSpace(s.AccessKeyID) == "" || strings.TrimSpace(s.SecretAccessKey) == "" {
+				add("backups.s3 requires access_key_id and secret_access_key")
+			}
+		}
 	}
 
 	if len(errs) > 0 {

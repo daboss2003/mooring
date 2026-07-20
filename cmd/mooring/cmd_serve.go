@@ -15,9 +15,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/daboss2003/mooring/internal/alert"
 	"github.com/daboss2003/mooring/internal/alertengine"
 	"github.com/daboss2003/mooring/internal/alertstore"
 	"github.com/daboss2003/mooring/internal/apitoken"
+	"github.com/daboss2003/mooring/internal/backupsched"
 	"github.com/daboss2003/mooring/internal/backupstore"
 	"github.com/daboss2003/mooring/internal/cfgstore"
 	"github.com/daboss2003/mooring/internal/config"
@@ -38,6 +40,7 @@ import (
 	"github.com/daboss2003/mooring/internal/provision"
 	"github.com/daboss2003/mooring/internal/provstore"
 	"github.com/daboss2003/mooring/internal/retention"
+	"github.com/daboss2003/mooring/internal/s3"
 	"github.com/daboss2003/mooring/internal/sandbox"
 	"github.com/daboss2003/mooring/internal/scale"
 	"github.com/daboss2003/mooring/internal/selfheal"
@@ -332,6 +335,55 @@ func cmdServe(args []string) error {
 	var backupStore *backupstore.Store
 	if key, kerr := config.DecodeKey(cfg.EncryptionKey); kerr == nil {
 		backupStore = backupstore.New(db, filepath.Join(cfg.DataDir, "backups"), key)
+
+		// Scheduled, encrypted app-data backups (opt-in). Snapshots every app's data volumes
+		// on a fixed interval, keeps N per target, and — when an S3 destination is configured —
+		// uploads each snapshot off-box. Rides the one-docker-child semaphore via TryAcquire
+		// (never queues a docker child, so it can't delay a deploy/self-heal).
+		if cfg.BackupsOn() && backupStore.Available() {
+			var uploader backupsched.Uploader
+			s3prefix := ""
+			if sc := cfg.Backups.S3; sc != nil {
+				pathStyle := true
+				if sc.PathStyle != nil {
+					pathStyle = *sc.PathStyle
+				}
+				cl, serr := s3.New(s3.Config{
+					Endpoint: sc.Endpoint, Region: sc.Region, Bucket: sc.Bucket,
+					AccessKeyID: sc.AccessKeyID, SecretAccessKey: sc.SecretAccessKey,
+					UsePathStyle: pathStyle, Insecure: sc.Insecure,
+				}, nil)
+				if serr != nil {
+					log.Warn("backups: S3 destination misconfigured; backing up locally only", "err", serr)
+				} else {
+					uploader = cl
+					s3prefix = sc.Prefix
+				}
+			}
+			appsFn := func() []string {
+				apps, _ := gitStore.List()
+				out := make([]string, 0, len(apps))
+				for _, a := range apps {
+					out = append(out, a.Project)
+				}
+				return out
+			}
+			alertCb := func(level, title, detail string) {
+				_ = alertStore.EnqueueInfra(context.Background(), alert.Outbox{
+					Target: "backups", Kind: "backup", Level: level, Transition: "firing",
+					Summary: title + ": " + detail, DedupeKey: "backup:" + title + ":" + detail,
+				})
+			}
+			bsCfg := backupsched.Config{
+				Interval: cfg.BackupSchedule(), Retention: cfg.BackupRetention(),
+				HelperImage: cfg.BackupHelperImage(), Key: key,
+				EnvFileDir: filepath.Join(cfg.DataDir, "backups", ".creds"), S3Prefix: s3prefix,
+			}
+			backupRunner := backupsched.New(runner, dockerSem, backupStore, appsFn, uploader, bsCfg, alertCb, log)
+			wg.Add(1)
+			go func() { defer wg.Done(); backupRunner.Run(ctx) }()
+			log.Info("scheduled app-data backups enabled", "interval", cfg.BackupSchedule(), "retention", cfg.BackupRetention(), "off_box", uploader != nil)
+		}
 	}
 	var edgeRecon *edge.Reconciler
 	edgeReason := ""
