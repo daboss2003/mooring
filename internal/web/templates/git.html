@@ -112,12 +112,15 @@
     <div class="table-scroll"><table class="grid">
       <thead><tr><th>When</th><th>Commit</th><th>Change</th><th></th></tr></thead>
       <tbody>
-        {{range .Versions}}
+        {{range $i, $v := .Versions}}
         <tr>
-          <td class="mono">{{template "ts" .CreatedAt}}</td>
-          <td class="mono">{{if .Commit}}{{shortSha .Commit}}{{else}}—{{end}}</td>
-          <td>{{.Note}}</td>
-          <td>{{if .Commit}}<button type="button" class="btn btn-sm btn-ghost lc-btn" data-lc-confirm="Roll back {{$proj}} to {{shortSha .Commit}}? This recreates its containers." data-lc-url="/apps/{{pathEscape $proj}}/versions/{{.ID}}/rollback">Roll back to this</button>{{end}}</td>
+          <td class="mono">{{template "ts" $v.CreatedAt}}</td>
+          <td class="mono">{{if $v.Commit}}{{shortSha $v.Commit}}{{else}}—{{end}}</td>
+          <td>{{$v.Note}}{{if not $i}} <span class="muted">(current)</span>{{end}}</td>
+          <td class="row-actions">
+            {{if $v.Commit}}<button type="button" class="btn btn-sm btn-ghost lc-btn" data-lc-confirm="Roll back {{$proj}} to {{shortSha $v.Commit}}? This recreates its containers." data-lc-url="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/rollback">Roll back to this</button>{{end}}
+            {{if $i}}<form method="post" action="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/delete" class="inline" data-confirm="Delete this deploy from history? It only trims the list — disk from old build images is reclaimed separately on the Server tab."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">delete</button></form>{{end}}
+          </td>
         </tr>
         {{end}}
       </tbody>

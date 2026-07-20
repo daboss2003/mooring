@@ -88,6 +88,24 @@ func (s *Store) DeleteApp(ctx context.Context, slug string) error {
 	return err
 }
 
+// DeleteVersion removes ONE past version from the history (trimming the rollback list). It
+// REFUSES to delete the latest version — that row is the live canonical, and losing it would
+// orphan the app's current shape. Returns an error if the id is the latest or unknown. Note:
+// this only frees the (tiny) history row; disk from superseded build images is reclaimed by
+// the image-prune path, not here.
+func (s *Store) DeleteVersion(ctx context.Context, slug string, id int64) error {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM definition_versions WHERE slug=? AND id=? AND id <> (SELECT MAX(id) FROM definition_versions WHERE slug=?)`,
+		slug, id, slug)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return errors.New("version not found, or it is the current live version (which cannot be deleted)")
+	}
+	return nil
+}
+
 // Current returns the live canonical definition for a slug (the latest version),
 // HMAC-verified and RE-PARSED. No version yet → (nil, nil).
 func (s *Store) Current(slug string) (*Definition, error) {

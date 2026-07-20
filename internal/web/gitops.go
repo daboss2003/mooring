@@ -642,6 +642,32 @@ func (s *Server) handleVersionRollback(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleVersionDelete removes one past version from the deploy history (the operator trimming
+// the rollback list). It refuses the live/latest version (see defStore.DeleteVersion). This
+// only frees the tiny history row — disk from superseded build images is reclaimed by the
+// image-prune path, not here. Gated auth + CSRF.
+func (s *Server) handleVersionDelete(w http.ResponseWriter, r *http.Request) {
+	if s.defStore == nil {
+		http.Error(w, "definition store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	project := r.PathValue("project")
+	id, perr := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if perr != nil || id <= 0 {
+		http.Error(w, "invalid version id", http.StatusBadRequest)
+		return
+	}
+	if err := s.defStore.DeleteVersion(r.Context(), project, id); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	_ = s.audit.Log(r.Context(), audit.Event{
+		Actor: sessionUser(r), IP: ClientIP(r.Context()).String(),
+		Action: "version_delete", Target: project + " v" + strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security,
+	})
+	http.Redirect(w, r, "/apps/"+project+"/git", http.StatusSeeOther)
+}
+
 // deployRepoApp promotes ONE reviewed commit sha. The CALLER must hold the
 // gitDeploy single-flight semaphore. Sequence (plan §7.6):
 //  1. sha-pin: the staged ref must STILL point at exactly the reviewed sha (a

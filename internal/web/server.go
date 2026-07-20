@@ -476,6 +476,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apps/{project}/git/fetch", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitFetch))))
 	mux.HandleFunc("POST /apps/{project}/git/deploy", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitDeploy))))
 	mux.HandleFunc("POST /apps/{project}/versions/{id}/rollback", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleVersionRollback))))
+	mux.HandleFunc("POST /apps/{project}/versions/{id}/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleVersionDelete))))
 	mux.HandleFunc("POST /apps/{project}/git/webhook-rotate", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleGitWebhookRotate))))
 	// Connect with GitHub (M20): OAuth web flow → repo picker → auto deploy-key.
 	// The callback is a cross-site navigation back from github.com, so the Strict

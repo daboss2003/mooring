@@ -116,6 +116,35 @@ func TestStoreCommitTamperRejected(t *testing.T) {
 	}
 }
 
+// DeleteVersion trims a past version from history but REFUSES the latest (the live canonical).
+func TestStoreDeleteVersion(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	id1, err := s.SaveCanonical(ctx, base(), "first", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := s.SaveCanonical(ctx, base(), "second", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The latest (id2) is the live canonical and must not be deletable.
+	if err := s.DeleteVersion(ctx, "shop", id2); err == nil {
+		t.Fatal("deleting the latest/live version must be refused")
+	}
+	// An older version is deletable.
+	if err := s.DeleteVersion(ctx, "shop", id1); err != nil {
+		t.Fatalf("deleting an older version should succeed, got %v", err)
+	}
+	if vs, _ := s.List("shop"); len(vs) != 1 || vs[0].ID != id2 {
+		t.Fatalf("after delete, only the live version should remain, got %+v", vs)
+	}
+	// Deleting an unknown id is an error (idempotent-safe: no rows changed).
+	if err := s.DeleteVersion(ctx, "shop", 99999); err == nil {
+		t.Error("deleting an unknown version should error")
+	}
+}
+
 func TestStoreHMACTamperRejected(t *testing.T) {
 	s, db := testStore(t)
 	ctx := context.Background()
