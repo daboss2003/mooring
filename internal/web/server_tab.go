@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -352,4 +353,52 @@ func parentRel(rel string) (string, bool) {
 		return "", true // parent is the root
 	}
 	return rel[:i], true
+}
+
+// handleReclaimDisk reclaims dangling docker images + build cache on demand — the disk hog from
+// superseded builds. It removes only garbage (docker never prunes a tagged or in-use image; a
+// rollback rebuilds), so it's gated by the normal auth+CSRF rather than a re-auth. Streams the
+// docker output to the caller (the lc-btn on the Server tab).
+func (s *Server) handleReclaimDisk(w http.ResponseWriter, r *http.Request) {
+	actor := sessionUser(r)
+	peer := ClientIP(r.Context()).String()
+	if s.runner == nil {
+		http.Error(w, "write plane unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if ok, reason := s.runner.WriteAllowed(); !ok {
+		http.Error(w, reason, http.StatusForbidden)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	clearWriteDeadline(w)
+	flusher, _ := w.(http.Flusher)
+	emit := func(line string) {
+		fmt.Fprintln(w, line)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+	defer cancel()
+	// Audit on a non-cancellable ctx so an aborted/timed-out reclaim (the case most worth
+	// recording) is still logged even though the request ctx is by then cancelled.
+	auditCtx := context.WithoutCancel(ctx)
+	emit("$ docker image prune -f   (removing dangling build images)")
+	if err := s.runner.PruneImages(ctx, emit); err != nil {
+		emit("[failed: " + err.Error() + "]")
+		_ = s.audit.Log(auditCtx, audit.Event{Actor: actor, IP: peer, Action: "disk_reclaim", Outcome: audit.Error, Level: audit.Security, Detail: err.Error()})
+		return
+	}
+	if s.cfg.Server.BuildCacheGCOn() {
+		keep := s.cfg.Server.BuildCacheKeepSize()
+		emit("$ docker builder prune   (keeping " + keep + " of recent cache)")
+		if err := s.runner.PruneBuildCache(ctx, keep, emit); err != nil {
+			emit("build-cache prune skipped: " + err.Error())
+		}
+	}
+	emit("\n[done] reload the page to see updated disk usage")
+	_ = s.audit.Log(auditCtx, audit.Event{Actor: actor, IP: peer, Action: "disk_reclaim", Outcome: audit.OK, Level: audit.Security})
 }

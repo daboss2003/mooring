@@ -394,6 +394,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /partials/server", s.requireAuth(s.handleServerPartial))
 	mux.HandleFunc("GET /server/files", s.requireAuth(s.withCSRFToken(s.handleServerFiles)))
 	mux.HandleFunc("POST /server/debs/delete", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleDebDelete))))
+	mux.HandleFunc("POST /server/reclaim-disk", capBody(loginBodyLimit, s.requireAuth(s.requireCSRF(s.handleReclaimDisk))))
 	mux.HandleFunc("GET /apps", s.requireAuth(s.withCSRFToken(s.handleAppsList)))
 	// Host metric series for the live dashboard charts (read plane; cookie-authed).
 	mux.HandleFunc("GET /partials/metrics.json", s.requireAuth(s.handleMetricsHistory))

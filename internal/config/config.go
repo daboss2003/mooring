@@ -129,6 +129,16 @@ type ServerConfig struct {
 	// Re-scanning unchanged images matters — new CVEs are disclosed daily.
 	ImageScanInterval Duration `yaml:"image_scan_interval"`
 
+	// DiskGCEnabled controls disk-pressure auto-reclaim: when disk usage crosses
+	// DiskGCThreshold, Mooring reclaims DANGLING docker images + build cache (the superseded
+	// builds that pile up as apps redeploy) and alerts. ON by default; safe because it only
+	// removes unreferenced garbage — never a tagged/in-use image, a rollback (which rebuilds),
+	// or any app data volume. Set false to disable.
+	DiskGCEnabled *bool `yaml:"disk_gc_enabled"`
+	// DiskGCThreshold is the disk-usage percent that triggers auto-reclaim (default 75,
+	// clamped to [50, 95]).
+	DiskGCThreshold int `yaml:"disk_gc_threshold"`
+
 	// BuildCacheKeepEnabled controls automatic reclamation of Docker/BuildKit build cache
 	// after a build-deploy. Mooring's generated multi-stage Dockerfiles emit a unique,
 	// single-use runtime layer per deploy (`COPY --from=build /app /app` + the non-root
@@ -150,6 +160,29 @@ func (s ServerConfig) VersionCheckOn() bool {
 // ImageScanOn reports whether app vulnerability scanning is enabled (default on).
 func (s ServerConfig) ImageScanOn() bool {
 	return s.ImageScanEnabled == nil || *s.ImageScanEnabled
+}
+
+// DiskGCOn reports whether disk-pressure auto-reclaim is enabled (default ON). When disk
+// crosses the threshold Mooring reclaims DANGLING docker images + build cache (safe garbage —
+// never a tagged/in-use image or any app data) and alerts. Set false to disable.
+func (s ServerConfig) DiskGCOn() bool {
+	return s.DiskGCEnabled == nil || *s.DiskGCEnabled
+}
+
+// DiskGCThresholdPct is the disk-usage percentage that triggers auto-reclaim (default 75,
+// clamped to [50, 95] so it can neither thrash nor wait until the disk is already full).
+func (s ServerConfig) DiskGCThresholdPct() int {
+	t := s.DiskGCThreshold
+	if t == 0 {
+		t = 75
+	}
+	if t < 50 {
+		t = 50
+	}
+	if t > 95 {
+		t = 95
+	}
+	return t
 }
 
 // BackupConfig configures scheduled, encrypted app-data backups (OPT-IN, default off). When

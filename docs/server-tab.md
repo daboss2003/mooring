@@ -17,11 +17,35 @@ read-only except one narrow, re-authenticated action (deleting an old `.deb`).
   (repo clones, generated compose/Dockerfile). It also explains where the **build
   caches** live: Mooring discards its own interrupted-deploy leftovers on boot, but
   **Docker's** build cache, dangling images, and stopped containers accumulate
-  separately — check them over SSH with `docker system df` and reclaim with
-  `docker system prune`. Mooring never prunes Docker for you.
+  separately — Mooring reclaims those for you (see **Reclaiming disk** below).
 - **Mooring downloads (`.deb`)** — lists the Mooring release packages you've
   downloaded so you can delete the old ones (see below).
 - **Files (read-only)** — an opt-in, allow-listed file viewer (see below).
+
+## Reclaiming disk
+
+Every time an app with a build step redeploys, Docker leaves the previous build
+image behind as a **dangling** (untagged) image, plus build cache. On a busy
+server these are usually the main thing that fills the disk.
+
+- **Reclaim disk now** — the button on the Server tab runs `docker image prune`
+  (dangling images) + a build-cache trim, and streams the output. It only removes
+  **garbage**: Docker never prunes a tagged image or one used by a container
+  (running *or* stopped), and a Mooring rollback rebuilds its image — so this can
+  never delete a running app, a rollback target, or any data volume.
+- **Automatic reclaim** — Mooring watches disk usage and, when it crosses
+  `server.disk_gc_threshold` (default **75%**), reclaims the same garbage on its
+  own and sends you an alert. It's on by default; set `server.disk_gc_enabled:
+  false` to turn it off, or change the threshold:
+
+  ```yaml
+  server:
+    disk_gc_enabled: true     # default
+    disk_gc_threshold: 75     # percent; clamped to 50–95
+  ```
+
+  If your disk stays full after a reclaim, the cause is app data or logs, not old
+  deploys — the alert says as much.
 
 ## Cleaning up old `.deb` downloads
 

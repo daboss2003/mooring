@@ -24,6 +24,7 @@ import (
 	"github.com/daboss2003/mooring/internal/cfgstore"
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/definition"
+	"github.com/daboss2003/mooring/internal/diskgc"
 	"github.com/daboss2003/mooring/internal/docker"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/edge"
@@ -296,6 +297,34 @@ func cmdServe(args []string) error {
 		wg.Add(1)
 		go func() { defer wg.Done(); scanRunner.Run(ctx) }()
 		log.Info("image vulnerability scanning enabled", "interval", iv)
+	}
+
+	// Disk-pressure auto-reclaim (ON by default). When disk usage crosses the threshold,
+	// reclaim DANGLING docker images + build cache — the superseded builds that pile up as apps
+	// redeploy — and alert. Only garbage is removed (never a tagged/in-use image, a rollback
+	// which rebuilds, or app data). Rides the one-docker-child slot via TryAcquire, so it never
+	// delays a deploy/self-heal.
+	if cfg.Server.DiskGCOn() {
+		gc := diskgc.New(
+			func() (uint64, uint64, bool) {
+				hs, herr := hostSampler.Sample()
+				if herr != nil {
+					return 0, 0, false
+				}
+				return hs.DiskUsed, hs.DiskTotal, true
+			},
+			runner, dockerSem, cfg.Server.DiskGCThresholdPct(), 15*time.Minute, cfg.Server.BuildCacheKeepSize(),
+			func(level, title, detail string) {
+				_ = alertStore.EnqueueInfra(context.Background(), alert.Outbox{
+					Target: "disk", Kind: "disk_pressure", Level: level, Transition: "firing",
+					Summary: title + ": " + detail, DedupeKey: "diskgc",
+				})
+			},
+			log,
+		)
+		wg.Add(1)
+		go func() { defer wg.Done(); gc.Run(ctx) }()
+		log.Info("disk-pressure auto-reclaim enabled", "threshold_pct", cfg.Server.DiskGCThresholdPct())
 	}
 
 	if cfg.Alerting.Enabled {

@@ -180,6 +180,20 @@ func (r *Runner) PruneBuildCache(ctx context.Context, keep string, onLine func(s
 		return err
 	}
 	defer r.sem.Release()
+	return r.pruneBuildCacheHeld(ctx, keep, onLine)
+}
+
+// PruneBuildCacheHeld is PruneBuildCache for a caller that ALREADY HOLDS the one-docker-child
+// semaphore (the disk-pressure auto-GC, which holds the slot across the image + cache prune —
+// calling the non-Held PruneBuildCache there would self-deadlock re-acquiring the one slot).
+func (r *Runner) PruneBuildCacheHeld(ctx context.Context, keep string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	return r.pruneBuildCacheHeld(ctx, keep, onLine)
+}
+
+func (r *Runner) pruneBuildCacheHeld(ctx context.Context, keep string, onLine func(string)) error {
 	return r.runArgv(ctx, "", []string{"builder", "prune", "-a", "-f", r.keepStorageFlag(ctx), keep}, onLine)
 }
 
@@ -305,6 +319,32 @@ func (r *Runner) runStreamStdinHeld(ctx context.Context, argv []string, stdin io
 	pw.Close()
 	<-done
 	return waitErr
+}
+
+// PruneImages reclaims DANGLING (untagged, unreferenced) images — the superseded builds that
+// pile up as apps redeploy and are the usual disk hog. `docker image prune -f` NEVER removes
+// an image referenced by a container (running OR stopped) or a tagged image, so it frees only
+// genuine garbage; and since a Mooring rollback rebuilds its image, this can't break rollback.
+// Runs under the §0 write gate + the one-docker-child semaphore. Output (incl. "Total
+// reclaimed space") streams to onLine.
+func (r *Runner) PruneImages(ctx context.Context, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.runArgv(ctx, "", []string{"image", "prune", "-f"}, onLine)
+}
+
+// PruneImagesHeld is PruneImages for a caller that ALREADY HOLDS the one-docker-child
+// semaphore (the disk-pressure auto-GC, which TryAcquires so it never queues a docker child).
+func (r *Runner) PruneImagesHeld(ctx context.Context, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	return r.runArgv(ctx, "", []string{"image", "prune", "-f"}, onLine)
 }
 
 // keepStorageFlag returns the correct "keep this much cache" flag for `docker builder

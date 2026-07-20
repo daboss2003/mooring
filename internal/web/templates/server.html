@@ -29,7 +29,9 @@
     <p class="muted">Measuring disk usage… reload in a moment.</p>
     {{end}}
     {{end}}
-    <p class="muted">Mooring discards its own build leftovers (interrupted-deploy staging dirs are swept on boot). <strong>Docker</strong>'s build cache, dangling images, and stopped containers do accumulate separately — check them over SSH with <code>docker system df</code> and reclaim with <code>docker system prune</code>. Mooring never prunes Docker for you (it could delete something you still want).</p>
+    <p class="muted"><strong>Docker</strong> accumulates dangling build images and old build cache as your apps redeploy — usually the main thing that fills a server. Mooring reclaims this <strong>automatically</strong> when disk gets tight (the <code>server.disk_gc_threshold</code>, default 75%), and you can reclaim it right now. Only unused garbage is removed — never a running app, a tagged image, or any data.</p>
+    <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Reclaim disk now? This removes dangling (unused) docker images and old build cache — never a running app or its data." data-lc-url="/server/reclaim-disk">Reclaim disk now</button>
+    <pre id="deploy-output" class="stream" hidden></pre>
   </section>
 
   {{/* Old-download cleanup. */}}
