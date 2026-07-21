@@ -4,6 +4,14 @@
 
 <h1 align="center">Mooring</h1>
 
+<p align="center">
+  <a href="https://daboss2003.github.io/mooring/"><strong>Website</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://daboss2003.github.io/mooring/docs/"><strong>Documentation</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://daboss2003.github.io/mooring/docs/#/installation"><strong>Install</strong></a>
+</p>
+
 **Run your apps on your own server — automatic HTTPS, live monitoring, and one clean dashboard — without the DevOps grind.**
 
 Mooring is a single small binary you install on a Linux server that has Docker. It owns the public edge (Caddy + automatic HTTPS), watches your apps' health, and gives you a dashboard and CLI to deploy and manage everything — so a plain server becomes a place you can ship to in minutes. Each app is defined by a `mooring.yaml` in its Git repo: you describe the services, domains, and config there, connect the repo, and Mooring runs it — generating and owning the Compose file and Dockerfile for you. You never hand-write either, hand-edit a proxy config, or run `certbot`.
