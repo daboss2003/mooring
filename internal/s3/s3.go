@@ -9,7 +9,9 @@
 //     pinned by a known-answer test against the AWS-documented example vectors, so a
 //     signing regression fails the build rather than silently corrupting auth.
 //   - Uploads use x-amz-content-sha256: UNSIGNED-PAYLOAD, which is valid over TLS and
-//     lets Put STREAM the body — a multi-GB backup is never hashed or buffered in RAM.
+//     lets Put STREAM the body — the backup is never hashed or buffered in RAM. Upload is a
+//     SINGLE PUT (no multipart yet), so objects over 5 GiB are rejected on AWS; MinIO/R2/B2
+//     have higher/no single-PUT caps.
 //   - The secret key and the Authorization header are never logged (this package logs
 //     nothing at all) and never appear in returned errors.
 //   - HTTPS by default; plain http is opt-in (Config.Insecure) for MinIO on a trusted
@@ -92,14 +94,25 @@ func New(cfg Config, hc *http.Client) (*Client, error) {
 	return &Client{cfg: cfg, hc: hc}, nil
 }
 
+// singlePutMax is AWS S3's single-PUT object-size ceiling (5 GiB). Larger objects require
+// multipart upload, which this client does not implement yet.
+const singlePutMax = 5 << 30
+
 // Put uploads exactly size bytes read from r to key. The body is streamed (never fully
-// buffered) using UNSIGNED-PAYLOAD signing. contentType may be "".
+// buffered) using UNSIGNED-PAYLOAD signing. contentType may be "". Objects over 5 GiB are
+// rejected (single PUT only; no multipart yet).
 func (c *Client) Put(ctx context.Context, key string, r io.Reader, size int64, contentType string) error {
 	if key == "" {
 		return errors.New("s3: put: empty key")
 	}
 	if size < 0 {
 		return errors.New("s3: put: negative size")
+	}
+	// A single PUT is capped at 5 GiB on AWS S3 (S3-compatible stores vary). This client does a
+	// single PUT (no multipart yet), so fail early with a clear message rather than a raw 400
+	// EntityTooLarge from the server after streaming the whole body.
+	if size > singlePutMax {
+		return fmt.Errorf("s3: object is %d bytes, over the %d-byte single-PUT limit (multipart upload is not yet implemented)", size, int64(singlePutMax))
 	}
 	u := c.objectURL(key)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), r)

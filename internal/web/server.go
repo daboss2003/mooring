@@ -413,6 +413,7 @@ func (s *Server) Handler() http.Handler {
 	// Webhook: allowlist-exempt (CI egress) + auth-exempt, but HMAC-gated,
 	// replay-protected, per-token rate-limited, and FETCH-ONLY (plan §5.7).
 	mux.HandleFunc("POST /webhook/{token}", capBody(1<<20, s.handleWebhook))
+	mux.HandleFunc("POST /webhook/pr/{token}", capBody(prWebhookBodyLimit, s.handlePRWebhook))
 	mux.HandleFunc("GET /login", s.withCSRFToken(s.handleLoginGet))
 	// capBody is OUTERMOST so the body is bounded before requireCSRF parses it.
 	mux.HandleFunc("POST /login", capBody(loginBodyLimit, s.requireCSRF(s.handleLoginPost)))
@@ -519,6 +520,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apps/{project}/versions/{id}/rollback", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleVersionRollback))))
 	mux.HandleFunc("POST /apps/{project}/versions/{id}/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleVersionDelete))))
 	mux.HandleFunc("POST /apps/{project}/git/webhook-rotate", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitWebhookRotate))))
+	mux.HandleFunc("POST /apps/{project}/preview", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handlePreviewToggle))))
 	// Connect with GitHub (M20): OAuth web flow → repo picker → auto deploy-key.
 	// The callback is a cross-site navigation back from github.com, so the Strict
 	// session cookie isn't sent — it is authenticated by the single-use Lax OAuth

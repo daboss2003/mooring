@@ -14,6 +14,7 @@ package backupsched
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -170,6 +171,12 @@ func (r *Runner) backupVolume(ctx context.Context, project, volume string) {
 		e := perr
 		if e == nil {
 			e = cerr
+		}
+		// A cancelled context (SIGTERM/reload landing mid-produce) is a benign skip, not a
+		// failure — don't page the operator with a false CRITICAL. It retries next cycle.
+		if ctx.Err() != nil || errors.Is(e, context.Canceled) {
+			r.logWarn("backup: skipped (shutting down) "+project+"/"+volume, project, e)
+			return
 		}
 		r.logWarn("backup: produce "+project+"/"+volume, project, e)
 		r.notify("critical", "Backup failed", fmt.Sprintf("%s volume %s: %v", project, volume, e))

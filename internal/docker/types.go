@@ -64,6 +64,10 @@ func (c Container) IPs() []string {
 // Project returns the compose project label (the app key), or "" if unlabeled.
 func (c Container) Project() string { return c.Labels[LabelProject] }
 
+// OneOff reports whether this is a transient `compose run` one-shot container (cron task or
+// backup/restore sidecar) rather than a supervised long-running service.
+func (c Container) OneOff() bool { return c.Labels[LabelOneOff] == "True" }
+
 // Service returns the compose service label, or "" if unlabeled.
 func (c Container) Service() string { return c.Labels[LabelService] }
 

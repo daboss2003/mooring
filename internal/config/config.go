@@ -876,6 +876,11 @@ func (c *Config) Validate() error {
 	}
 
 	// --- additional users (RBAC) ---
+	// Login timing-parity uses ONE dummy hash built from the owner's argon2 params, so a username
+	// miss costs the same as the owner. If a real user were hashed at a DIFFERENT cost, its verify
+	// latency would differ from the dummy and make that username enumerable — so require every
+	// user's argon2 params (memory/time/parallelism) to match the owner's.
+	ownerParams, _, _, ownerParamErr := crypto.ParseArgon2(c.Auth.PasswordHash)
 	seenUser := map[string]bool{c.Auth.Username: true}
 	for i, u := range c.ExtraUsers {
 		if u.Username == "" {
@@ -888,8 +893,10 @@ func (c *Config) Validate() error {
 		seenUser[u.Username] = true
 		if u.PasswordHash == "" {
 			add("users[%d] (%s): password_hash required (run `mooring hash-password`)", i, u.Username)
-		} else if _, _, _, err := crypto.ParseArgon2(u.PasswordHash); err != nil {
+		} else if p, _, _, err := crypto.ParseArgon2(u.PasswordHash); err != nil {
 			add("users[%d] (%s).password_hash: %v", i, u.Username, err)
+		} else if ownerParamErr == nil && (p.Memory != ownerParams.Memory || p.Time != ownerParams.Time || p.Parallelism != ownerParams.Parallelism) {
+			add("users[%d] (%s).password_hash: argon2 cost (memory/time/parallelism) must match the auth owner's — hash all users with the same `mooring hash-password` settings", i, u.Username)
 		}
 		if u.TOTPSecret != "" && !validBase32(u.TOTPSecret) {
 			add("users[%d] (%s).totp_secret: not valid base32", i, u.Username)

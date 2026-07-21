@@ -51,6 +51,8 @@ type Config struct {
 	LastFetchAt    int64
 	LastFetchError string
 	HasWebhook     bool
+	PreviewEnabled bool   // base app opts into per-PR preview environments
+	PreviewOf      string // non-empty ⇒ this app is an ephemeral preview OF this base slug
 }
 
 // Store persists GitOps config.
@@ -166,14 +168,15 @@ func (s *Store) Delete(ctx context.Context, project string) error {
 // Get returns a repo app's config (no secret material).
 func (s *Store) Get(project string) (Config, bool, error) {
 	var c Config
-	var ad int
+	var ad, pe int
 	err := s.db.QueryRow(
 		`SELECT project, repo_url, git_ref, compose_path, dockerfile_path, mooring_file_path, auto_deploy, build_policy, cred_kind,
 		        deployed_commit, staged_commit, update_state, commits_behind, last_fetch_at, last_fetch_error,
-		        webhook_token_hash IS NOT NULL
+		        webhook_token_hash IS NOT NULL, preview_enabled, preview_of
 		 FROM app_git WHERE project=?`, project).Scan(
 		&c.Project, &c.RepoURL, &c.Ref, &c.ComposePath, &c.DockerfilePath, &c.MooringFile, &ad, &c.BuildPolicy, &c.CredKind,
-		&c.DeployedCommit, &c.StagedCommit, &c.UpdateState, &c.CommitsBehind, &c.LastFetchAt, &c.LastFetchError, &c.HasWebhook)
+		&c.DeployedCommit, &c.StagedCommit, &c.UpdateState, &c.CommitsBehind, &c.LastFetchAt, &c.LastFetchError, &c.HasWebhook,
+		&pe, &c.PreviewOf)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Config{}, false, nil
 	}
@@ -181,7 +184,81 @@ func (s *Store) Get(project string) (Config, bool, error) {
 		return Config{}, false, err
 	}
 	c.AutoDeploy = ad == 1
+	c.PreviewEnabled = pe == 1
 	return c, true, nil
+}
+
+// SetPreviewEnabled toggles a base app's opt-in for per-PR preview environments.
+func (s *Store) SetPreviewEnabled(ctx context.Context, project string, enabled bool) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE app_git SET preview_enabled=? WHERE project=?`, b2i(enabled), project)
+	return err
+}
+
+// RegisterPreview creates (or refreshes the ref of) an ephemeral per-PR app that INHERITS the
+// base app's repo, credentials, build policy, and mooring file, checking out the PR head `ref`.
+// preview_of is set to `base`, which scopes teardown. It fail-closes: the base must exist AND
+// have previews enabled, and it refuses to touch a slug already owned by a NON-preview app or a
+// preview of a DIFFERENT base — so a preview can never clobber a real app.
+func (s *Store) RegisterPreview(ctx context.Context, base, slug, ref string) error {
+	if !slugRe.MatchString(slug) || slug == base || strings.TrimSpace(ref) == "" {
+		return errors.New("gitstore: invalid preview slug/ref")
+	}
+	var repoURL, composePath, dockerfilePath, mooringFile, buildPolicy, credKind string
+	var credEnc, khEnc []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT repo_url, compose_path, dockerfile_path, mooring_file_path, build_policy, cred_kind, cred_enc, known_hosts_enc
+		 FROM app_git WHERE project=? AND preview_enabled=1`, base).
+		Scan(&repoURL, &composePath, &dockerfilePath, &mooringFile, &buildPolicy, &credKind, &credEnc, &khEnc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errors.New("gitstore: base app not found or previews not enabled")
+	}
+	if err != nil {
+		return err
+	}
+	// Never clobber an existing app that isn't already a preview of THIS base.
+	var existingOf string
+	switch e := s.db.QueryRowContext(ctx, `SELECT preview_of FROM app_git WHERE project=?`, slug).Scan(&existingOf); {
+	case errors.Is(e, sql.ErrNoRows): // new slug — fine
+	case e != nil:
+		return e
+	default:
+		if existingOf != base {
+			return errors.New("gitstore: slug already in use by a non-preview app")
+		}
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO app_git(project, repo_url, git_ref, compose_path, dockerfile_path, mooring_file_path, auto_deploy, build_policy, cred_kind, cred_enc, known_hosts_enc, preview_of, updated_at)
+		 VALUES(?,?,?,?,?,?,0,?,?,?,?,?,?)
+		 ON CONFLICT(project) DO UPDATE SET git_ref=excluded.git_ref, updated_at=excluded.updated_at`,
+		slug, repoURL, ref, composePath, dockerfilePath, mooringFile, buildPolicy, credKind, credEnc, khEnc, base, time.Now().Unix())
+	return err
+}
+
+// CountPreviews returns how many live previews exist for a base app (the per-base cap input).
+func (s *Store) CountPreviews(base string) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM app_git WHERE preview_of=?`, base).Scan(&n)
+	return n, err
+}
+
+// StalePreviews returns the slugs of preview apps whose last activity (updated_at) is older than
+// `before` (unix seconds) — the TTL reaper's input, so an abandoned preview (a "closed" event
+// that never arrived) is still cleaned up.
+func (s *Store) StalePreviews(before int64) ([]string, error) {
+	rows, err := s.db.Query(`SELECT project FROM app_git WHERE preview_of<>'' AND updated_at<?`, before)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // List returns all repo apps. It selects every column in ONE query and scans each
@@ -194,7 +271,7 @@ func (s *Store) List() ([]Config, error) {
 	rows, err := s.db.Query(
 		`SELECT project, repo_url, git_ref, compose_path, dockerfile_path, mooring_file_path, auto_deploy, build_policy, cred_kind,
 		        deployed_commit, staged_commit, update_state, commits_behind, last_fetch_at, last_fetch_error,
-		        webhook_token_hash IS NOT NULL
+		        webhook_token_hash IS NOT NULL, preview_enabled, preview_of
 		 FROM app_git ORDER BY project`)
 	if err != nil {
 		return nil, err
@@ -203,13 +280,15 @@ func (s *Store) List() ([]Config, error) {
 	var out []Config
 	for rows.Next() {
 		var c Config
-		var ad int
+		var ad, pe int
 		if err := rows.Scan(
 			&c.Project, &c.RepoURL, &c.Ref, &c.ComposePath, &c.DockerfilePath, &c.MooringFile, &ad, &c.BuildPolicy, &c.CredKind,
-			&c.DeployedCommit, &c.StagedCommit, &c.UpdateState, &c.CommitsBehind, &c.LastFetchAt, &c.LastFetchError, &c.HasWebhook); err != nil {
+			&c.DeployedCommit, &c.StagedCommit, &c.UpdateState, &c.CommitsBehind, &c.LastFetchAt, &c.LastFetchError, &c.HasWebhook,
+			&pe, &c.PreviewOf); err != nil {
 			return nil, err
 		}
 		c.AutoDeploy = ad == 1
+		c.PreviewEnabled = pe == 1
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -264,6 +343,23 @@ func (s *Store) SetFetchError(ctx context.Context, project, classified string) {
 // SetDeployed records a successful deploy (pins deployed_commit, FSM up_to_date).
 func (s *Store) SetDeployed(ctx context.Context, project, sha string) {
 	_, _ = s.db.ExecContext(ctx, `UPDATE app_git SET deployed_commit=?, update_state='up_to_date', commits_behind=0 WHERE project=?`, sha, project)
+}
+
+// SetDeployedBehind records a deploy of `sha` that is `behind` commits behind the staged tip —
+// used by ROLLBACK, where the app is intentionally moved to an OLDER commit while the branch tip
+// is still ahead. Setting the true state (not a false 'up_to_date') keeps the UI honest.
+func (s *Store) SetDeployedBehind(ctx context.Context, project, sha string, behind int) {
+	state := "up_to_date"
+	if behind > 0 {
+		state = "update_available"
+	}
+	_, _ = s.db.ExecContext(ctx, `UPDATE app_git SET deployed_commit=?, update_state=?, commits_behind=? WHERE project=?`, sha, state, behind, project)
+}
+
+// SetAutoDeploy toggles a repo app's auto-deploy flag (used to PAUSE auto-deploy after a
+// rollback, so the next webhook can't silently re-promote the commit the operator rolled away).
+func (s *Store) SetAutoDeploy(ctx context.Context, project string, enabled bool) {
+	_, _ = s.db.ExecContext(ctx, `UPDATE app_git SET auto_deploy=? WHERE project=?`, b2i(enabled), project)
 }
 
 // SetState transitions the FSM (e.g. deploying, update_blocked).

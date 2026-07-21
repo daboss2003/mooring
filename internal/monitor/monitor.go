@@ -212,6 +212,9 @@ func (m *Monitor) pollOnce(parent context.Context) *Snapshot {
 		if project == "" {
 			continue // not a compose-managed app
 		}
+		if c.OneOff() {
+			continue // transient `compose run` one-shot (cron task / backup sidecar), not a service
+		}
 		if _, ok := projMeta[project]; !ok {
 			projMeta[project] = c
 		}

@@ -107,3 +107,25 @@ After that, **Connect with GitHub** appears on the Connect-a-repository page. Op
 ## Building images vs pulling them
 
 By default Mooring **pulls** the images your Compose references — it doesn't build on your server. If your app needs an on-box build, set the build option when connecting the repo; building requires a server with at least 1 GB of RAM.
+
+## Preview environments (a deploy per pull request)
+
+Turn this on for a connected app and every pull request gets its **own running copy** of the app — at its own URL — so reviewers can click a link and try the change instead of reading a diff. When the PR closes, the copy is torn down automatically.
+
+**How it works.** Open a PR → GitHub sends Mooring a signed `pull_request` webhook → Mooring spins up a throwaway app, `<app>-pr<n>`, from your repo but checking out the PR's code (`refs/pull/<n>/head`, which works for forks too). It gets its own subdomain, `<app>-pr<n>.<base_domain>`, already covered by your wildcard certificate — so **HTTPS is instant**, with no new certificate to issue. Push more commits and it redeploys; close or merge the PR and it's removed.
+
+**Turning it on.**
+
+1. On the app's **Repository** page, click **Enable previews** (this is an owner-only action — it grants a webhook unattended authority to create and destroy preview apps).
+2. Create (or rotate) the app's webhook to get its token + secret.
+3. In your GitHub repo → **Settings → Webhooks → Add webhook**:
+   - **Payload URL:** `https://<your-admin-host>/webhook/pr/<your-webhook-token>`
+   - **Content type:** `application/json`
+   - **Secret:** the app's webhook secret
+   - **Events:** *Let me select individual events* → **Pull requests** only
+
+**What a preview inherits.** The base app's **non-secret** environment (plain config values), plus fresh `generate:` secrets minted per preview — so a preview's own database gets its own random password and the app boots. It deliberately does **not** inherit the operator's pasted secrets (API keys, external DB passwords): a PR runs untrusted fork code, so leaking real credentials to it would be dangerous. If a preview needs an external secret it simply won't have it (fail-closed) rather than exposing production keys. Each preview is a separate Compose project with its own volumes — it **cannot affect production**.
+
+**Safety.** The webhook is authenticated by GitHub's `X-Hub-Signature-256` HMAC over the request body — nothing happens without a valid signature. Teardown is **scoped**: the webhook can only remove an app that is a preview *of its own base app*, so it can never delete a real app. Because a PR's `mooring.yaml` is untrusted, a preview's routes are rewritten to its own subdomain and any fork-supplied `cert_bindings` or `l4_routes` are stripped — so a PR can't grab a production TLS certificate or claim a host port. There's a cap on live previews per app, and a TTL reaper removes previews abandoned for two weeks in case a "closed" event is ever missed.
+
+**Requirements & limits.** You need `edge.base_domain` set (previews live under the wildcard). An app that exposes itself with a fixed `hostname:` rather than the subdomain shorthand can't have previews — a preview would collide with production's hostname, so it's declined (production is never affected).

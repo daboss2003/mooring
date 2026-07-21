@@ -239,3 +239,65 @@ func TestFSMTransitions(t *testing.T) {
 		t.Errorf("invalid state applied: %q", cfg.UpdateState)
 	}
 }
+
+// RegisterPreview is fail-closed + scoped: it needs the base to exist with previews enabled,
+// sets preview_of, and NEVER clobbers a real app or a preview of a different base.
+func TestRegisterPreviewScoping(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	// Base app, previews OFF.
+	if err := s.Save(ctx, SaveInput{Project: "shop", RepoURL: "https://github.com/o/shop.git", Ref: "refs/heads/main", BuildPolicy: "never"}); err != nil {
+		t.Fatal(err)
+	}
+	// Refused: previews not enabled on the base.
+	if err := s.RegisterPreview(ctx, "shop", "shop-pr1", "refs/pull/1/head"); err == nil {
+		t.Fatal("RegisterPreview must refuse when the base has previews disabled")
+	}
+	// Enable previews, then it works and sets preview_of.
+	if err := s.SetPreviewEnabled(ctx, "shop", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RegisterPreview(ctx, "shop", "shop-pr1", "refs/pull/1/head"); err != nil {
+		t.Fatalf("RegisterPreview: %v", err)
+	}
+	cfg, ok, _ := s.Get("shop-pr1")
+	if !ok || cfg.PreviewOf != "shop" || cfg.Ref != "refs/pull/1/head" || cfg.RepoURL != "https://github.com/o/shop.git" {
+		t.Fatalf("preview app wrong: %+v", cfg)
+	}
+	// A second base must NOT be able to hijack an existing preview slug of "shop".
+	if err := s.Save(ctx, SaveInput{Project: "evil", RepoURL: "https://github.com/x/evil.git", Ref: "refs/heads/main", BuildPolicy: "never"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetPreviewEnabled(ctx, "evil", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RegisterPreview(ctx, "evil", "shop-pr1", "refs/pull/9/head"); err == nil {
+		t.Fatal("RegisterPreview must refuse a slug already owned by a preview of a DIFFERENT base")
+	}
+	// And it must never clobber a REAL (non-preview) app.
+	if err := s.RegisterPreview(ctx, "shop", "evil", "refs/pull/1/head"); err == nil {
+		t.Fatal("RegisterPreview must refuse to overwrite a non-preview app")
+	}
+}
+
+func TestStalePreviews(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.Save(ctx, SaveInput{Project: "shop", RepoURL: "https://github.com/o/shop.git", Ref: "refs/heads/main", BuildPolicy: "never"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = s.SetPreviewEnabled(ctx, "shop", true)
+	_ = s.RegisterPreview(ctx, "shop", "shop-pr1", "refs/pull/1/head")
+	// Not stale yet (updated_at is ~now).
+	if stale, _ := s.StalePreviews(time.Now().Add(-time.Hour).Unix()); len(stale) != 0 {
+		t.Fatalf("nothing should be stale yet, got %v", stale)
+	}
+	// Stale against a future cutoff.
+	if stale, _ := s.StalePreviews(time.Now().Add(time.Hour).Unix()); len(stale) != 1 || stale[0] != "shop-pr1" {
+		t.Fatalf("shop-pr1 should be stale, got %v", stale)
+	}
+	// A non-preview app is never returned.
+	if stale, _ := s.StalePreviews(time.Now().Add(time.Hour).Unix()); len(stale) == 1 && stale[0] == "shop" {
+		t.Fatal("a non-preview app must not be reaped")
+	}
+}

@@ -96,3 +96,26 @@ func TestUsersValidationRejects(t *testing.T) {
 		}
 	}
 }
+
+// A user hashed at a DIFFERENT argon2 cost than the owner is rejected — else its login-verify
+// latency would differ from the timing-parity dummy and make the username enumerable.
+func TestUsersRejectMismatchedArgonParams(t *testing.T) {
+	owner := realHash(t) // DefaultArgon2Params
+	// Same password, deliberately different memory cost.
+	p := crypto.DefaultArgon2Params
+	p.Memory *= 2
+	other, err := crypto.HashPassword([]byte("whatever"), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	users := "users:\n  - {username: bob, password_hash: \"" + other + "\", role: viewer}"
+	if _, err := Parse([]byte(rbacConfig(owner, users))); err == nil {
+		t.Error("a user hashed at a different argon2 cost must be rejected")
+	}
+	// Sanity: a user hashed at the SAME cost is accepted.
+	same := realHash(t)
+	okUsers := "users:\n  - {username: carol, password_hash: \"" + same + "\", role: viewer}"
+	if _, err := Parse([]byte(rbacConfig(owner, okUsers))); err != nil {
+		t.Errorf("matching argon2 params should be accepted: %v", err)
+	}
+}

@@ -22,8 +22,9 @@ import (
 
 // authExempt are the deliberately public (no requireAuth) routes.
 var authExempt = map[string]bool{
-	"GET /healthz":          true,
-	"POST /webhook/{token}": true, // HMAC + replay + rate-limit gated instead
+	"GET /healthz":             true,
+	"POST /webhook/{token}":    true, // HMAC + replay + rate-limit gated instead
+	"POST /webhook/pr/{token}": true, // GitHub HMAC (X-Hub-Signature-256) gated instead
 	"GET /login":            true,
 	"POST /login":           true,
 	"POST /logout":          true,
@@ -38,7 +39,8 @@ var authExempt = map[string]bool{
 
 // csrfExempt are the mutating routes that intentionally do NOT use requireCSRF.
 var csrfExempt = map[string]bool{
-	"POST /webhook/{token}": true, // authenticated by HMAC signature, not a session/CSRF
+	"POST /webhook/{token}":    true, // authenticated by HMAC signature, not a session/CSRF
+	"POST /webhook/pr/{token}": true, // authenticated by GitHub HMAC signature, not a session/CSRF
 }
 
 var mutatingVerb = map[string]bool{"POST": true, "PUT": true, "PATCH": true, "DELETE": true}

@@ -370,3 +370,15 @@ func TestNewValidatesConfig(t *testing.T) {
 		t.Errorf("endpoint not normalized: %q", c.cfg.Endpoint)
 	}
 }
+
+// Objects over the 5 GiB single-PUT ceiling are rejected up front with a clear message (no
+// multipart yet), rather than streaming the whole body only to get a server 400.
+func TestPutRejectsOversized(t *testing.T) {
+	c, err := New(Config{Endpoint: "s3.us-east-1.amazonaws.com", Region: "us-east-1", Bucket: "b", AccessKeyID: "k", SecretAccessKey: "s"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put(context.Background(), "big.mbk", bytes.NewReader(nil), (5<<30)+1, ""); err == nil || !strings.Contains(err.Error(), "single-PUT") {
+		t.Fatalf("oversized PUT should be rejected with a clear message, got %v", err)
+	}
+}

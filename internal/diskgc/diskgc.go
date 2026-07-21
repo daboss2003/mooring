@@ -35,20 +35,22 @@ type Sem interface {
 
 // Runner is the disk-pressure watcher.
 type Runner struct {
-	sample    Sampler
-	prune     Pruner
-	sem       Sem
-	threshold float64 // percent
-	interval  time.Duration
-	keep      string // build-cache keep size (e.g. "5GB")
-	alert     func(level, title, detail string)
-	log       *slog.Logger
-	lastAlert time.Time
+	sample       Sampler
+	prune        Pruner
+	sem          Sem
+	threshold    float64 // percent
+	interval     time.Duration
+	keep         string // build-cache keep size (e.g. "5GB")
+	buildCacheGC bool   // honor server.build_cache_keep_enabled (skip the cache prune when off)
+	alert        func(level, title, detail string)
+	log          *slog.Logger
+	lastAlert    time.Time
 }
 
-// New builds a Runner. alert may be nil.
-func New(sample Sampler, prune Pruner, sem Sem, thresholdPct int, interval time.Duration, keep string, alert func(level, title, detail string), log *slog.Logger) *Runner {
-	return &Runner{sample: sample, prune: prune, sem: sem, threshold: float64(thresholdPct), interval: interval, keep: keep, alert: alert, log: log}
+// New builds a Runner. alert may be nil. buildCacheGC=false skips the build-cache prune (honors
+// the operator's build_cache_keep_enabled:false opt-out); the dangling-image prune always runs.
+func New(sample Sampler, prune Pruner, sem Sem, thresholdPct int, interval time.Duration, keep string, buildCacheGC bool, alert func(level, title, detail string), log *slog.Logger) *Runner {
+	return &Runner{sample: sample, prune: prune, sem: sem, threshold: float64(thresholdPct), interval: interval, keep: keep, buildCacheGC: buildCacheGC, alert: alert, log: log}
 }
 
 const minInterval = 5 * time.Minute
@@ -100,18 +102,33 @@ func (r *Runner) Check(ctx context.Context) bool {
 			r.log.Info("diskgc", "line", l)
 		}
 	}
-	if err := r.prune.PruneImagesHeld(ctx, onLine); err != nil && r.log != nil {
-		r.log.Warn("diskgc: image prune", "err", err)
+	reclaimed := false // did at least one prune actually run (so the alert doesn't falsely claim success)?
+	if err := r.prune.PruneImagesHeld(ctx, onLine); err != nil {
+		if r.log != nil {
+			r.log.Warn("diskgc: image prune", "err", err)
+		}
+	} else {
+		reclaimed = true
 	}
-	if err := r.prune.PruneBuildCacheHeld(ctx, r.keep, onLine); err != nil && r.log != nil {
-		r.log.Warn("diskgc: build-cache prune", "err", err)
+	// Honor the operator's build-cache opt-out (server.build_cache_keep_enabled:false); the
+	// dangling-image prune above always runs.
+	if r.buildCacheGC {
+		if err := r.prune.PruneBuildCacheHeld(ctx, r.keep, onLine); err != nil {
+			if r.log != nil {
+				r.log.Warn("diskgc: build-cache prune", "err", err)
+			}
+		} else {
+			reclaimed = true
+		}
 	}
-	r.notify(pct, lines)
+	r.notify(pct, lines, reclaimed)
 	return true
 }
 
 // notify alerts the operator, at most once per 6h (so a persistently-full disk doesn't spam).
-func (r *Runner) notify(pct float64, lines []string) {
+// The wording reflects whether reclamation actually ran — it never falsely claims success (e.g.
+// when the write plane is disabled and both prunes no-op).
+func (r *Runner) notify(pct float64, lines []string, reclaimed bool) {
 	if r.alert == nil {
 		return
 	}
@@ -120,8 +137,22 @@ func (r *Runner) notify(pct float64, lines []string) {
 		return
 	}
 	r.lastAlert = now
-	detail := fmt.Sprintf("Disk reached %.0f%%. Reclaimed dangling docker images + build cache. %sIf disk stays high, the cause is app data or logs, not old deploys.", pct, reclaimedLine(lines))
-	r.alert("warning", "Disk pressure — reclaimed docker garbage", detail)
+	var detail string
+	if reclaimed {
+		detail = fmt.Sprintf("Disk reached %.0f%%. Reclaimed dangling docker images%s. %sIf disk stays high, the cause is app data or logs, not old deploys.",
+			pct, buildCacheNote(r.buildCacheGC), reclaimedLine(lines))
+		r.alert("warning", "Disk pressure — reclaimed docker garbage", detail)
+		return
+	}
+	detail = fmt.Sprintf("Disk reached %.0f%%, but automatic reclaim could not run (the write plane may be disabled or docker unreachable). Free space manually if it stays high.", pct)
+	r.alert("warning", "Disk pressure — reclaim unavailable", detail)
+}
+
+func buildCacheNote(on bool) string {
+	if on {
+		return " + build cache"
+	}
+	return ""
 }
 
 // reclaimedLine pulls docker's "Total reclaimed space: …" line (if any) for the alert body.

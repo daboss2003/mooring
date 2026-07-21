@@ -202,6 +202,7 @@ type gitView struct {
 	Diff                *gitDiffView
 	WriteDisabledReason string
 	Versions            []definition.VersionMeta // deploy/edit history; rows with a Commit are rollback targets
+	PreviewEnabled      bool                     // per-PR preview environments opt-in
 }
 
 func shortSha(s string) string {
@@ -309,6 +310,7 @@ func (s *Server) handleGitGet(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		gv.Diff = s.buildDiff(r.Context(), project, cfg)
+		gv.PreviewEnabled = cfg.PreviewEnabled
 		if s.defStore != nil {
 			gv.Versions, _ = s.defStore.List(project) // newest first; rows with a Commit are rollback targets
 		}
@@ -652,17 +654,30 @@ func (s *Server) handleVersionDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	project := r.PathValue("project")
+	actor := sessionUser(r)
+	peer := ClientIP(r.Context()).String()
+	if s.cfg.IsProtectedProject(project) { // consistency with every other git handler
+		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "version_delete", Target: project, Outcome: audit.Deny, Level: audit.Security, Detail: "protected project"})
+		http.Error(w, "protected project", http.StatusForbidden)
+		return
+	}
 	id, perr := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if perr != nil || id <= 0 {
 		http.Error(w, "invalid version id", http.StatusBadRequest)
 		return
 	}
 	if err := s.defStore.DeleteVersion(r.Context(), project, id); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		if errors.Is(err, definition.ErrNotDeletable) {
+			http.Error(w, err.Error(), http.StatusBadRequest) // safe sentinel message
+			return
+		}
+		// A raw DB error is internal — don't echo the driver string; record the failed attempt.
+		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "version_delete", Target: project + " v" + strconv.FormatInt(id, 10), Outcome: audit.Error, Level: audit.Security, Detail: err.Error()})
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	_ = s.audit.Log(r.Context(), audit.Event{
-		Actor: sessionUser(r), IP: ClientIP(r.Context()).String(),
+		Actor: actor, IP: peer,
 		Action: "version_delete", Target: project + " v" + strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security,
 	})
 	http.Redirect(w, r, "/apps/"+project+"/git", http.StatusSeeOther)
@@ -722,6 +737,12 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	}
 	if scaffolded {
 		onLine("no mooring file in the repo — using a generated default")
+	}
+	// For a PREVIEW app, rewrite its edge routes to unique slug-derived subdomains BEFORE the
+	// shorthand is expanded — so a preview lands on its own hostname (covered by the wildcard
+	// cert) and can never collide with production, whatever the base app declared.
+	if cfg.PreviewOf != "" {
+		applyPreviewPrefix(def, slug)
 	}
 	// Resolve every `subdomain:` shorthand to a full <subdomain>.<edge.base_domain> hostname
 	// IN PLACE, ONCE, before anything reads it — so compose bind mounts, cert issue/wait/sync,
@@ -907,7 +928,20 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	if err := repo.SetDeployedRef(bg, sha); err != nil {
 		onLine("warning: could not pin deployed ref: " + err.Error())
 	}
-	s.gitStore.SetDeployed(bg, slug, sha)
+	if rollback {
+		// A rollback moves the deployed commit BACKWARD while the branch tip is still ahead.
+		// Record the true "behind" state (not a false up_to_date), and PAUSE auto-deploy so the
+		// next webhook can't silently re-promote the commit the operator just rolled away from.
+		behind, _ := repo.CommitsBehind(ctx, sha, cfg.StagedCommit)
+		s.gitStore.SetDeployedBehind(bg, slug, sha, behind)
+		if cfg.AutoDeploy {
+			s.gitStore.SetAutoDeploy(bg, slug, false)
+			onLine("auto-deploy paused (rolled back below the branch tip) — re-enable it on the repo page once resolved")
+			_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: "", Action: "auto_deploy_paused", Target: slug, Outcome: audit.OK, Level: audit.Security, Detail: "rollback to " + shortSha(sha)})
+		}
+	} else {
+		s.gitStore.SetDeployed(bg, slug, sha)
+	}
 	onLine("deployed " + shortSha(sha))
 
 	// Reclaim build cache so the generated multi-stage builds' single-use runtime layers

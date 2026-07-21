@@ -26,6 +26,10 @@ const (
 	LabelService     = "com.docker.compose.service"
 	LabelWorkingDir  = "com.docker.compose.project.working_dir"
 	LabelConfigFiles = "com.docker.compose.project.config_files"
+	// LabelOneOff marks a `docker compose run` container ("True"). These are transient one-shot
+	// containers (cron scheduled_tasks, backup/restore sidecars) — NOT supervised services — so
+	// the monitor/self-heal must exclude them from the app snapshot.
+	LabelOneOff = "com.docker.compose.oneoff"
 )
 
 const maxResponseBytes = 16 << 20 // cap untrusted API responses

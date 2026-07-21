@@ -315,6 +315,7 @@ func cmdServe(args []string) error {
 				return hs.DiskUsed, hs.DiskTotal, true
 			},
 			runner, dockerSem, cfg.Server.DiskGCThresholdPct(), 15*time.Minute, cfg.Server.BuildCacheKeepSize(),
+			cfg.Server.BuildCacheGCOn(),
 			func(level, title, detail string) {
 				_ = alertStore.EnqueueInfra(context.Background(), alert.Outbox{
 					Target: "disk", Kind: "disk_pressure", Level: level, Transition: "firing",
@@ -682,6 +683,10 @@ func cmdServe(args []string) error {
 	// one-shot `compose run --rm` containers. No-op for apps with no scheduled_tasks.
 	wg.Add(1)
 	go func() { defer wg.Done(); srv.RunCron(ctx) }()
+
+	// Preview-environment reaper: a TTL backstop that tears down abandoned per-PR previews.
+	wg.Add(1)
+	go func() { defer wg.Done(); srv.RunPreviewReaper(ctx) }()
 
 	// Cert-renewal watcher: when the managed edge renews a leaf, re-sync each app's
 	// cert_bindings + recreate the affected TLS services so they pick it up WITHOUT a

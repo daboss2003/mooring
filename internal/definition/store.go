@@ -14,6 +14,10 @@ import (
 // Mooring). It is never loaded — fail-closed.
 var ErrTampered = errors.New("definition HMAC mismatch (tampered)")
 
+// ErrNotDeletable means a version delete targeted a non-existent id or the current live version
+// (the latest row, which cannot be deleted). It maps to a 400 (a raw DB error maps to a 500).
+var ErrNotDeletable = errors.New("version not found, or it is the current live version (which cannot be deleted)")
+
 // Store persists applied canonical definitions (the history; the latest per slug is
 // the live canonical). Every read RE-PARSES + RE-VALIDATES the stored YAML through
 // the full pipeline (re-derive, never a verbatim replay), and the per-row HMAC is
@@ -101,7 +105,7 @@ func (s *Store) DeleteVersion(ctx context.Context, slug string, id int64) error 
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		return errors.New("version not found, or it is the current live version (which cannot be deleted)")
+		return ErrNotDeletable
 	}
 	return nil
 }
