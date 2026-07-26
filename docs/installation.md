@@ -7,12 +7,52 @@ This is the one part you do over SSH. It takes about five minutes: put the progr
 ## What you need
 
 - A **Linux server** with `systemd` (any cheap VPS works).
-- **Docker** installed, with the Compose plugin (`docker compose`).
+- **Docker** installed, with the Compose plugin (`docker compose`) — [how to install it is just below](#install-docker-first).
 - **Caddy** — the managed HTTPS edge supervises a child Caddy for `:80`/`:443` + automatic certificates. It isn't bundled (it's third-party, like Docker); `mooring setup` installs it for you (below), or the `.deb`/`.rpm` pulls it in if you've added Caddy's apt repo.
 - **SSH access** to the server.
 - **1 GB of RAM or more** if you want to deploy and build apps on the box. Monitoring and HTTPS run fine on a smaller server.
 
 > **Why doesn't Mooring just install these itself at runtime?** Because the running service is deliberately **unprivileged** — it can't install packages, edit host DNS, or grant capabilities. That's the security model: a compromised dashboard must not be able to either. So prerequisites are a one-time, admin-run, root job — which `mooring setup` makes a single command (it runs as *you* over SSH, not as the service).
+
+### Install Docker first
+
+`mooring setup` installs Caddy for you, but **Docker is deliberately left to you.** It's your host's container runtime and root-equivalent trust base, and installing it — choosing storage/cgroup drivers, daemon config, group membership — redefines the box in ways a control plane shouldn't decide on your behalf. So set it up once, up front. (`mooring doctor` will report Docker as **missing** until you do.)
+
+If both of these already print a version, you're set — skip ahead:
+
+```bash
+docker --version
+docker compose version    # note the space — the v2 "Compose plugin", not the old docker-compose
+```
+
+If not, install the **engine plus the Compose and Buildx plugins** (Mooring needs all three — it builds images with BuildKit). On **Ubuntu**, using Docker's official apt repo:
+
+```bash
+# 1. Add Docker's official GPG key
+sudo apt update
+sudo apt install -y ca-certificates curl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+# 2. Add Docker's apt repo
+sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
+Types: deb
+URIs: https://download.docker.com/linux/ubuntu
+Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+sudo apt update
+
+# 3. Install the engine + plugins
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+> **On Debian**, replace both `ubuntu` occurrences above with `debian`. **Fedora / RHEL / other distros:** follow <https://docs.docker.com/engine/install/>. In a hurry on Debian/Ubuntu and don't need the newest engine? The distro's own packages work too: `sudo apt install docker.io docker-compose-v2 docker-buildx`.
+
+Then confirm the Compose plugin is live — `docker compose version` should print `v2.x`. That's all the Docker you touch — from here, Mooring drives it for you over a locked-down, read-only connection.
 
 ## 1. Install the program
 
