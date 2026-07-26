@@ -427,18 +427,28 @@ func cmdServe(args []string) error {
 			CAs:            edgeCAs(cfg),
 			AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
 			AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
-			AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
-			BaseDomain:     cfg.Edge.BaseDomain,
+			AdminUpstream:  cfg.AdminEdgeListen(), // the dedicated edge listener (not the SSH-tunnel bind)
 		}
-		if d := cfg.Edge.DNS01; d != nil { // opt-in *.<base_domain> wildcard via DNS-01
-			base.DNS01Provider, base.DNS01Token = d.Provider, d.APIToken
-			log.Info("edge: issuing a *."+cfg.Edge.BaseDomain+" wildcard cert via ACME DNS-01", "provider", d.Provider)
-			// Install the provider's Caddy DNS plugin automatically (no manual xcaddy build).
-			// Best-effort: if it can't install, the edge still comes up on the module-free boot
-			// floor and only the wildcard reconcile fails visibly.
-			if ierr := edge.EnsureDNSProvider(ctx, "caddy", d.Provider, log); ierr != nil {
-				log.Warn("edge: could not auto-install the Caddy DNS plugin — the wildcard cert won't issue until it's present",
-					"provider", d.Provider, "err", ierr.Error())
+		// Per-namespace DNS-01 wildcards. Install each DISTINCT provider's Caddy plugin (add-package
+		// accumulates modules into the binary), and include a namespace's wildcard in the rendered
+		// config ONLY if its provider module is actually present. This ISOLATES failures: one
+		// namespace's missing/failed DNS plugin can never make Caddy reject the whole /load and deny
+		// routes to every OTHER namespace (including pure HTTP-01 apps with no dns01 at all). A
+		// namespace whose module is unavailable falls back to per-name HTTP-01 for its subdomains
+		// (issued only if HTTP-reachable), logged loudly.
+		providerOK := map[string]bool{}
+		for _, w := range edgeWildcards(cfg) {
+			if _, done := providerOK[w.DNS01Provider]; !done {
+				ierr := edge.EnsureDNSProvider(ctx, "caddy", w.DNS01Provider, log)
+				providerOK[w.DNS01Provider] = ierr == nil
+				if ierr != nil {
+					log.Warn("edge: Caddy DNS plugin unavailable — wildcards using it fall back to per-name HTTP-01 until it's installed",
+						"provider", w.DNS01Provider, "err", ierr.Error())
+				}
+			}
+			if providerOK[w.DNS01Provider] {
+				log.Info("edge: issuing a *."+w.Domain+" wildcard cert via ACME DNS-01", "provider", w.DNS01Provider)
+				base.Wildcards = append(base.Wildcards, w)
 			}
 		}
 		if ok, why := edge.Available(""); ok {
@@ -460,7 +470,7 @@ func cmdServe(args []string) error {
 			// boot — so a missing module never bricks the whole edge (:80/:443 + all HTTP-01
 			// apps + the admin vhost). The wildcard is then introduced by the first Reconcile.
 			floor := base
-			floor.DNS01Provider, floor.DNS01Token = "", ""
+			floor.Wildcards = nil
 			if initCfg, rerr := edge.Render(floor, nil, nil); rerr == nil {
 				sup.InitialCfg = initCfg
 			}
@@ -766,6 +776,22 @@ func edgeCAs(cfg *config.Config) []edge.CA {
 			roots = []string{c.TrustedRoot}
 		}
 		out = append(out, edge.CA{Name: c.Name, DirectoryURL: c.DirectoryURL, Email: c.Email, TrustedRoots: roots})
+	}
+	return out
+}
+
+// edgeWildcards collects the *.<domain> DNS-01 wildcard certs to issue: the default base_domain
+// (when it sets edge.dns01) plus each named edge.base_domains entry that sets dns01. A namespace
+// without dns01 keeps per-name HTTP-01 for its subdomains.
+func edgeWildcards(cfg *config.Config) []edge.WildcardCert {
+	var out []edge.WildcardCert
+	if bd := strings.TrimSpace(cfg.Edge.BaseDomain); bd != "" && cfg.Edge.DNS01 != nil {
+		out = append(out, edge.WildcardCert{Domain: bd, DNS01Provider: cfg.Edge.DNS01.Provider, DNS01Token: cfg.Edge.DNS01.APIToken})
+	}
+	for _, b := range cfg.Edge.BaseDomains {
+		if b.DNS01 != nil {
+			out = append(out, edge.WildcardCert{Domain: b.Domain, DNS01Provider: b.DNS01.Provider, DNS01Token: b.DNS01.APIToken})
+		}
 	}
 	return out
 }

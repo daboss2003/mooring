@@ -63,11 +63,19 @@ type BaseConfig struct {
 	AdminHostname  string   // "" = NO admin vhost (reach the UI via SSH tunnel)
 	AdminAllowlist []string // IP-allowlist CIDRs for the admin vhost (typed, mandatory if AdminHostname set)
 	AdminUpstream  string   // the ONLY loopback upstream, identity-pinned (e.g. 127.0.0.1:9000)
-	// BaseDomain + DNS01* enable an OPTIONAL *.<BaseDomain> wildcard cert via ACME DNS-01:
-	// any default-CA subject at/under BaseDomain is served by the one wildcard (dropped from
-	// per-name HTTP-01 issuance). Empty DNS01Provider = disabled (per-subdomain HTTP-01).
-	BaseDomain    string
-	DNS01Provider string // caddy DNS module name (must be compiled into the caddy binary)
+	// Wildcards enable OPTIONAL *.<Domain> wildcard certs via ACME DNS-01 — one entry per
+	// operator-declared subdomain namespace (the default base_domain and each edge.base_domains)
+	// that sets dns01. Any default-CA subject at/under a wildcard's Domain is served by that
+	// wildcard (dropped from per-name HTTP-01 issuance). Empty slice = all per-name HTTP-01.
+	Wildcards []WildcardCert
+}
+
+// WildcardCert is one *.<Domain> DNS-01 wildcard: a namespace apex + the DNS provider
+// credentials that answer its ACME DNS-01 challenge. The provider module must be compiled into
+// the caddy binary (Mooring installs it via `caddy add-package`).
+type WildcardCert struct {
+	Domain        string
+	DNS01Provider string // caddy DNS module name
 	DNS01Token    string // provider credential (secret)
 }
 
@@ -276,24 +284,23 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 	// policy (its issuer directory + optional trusted roots), and everything else uses
 	// the default issuer. An unknown CA name falls back to the default (defensive — the
 	// apply layer already rejects unknown names).
-	// Optional *.<base_domain> wildcard via DNS-01: any DEFAULT-CA subject at/under base_domain
-	// is served by the ONE wildcard cert, so drop it from per-name issuance (dodges HTTP-01
-	// rate limits and covers non-HTTP-reachable names). A named-CA subject or a subject outside
-	// base_domain keeps its own HTTP-01 cert. The wildcard string is Mooring-generated (never
-	// operator route input), so it never passes through the no-wildcard hostname check.
-	wildcard := ""
-	if base.DNS01Provider != "" && base.BaseDomain != "" {
-		wildcard = "*." + base.BaseDomain
+	// Optional *.<domain> wildcards via DNS-01, ONE per operator-declared namespace that set
+	// dns01 (base.Wildcards). Any DEFAULT-CA subject at/under a namespace apex is served by that
+	// namespace's wildcard, so drop it from per-name issuance (dodges HTTP-01 rate limits and
+	// covers non-HTTP-reachable names). A named-CA subject, or a subject outside every wildcard
+	// apex, keeps its own HTTP-01 cert. Each wildcard string is Mooring-generated (never operator
+	// route input), so it never passes through the no-wildcard hostname check.
+	if len(base.Wildcards) > 0 {
 		kept := make([]string, 0, len(subjects))
 		for _, h := range subjects {
-			if subjectCA[h] == "" && coveredByWildcard(h, base.BaseDomain) {
-				continue // covered by the wildcard
+			if subjectCA[h] == "" && coveredByAnyWildcard(h, base.Wildcards) {
+				continue // covered by some namespace's wildcard
 			}
 			kept = append(kept, h)
 		}
 		subjects = kept
 	}
-	if len(subjects) > 0 || wildcard != "" {
+	if len(subjects) > 0 || len(base.Wildcards) > 0 {
 		caByName := map[string]CA{}
 		for _, c := range base.CAs {
 			caByName[c.Name] = c
@@ -312,7 +319,7 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			}
 			groups[name] = append(groups[name], h)
 		}
-		policies := make([]caddyTLSPolicy, 0, len(order)+1)
+		policies := make([]caddyTLSPolicy, 0, len(order)+len(base.Wildcards))
 		for _, name := range order {
 			iss := caddyIssuer{Module: "acme", CA: base.ACMECA, Email: base.ACMEEmail}
 			if name != "" {
@@ -325,17 +332,22 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			}
 			policies = append(policies, caddyTLSPolicy{Subjects: groups[name], Issuers: []caddyIssuer{iss}})
 		}
-		automate := subjects
-		if wildcard != "" {
-			// One DNS-01 policy for the wildcard (default ACME CA/email + the DNS challenge).
+		automate := append([]string(nil), subjects...)
+		for _, w := range base.Wildcards {
+			if w.Domain == "" || w.DNS01Provider == "" {
+				continue
+			}
+			wc := "*." + w.Domain
+			// One DNS-01 policy per namespace wildcard (default ACME CA/email + that namespace's
+			// DNS provider + token).
 			dnsIss := caddyIssuer{
 				Module: "acme", CA: base.ACMECA, Email: base.ACMEEmail,
 				Challenges: &caddyChallenges{DNS: &caddyDNSChallenge{Provider: map[string]any{
-					"name": base.DNS01Provider, "api_token": base.DNS01Token,
+					"name": w.DNS01Provider, "api_token": w.DNS01Token,
 				}}},
 			}
-			policies = append(policies, caddyTLSPolicy{Subjects: []string{wildcard}, Issuers: []caddyIssuer{dnsIss}})
-			automate = append(append([]string(nil), subjects...), wildcard)
+			policies = append(policies, caddyTLSPolicy{Subjects: []string{wc}, Issuers: []caddyIssuer{dnsIss}})
+			automate = append(automate, wc)
 		}
 		cfg.Apps.TLS = &caddyTLS{
 			// automate makes Caddy actually obtain a cert for every subject — including
@@ -346,6 +358,19 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		}
 	}
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// coveredByAnyWildcard reports whether host is a single-label subdomain of ANY configured
+// wildcard namespace apex (so it can be dropped from per-name issuance in favor of that
+// wildcard). Namespace apexes are validated disjoint (no nesting) in config, so at most one
+// wildcard can match.
+func coveredByAnyWildcard(host string, wildcards []WildcardCert) bool {
+	for _, w := range wildcards {
+		if w.Domain != "" && w.DNS01Provider != "" && coveredByWildcard(host, w.Domain) {
+			return true
+		}
+	}
+	return false
 }
 
 // coveredByWildcard reports whether a *.base certificate covers host. A wildcard matches

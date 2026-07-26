@@ -88,14 +88,14 @@ func TestApplyPreviewPrefix(t *testing.T) {
 	// Single route: subdomain becomes exactly the slug; a fixed hostname is cleared.
 	def := &definition.Definition{}
 	def.Spec.Edge.Routes = []definition.Route{{Hostname: "shop.example.com", Service: "web"}}
-	applyPreviewPrefix(def, "shop-pr42")
+	applyPreviewPrefix(def, "shop-pr42", "")
 	if got := def.Spec.Edge.Routes[0]; got.Subdomain != "shop-pr42" || got.Hostname != "" {
 		t.Fatalf("single route rewrite: %+v", got)
 	}
 	// Multiple routes: indexed subdomains, all fixed hostnames cleared.
 	def2 := &definition.Definition{}
 	def2.Spec.Edge.Routes = []definition.Route{{Subdomain: "api", Service: "api"}, {Hostname: "web.example.com", Service: "web"}}
-	applyPreviewPrefix(def2, "shop-pr7")
+	applyPreviewPrefix(def2, "shop-pr7", "")
 	if def2.Spec.Edge.Routes[0].Subdomain != "shop-pr7-0" || def2.Spec.Edge.Routes[1].Subdomain != "shop-pr7-1" {
 		t.Fatalf("multi route rewrite: %+v", def2.Spec.Edge.Routes)
 	}
@@ -115,7 +115,7 @@ func TestApplyPreviewPrefix(t *testing.T) {
 			Ports:        []definition.Port{{Internal: 8080, Publish: true, Public: true, Published: 8080}},
 		},
 	}
-	applyPreviewPrefix(def3, "shop-pr5")
+	applyPreviewPrefix(def3, "shop-pr5", "")
 	if len(def3.Spec.Edge.L4Routes) != 0 {
 		t.Error("a preview must strip fork-controlled L4 routes")
 	}
@@ -124,5 +124,20 @@ func TestApplyPreviewPrefix(t *testing.T) {
 	}
 	if p := def3.Spec.Compose.Services["web"].Ports[0]; p.Publish || p.Public || p.Published != 0 {
 		t.Errorf("a preview must strip host-port publishing, got %+v", p)
+	}
+}
+
+// A preview is PINNED to the base app's edge namespace — a fork PR's app-level or per-route
+// base_domain choice is overwritten/cleared, so it can't aim its preview at another namespace.
+func TestApplyPreviewPrefixPinsNamespace(t *testing.T) {
+	def := &definition.Definition{}
+	def.Spec.Edge.BaseDomain = "prod" // the untrusted PR head tries to pick "prod"…
+	def.Spec.Edge.Routes = []definition.Route{{Subdomain: "api", BaseDomain: "prod", Service: "api"}}
+	applyPreviewPrefix(def, "shop-pr9", "staging") // …but the base app is on "staging"
+	if def.Spec.Edge.BaseDomain != "staging" {
+		t.Errorf("preview namespace must be pinned to the base app: got %q, want staging", def.Spec.Edge.BaseDomain)
+	}
+	if def.Spec.Edge.Routes[0].BaseDomain != "" {
+		t.Error("a per-route fork namespace override must be cleared on a preview")
 	}
 }

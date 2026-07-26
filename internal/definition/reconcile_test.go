@@ -195,6 +195,44 @@ func TestValidateEdgeUnknownService(t *testing.T) {
 	}
 }
 
+func TestValidateEdgeBaseDomain(t *testing.T) {
+	// Build a full mooring.yaml with a custom edge: block (Parse runs the schema validation
+	// where the base_domain-namespace checks live — the package-level Validate above is the
+	// separate compose gate).
+	doc := func(edge string) []byte {
+		return []byte(`apiVersion: mooring/v1
+kind: App
+metadata:
+  slug: shop
+spec:
+  compose:
+    source: generated
+    services:
+      web:
+        image: ghcr.io/acme/web:1.2
+        ports:
+          - internal: 8080
+  edge:
+` + edge)
+	}
+	// Valid: app-level namespace NAME + a subdomain route (existence deferred to deploy).
+	if _, err := Parse(doc("    base_domain: staging\n    routes:\n      - subdomain: api\n        service: web\n        port: 8080\n")); err != nil {
+		t.Fatalf("app-level base_domain name + subdomain should validate: %v", err)
+	}
+	// Valid: per-item override + subdomain.
+	if _, err := Parse(doc("    routes:\n      - subdomain: cdn\n        base_domain: edge\n        service: web\n        port: 8080\n")); err != nil {
+		t.Fatalf("per-item base_domain override on a subdomain should validate: %v", err)
+	}
+	// Reject: an FQDN base_domain (it's a namespace NAME, not an apex the app can invent).
+	if _, err := Parse(doc("    base_domain: staging.example.com\n    routes:\n      - hostname: shop.example.com\n        service: web\n        port: 8080\n")); err == nil {
+		t.Error("an FQDN base_domain must be rejected (namespace NAME, not an apex)")
+	}
+	// Reject: per-item base_domain alongside a literal hostname (no subdomain) — meaningless.
+	if _, err := Parse(doc("    routes:\n      - hostname: shop.example.com\n        base_domain: staging\n        service: web\n        port: 8080\n")); err == nil {
+		t.Error("base_domain without a subdomain must be rejected")
+	}
+}
+
 func TestDiffPlan(t *testing.T) {
 	if p, _ := DiffPlan(nil, base()); !p.NewApp {
 		t.Error("nil current must be a NewApp plan")

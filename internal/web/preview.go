@@ -105,11 +105,17 @@ func previewRef(number int) string {
 // applyPreviewPrefix rewrites a preview app's EDGE ROUTES to unique subdomains derived from its
 // slug, so a preview can NEVER collide with production regardless of how the base app exposed
 // itself (subdomain OR fixed hostname). One exposed route → "<slug>"; multiple → "<slug>-<i>"
-// (index-based, so the label is always valid). The base_domain wildcard cert covers them, so
+// (index-based, so the label is always valid). The namespace wildcard cert covers them, so
 // HTTPS is automatic. Cert-bindings (an app terminating its own TLS on a fixed hostname) are
 // left untouched — such an app can't have a preview and fails closed on the route-collision
 // check rather than ever affecting production.
-func applyPreviewPrefix(def *definition.Definition, slug string) {
+//
+// baseNamespace PINS the preview to the BASE app's edge namespace (config.yaml
+// edge.base_domains name, or "" for the default base_domain). The whole def comes from the
+// untrusted PR head, so we OVERWRITE its app-level base_domain and CLEAR every per-item
+// base_domain — a fork PR must not be able to aim its preview at a different namespace's
+// wildcard than the base app uses.
+func applyPreviewPrefix(def *definition.Definition, slug, baseNamespace string) {
 	routes := def.Spec.Edge.Routes
 	multi := len(routes) > 1
 	for i := range routes {
@@ -118,8 +124,11 @@ func applyPreviewPrefix(def *definition.Definition, slug string) {
 			sub = fmt.Sprintf("%s-%d", slug, i)
 		}
 		routes[i].Subdomain = sub
-		routes[i].Hostname = "" // drop any fixed hostname so it can't collide with prod
+		routes[i].Hostname = ""   // drop any fixed hostname so it can't collide with prod
+		routes[i].BaseDomain = "" // drop any per-route namespace the fork chose
 	}
+	// Pin the whole preview to the base app's namespace (never the fork's choice).
+	def.Spec.Edge.BaseDomain = baseNamespace
 	// The whole mooring.yaml comes from the (untrusted) PR head, so STRIP anything a fork could
 	// aim at production: cert_bindings (which would copy an already-issued TLS private key — for
 	// ANY hostname the edge has a cert for — into the fork's container) and L4 routes (which
@@ -139,6 +148,56 @@ func applyPreviewPrefix(def *definition.Definition, slug string) {
 		def.Spec.Compose.Services[name] = svc
 	}
 	def.Spec.Edge.L4Routes = nil
+}
+
+// basePreviewNamespace resolves which edge namespace a preview of `base` must be PINNED to — the
+// base app's own namespace, never the fork PR's choice. It is fail-CLOSED: if the base app's
+// canonical can't be loaded (not deployed yet, or a store error) it returns an error so the
+// preview is REFUSED, rather than silently homing fork code on the production default apex. When
+// the base has no app-level default it recovers the namespace from the base's (already-expanded,
+// literal) route/cert hostnames; a base spanning multiple namespaces is an error (ambiguous).
+func (s *Server) basePreviewNamespace(base string) (string, error) {
+	if s.defStore == nil {
+		return "", fmt.Errorf("preview: definition store unavailable")
+	}
+	bdef, err := s.defStore.Current(base)
+	if err != nil {
+		return "", fmt.Errorf("preview: cannot read base app %q definition: %w", base, err)
+	}
+	if bdef == nil {
+		return "", fmt.Errorf("preview: base app %q has not been deployed yet — deploy it before previews can pin a namespace", base)
+	}
+	if ns := strings.TrimSpace(bdef.Spec.Edge.BaseDomain); ns != "" {
+		return ns, nil // the app-level default namespace
+	}
+	// No app-level default: recover the namespace from the base's expanded hostnames.
+	seen := map[string]bool{}
+	var names []string
+	consider := func(host string) {
+		if host == "" {
+			return
+		}
+		if name, ok := s.cfg.NamespaceForHost(host); ok && !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	for _, r := range bdef.Spec.Edge.Routes {
+		consider(r.Hostname)
+	}
+	for _, svc := range bdef.Spec.Compose.Services {
+		for _, cb := range svc.CertBindings {
+			consider(cb.Hostname)
+		}
+	}
+	switch len(names) {
+	case 0:
+		return "", nil // base uses no namespaced subdomain → the default namespace
+	case 1:
+		return names[0], nil
+	default:
+		return "", fmt.Errorf("preview: base app %q spans multiple namespaces — set spec.edge.base_domain on it to pin previews", base)
+	}
 }
 
 // prWebhookBodyLimit caps the PR webhook body (GitHub payloads are tens of KB; this is slack).

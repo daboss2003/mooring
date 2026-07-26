@@ -66,6 +66,18 @@ func validateHostOrSubdomain(what, hostname, subdomain string) error {
 	return nil
 }
 
+// validateBaseDomainName checks a base_domain NAMESPACE NAME reference (an app-level default or
+// a per-item override). It must be a name token — the actual namespace is declared in the
+// operator's config.yaml edge.base_domains, so existence is deferred to deploy exactly like the
+// subdomain→apex expansion (base_domain lives in operator config, not the app repo). The empty
+// string is the default namespace and always valid.
+func validateBaseDomainName(what, name string) error {
+	if name != "" && !edgeCANameRe.MatchString(name) {
+		return fmt.Errorf("%s base_domain %q must be a namespace NAME [a-z][a-z0-9-]{0,30} declared in config.yaml edge.base_domains, not an FQDN", what, name)
+	}
+	return nil
+}
+
 // buildLanguages are the recognized build languages. "auto" (the default) detects
 // the stack from the repo; "generic" wraps the operator's own base + commands.
 var buildLanguages = map[string]bool{
@@ -317,10 +329,11 @@ func (b *Binding) UnmarshalYAML(n *yaml.Node) error {
 // service when the edge renews the leaf), so a renewed cert is picked up without a
 // manual redeploy.
 type CertBinding struct {
-	Hostname  string `yaml:"hostname"`
-	Subdomain string `yaml:"subdomain,omitempty"` // XOR hostname: expands to <subdomain>.<edge.base_domain>
-	Mount     string `yaml:"mount"`
-	CA        string `yaml:"ca,omitempty"` // "" = default issuer; else a named CA from config.yaml edge.cas
+	Hostname   string `yaml:"hostname"`
+	Subdomain  string `yaml:"subdomain,omitempty"`   // XOR hostname: expands to <subdomain>.<namespace apex>
+	BaseDomain string `yaml:"base_domain,omitempty"` // per-item namespace NAME override (only with subdomain)
+	Mount      string `yaml:"mount"`
+	CA         string `yaml:"ca,omitempty"` // "" = default issuer; else a named CA from config.yaml edge.cas
 }
 
 // Secret declares a name (+ optional generate hint) — NEVER a value.
@@ -331,8 +344,14 @@ type Secret struct {
 
 // Edge is the Layer-1 route input (§6).
 type Edge struct {
-	Routes   []Route   `yaml:"routes,omitempty"`
-	L4Routes []L4Route `yaml:"l4_routes,omitempty"`
+	// BaseDomain names which operator-declared namespace (config.yaml edge.base_domains[].name)
+	// this app's `subdomain:` shorthands expand under. "" = the default (edge.base_domain). It
+	// is a NAME referencing operator config, never an apex the app can invent — an undeclared
+	// name fails the deploy (the name lives in config.yaml, not this repo). A route/cert_binding
+	// may override it per-item.
+	BaseDomain string    `yaml:"base_domain,omitempty"`
+	Routes     []Route   `yaml:"routes,omitempty"`
+	L4Routes   []L4Route `yaml:"l4_routes,omitempty"`
 }
 
 // L4Route is one managed Layer-4 (TCP/UDP) listener: a fixed public port the L4 load
@@ -352,7 +371,8 @@ type L4Route struct {
 // Route is one managed edge vhost. Upstream is a SELECTOR — "service:port".
 type Route struct {
 	Hostname        string `yaml:"hostname"`
-	Subdomain       string `yaml:"subdomain,omitempty"` // XOR hostname: expands to <subdomain>.<edge.base_domain>
+	Subdomain       string `yaml:"subdomain,omitempty"`   // XOR hostname: expands to <subdomain>.<namespace apex>
+	BaseDomain      string `yaml:"base_domain,omitempty"` // per-item namespace NAME override (only with subdomain)
 	Service         string `yaml:"service"`
 	Port            int    `yaml:"port"`
 	PathPrefix      string `yaml:"path_prefix"`
@@ -1004,6 +1024,12 @@ func validateCertBinding(svc string, cb CertBinding) error {
 	if err := validateHostOrSubdomain(fmt.Sprintf("service %q cert_bindings", svc), cb.Hostname, cb.Subdomain); err != nil {
 		return err
 	}
+	if err := validateBaseDomainName(fmt.Sprintf("service %q cert_bindings", svc), cb.BaseDomain); err != nil {
+		return err
+	}
+	if cb.BaseDomain != "" && cb.Subdomain == "" {
+		return fmt.Errorf("service %q cert_bindings sets base_domain without a subdomain — base_domain only selects the namespace for the subdomain shorthand", svc)
+	}
 	if err := mountPath(cb.Mount); err != nil {
 		return fmt.Errorf("service %q cert_bindings mount: %w", svc, err)
 	}
@@ -1063,6 +1089,9 @@ func (s *Spec) validateEdge() error {
 	for n := range s.Compose.Services {
 		declared[n] = true
 	}
+	if err := validateBaseDomainName("edge", s.Edge.BaseDomain); err != nil {
+		return err
+	}
 	for _, r := range s.Edge.Routes {
 		id := r.Hostname
 		if id == "" {
@@ -1070,6 +1099,12 @@ func (s *Spec) validateEdge() error {
 		}
 		if err := validateHostOrSubdomain("edge route "+id, r.Hostname, r.Subdomain); err != nil {
 			return err
+		}
+		if err := validateBaseDomainName("edge route "+id, r.BaseDomain); err != nil {
+			return err
+		}
+		if r.BaseDomain != "" && r.Subdomain == "" {
+			return fmt.Errorf("edge route %q sets base_domain without a subdomain — base_domain only selects the namespace for the subdomain shorthand", id)
 		}
 		if !svcRe.MatchString(r.Service) {
 			return fmt.Errorf("edge route %q must name a valid service (upstream is a selector, never a literal dial target)", id)

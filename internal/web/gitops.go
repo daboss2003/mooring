@@ -740,9 +740,15 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	}
 	// For a PREVIEW app, rewrite its edge routes to unique slug-derived subdomains BEFORE the
 	// shorthand is expanded — so a preview lands on its own hostname (covered by the wildcard
-	// cert) and can never collide with production, whatever the base app declared.
+	// cert) and can never collide with production, whatever the base app declared. Pin it to the
+	// BASE app's edge namespace (read from the base's canonical def), never the fork PR's choice.
 	if cfg.PreviewOf != "" {
-		applyPreviewPrefix(def, slug)
+		baseNamespace, nerr := s.basePreviewNamespace(cfg.PreviewOf)
+		if nerr != nil {
+			s.gitStore.SetState(bg, slug, "update_blocked")
+			return nerr
+		}
+		applyPreviewPrefix(def, slug, baseNamespace)
 	}
 	// Resolve every `subdomain:` shorthand to a full <subdomain>.<edge.base_domain> hostname
 	// IN PLACE, ONCE, before anything reads it — so compose bind mounts, cert issue/wait/sync,

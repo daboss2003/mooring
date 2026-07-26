@@ -388,10 +388,29 @@ type EdgeConfig struct {
 	// per-name rate limits, and it works for names that aren't HTTP-reachable. It REQUIRES a
 	// caddy binary with your DNS provider's module compiled in (vanilla Caddy has none —
 	// build one with xcaddy). Optional; leave unset to keep per-subdomain HTTP-01.
-	DNS01            *EdgeDNS01 `yaml:"dns01,omitempty"`
-	ApplyProbeWindow Duration   `yaml:"apply_probe_window"`
-	L4Enabled        bool       `yaml:"l4_enabled"`      // own a managed L4 (TCP/UDP) load balancer (nginx-stream)
-	L4NginxDigest    string     `yaml:"l4_nginx_digest"` // pinned SHA-256 of the nginx binary (optional)
+	DNS01 *EdgeDNS01 `yaml:"dns01,omitempty"`
+	// BaseDomains are ADDITIONAL, named subdomain namespaces on top of the default base_domain
+	// above. Colocated apps (e.g. prod + staging on one box) each opt into one BY NAME so both
+	// can keep the `subdomain:` shorthand under their own apex without a route collision. The
+	// scalar base_domain stays the DEFAULT (unnamed) namespace — this is purely additive, and
+	// mirrors how the scalar acme_ca coexists with the named `cas` list. Declared ONLY here in
+	// the root-of-trust config; an app references a name and can never introduce an apex.
+	BaseDomains      []EdgeBaseDomain `yaml:"base_domains,omitempty"`
+	ApplyProbeWindow Duration         `yaml:"apply_probe_window"`
+	L4Enabled        bool             `yaml:"l4_enabled"`      // own a managed L4 (TCP/UDP) load balancer (nginx-stream)
+	L4NginxDigest    string           `yaml:"l4_nginx_digest"` // pinned SHA-256 of the nginx binary (optional)
+}
+
+// EdgeBaseDomain is a NAMED subdomain namespace — an additional apex the operator declares so
+// colocated apps can each use the `subdomain:` shorthand under their own root. An app (or a
+// single route/cert_binding) opts in by Name; unset = the default scalar edge.base_domain.
+// Declared ONLY in the root-of-trust config (an app repo must never introduce an apex). Domain
+// must be a bare FQDN (no wildcards). DNS01, when set, issues a *.<Domain> wildcard cert via
+// ACME DNS-01 for THIS namespace (Phase 2 wires the issuance).
+type EdgeBaseDomain struct {
+	Name   string     `yaml:"name"`   // [a-z][a-z0-9-]{0,30}; referenced as `base_domain: <name>`
+	Domain string     `yaml:"domain"` // the apex FQDN, e.g. staging.example.com
+	DNS01  *EdgeDNS01 `yaml:"dns01,omitempty"`
 }
 
 // EdgeCA is an additional ACME issuer — a private/internal CA (e.g. step-ca). A
@@ -429,6 +448,64 @@ func (c *Config) EdgeCAByName(name string) (EdgeCA, bool) {
 
 // HasEdgeCA reports whether a named edge CA is configured.
 func (c *Config) HasEdgeCA(name string) bool { _, ok := c.EdgeCAByName(name); return ok }
+
+// BaseDomainByName resolves a subdomain-namespace reference to its apex + optional wildcard
+// dns01. The empty name "" means the DEFAULT namespace — the scalar edge.base_domain (with the
+// scalar edge.dns01). A non-empty name looks up edge.base_domains. This is the single resolver
+// every subdomain-expansion site uses, so named and default namespaces behave identically.
+// ok=false means the namespace isn't configured (unknown name, or "" with no base_domain set).
+func (c *Config) BaseDomainByName(name string) (EdgeBaseDomain, bool) {
+	// Always return a normalized (trimmed, lowercased) apex so every expansion site produces a
+	// well-formed, case-consistent hostname regardless of how the operator typed the config.
+	if name == "" {
+		if bd := strings.ToLower(strings.TrimSpace(c.Edge.BaseDomain)); bd != "" {
+			return EdgeBaseDomain{Name: "", Domain: bd, DNS01: c.Edge.DNS01}, true
+		}
+		return EdgeBaseDomain{}, false
+	}
+	for _, b := range c.Edge.BaseDomains {
+		if b.Name == name {
+			b.Domain = strings.ToLower(strings.TrimSpace(b.Domain))
+			return b, true
+		}
+	}
+	return EdgeBaseDomain{}, false
+}
+
+// HasBaseDomain reports whether a base_domain namespace exists (a named one, or the default
+// when name is "").
+func (c *Config) HasBaseDomain(name string) bool { _, ok := c.BaseDomainByName(name); return ok }
+
+// NamespaceForHost returns the NAME of the declared namespace whose apex `host` is a single-label
+// subdomain of ("" = the default base_domain), and ok=false if host is under no declared apex.
+// Named namespaces are checked before the default; apexes are validated disjoint, so at most one
+// matches. Used to recover which namespace an already-expanded (literal) hostname belongs to.
+func (c *Config) NamespaceForHost(host string) (string, bool) {
+	h := strings.ToLower(strings.TrimSpace(host))
+	for _, b := range c.Edge.BaseDomains {
+		if oneLabelUnder(h, strings.ToLower(strings.TrimSpace(b.Domain))) {
+			return b.Name, true
+		}
+	}
+	if bd := strings.ToLower(strings.TrimSpace(c.Edge.BaseDomain)); bd != "" && oneLabelUnder(h, bd) {
+		return "", true
+	}
+	return "", false
+}
+
+// oneLabelUnder reports whether host is EXACTLY one DNS label below apex (foo.apex, not the apex
+// itself nor a.b.apex) — the same coverage rule as a *.apex wildcard.
+func oneLabelUnder(host, apex string) bool {
+	if apex == "" {
+		return false
+	}
+	suffix := "." + apex
+	if !strings.HasSuffix(host, suffix) {
+		return false
+	}
+	label := host[:len(host)-len(suffix)]
+	return label != "" && !strings.Contains(label, ".")
+}
 
 // AdminConfig optionally fronts the admin UI through the edge and points at the
 // Caddy admin endpoint (plan §6.1 SBD-1/SBD-2).
@@ -969,6 +1046,53 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// --- extra named base_domains (additional subdomain namespaces) ---
+	// Names must be unique and grammatical; domains must be disjoint apexes (no exact dupes and
+	// no nesting) — overlapping apexes would make wildcard coverage and subject grouping
+	// ambiguous. The default scalar base_domain participates in the disjointness check so a
+	// named namespace can't shadow it.
+	seenBD := map[string]bool{}
+	seenBDDomain := map[string]string{} // lowercased domain -> owning namespace label (for error text)
+	if bd := strings.ToLower(strings.TrimSpace(c.Edge.BaseDomain)); bd != "" {
+		seenBDDomain[bd] = "edge.base_domain"
+	}
+	for i, b := range c.Edge.BaseDomains {
+		if !edgeCANameRe.MatchString(b.Name) {
+			add("edge.base_domains[%d].name: must match [a-z][a-z0-9-]{0,30} (got %q)", i, b.Name)
+		}
+		if seenBD[b.Name] {
+			add("edge.base_domains: duplicate name %q", b.Name)
+		}
+		seenBD[b.Name] = true
+		// Validate the raw (trimmed, NOT lowercased) domain against the lowercase-only FQDN
+		// grammar — same as the scalar base_domain at line ~966 — so an uppercase apex is
+		// rejected here rather than silently lowercased. The lowercased `dom` is used only for
+		// the disjointness/overlap check below (and BaseDomainByName normalizes at use).
+		rawDom := strings.TrimSpace(b.Domain)
+		dom := strings.ToLower(rawDom)
+		if rawDom == "" || len(rawDom) > 253 || !edgeHostnameRe.MatchString(rawDom) {
+			add("edge.base_domains[%d] (%s): domain %q must be a valid lowercase FQDN with no wildcards (e.g. staging.example.com)", i, b.Name, b.Domain)
+		} else {
+			for other, owner := range seenBDDomain {
+				switch {
+				case dom == other:
+					add("edge.base_domains[%d] (%s): domain %q duplicates %s — namespaces must be distinct", i, b.Name, b.Domain, owner)
+				case strings.HasSuffix(dom, "."+other) || strings.HasSuffix(other, "."+dom):
+					add("edge.base_domains[%d] (%s): domain %q nests with %s (%s) — namespaces must be disjoint apexes", i, b.Name, b.Domain, owner, other)
+				}
+			}
+			seenBDDomain[dom] = fmt.Sprintf("edge.base_domains[%d] (%s)", i, b.Name)
+		}
+		if d := b.DNS01; d != nil {
+			if !dnsProviderRe.MatchString(strings.TrimSpace(d.Provider)) {
+				add("edge.base_domains[%d] (%s): dns01.provider %q must be a caddy DNS module name [a-z0-9._-] (e.g. cloudflare)", i, b.Name, d.Provider)
+			}
+			if strings.TrimSpace(d.APIToken) == "" {
+				add("edge.base_domains[%d] (%s): dns01.api_token is required for the wildcard cert", i, b.Name)
+			}
+		}
+	}
+
 	// --- admin.listen, when set, must never be routable ---
 	if c.Admin.Listen != "" && !adminListenSafe(c.Admin.Listen) {
 		add("admin.listen: must be a unix socket (unix//...) or 127.0.0.1:2019, never routable; got %q", c.Admin.Listen)
@@ -992,8 +1116,17 @@ func (c *Config) Validate() error {
 		if len(h) > 253 || !edgeHostnameRe.MatchString(h) {
 			add("admin hostname %q is not a valid FQDN", h)
 		}
-		if h != "" && h == strings.TrimSpace(c.Edge.BaseDomain) {
+		// Admin must never sit on a namespace APEX (the default base_domain OR any named
+		// base_domains apex): the admin plane sends HSTS includeSubDomains, so an apex admin
+		// would pin every app subdomain under that namespace, and the *.<apex> wildcard doesn't
+		// even cover the apex (cert divergence). Case-insensitive.
+		if h != "" && strings.EqualFold(h, strings.TrimSpace(c.Edge.BaseDomain)) {
 			add("admin must be a subdomain (e.g. admin.%s), not the base_domain apex — apex HSTS would pin every app subdomain", c.Edge.BaseDomain)
+		}
+		for _, b := range c.Edge.BaseDomains {
+			if h != "" && strings.EqualFold(h, strings.TrimSpace(b.Domain)) {
+				add("admin must be a subdomain, not the %q namespace apex %q — apex HSTS would pin every app subdomain under it", b.Name, b.Domain)
+			}
 		}
 		if !isLoopbackBind(c.AdminEdgeListen()) {
 			add("admin.edge_listen %q must be loopback (127.0.0.1:PORT), never routable", c.AdminEdgeListen())

@@ -391,9 +391,41 @@ edge:
 >       port: 3000
 > ```
 
+#### `spec.edge.base_domain` (namespaces)
+
+Running more than one app on a single server (e.g. **prod + staging on one box**)? Declare **named** namespaces in `config.yaml` and let each app pick one by name — so both can keep the `subdomain:` shorthand without colliding on `UNIQUE(hostname)`:
+
+```yaml
+# config.yaml  (operator, SSH-only — the root of trust)
+edge:
+  base_domain: prod.example.com          # the DEFAULT (unnamed) namespace — unchanged
+  base_domains:                          # additional NAMED namespaces
+    - name: staging
+      domain: staging.example.com
+      # dns01: { provider: cloudflare, api_token: … }   # optional per-namespace wildcard cert
+```
+
+```yaml
+# mooring.staging.yaml  (the app)
+spec:
+  edge:
+    base_domain: staging      # a NAME from config.yaml edge.base_domains — NOT an FQDN
+    routes:
+      - subdomain: api        # → api.staging.example.com  (still the shorthand, no full domain)
+        service: api
+        port: 3000
+```
+
+- `spec.edge.base_domain` sets the namespace for **every** `subdomain:` in the app; `""` (omitted) means the default `edge.base_domain`. A single route or `cert_binding` may override it with its own `base_domain: <name>` (only meaningful alongside a `subdomain:`).
+- It is a **name the operator declared**, never an apex the app can invent — an **undeclared name fails the deploy** (fail-closed, exactly like a subdomain with no `base_domain` configured).
+- Each namespace has its own `*.<domain>` wildcard DNS record; add `dns01` to a namespace and it gets its **own** wildcard cert (so `subdomain:` names under it are HTTPS with no per-name issuance). Namespaces must be **disjoint apexes** (Mooring rejects overlapping/nested domains).
+- The **admin dashboard** always lives under the default `edge.base_domain` (not a named namespace).
+- Omit `base_domains` entirely and the single `edge.base_domain` is your only namespace — nothing changes.
+
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `hostname` | string | required *(or `subdomain`)* | The public vhost (a full FQDN). Subject to the §6.2 conflict gate: it may not shadow a managed hostname, the admin vhost, a cert-only hostname, or an auto-scaled pool. |
+| `base_domain` | string | — | **(with `subdomain` only)** The namespace **name** (from `config.yaml` `edge.base_domains`) to expand this route's subdomain under; overrides `spec.edge.base_domain`. See [namespaces](#specedgebase_domain-namespaces). |
 | `subdomain` | string | — | **Instead of `hostname`** (exactly one of the two): a single DNS label expanded to `<subdomain>.<edge.base_domain>`. Needs `edge.base_domain` set in `config.yaml`. See [Subdomain shorthand](#specedgeroutes) above. |
 | `service` | string | required (proxy routes) | The service **in this app's compose** to route to — resolved against this app's discovered containers, never a literal host:port. Cross-project names are rejected; the pinned-dialer + egress-firewall refuse any resolution to a control-plane port (`9000/2019/2375`), loopback, or metadata. |
 | `port` | int | required (proxy routes) | The service's internal container port to forward to. |

@@ -264,6 +264,10 @@ With `dns01` set, subjects at/under `base_domain` are served by the one wildcard
 outside it keep their own HTTP-01 cert. The `api_token` is stored only in the root-only
 `config.yaml` (never logged or shown in the dashboard) and passed solely to the supervised Caddy.
 
+> **More than one app on this box?** Add **named** `edge.base_domains` (each with its own
+> optional `dns01`) so colocated apps — prod, staging, … — each keep the `subdomain:` shorthand
+> under their own apex without colliding. See [namespaces](./definition-file.md#specedgebase_domain-namespaces).
+
 Mooring validates this file at startup. If a required value is missing or the file permissions are too open, it stops with a clear message explaining what to fix.
 
 > Everything *else* about your apps lives in the dashboard (or an optional per-app file). This config is just the foundation.

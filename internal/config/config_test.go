@@ -68,6 +68,90 @@ func TestEdgeCAsValidatedAndParsed(t *testing.T) {
 	mustReject(t, validYAML(t, "  cas:\n    - name: internal\n      directory_url: \"https://x/d\"\n      trusted_root: \"/no/such/file.pem\"\n"), "trusted_root")
 }
 
+func TestEdgeBaseDomainsValidatedAndResolved(t *testing.T) {
+	ov := "  base_domain: \"prod.example.com\"\n" +
+		"  base_domains:\n" +
+		"    - name: staging\n      domain: \"staging.example.com\"\n" +
+		"    - name: edge\n      domain: \"edge.example.com\"\n      dns01:\n        provider: cloudflare\n        api_token: \"tok\"\n"
+	cfg, err := Parse([]byte(validYAML(t, ov)))
+	if err != nil {
+		t.Fatalf("valid edge.base_domains rejected: %v", err)
+	}
+	// The empty name is the DEFAULT namespace — the scalar edge.base_domain.
+	if bd, ok := cfg.BaseDomainByName(""); !ok || bd.Domain != "prod.example.com" {
+		t.Errorf("default namespace resolve = %+v ok=%v, want prod.example.com", bd, ok)
+	}
+	if bd, ok := cfg.BaseDomainByName("staging"); !ok || bd.Domain != "staging.example.com" {
+		t.Errorf("staging resolve = %+v ok=%v", bd, ok)
+	}
+	// A named namespace carries its own dns01.
+	if bd, ok := cfg.BaseDomainByName("edge"); !ok || bd.DNS01 == nil || bd.DNS01.Provider != "cloudflare" {
+		t.Errorf("edge namespace dns01 not carried: %+v ok=%v", bd, ok)
+	}
+	if !cfg.HasBaseDomain("staging") || cfg.HasBaseDomain("ghost") {
+		t.Error("HasBaseDomain wrong")
+	}
+	// With no base_domain scalar set, the default namespace does not resolve.
+	bare, err := Parse([]byte(validYAML(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bare.BaseDomainByName(""); ok {
+		t.Error("default namespace must be unresolved when edge.base_domain is empty")
+	}
+
+	// Rejections: bad name, invalid domain, duplicate name, duplicate/nested domain, nesting the
+	// default scalar, and dns01 missing its token.
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: \"Bad Name\"\n      domain: \"x.example.com\"\n"), "name")
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: ok\n      domain: \"not a domain\"\n"), "domain")
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"a.example.com\"\n    - name: a\n      domain: \"b.example.com\"\n"), "duplicate name")
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"dup.example.com\"\n    - name: b\n      domain: \"dup.example.com\"\n"), "duplicates")
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"example.com\"\n    - name: b\n      domain: \"sub.example.com\"\n"), "nests")
+	mustReject(t, validYAML(t, "  base_domain: \"example.com\"\n  base_domains:\n    - name: b\n      domain: \"sub.example.com\"\n"), "nests")
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"a.example.com\"\n      dns01:\n        provider: cloudflare\n"), "api_token")
+}
+
+// Hardening from the Phase-1 adversarial review.
+func TestEdgeBaseDomainsHardening(t *testing.T) {
+	// (1) An uppercase apex is rejected at validation — consistent with the scalar base_domain,
+	// instead of being silently lowercased.
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"Staging.Example.com\"\n"), "lowercase FQDN")
+
+	// (2) BaseDomainByName normalizes (trim + lowercase) whatever is stored, so every expansion
+	// site produces a well-formed, case-consistent apex.
+	c := &Config{Edge: EdgeConfig{BaseDomains: []EdgeBaseDomain{{Name: "s", Domain: "  Staging.Example.COM  "}}}}
+	if bd, ok := c.BaseDomainByName("s"); !ok || bd.Domain != "staging.example.com" {
+		t.Errorf("BaseDomainByName should normalize the apex, got %q ok=%v", bd.Domain, ok)
+	}
+
+	// (3) Admin must not sit on a NAMED namespace apex (apex-HSTS hazard), not just the scalar.
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: staging\n      domain: \"staging.example.com\"\nadmin:\n  hostname: \"staging.example.com\"\n"), "apex")
+}
+
+// NamespaceForHost maps an expanded (literal) hostname back to the namespace it belongs to —
+// used by preview pinning to recover a base app's namespace from its stored hostnames.
+func TestNamespaceForHost(t *testing.T) {
+	c := &Config{Edge: EdgeConfig{
+		BaseDomain:  "prod.example.com",
+		BaseDomains: []EdgeBaseDomain{{Name: "staging", Domain: "staging.example.com"}},
+	}}
+	cases := []struct {
+		host, name string
+		ok         bool
+	}{
+		{"api.prod.example.com", "", true},           // default namespace
+		{"api.staging.example.com", "staging", true}, // named namespace
+		{"prod.example.com", "", false},              // an apex is NOT one-label-under itself
+		{"a.b.staging.example.com", "", false},       // two labels below → not covered
+		{"api.other.com", "", false},                 // off every namespace
+	}
+	for _, tc := range cases {
+		if name, ok := c.NamespaceForHost(tc.host); ok != tc.ok || name != tc.name {
+			t.Errorf("NamespaceForHost(%q) = (%q,%v), want (%q,%v)", tc.host, name, ok, tc.name, tc.ok)
+		}
+	}
+}
+
 func TestServerTabConfigValidated(t *testing.T) {
 	// A valid server block parses.
 	cfg, err := Parse([]byte(validYAML(t, "server:\n  deb_cache_dir: \"/root/dl\"\n  file_roots:\n    - name: logs\n      path: \"/var/log/app\"\n")))

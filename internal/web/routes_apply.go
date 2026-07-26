@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -169,24 +170,51 @@ func selfHealPolicy(sh *definition.SelfHealing) selfheal.Policy {
 // persisted and a later reconcile or edge restart picks them up, so a transient edge
 // hiccup can't block an otherwise-good apply.
 // expandSubdomains resolves every `subdomain:` shorthand on the definition's edge routes and
-// cert_bindings into a full <subdomain>.<edge.base_domain> hostname IN PLACE, then clears the
-// Subdomain field. This is the SINGLE expansion point: after it, every downstream consumer
-// (compose bind mounts, cert issue/wait/sync, routes, collision checks, the re-validated
-// canonical) reads the final FQDN from .Hostname and none has to know about subdomains. It
-// errors if a subdomain is used but edge.base_domain isn't configured. The schema already
-// validated the label and the hostname/subdomain XOR.
+// cert_bindings into a full <subdomain>.<namespace apex> hostname IN PLACE, then clears the
+// Subdomain (and per-item BaseDomain) field. This is the SINGLE expansion point: after it,
+// every downstream consumer (compose bind mounts, cert issue/wait/sync, routes, collision
+// checks, the re-validated canonical) reads the final FQDN from .Hostname and none has to know
+// about subdomains or namespaces.
+//
+// The apex is chosen by namespace NAME with precedence: per-item base_domain > spec.edge.base_domain
+// > "" (the default scalar edge.base_domain). The name resolves through cfg.BaseDomainByName, so
+// named and default namespaces behave identically. A name the operator hasn't declared is a hard,
+// fail-closed error (the operator whitelists namespaces in config.yaml — an app can never invent
+// an apex). The schema already validated the label, the hostname/subdomain XOR, and the name token.
 func (s *Server) expandSubdomains(def *definition.Definition) error {
-	base := strings.TrimSpace(s.cfg.Edge.BaseDomain)
-	need := func(sub string) error {
-		return fmt.Errorf("subdomain %q needs edge.base_domain set in config.yaml (e.g. base_domain: mooring.example.com)", sub)
+	appDefault := strings.TrimSpace(def.Spec.Edge.BaseDomain)
+	// A typo'd app-level namespace NAME fails the deploy loudly — but ONLY while the def still has
+	// a subdomain that could consume it. An already-expanded canonical (literal hostnames, no
+	// subdomains) keeps its Edge.BaseDomain as a record for preview pinning, so we must NOT re-fail
+	// its redeploy/re-import if the operator later retired that namespace. ("" = default, checked
+	// per item; a subdomain that actually resolves through an undeclared name still fails in
+	// resolve() below regardless.)
+	if appDefault != "" && defUsesSubdomain(def) && !s.cfg.HasBaseDomain(appDefault) {
+		return fmt.Errorf("spec.edge.base_domain %q is not a namespace declared in config.yaml edge.base_domains", appDefault)
+	}
+	resolve := func(sub, itemBase string) (string, error) {
+		name := strings.TrimSpace(itemBase)
+		if name == "" {
+			name = appDefault
+		}
+		bd, ok := s.cfg.BaseDomainByName(name)
+		if !ok {
+			if name == "" {
+				return "", fmt.Errorf("subdomain %q needs edge.base_domain set in config.yaml (e.g. base_domain: mooring.example.com)", sub)
+			}
+			return "", fmt.Errorf("subdomain %q uses base_domain namespace %q, which is not declared in config.yaml edge.base_domains", sub, name)
+		}
+		return sub + "." + bd.Domain, nil
 	}
 	for i := range def.Spec.Edge.Routes {
 		if sub := def.Spec.Edge.Routes[i].Subdomain; sub != "" {
-			if base == "" {
-				return need(sub)
+			host, err := resolve(sub, def.Spec.Edge.Routes[i].BaseDomain)
+			if err != nil {
+				return err
 			}
-			def.Spec.Edge.Routes[i].Hostname = sub + "." + base
+			def.Spec.Edge.Routes[i].Hostname = host
 			def.Spec.Edge.Routes[i].Subdomain = ""
+			def.Spec.Edge.Routes[i].BaseDomain = ""
 		}
 	}
 	// Services is a map of structs, but CertBindings is a slice whose backing array is shared
@@ -195,14 +223,21 @@ func (s *Server) expandSubdomains(def *definition.Definition) error {
 		cbs := def.Spec.Compose.Services[name].CertBindings
 		for i := range cbs {
 			if sub := cbs[i].Subdomain; sub != "" {
-				if base == "" {
-					return need(sub)
+				host, err := resolve(sub, cbs[i].BaseDomain)
+				if err != nil {
+					return err
 				}
-				cbs[i].Hostname = sub + "." + base
+				cbs[i].Hostname = host
 				cbs[i].Subdomain = ""
+				cbs[i].BaseDomain = ""
 			}
 		}
 	}
+	// NOTE: per-item BaseDomain is cleared above (re-validation rejects base_domain without a
+	// subdomain), but the app-level Edge.BaseDomain is deliberately KEPT — it records which
+	// namespace this app's subdomains resolved under, which preview environments read to pin a
+	// PR preview to the BASE app's namespace (never the fork's). It's a valid name token, so the
+	// re-validated canonical still passes.
 	return nil
 }
 
@@ -230,18 +265,54 @@ func defUsesSubdomain(def *definition.Definition) bool {
 // a clearer heads-up than a cert that silently fails to issue. The lookup is a plain DNS
 // resolve of a fixed probe label (no attacker-controlled dial → no SSRF surface).
 func (s *Server) adviseSubdomainDNS(ctx context.Context, def *definition.Definition, onLine func(string)) {
-	base := strings.TrimSpace(s.cfg.Edge.BaseDomain)
-	if base == "" || onLine == nil || !defUsesSubdomain(def) {
+	if onLine == nil {
 		return
 	}
-	onLine("subdomains resolve via one wildcard DNS record: *." + base + "  A/AAAA → this server's public IP")
-	probe := "mooring-dns-check." + base
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	if addrs, err := net.DefaultResolver.LookupHost(cctx, probe); err != nil || len(addrs) == 0 {
-		onLine("  ⚠ the wildcard record isn't resolving yet (" + probe + " → no answer) — add it, or certs can't issue")
-	} else {
-		onLine("  ✓ wildcard resolves (" + strings.Join(addrs, ", ") + ")")
+	// Collect the DISTINCT namespace apexes this deploy's subdomains resolve to (an app can span
+	// more than one namespace via per-item base_domain). Runs BEFORE expandSubdomains, so the
+	// Subdomain/BaseDomain fields are still set. An unresolvable name is skipped here — the deploy
+	// fails with a clear error in expandSubdomains, so we don't double-report.
+	appDefault := strings.TrimSpace(def.Spec.Edge.BaseDomain)
+	apexes := map[string]bool{}
+	consider := func(sub, itemBase string) {
+		if sub == "" {
+			return
+		}
+		name := strings.TrimSpace(itemBase)
+		if name == "" {
+			name = appDefault
+		}
+		if bd, ok := s.cfg.BaseDomainByName(name); ok {
+			apexes[bd.Domain] = true
+		}
+	}
+	for _, r := range def.Spec.Edge.Routes {
+		consider(r.Subdomain, r.BaseDomain)
+	}
+	for _, svc := range def.Spec.Compose.Services {
+		for _, cb := range svc.CertBindings {
+			consider(cb.Subdomain, cb.BaseDomain)
+		}
+	}
+	if len(apexes) == 0 {
+		return
+	}
+	bases := make([]string, 0, len(apexes))
+	for a := range apexes {
+		bases = append(bases, a)
+	}
+	sort.Strings(bases)
+	for _, base := range bases {
+		onLine("subdomains resolve via one wildcard DNS record: *." + base + "  A/AAAA → this server's public IP")
+		probe := "mooring-dns-check." + base
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		addrs, err := net.DefaultResolver.LookupHost(cctx, probe)
+		cancel()
+		if err != nil || len(addrs) == 0 {
+			onLine("  ⚠ the wildcard record for *." + base + " isn't resolving yet (" + probe + " → no answer) — add it, or certs can't issue")
+		} else {
+			onLine("  ✓ wildcard *." + base + " resolves (" + strings.Join(addrs, ", ") + ")")
+		}
 	}
 }
 
