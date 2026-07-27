@@ -62,6 +62,15 @@ func (s *Server) Remediate(ctx context.Context, app monitor.App, service string,
 	}
 
 	job := dockerexec.Job{Project: app.Project, Dir: app.WorkingDir, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: args, Service: service}
+	if len(args) > 0 && args[0] == "up" {
+		// Recreate remediation is an `up` — recover a stranded name conflict too. This path ALREADY
+		// holds the one-docker-child semaphore (RunHeld), so the reap must use the *Held variants
+		// (re-acquiring the non-reentrant semaphore here would self-deadlock).
+		declared := s.reapScope(ctx, app.Project)
+		return s.runUpWithConflictReap(ctx, app.Project, declared,
+			func(c context.Context, ol func(string)) error { return s.runner.RunHeld(c, job, ol) },
+			s.runner.RemoveContainersHeld, nil)
+	}
 	return s.runner.RunHeld(ctx, job, nil)
 }
 

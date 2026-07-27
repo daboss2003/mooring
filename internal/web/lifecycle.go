@@ -128,7 +128,17 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 	// Hold an expected_down lease so the self-healing supervisor doesn't read this
 	// intentional restart/redeploy as a crash loop (plan §8.5).
 	defer s.leaseExpectedDown(ctx, project)()
-	runErr := s.runner.Run(ctx, job, func(line string) { writeln("%s", line) })
+	onl := func(line string) { writeln("%s", line) }
+	var runErr error
+	if len(args) > 0 && args[0] == "up" {
+		// A redeploy is an `up` — recover from a stranded name conflict (interrupted recreate).
+		declared := s.reapScope(ctx, project)
+		runErr = s.runUpWithConflictReap(ctx, project, declared,
+			func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
+			s.runner.RemoveContainers, onl)
+	} else {
+		runErr = s.runner.Run(ctx, job, onl) // restart/stop/start: no name-allocation to conflict
+	}
 
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(ctx, depID, code, outcome)

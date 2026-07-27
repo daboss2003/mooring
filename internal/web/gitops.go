@@ -892,11 +892,15 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// Suppress the self-healing supervisor for this app while we intentionally
 	// recreate it (plan §8.5) — a deploy mid-flight must not look like a crash loop.
 	defer s.leaseExpectedDown(ctx, slug)()
-	runErr := s.runner.Run(ctx, job, onLine)
+	declared := declaredServiceSet(def)
+	runErr := s.runUpWithConflictReap(ctx, slug, declared,
+		func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
+		s.runner.RemoveContainers, onLine)
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(bg, depID, code, outcome)
 	if runErr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
+		s.streamOOMHint(ctx, slug, declared, onLine)
 		return fmt.Errorf("docker compose up failed: %w", runErr)
 	}
 
@@ -906,8 +910,12 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		onLine("$ docker compose up -d --force-recreate " + strings.Join(changed, " ") + "  (changed config/secret/cert)")
 		recreate := append([]string{"up", "-d", "--no-build", "--force-recreate", "--"}, changed...)
 		rjob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: recreate}
-		if rerr := s.runner.Run(ctx, rjob, onLine); rerr != nil {
+		rerr := s.runUpWithConflictReap(ctx, slug, declared,
+			func(c context.Context, ol func(string)) error { return s.runner.Run(c, rjob, ol) },
+			s.runner.RemoveContainers, onLine)
+		if rerr != nil {
 			s.gitStore.SetState(bg, slug, "update_blocked")
+			s.streamOOMHint(ctx, slug, declared, onLine)
 			return fmt.Errorf("recreate of changed services failed: %w", rerr)
 		}
 	}

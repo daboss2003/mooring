@@ -371,6 +371,38 @@ func (r *Runner) ReapOneOffHeld(ctx context.Context, project string) {
 	_ = r.runArgv(ctx, "", append([]string{"rm", "-f"}, ids...), nil)
 }
 
+// RemoveContainers force-removes containers by id (`docker rm -f <id>...`) — write-plane, §0
+// resource-gated, acquiring the one-docker-child semaphore. It does NO scoping of its own: the
+// CALLER must pass only ids it has already verified belong to the intended project (the web-layer
+// conflict reconcile resolves each id's compose project/service label over the READ plane first,
+// so a foreign or system container is never passed here). Returns the rm exit error (if any).
+func (r *Runner) RemoveContainers(ctx context.Context, ids []string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.RemoveContainersHeld(ctx, ids, onLine)
+}
+
+// RemoveContainersHeld is RemoveContainers for a caller that ALREADY HOLDS the one-docker-child
+// semaphore (e.g. the self-heal remediation path, which runs its `up` via RunHeld). It must not
+// be called without holding the semaphore. Same no-scoping contract as RemoveContainers.
+func (r *Runner) RemoveContainersHeld(ctx context.Context, ids []string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return r.runArgv(ctx, "", append([]string{"rm", "-f"}, ids...), onLine)
+}
+
 // keepStorageFlag returns the correct "keep this much cache" flag for `docker builder
 // prune` on this host. Newer BuildKit renamed --keep-storage → --reserved-space (the old
 // name prints a deprecation warning and will be removed); older Docker only knows

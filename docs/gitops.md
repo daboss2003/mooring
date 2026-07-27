@@ -41,6 +41,8 @@ You'll find this on the app's page (a **Repository & updates** panel) and on the
 
 > **Want instant deploys?** By default Mooring checks every couple of minutes. If you want a push to be picked up immediately, you can add an optional **webhook** — but it's not required. And if you want truly hands-off releases, turn on **auto-deploy** (off by default): Mooring then deploys a new commit for you, through the same checks, when it's a clean fast-forward. The background check on its own only ever *fetches* — it never deploys.
 
+> **Self-healing a stuck container.** If a deploy is interrupted mid-recreate (most often the box runs out of memory and the OOM killer steps in), Docker can leave a half-renamed container occupying a service's name — and every later redeploy then fails with `the container name "…" is already in use`. Mooring now recovers automatically: it reclaims **that app's own** stuck container (verified by its compose project label — never another app's or a system container) and retries the deploy once, logging a line like *"reclaimed stuck container credlock-worker-1 … — retrying the deploy."* If the culprit is a container Mooring can't prove is yours (a foreign or manually-run one), it leaves it and tells you to `docker rm -f` it. When a deploy was OOM-killed, the log points you at the real fix (add RAM or lower the service's `mem_limit`) so it doesn't keep recurring.
+
 ## Deleting an app
 
 The app's page has a **Danger zone** with a **Delete** button. Deleting is **permanent and cannot be undone** — it is gated behind re-entering your password (a live session isn't enough) and, because it stops containers, it needs the write plane to be available. When you confirm, Mooring:

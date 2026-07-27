@@ -120,10 +120,15 @@ func (s *Server) handleProvisionDeploy(w http.ResponseWriter, r *http.Request) {
 	// Suppress the self-healing supervisor for this app while we intentionally
 	// provision/recreate it (plan §8.5).
 	defer s.leaseExpectedDown(r.Context(), slug)()
-	runErr := s.runner.Run(r.Context(), job, func(line string) { writeln("%s", line) })
+	onl := func(line string) { writeln("%s", line) }
+	declared := s.reapScope(r.Context(), slug)
+	runErr := s.runUpWithConflictReap(r.Context(), slug, declared,
+		func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
+		s.runner.RemoveContainers, onl)
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(context.Background(), depID, code, outcome)
 	if runErr != nil {
+		s.streamOOMHint(r.Context(), slug, declared, onl)
 		writeln("\n[failed: %v]", runErr)
 		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "provision_deploy", Target: slug, Outcome: audit.Error, Level: audit.Security})
 		return
