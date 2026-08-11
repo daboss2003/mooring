@@ -274,11 +274,11 @@ func (s *Server) handleServiceLogs(w http.ResponseWriter, r *http.Request) {
 	var containerID string
 	if snap := s.snapshot(); snap != nil {
 		if app := snap.AppByProject(project); app != nil {
-			for _, svc := range app.Services {
-				if svc.Service == service && svc.ContainerID != "" {
-					containerID = svc.ContainerID
-					break
-				}
+			// ?copy=<id> streams a SPECIFIC replica's logs (a scaled service has many); the
+			// selection is scoped to this app's own service containers, so a client can never
+			// stream a container outside it. Empty/stale copy → the first (newest).
+			if chosen, _, ok := selectCopy(app, service, r.URL.Query().Get("copy")); ok {
+				containerID = chosen.ContainerID
 			}
 		}
 	}

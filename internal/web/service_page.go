@@ -25,11 +25,43 @@ type serviceView struct {
 	CPUPercent                float64
 	MemBytes, MemLimit        uint64
 	RestartCount              int
+	ContainerID               string    // the SPECIFIC copy being shown (a scaled service has many)
+	ContainerName             string    // e.g. myapp-api-2 — so the user sees which copy this is
+	Copies                    []copyRef // sibling replicas of this service, for the copy switcher
 	Phase                     string              // self-heal supervisor phase, e.g. CIRCUIT_OPEN
 	DesiredReplicas           int                 // 0 when scaling isn't active
 	Policy                    *definition.Scaling // current scaling policy; nil = none yet
 	HasOps                    bool                // the service declares an enabled (non-basic) ops endpoint → live-poll its fragment
 	Ops                       *ops.Result         // live ops probe (RICH queues/metrics); nil if no ops endpoint or unreachable
+}
+
+// copyRef identifies one replica (copy) of a scaled service for the per-service page's copy
+// switcher. Selected marks the one currently being viewed.
+type copyRef struct {
+	ID       string
+	Name     string
+	Selected bool
+}
+
+// selectCopy picks the container to show for a (service, optional copyID): the requested copy when
+// it matches a LIVE container of THIS service, else the first (newest). Because it only ever ranges
+// this app's own service containers, a client-supplied copyID can never select a container outside
+// this app+service — a stale/foreign id simply falls back to the first. Also returns every copy of
+// the service (for the switcher).
+func selectCopy(app *monitor.App, service, copyID string) (chosen monitor.ServiceStatus, copies []monitor.ServiceStatus, ok bool) {
+	if app == nil {
+		return
+	}
+	for _, svc := range app.Services {
+		if svc.Service != service {
+			continue
+		}
+		copies = append(copies, svc)
+		if !ok || (copyID != "" && svc.ContainerID == copyID) {
+			chosen, ok = svc, true
+		}
+	}
+	return
 }
 
 // probeServiceOps probes one service's own ops endpoint (from the canonical def) on
@@ -134,15 +166,18 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 		app = snap.AppByProject(project)
 	}
 	sv := &serviceView{Project: project, Service: service}
-	if app != nil {
-		for _, svc := range app.Services {
-			if svc.Service == service {
-				sv.Found = true
-				sv.Running = svc.Running()
-				sv.State, sv.Health, sv.StatusText = svc.State, svc.Health, svc.StatusText
-				sv.CPUPercent, sv.MemBytes, sv.MemLimit = svc.CPUPercent, svc.MemBytes, svc.MemLimit
-				sv.RestartCount = svc.RestartCount
-				break
+	// A scaled service has many containers (copies) sharing one service name; ?copy=<id> selects
+	// the specific one, else the first. Without this every copy resolved to the newest.
+	if chosen, copies, found := selectCopy(app, service, r.URL.Query().Get("copy")); found {
+		sv.Found = true
+		sv.Running = chosen.Running()
+		sv.State, sv.Health, sv.StatusText = chosen.State, chosen.Health, chosen.StatusText
+		sv.CPUPercent, sv.MemBytes, sv.MemLimit = chosen.CPUPercent, chosen.MemBytes, chosen.MemLimit
+		sv.RestartCount = chosen.RestartCount
+		sv.ContainerID, sv.ContainerName = chosen.ContainerID, chosen.Name
+		if len(copies) > 1 { // only show the switcher when the service actually has multiple copies
+			for _, c := range copies {
+				sv.Copies = append(sv.Copies, copyRef{ID: c.ContainerID, Name: c.Name, Selected: c.ContainerID == chosen.ContainerID})
 			}
 		}
 	}

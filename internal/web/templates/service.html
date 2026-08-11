@@ -4,6 +4,13 @@
   {{with .Svc}}
   <p><a href="/apps/{{pathEscape .Project}}">← {{.Project}}</a></p>
   <h1>{{.Service}} <span class="muted">— {{.Project}}</span></h1>
+  {{if .ContainerName}}<p class="muted mono" title="the specific copy shown">copy: {{.ContainerName}}</p>{{end}}
+  {{if .Copies}}
+  {{$proj := .Project}}{{$svc := .Service}}
+  <nav class="copy-switcher"><span class="muted">This service is scaled — pick a copy:</span>
+    {{range .Copies}} <a class="pill{{if .Selected}} pill-ok{{end}}" href="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}?copy={{pathEscape .ID}}">{{.Name}}</a>{{end}}
+  </nav>
+  {{end}}
 
   <section class="panel">
     <h2>Status</h2>
@@ -22,7 +29,7 @@
       </tbody>
     </table></div>
     <div class="queue-actions mt1">
-      <button type="button" class="btn btn-sm lc-btn" data-log-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs">View logs</button>
+      <button type="button" class="btn btn-sm lc-btn" data-log-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs{{if .ContainerID}}?copy={{pathEscape .ContainerID}}{{end}}">View logs</button>
       {{if and (not $.WriteDisabledReason) (not $.Protected)}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart the {{.Service}} service?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart">Restart</button>
       {{if eq .Phase "CIRCUIT_OPEN"}}

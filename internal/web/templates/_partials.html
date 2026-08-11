@@ -49,7 +49,7 @@
   <h2>Service health</h2>
   <div class="health-grid">
     {{range $.OrderedApps}}{{$app := .DisplayName}}{{$proj := .Project}}{{range .Services}}
-    <a class="health-cell hs-{{if .Health}}{{.Health}}{{else}}none{{end}}" href="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}" title="{{$app}} / {{.Service}}: {{if .Health}}{{.Health}}{{else}}no healthcheck{{end}}">
+    <a class="health-cell hs-{{if .Health}}{{.Health}}{{else}}none{{end}}" href="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}?copy={{pathEscape .ContainerID}}" title="{{$app}} / {{.Name}}: {{if .Health}}{{.Health}}{{else}}no healthcheck{{end}}">
       <span class="health-dot"></span>
       <span class="health-svc">{{.Service}}</span>
       <span class="health-state">{{if .Health}}{{.Health}}{{else}}—{{end}}</span>
@@ -181,7 +181,7 @@
     {{range .Services}}
     {{$phase := index $sup .Service}}
     <tr class="{{if .Running}}row-ok{{else}}row-down{{end}}">
-      <td><a href="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}">{{.Service}}</a></td>
+      <td><a href="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}?copy={{pathEscape .ContainerID}}">{{.Service}}</a>{{if .Name}} <span class="muted mono" title="container (copy)">{{.Name}}</span>{{end}}</td>
       <td>{{.State}}</td>
       <td class="health-{{.Health}}">{{.Health}}</td>
       <td class="mono">{{pct1 .CPUPercent}}</td>
@@ -201,7 +201,7 @@
       </td>
       <td class="muted">{{.StatusText}}</td>
       <td class="queue-actions">
-        <button type="button" class="link lc-btn" data-log-url="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}/logs">logs</button>
+        <button type="button" class="link lc-btn" data-log-url="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}/logs?copy={{pathEscape .ContainerID}}">logs</button>
         {{if and (not $wdr) (not $prot)}}<button type="button" class="link lc-btn" data-lc-confirm="Restart the {{.Service}} service?" data-lc-url="/apps/{{pathEscape $proj}}/services/{{pathEscape .Service}}/restart">restart</button>{{end}}
       </td>
     </tr>
