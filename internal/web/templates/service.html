@@ -4,7 +4,7 @@
   {{with .Svc}}
   <p><a href="/apps/{{pathEscape .Project}}">← {{.Project}}</a></p>
   <h1>{{.Service}} <span class="muted">— {{.Project}}</span></h1>
-  {{if .ContainerName}}<p class="muted mono" title="the specific copy shown">copy: {{.ContainerName}}</p>{{end}}
+  {{if .Copies}}<p class="muted mono" title="the specific copy shown">copy: {{.ContainerName}}</p>{{end}}
   {{if .Copies}}
   {{$proj := .Project}}{{$svc := .Service}}
   <nav class="copy-switcher"><span class="muted">This service is scaled — pick a copy:</span>
