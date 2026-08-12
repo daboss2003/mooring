@@ -307,20 +307,45 @@ func classifyErr(stderr []byte, err error) error {
 	s := strings.ToLower(string(stderr))
 	var msg string
 	switch {
+	case isStaleLockStderr(s):
+		// An interrupted/killed git op (reboot, OOM, cancellation) left a *.lock behind, wedging the
+		// repo. The fetch path self-heals this (clears the lock + retries); if it still surfaces, the
+		// operator knows it's a local lock, NOT a repo/credential problem.
+		msg = "git: a previous git operation was interrupted and left a stale lock in the local clone (Mooring clears it and retries automatically)"
 	case strings.Contains(s, "authentication") || strings.Contains(s, "403") || strings.Contains(s, "permission denied") || strings.Contains(s, "could not read") && strings.Contains(s, "credential"):
 		msg = "git: authentication failed"
 	case strings.Contains(s, "host key") || strings.Contains(s, "known_hosts") || strings.Contains(s, "host key verification"):
 		msg = "git: host key verification failed"
 	case strings.Contains(s, "could not resolve host") || strings.Contains(s, "connection") || strings.Contains(s, "timed out") || strings.Contains(s, "network"):
 		msg = "git: network error reaching the remote"
-	case strings.Contains(s, "not found") || strings.Contains(s, "does not exist") || strings.Contains(s, "repository") && strings.Contains(s, "not"):
+	case strings.Contains(s, "not found") || strings.Contains(s, "does not exist") || strings.Contains(s, "not a git repository"):
 		// GitHub answers "Repository not found" for BOTH a missing/renamed repo AND a token/key that
 		// lost access (it hides private repos), so spell out both so the operator knows where to look.
+		// NOTE: matched on the specific phrases, NOT a loose "repository"+"not" — that used to
+		// mis-bucket a stale-lock error ("...another... in this repository...") as not-found.
 		msg = "git: repository or ref not found — check the repo URL (renamed/moved?) and that the access token or deploy key is still valid and authorized for it"
 	default:
 		msg = "git: command failed"
 	}
 	return &gitError{msg: msg, raw: boundRawStderr(stderr)}
+}
+
+// isStaleLockStderr reports whether git's (already-lowercased) stderr is the "another git process /
+// *.lock: File exists" error a crashed/interrupted git op leaves behind.
+func isStaleLockStderr(s string) bool {
+	return strings.Contains(s, "another git process seems to be running") ||
+		(strings.Contains(s, ".lock") && strings.Contains(s, "file exists")) ||
+		(strings.Contains(s, "unable to create") && strings.Contains(s, ".lock"))
+}
+
+// StaleLock reports whether a classified git error is the stale-lock error (used by the fetch
+// self-heal to decide whether to clear the lock and retry).
+func StaleLock(err error) bool {
+	var ge *gitError
+	if errors.As(err, &ge) {
+		return isStaleLockStderr(strings.ToLower(ge.raw))
+	}
+	return false
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }

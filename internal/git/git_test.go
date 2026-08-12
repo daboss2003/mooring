@@ -227,3 +227,62 @@ func TestClassifyErrCarriesRawStderr(t *testing.T) {
 		t.Errorf("userinfo must be redacted from raw stderr: %q", red)
 	}
 }
+
+func TestClassifyErrStaleLock(t *testing.T) {
+	lock := []byte("fatal: Unable to create '/var/lib/mooring/git/credlock.git/shallow.lock': File exists.\n\n" +
+		"Another git process seems to be running in this repository, e.g.\nan editor opened by 'git commit'.")
+	e := classifyErr(lock, errors.New("exit status 128"))
+	// The stale-lock error must NOT be mis-classified as "repository or ref not found" (the bug that
+	// sent a real operator chasing tokens/keys for hours) — and StaleLock must detect it.
+	if strings.Contains(e.Error(), "repository or ref not found") {
+		t.Errorf("stale lock mis-classified as not-found: %q", e.Error())
+	}
+	if !strings.Contains(e.Error(), "stale lock") {
+		t.Errorf("stale-lock message = %q, want it to name the stale lock", e.Error())
+	}
+	if !StaleLock(e) {
+		t.Error("StaleLock must detect the lock error (so the fetch self-heals)")
+	}
+
+	// GitHub's genuine "Repository not found." must still classify as not-found (and NOT as a lock).
+	nf := classifyErr([]byte("ERROR: Repository not found.\nfatal: Could not read from remote repository."), errors.New("x"))
+	if !strings.Contains(nf.Error(), "repository or ref not found") {
+		t.Errorf("real not-found = %q", nf.Error())
+	}
+	if StaleLock(nf) {
+		t.Error("a real not-found must not be treated as a stale lock")
+	}
+	if StaleLock(errors.New("plain")) {
+		t.Error("a non-git error is not a stale lock")
+	}
+}
+
+func TestClearStaleLocks(t *testing.T) {
+	dir := t.TempDir()
+	// Plant the locks a crashed fetch strands: top-level ones + a ref lock.
+	must := func(p string) {
+		if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("stale"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(filepath.Join(dir, "shallow.lock"))
+	must(filepath.Join(dir, "packed-refs.lock"))
+	must(filepath.Join(dir, StagedRef+".lock"))
+	keep := filepath.Join(dir, "config") // a NON-lock file must survive
+	must(keep)
+
+	r := &Repo{dir: dir, binary: "git"}
+	r.clearStaleLocks()
+
+	for _, p := range []string{"shallow.lock", "packed-refs.lock", StagedRef + ".lock"} {
+		if _, err := os.Stat(filepath.Join(dir, p)); !os.IsNotExist(err) {
+			t.Errorf("%s must be removed", p)
+		}
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Errorf("a non-lock file must be preserved: %v", err)
+	}
+}

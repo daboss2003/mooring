@@ -45,6 +45,21 @@ func (r *Repo) Fetch(ctx context.Context, repoURL, ref string, creds Creds) (str
 	}
 
 	refspec := "+" + ref + ":" + StagedRef
+	sha, err := r.fetchOnce(ctx, env, repoURL, refspec)
+	if err != nil && StaleLock(err) {
+		// A crashed/killed/cancelled/rebooted fetch leaves a *.lock (e.g. shallow.lock) behind and
+		// wedges the clone FOREVER — every later fetch fails "File exists". Git ops on this repo are
+		// single-flighted by the caller (the gitDeploy semaphore), so a lock present now means a
+		// PREVIOUS op died with no live holder — safe to clear and retry ONCE (self-heal, mirroring
+		// the container-name-conflict recovery).
+		r.clearStaleLocks()
+		sha, err = r.fetchOnce(ctx, env, repoURL, refspec)
+	}
+	return sha, err
+}
+
+// fetchOnce runs a single shallow fetch of refspec into the staged ref.
+func (r *Repo) fetchOnce(ctx context.Context, env []string, repoURL, refspec string) (string, error) {
 	_, errb, ferr := r.run(ctx, env,
 		"fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
 		"--force", "--quiet", "--depth=1", repoURL, refspec)
@@ -52,6 +67,20 @@ func (r *Repo) Fetch(ctx context.Context, repoURL, ref string, creds Creds) (str
 		return "", classifyErr(errb, ferr)
 	}
 	return r.ResolveRef(ctx, StagedRef)
+}
+
+// clearStaleLocks removes the lock files a crashed git op can strand in the bare repo: the
+// top-level *.lock (shallow.lock, index.lock, config.lock, packed-refs.lock, FETCH_HEAD.lock, …)
+// plus the staged/deployed ref locks. Best-effort — a missing file is fine. Only ever called after
+// a "lock exists" error under the caller's single-flight gate, so nothing live holds these.
+func (r *Repo) clearStaleLocks() {
+	if matches, err := filepath.Glob(filepath.Join(r.dir, "*.lock")); err == nil {
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+	_ = os.Remove(filepath.Join(r.dir, StagedRef+".lock"))
+	_ = os.Remove(filepath.Join(r.dir, DeployedRef+".lock"))
 }
 
 // credEnv writes credential material into credDir (0600) and returns the git env
