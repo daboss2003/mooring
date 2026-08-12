@@ -276,7 +276,9 @@ func classifyErr(stderr []byte, err error) error {
 	case strings.Contains(s, "could not resolve host") || strings.Contains(s, "connection") || strings.Contains(s, "timed out") || strings.Contains(s, "network"):
 		return errors.New("git: network error reaching the remote")
 	case strings.Contains(s, "not found") || strings.Contains(s, "does not exist") || strings.Contains(s, "repository") && strings.Contains(s, "not"):
-		return errors.New("git: repository or ref not found")
+		// GitHub answers "Repository not found" for BOTH a missing/renamed repo AND a token that lost
+		// access (it hides private repos), so spell out both so the operator knows where to look.
+		return errors.New("git: repository or ref not found — check the repo URL (renamed/moved?) and that the access token or deploy key is still valid and authorized for it")
 	default:
 		return errors.New("git: command failed")
 	}

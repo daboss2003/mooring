@@ -437,12 +437,18 @@ func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.gitDeploy.Release()
 
-	_, _, err := s.doFetch(r.Context(), project)
+	// Run the fetch + audit on a BACKGROUND context: a fetch is a slow network op, so if the operator
+	// navigates away mid-fetch the request context cancels — which used to (a) mask the real fetch
+	// error with "context canceled" and (b) drop the audit record ("audit write failed"). doFetch
+	// keeps its own gitFetchTimeout bound, so background is still bounded. r stays the actor/IP source.
+	bg := context.Background()
+	actor, ip := sessionUser(r), ClientIP(r.Context()).String()
+	_, _, err := s.doFetch(bg, project)
 	outcome := audit.OK
 	if err != nil {
 		outcome = audit.Error
 	}
-	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "git_fetch", Target: project, Outcome: outcome, Level: audit.Security})
+	_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: ip, Action: "git_fetch", Target: project, Outcome: outcome, Level: audit.Security})
 	// Redirect either way; the page surfaces last_fetch_error / the new diff.
 	http.Redirect(w, r, "/apps/"+project+"/git", http.StatusSeeOther)
 }

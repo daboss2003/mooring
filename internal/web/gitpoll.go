@@ -91,6 +91,8 @@ func (s *Server) pollOneRepo(ctx context.Context, project string) {
 	}
 	defer s.gitDeploy.Release()
 	if _, _, err := s.doFetch(ctx, project); err != nil {
-		s.log.Warn("git poll fetch failed", "project", project)
+		// err is a CLASSIFIED git error (never raw stderr / creds), so logging the reason is safe —
+		// and it means the journal shows WHY (e.g. "repository or ref not found") without digging.
+		s.log.Warn("git poll fetch failed", "project", project, "err", err.Error())
 	}
 }
