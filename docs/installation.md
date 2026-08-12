@@ -64,7 +64,24 @@ Then confirm the Compose plugin is live — `docker compose version` should prin
 sudo apt install ./mooring_<version>_linux_amd64.deb
 ```
 
-`apt` pulls in any dependencies, creates the `mooring` service user, and installs the systemd unit — so you can **skip Step 4**. To update later, download the newer `.deb` and run the same command.
+`apt` pulls in any dependencies, creates the `mooring` service user, and installs the systemd unit — so you can **skip Step 4**. To update later, download the newer `.deb` and run the same command. (Updates never disable boot-start — the package keeps the service enabled and running across upgrades.)
+
+> **Download into a Mooring-cleanable folder so old `.deb`s don't pile up.** Each update leaves the previous `.deb` behind. Put them in a Mooring-owned cache dir and the **Server tab** can list + delete the superseded ones for you (behind password + TOTP). One-time, after your first install:
+>
+> ```bash
+> sudo install -d -o mooring -g mooring -m 0755 /var/lib/mooring/deb-cache
+> ```
+> Add `server.deb_cache_dir: /var/lib/mooring/deb-cache` to `/etc/mooring/config.yaml`, then download + install updates from there:
+>
+> ```bash
+> ARCH=$(dpkg --print-architecture)
+> TAG=$(curl -fsSL https://api.github.com/repos/daboss2003/mooring/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
+> sudo curl -fsSL -o "/var/lib/mooring/deb-cache/mooring_${TAG#v}_linux_${ARCH}.deb" \
+>   "https://github.com/daboss2003/mooring/releases/download/${TAG}/mooring_${TAG#v}_linux_${ARCH}.deb"
+> sudo dpkg -i "/var/lib/mooring/deb-cache/mooring_${TAG#v}_linux_${ARCH}.deb"
+> sudo systemctl daemon-reload && sudo systemctl restart mooring
+> ```
+> It must live **under `/var/lib/mooring`** — a path that's both writable by the `mooring` service and inside the unit's `ReadWritePaths`, so the Server-tab cleanup can delete there. A home-directory path (`~/…`) can't be cleaned up: the service user can't reach it. Delete any old `.deb`s already sitting in your home dir with `rm -f ~/mooring_*.deb`.
 
 > **Seeing `N: Download is performed unsandboxed as root … couldn't be accessed by user '_apt' … Permission denied`?** That's a harmless *note*, not a failure. `apt`'s unprivileged sandbox user can't read files in your home directory (it's mode `0750`), so `apt` copies the `.deb` as root and the install completes anyway — confirm with `dpkg -l mooring`. To avoid the note, install from a path `_apt` can read (download into `/tmp`), or skip the sandbox with `dpkg`:
 >

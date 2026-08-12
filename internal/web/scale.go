@@ -98,7 +98,10 @@ func (s *Server) handleScalingSave(w http.ResponseWriter, r *http.Request) {
 	// canonical store), fall back to writing the projection directly.
 	if s.defStore != nil {
 		if def, derr := s.defStore.Current(project); derr == nil && def != nil {
-			def.Spec.Scaling = upsertScaling(def.Spec.Scaling, scalingFromForm(service, enabled, r))
+			// Preserve custom metrics (source: edge / source: ops): they're deploy-time config authored
+			// in mooring.yaml, NOT editable in this CPU/mem panel, and must survive a dashboard tune.
+			entry := preserveMetrics(def.Spec.Scaling, scalingFromForm(service, enabled, r))
+			def.Spec.Scaling = upsertScaling(def.Spec.Scaling, entry)
 			if err := s.applyDefinition(r.Context(), project, def, "dashboard: scaling "+service, ""); err != nil {
 				http.Error(w, "scaling policy rejected: "+err.Error(), http.StatusUnprocessableEntity)
 				return
@@ -139,6 +142,20 @@ func scalingFromForm(service string, enabled bool, r *http.Request) definition.S
 
 // upsertScaling replaces the entry for e.Service (or appends it), so the canonical
 // holds exactly one policy per service.
+// preserveMetrics carries an existing service's custom metrics (source: edge/ops) into a
+// dashboard-form entry, which never sets them (scalingFromForm covers only CPU/mem/min/max). Without
+// this, a dashboard scaling save would REPLACE the entry and silently drop mooring.yaml-authored
+// signals. Metrics are edited in the file, not this panel; here we only keep them intact.
+func preserveMetrics(existing []definition.Scaling, entry definition.Scaling) definition.Scaling {
+	for _, ex := range existing {
+		if ex.Service == entry.Service {
+			entry.Metrics = ex.Metrics
+			break
+		}
+	}
+	return entry
+}
+
 func upsertScaling(list []definition.Scaling, e definition.Scaling) []definition.Scaling {
 	for i := range list {
 		if list[i].Service == e.Service {

@@ -53,3 +53,26 @@ func TestScalingPolicyRowDefaultsAreValid(t *testing.T) {
 		t.Fatalf("explicit policy must be valid, got %q", why)
 	}
 }
+
+func TestDashboardScalingSavePreservesMetrics(t *testing.T) {
+	// A service configured (in mooring.yaml) with a source:edge metric...
+	existing := []definition.Scaling{{
+		Service: "api", Enabled: true, Min: 2, Max: 8,
+		Metrics: []definition.ScalingMetric{{Name: "latency", Source: "edge", Select: "p95_latency_ms", Up: 800, Down: 300}},
+	}}
+	// ...then tuned via the CPU/mem dashboard panel (which knows nothing about metrics).
+	formEntry := definition.Scaling{Service: "api", Enabled: true, Min: 2, Max: 10, UpCPUPct: 70, DownCPUPct: 30}
+
+	merged := preserveMetrics(existing, formEntry)
+	if len(merged.Metrics) != 1 || merged.Metrics[0].Select != "p95_latency_ms" {
+		t.Fatalf("dashboard save must PRESERVE the source:edge metric, got %+v", merged.Metrics)
+	}
+	// The tuned CPU/min/max still take effect.
+	if merged.Max != 10 || merged.UpCPUPct != 70 {
+		t.Errorf("form values must apply: %+v", merged)
+	}
+	// A service with no prior metrics stays empty (no phantom metrics).
+	if got := preserveMetrics(existing, definition.Scaling{Service: "other"}); got.Metrics != nil {
+		t.Errorf("unrelated service must not inherit metrics: %+v", got.Metrics)
+	}
+}

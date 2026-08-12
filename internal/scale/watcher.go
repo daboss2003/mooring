@@ -438,7 +438,11 @@ func (w *Watcher) emitRefused(ctx context.Context, k Key, nearOOM bool, reason s
 		msg += ": " + sanitizeName(reason)
 	}
 	if w.cfg.Alerts == nil {
-		w.cfg.Log.Warn("scale: refused (no channels configured)", "target", target, "reason", reason)
+		// The refusal is a HOST-CAPACITY decision — "no alert channels" only means we can't notify
+		// beyond this log. Say so plainly (the old "refused (no channels configured)" read as if the
+		// missing channel caused the refusal).
+		w.cfg.Log.Warn("scale: up refused — the host has no capacity for another replica (add an alert channel to be notified of this)",
+			"target", target, "reason", reason, "near_oom", nearOOM)
 		return
 	}
 	w.refused[k] = true
