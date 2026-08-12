@@ -173,6 +173,16 @@ func plan(apply, l4, restart bool) []step {
 			step{"restart docker to apply the log cap — BOUNCES running containers (run setup before deploying apps)", func() error { return run(apply, "systemctl", "restart", "docker") }},
 		)
 	}
+	// Enable the mooring service so it survives a reboot. The package intentionally does NOT
+	// auto-enable on install (it can't boot without a config yet), so an operator who only ran
+	// `systemctl start` silently loses Mooring on the next reboot. ALLOWLIST the states where
+	// `systemctl enable` both applies and can succeed: `disabled` (the trap) and the runtime-only
+	// enablements (make them persistent). NEVER masked/static/generated — `enable` fails there and
+	// would abort the whole setup run; masking is a deliberate operator choice we don't undo.
+	if st, ok := systemctlShow("UnitFileState"); ok && (st == "disabled" || st == "enabled-runtime" || st == "linked-runtime") {
+		steps = append(steps, step{"enable the mooring service (start on boot)",
+			func() error { return run(apply, "systemctl", "enable", "mooring") }})
+	}
 	if restart {
 		steps = append(steps, step{"restart the mooring service", func() error { return run(apply, "systemctl", "restart", "mooring") }})
 	}
@@ -249,6 +259,7 @@ func preflight(l4 bool, cfg *config.Config, runtimeChecks bool) report {
 		r.add(checkResolvedStub())
 	}
 	if runtimeChecks {
+		r.add(checkServiceEnabled()) // will it survive a reboot? (setup skips this — it does the enabling)
 		if managed {
 			r.add(checkRunDir(cfg))
 			r.add(checkEgress())
@@ -313,6 +324,46 @@ func checkDistroService(name, ports string) result {
 			"sudo systemctl disable --now " + name + "   (or: sudo mooring setup --yes)"}
 	}
 	return result{name + " conflict", "ok", "no conflicting distro " + name + ".service", ""}
+}
+
+// checkServiceEnabled verifies the mooring service is ENABLED to start on boot. A service that is
+// running but NOT enabled silently vanishes after a reboot — the package deliberately does not
+// auto-enable (it can't start without a config at install time), so an operator who ran only
+// `systemctl start` (not `enable`) loses Mooring on the next reboot with no earlier warning. Read
+// via UnitFileState; degrades to a warn when systemctl is unavailable (non-systemd host).
+func checkServiceEnabled() result {
+	state, ok := systemctlShow("UnitFileState")
+	return serviceEnabledResult(state, ok)
+}
+
+// serviceEnabledResult is the pure state→result mapping (unit-tested; checkServiceEnabled just
+// feeds it the live UnitFileState).
+func serviceEnabledResult(state string, ok bool) result {
+	if !ok || state == "" {
+		return result{"boot-enabled", "warn", "could not confirm the mooring service is enabled for boot",
+			"verify: systemctl is-enabled mooring   (enable with: sudo systemctl enable mooring)"}
+	}
+	switch state {
+	case "enabled":
+		return result{"boot-enabled", "ok", "mooring is enabled — it will start automatically after a reboot", ""}
+	case "enabled-runtime", "linked-runtime":
+		// --runtime enablement lives in /run (tmpfs) and is WIPED on reboot — the exact trap.
+		return result{"boot-enabled", "fail",
+			"mooring is " + state + " — enabled only for THIS boot (--runtime, in /run); it will NOT start after a reboot",
+			"sudo systemctl enable mooring   (persistent — no --runtime)"}
+	case "masked", "masked-runtime":
+		return result{"boot-enabled", "fail",
+			"mooring is " + state + " — masked, so systemd will not start it at all",
+			"sudo systemctl unmask mooring && sudo systemctl enable --now mooring"}
+	case "static", "indirect", "alias", "generated", "linked":
+		// Unusual for Mooring's top-level unit; can't assert boot behavior — flag, don't fail.
+		return result{"boot-enabled", "warn", "mooring reports " + state + " — confirm it starts on boot",
+			"verify: systemctl is-enabled mooring"}
+	default: // disabled, transient, bad, …
+		return result{"boot-enabled", "fail",
+			"mooring is " + state + " — it will NOT start after a reboot (it's running now, but a reboot loses it)",
+			"sudo systemctl enable mooring   (or: sudo mooring setup --yes)"}
+	}
 }
 
 func checkDNS() result {

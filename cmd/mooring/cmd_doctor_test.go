@@ -139,3 +139,38 @@ func TestOnlyLoopback(t *testing.T) {
 		}
 	}
 }
+
+func TestServiceEnabledResult(t *testing.T) {
+	cases := []struct {
+		state string
+		ok    bool
+		want  string
+	}{
+		{"enabled", true, "ok"},          // the only true boot-enabled state
+		{"enabled-runtime", true, "fail"}, // --runtime lives in /run → wiped on reboot
+		{"linked-runtime", true, "fail"},
+		{"disabled", true, "fail"}, // running-but-not-enabled: the reboot trap
+		{"masked", true, "fail"},
+		{"masked-runtime", true, "fail"},
+		{"static", true, "warn"}, // unusual for a top-level unit — flag, don't fail
+		{"", false, "warn"},      // systemctl unavailable
+		{"", true, "warn"},       // empty state → can't confirm
+	}
+	for _, c := range cases {
+		got := serviceEnabledResult(c.state, c.ok)
+		if got.state != c.want {
+			t.Errorf("serviceEnabledResult(%q, %v).state = %q, want %q", c.state, c.ok, got.state, c.want)
+		}
+		if c.want == "fail" && got.fix == "" {
+			t.Errorf("a not-enabled state (%q) must carry a fix command", c.state)
+		}
+	}
+	// The disabled case must name the enable command; the masked case must say to unmask FIRST
+	// (a plain `enable` errors on a masked unit).
+	if fix := serviceEnabledResult("disabled", true).fix; !strings.Contains(fix, "systemctl enable mooring") {
+		t.Errorf("disabled fix should point at `systemctl enable mooring`, got %q", fix)
+	}
+	if fix := serviceEnabledResult("masked", true).fix; !strings.Contains(fix, "unmask") {
+		t.Errorf("masked fix must tell the operator to unmask first, got %q", fix)
+	}
+}
