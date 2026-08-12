@@ -132,6 +132,43 @@ func TestCreateDeployKey(t *testing.T) {
 	}
 }
 
+func TestListAndDeleteDeployKeys(t *testing.T) {
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/octocat/app/keys" && r.Method == http.MethodGet:
+			_, _ = w.Write([]byte(`[{"id":11,"title":"mooring:app"},{"id":22,"title":"someone-else"}]`))
+		case strings.HasPrefix(r.URL.Path, "/repos/octocat/app/keys/") && r.Method == http.MethodDelete:
+			deleted = append(deleted, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+		case r.URL.Path == "/repos/octocat/gone/keys/99" && r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNotFound) // idempotent
+		default:
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+	c := New(srv.Client(), srv.URL, srv.URL)
+
+	keys, err := c.ListDeployKeys(context.Background(), "gho_X", "octocat", "app")
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(keys) != 2 || keys[0].ID != 11 || keys[0].Title != "mooring:app" {
+		t.Fatalf("unexpected keys: %+v", keys)
+	}
+	if err := c.DeleteDeployKey(context.Background(), "gho_X", "octocat", "app", 11); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if len(deleted) != 1 || deleted[0] != "/repos/octocat/app/keys/11" {
+		t.Errorf("wrong delete target: %v", deleted)
+	}
+	// A 404 (already gone) is treated as success (idempotent).
+	if err := c.DeleteDeployKey(context.Background(), "gho_X", "octocat", "gone", 99); err != nil {
+		t.Errorf("404 delete should be idempotent success, got %v", err)
+	}
+}
+
 func TestErrorsNeverLeakToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)

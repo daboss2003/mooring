@@ -320,6 +320,127 @@ func (s *Server) handleGitHubDisconnect(w http.ResponseWriter, r *http.Request) 
 	http.Redirect(w, r, "/git/new", http.StatusSeeOther)
 }
 
+// handleGitHubReconnect (POST, admin+CSRF) repairs an OAuth-connected app whose stored SSH deploy
+// key has DRIFTED from the key on the repo (fetches fail "repository not found" because the stored
+// private key no longer matches an installed public key). It removes the app's OWN "mooring:<slug>"
+// key, installs a FRESH read-only keypair via the OAuth token, and rewrites the stored SSH
+// credential + URL TOGETHER — so the private key on disk always matches the public key on GitHub. It
+// preserves every other setting (build policy, ref, auto-deploy, mooring file) and NEVER touches a
+// deploy key that isn't titled exactly "mooring:<slug>".
+func (s *Server) handleGitHubReconnect(w http.ResponseWriter, r *http.Request) {
+	if !s.githubEnabled() {
+		notFound(w)
+		return
+	}
+	project := r.PathValue("project")
+	actor := sessionUser(r)
+	peer := ClientIP(r.Context()).String()
+	if s.cfg.IsProtectedProject(project) {
+		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "github_reconnect", Target: project, Outcome: audit.Deny, Level: audit.Security, Detail: "protected project"})
+		http.Error(w, "protected project", http.StatusForbidden)
+		return
+	}
+	cfg, ok, err := s.gitStore.Get(project)
+	if err != nil || !ok {
+		http.Error(w, "repository not configured", http.StatusNotFound)
+		return
+	}
+	owner, name, ok := parseGitHubRepo(cfg.RepoURL)
+	if !ok {
+		http.Error(w, "this app isn't connected to a github.com repository via the OAuth app — use the credential form below instead", http.StatusBadRequest)
+		return
+	}
+	conn, ok, err := s.gitStore.GitHubConn(r.Context())
+	if err != nil || !ok {
+		http.Error(w, "no GitHub authorization on file — click \"Connect with GitHub\" first", http.StatusBadRequest)
+		return
+	}
+	// Serialize with fetch/deploy (shared single-flight): we mutate the repo's deploy keys AND the
+	// app's stored credential; a concurrent fetch mid-swap would race a half-updated credential.
+	if !s.gitDeploy.TryAcquire() {
+		http.Error(w, "a git operation is already in progress; try again shortly", http.StatusConflict)
+		return
+	}
+	defer s.gitDeploy.Release()
+
+	title := "mooring:" + project
+	// 1. Remove ONLY this app's own key(s), matched by an EXACT title — never another app's
+	//    "mooring:<other>" key nor a key the operator added by hand. Best-effort: a stale key we
+	//    can't see/remove doesn't block installing the fresh one (create fails loudly if it can't).
+	if keys, lerr := s.githubClient.ListDeployKeys(r.Context(), conn.Token, owner, name); lerr == nil {
+		for _, k := range keys {
+			if k.Title == title {
+				if derr := s.githubClient.DeleteDeployKey(r.Context(), conn.Token, owner, name, k.ID); derr != nil {
+					s.log.Warn("reconnect: could not remove the stale deploy key", "project", project, "err", derr.Error())
+				}
+			}
+		}
+	} else {
+		s.log.Warn("reconnect: could not list deploy keys", "project", project, "err", lerr.Error())
+	}
+	// 2. Install a FRESH read-only key.
+	key, err := github.GenerateDeployKey(title)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := s.githubClient.CreateDeployKey(r.Context(), conn.Token, owner, name, title, key.PublicLine); err != nil {
+		if err == github.ErrKeyExists {
+			http.Error(w, "a deploy key named \""+title+"\" still exists on the repo and couldn't be replaced — remove it on GitHub (Settings → Deploy keys) and try again", http.StatusConflict)
+			return
+		}
+		s.log.Warn("reconnect: create deploy key failed", "project", project, "err", err.Error())
+		http.Error(w, "could not install the deploy key on github", http.StatusBadGateway)
+		return
+	}
+	// 3. Rewrite ONLY the credential (+ refresh the URL to the canonical SSH form), preserving every
+	//    other stored setting by re-supplying it from the current config.
+	in := gitstore.SaveInput{
+		Project:        project,
+		RepoURL:        "git@github.com:" + owner + "/" + name + ".git",
+		Ref:            cfg.Ref,
+		ComposePath:    cfg.ComposePath,
+		DockerfilePath: cfg.DockerfilePath,
+		MooringFile:    cfg.MooringFile,
+		AutoDeploy:     cfg.AutoDeploy,
+		BuildPolicy:    cfg.BuildPolicy,
+		NewCred:        &key.PrivatePEM,
+		CredKind:       "ssh",
+		KnownHosts:     github.KnownHosts,
+	}
+	if err := s.gitStore.Save(r.Context(), in); err != nil {
+		http.Error(w, "repository config rejected: "+err.Error(), http.StatusUnprocessableEntity)
+		return
+	}
+	// A live preview inherits the base's deploy key (RegisterPreview copies it), so rotating the base
+	// key would strand every active preview on the now-revoked key. Re-sync them to the fresh key +
+	// URL. Best-effort: the base itself is already repaired; a preview refresh failure just logs.
+	if err := s.gitStore.RefreshPreviewCreds(r.Context(), project, in.RepoURL, key.PrivatePEM, github.KnownHosts); err != nil {
+		s.log.Warn("reconnect: could not refresh inherited preview credentials", "project", project, "err", err.Error())
+	}
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "github_reconnect", Target: project, Outcome: audit.OK, Level: audit.Security, Detail: owner + "/" + name})
+	http.Redirect(w, r, "/apps/"+project+"/git", http.StatusSeeOther)
+}
+
+// parseGitHubRepo extracts owner/name from a github.com SSH or HTTPS repo URL. ok=false for any
+// non-github.com URL, so the reconnect flow can only ever act on a github.com repository.
+func parseGitHubRepo(repoURL string) (owner, name string, ok bool) {
+	u := strings.TrimSpace(repoURL)
+	var rest string
+	switch {
+	case strings.HasPrefix(u, "git@github.com:"):
+		rest = strings.TrimPrefix(u, "git@github.com:")
+	case strings.HasPrefix(u, "ssh://git@github.com/"):
+		rest = strings.TrimPrefix(u, "ssh://git@github.com/")
+	case strings.HasPrefix(u, "https://github.com/"):
+		rest = strings.TrimPrefix(u, "https://github.com/")
+	default:
+		return "", "", false
+	}
+	rest = strings.TrimSuffix(rest, ".git")
+	return splitFullName(rest)
+}
+
 // splitFullName splits "owner/name" with light validation (no path traversal, single
 // slash). The GitHub API call path-escapes these anyway.
 func splitFullName(full string) (owner, name string, ok bool) {

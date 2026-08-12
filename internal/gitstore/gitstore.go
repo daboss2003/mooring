@@ -234,6 +234,25 @@ func (s *Store) RegisterPreview(ctx context.Context, base, slug, ref string) err
 	return err
 }
 
+// RefreshPreviewCreds re-copies a base app's (rotated) SSH credential + URL into every live preview
+// that inherits it. A preview has no deploy key of its own — RegisterPreview copies the BASE's key —
+// so rotating the base key (reconnect / reinstall) would strand every active preview on the now-
+// revoked key. This re-syncs them. A no-op when the base has no previews.
+func (s *Store) RefreshPreviewCreds(ctx context.Context, base, repoURL, privatePEM, knownHosts string) error {
+	credEnc, err := s.cipher.Seal([]byte(privatePEM))
+	if err != nil {
+		return err
+	}
+	khEnc, err := s.cipher.Seal([]byte(knownHosts))
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE app_git SET repo_url=?, cred_kind='ssh', cred_enc=?, known_hosts_enc=?, updated_at=? WHERE preview_of=?`,
+		strings.TrimSpace(repoURL), credEnc, khEnc, time.Now().Unix(), base)
+	return err
+}
+
 // CountPreviews returns how many live previews exist for a base app (the per-base cap input).
 func (s *Store) CountPreviews(base string) (int, error) {
 	var n int

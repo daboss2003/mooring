@@ -203,6 +203,7 @@ type gitView struct {
 	WriteDisabledReason string
 	Versions            []definition.VersionMeta // deploy/edit history; rows with a Commit are rollback targets
 	PreviewEnabled      bool                     // per-PR preview environments opt-in
+	CanReinstallKey     bool                     // OAuth-connected github repo → offer "reinstall deploy key" (repairs a drifted key)
 }
 
 func shortSha(s string) string {
@@ -311,6 +312,14 @@ func (s *Server) handleGitGet(w http.ResponseWriter, r *http.Request) {
 		}
 		gv.Diff = s.buildDiff(r.Context(), project, cfg)
 		gv.PreviewEnabled = cfg.PreviewEnabled
+		// Offer the deploy-key reinstall only when the OAuth app is set up AND this app points at a
+		// github.com repo (the reconnect handler re-checks the OAuth authorization). This is the
+		// supported repair for a drifted OAuth deploy key.
+		if s.githubEnabled() {
+			if _, _, gok := parseGitHubRepo(cfg.RepoURL); gok {
+				gv.CanReinstallKey = true
+			}
+		}
 		if s.defStore != nil {
 			gv.Versions, _ = s.defStore.List(project) // newest first; rows with a Commit are rollback targets
 		}

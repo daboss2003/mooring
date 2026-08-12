@@ -187,6 +187,50 @@ func (c *Client) CreateDeployKey(ctx context.Context, token, owner, repo, title,
 // ErrKeyExists means an identical deploy key is already installed (treat as success).
 var ErrKeyExists = errors.New("github: deploy key already exists")
 
+// DeployKeyInfo is the subset of a repo deploy key the reconnect flow needs to find + remove a
+// stale key by its title.
+type DeployKeyInfo struct {
+	ID    int64  `json:"id"`
+	Title string `json:"title"`
+}
+
+// ListDeployKeys returns owner/repo's deploy keys (id + title). Used by the reconnect flow to find
+// the app's own "mooring:<slug>" key so it can be replaced — it NEVER acts on a key by anything but
+// an exact title match the caller controls.
+func (c *Client) ListDeployKeys(ctx context.Context, token, owner, repo string) ([]DeployKeyInfo, error) {
+	req, err := c.authedGet(ctx, token,
+		"/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/keys?per_page=100")
+	if err != nil {
+		return nil, err
+	}
+	var keys []DeployKeyInfo
+	if err := c.do(req, &keys); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+// DeleteDeployKey removes one deploy key by numeric id. The caller resolves the id from
+// ListDeployKeys by an exact title match, so this can only ever remove a key it identified.
+func (c *Client) DeleteDeployKey(ctx context.Context, token, owner, repo string, keyID int64) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		c.apiBase+"/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/keys/"+strconv.FormatInt(keyID, 10), nil)
+	if err != nil {
+		return err
+	}
+	c.setAuth(req, token)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer drain(resp)
+	// 204 = deleted; 404 = already gone (idempotent — treat as success).
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	return fmt.Errorf("github: delete deploy key: unexpected status %d", resp.StatusCode)
+}
+
 // Release is the subset of a GitHub release Mooring's update check needs.
 type Release struct {
 	TagName    string `json:"tag_name"`

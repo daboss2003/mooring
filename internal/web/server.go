@@ -516,6 +516,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /apps/{project}/git", s.requireAuth(s.withCSRFToken(s.handleGitGet)))
 	mux.HandleFunc("POST /apps/{project}/git", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitSave))))
 	mux.HandleFunc("POST /apps/{project}/git/fetch", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleGitFetch))))
+	mux.HandleFunc("POST /apps/{project}/git/reconnect", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitHubReconnect))))
 	mux.HandleFunc("POST /apps/{project}/git/deploy", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleGitDeploy))))
 	mux.HandleFunc("POST /apps/{project}/versions/{id}/rollback", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleVersionRollback))))
 	mux.HandleFunc("POST /apps/{project}/versions/{id}/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleVersionDelete))))
