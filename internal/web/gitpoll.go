@@ -4,6 +4,8 @@ import (
 	"context"
 	"net/http"
 	"time"
+
+	"github.com/daboss2003/mooring/internal/git"
 )
 
 // dashActiveWindow is how long after the last focused-dashboard heartbeat the git
@@ -93,6 +95,8 @@ func (s *Server) pollOneRepo(ctx context.Context, project string) {
 	if _, _, err := s.doFetch(ctx, project); err != nil {
 		// err is a CLASSIFIED git error (never raw stderr / creds), so logging the reason is safe —
 		// and it means the journal shows WHY (e.g. "repository or ref not found") without digging.
-		s.log.Warn("git poll fetch failed", "project", project, "err", err.Error())
+		// git_stderr is the bounded, credential-free RAW git message (operator journald only) so an
+		// opaque classification can be pinned to GitHub's actual words.
+		s.log.Warn("git poll fetch failed", "project", project, "err", err.Error(), "git_stderr", git.RawStderr(err))
 	}
 }

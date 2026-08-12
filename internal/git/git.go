@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -264,24 +265,62 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	return c.b.Write(p)
 }
 
-// errClass categorizes a git failure so a credential in a URL can never surface
-// in last_fetch_error/logs (plan §7.6: classified, not echoed).
+// gitError carries the operator-safe CLASSIFIED message (what Error / last_fetch_error / the audit
+// log see — plan §7.6: classified, not echoed) PLUS a bounded snippet of the RAW git stderr for
+// operator-only journald diagnostics (RawStderr). The raw snippet is credential-free by construction
+// — Mooring never puts a credential in the git argv/URL (SSH uses a key FILE; HTTPS uses GIT_ASKPASS)
+// — and boundRawStderr redacts any userinfo as belt-and-suspenders. The raw snippet is NEVER surfaced
+// in the UI or audit; only a deliberate operator-log call (git.RawStderr) can read it.
+type gitError struct {
+	msg string
+	raw string
+}
+
+func (e *gitError) Error() string { return e.msg }
+
+// RawStderr returns the bounded, redacted raw git stderr behind a classified git error (for OPERATOR
+// journald logs only — it makes an opaque "repository or ref not found" show the actual git message),
+// or "" if err isn't a classified git error.
+func RawStderr(err error) string {
+	var ge *gitError
+	if errors.As(err, &ge) {
+		return ge.raw
+	}
+	return ""
+}
+
+var urlUserinfoRe = regexp.MustCompile(`(https?://)[^/@\s]*@`)
+
+func boundRawStderr(stderr []byte) string {
+	s := strings.TrimSpace(string(stderr))
+	s = urlUserinfoRe.ReplaceAllString(s, "$1") // defense-in-depth: strip any user:pass@ (never present)
+	if len(s) > 600 {
+		s = s[:600] + "…"
+	}
+	return s
+}
+
+// classifyErr categorizes a git failure so a credential in a URL can never surface in
+// last_fetch_error/audit (plan §7.6: classified, not echoed). The returned error ALSO carries the
+// raw (bounded, redacted) stderr for operator journald diagnostics via git.RawStderr.
 func classifyErr(stderr []byte, err error) error {
 	s := strings.ToLower(string(stderr))
+	var msg string
 	switch {
 	case strings.Contains(s, "authentication") || strings.Contains(s, "403") || strings.Contains(s, "permission denied") || strings.Contains(s, "could not read") && strings.Contains(s, "credential"):
-		return errors.New("git: authentication failed")
+		msg = "git: authentication failed"
 	case strings.Contains(s, "host key") || strings.Contains(s, "known_hosts") || strings.Contains(s, "host key verification"):
-		return errors.New("git: host key verification failed")
+		msg = "git: host key verification failed"
 	case strings.Contains(s, "could not resolve host") || strings.Contains(s, "connection") || strings.Contains(s, "timed out") || strings.Contains(s, "network"):
-		return errors.New("git: network error reaching the remote")
+		msg = "git: network error reaching the remote"
 	case strings.Contains(s, "not found") || strings.Contains(s, "does not exist") || strings.Contains(s, "repository") && strings.Contains(s, "not"):
-		// GitHub answers "Repository not found" for BOTH a missing/renamed repo AND a token that lost
-		// access (it hides private repos), so spell out both so the operator knows where to look.
-		return errors.New("git: repository or ref not found — check the repo URL (renamed/moved?) and that the access token or deploy key is still valid and authorized for it")
+		// GitHub answers "Repository not found" for BOTH a missing/renamed repo AND a token/key that
+		// lost access (it hides private repos), so spell out both so the operator knows where to look.
+		msg = "git: repository or ref not found — check the repo URL (renamed/moved?) and that the access token or deploy key is still valid and authorized for it"
 	default:
-		return errors.New("git: command failed")
+		msg = "git: command failed"
 	}
+	return &gitError{msg: msg, raw: boundRawStderr(stderr)}
 }
 
 func itoa(n int) string { return strconv.Itoa(n) }

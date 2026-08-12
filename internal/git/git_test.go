@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -199,5 +200,30 @@ func TestValidateRepoURL(t *testing.T) {
 		if err := ValidateRepoURL(u); err == nil {
 			t.Errorf("ValidateRepoURL(%q) accepted an unsafe URL", u)
 		}
+	}
+}
+
+func TestClassifyErrCarriesRawStderr(t *testing.T) {
+	raw := []byte("ERROR: Repository not found.\nfatal: Could not read from remote repository.")
+	e := classifyErr(raw, errors.New("exit status 128"))
+	// The operator-facing message stays CLASSIFIED (no raw stderr in it).
+	if got := e.Error(); !strings.Contains(got, "repository or ref not found") {
+		t.Errorf("classified message = %q", got)
+	}
+	if strings.Contains(e.Error(), "Could not read") {
+		t.Error("the classified message must NOT echo raw git stderr")
+	}
+	// …but RawStderr surfaces the real git words for the operator journal.
+	if rs := RawStderr(e); !strings.Contains(rs, "Repository not found") {
+		t.Errorf("RawStderr = %q, want GitHub's actual message", rs)
+	}
+	// A non-git error yields no raw detail.
+	if RawStderr(errors.New("plain")) != "" {
+		t.Error("RawStderr must be empty for a non-git error")
+	}
+	// Defense-in-depth: any userinfo in a URL is redacted (never present, but proven stripped).
+	red := RawStderr(classifyErr([]byte("fatal: unable to access https://x-access-token:ghs_SECRET@github.com/o/r.git: not found"), errors.New("x")))
+	if strings.Contains(red, "ghs_SECRET") || strings.Contains(red, "x-access-token") {
+		t.Errorf("userinfo must be redacted from raw stderr: %q", red)
 	}
 }
