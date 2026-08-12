@@ -247,3 +247,38 @@ func TestDiffPlan(t *testing.T) {
 		t.Error("a changed def must produce a non-empty plan")
 	}
 }
+
+func TestValidateScalingMetrics(t *testing.T) {
+	doc := func(metrics string) []byte {
+		return []byte(`apiVersion: mooring/v1
+kind: App
+metadata:
+  slug: shop
+spec:
+  compose:
+    source: generated
+    services:
+      worker:
+        image: ghcr.io/acme/worker:1
+  scaling:
+    - service: worker
+      enabled: true
+      min: 2
+      max: 10
+` + metrics)
+	}
+	// A valid queue metric parses.
+	if _, err := Parse(doc("      metrics:\n        - name: queue\n          source: ops\n          select: jobs\n          up: 100\n          down: 40\n")); err != nil {
+		t.Fatalf("valid queue metric rejected: %v", err)
+	}
+	// Rejections: up<=down (dead band), non-ops source (phase 1), duplicate name.
+	if _, err := Parse(doc("      metrics:\n        - name: queue\n          source: ops\n          up: 40\n          down: 40\n")); err == nil {
+		t.Error("up <= down must be rejected")
+	}
+	if _, err := Parse(doc("      metrics:\n        - name: queue\n          source: prometheus\n          up: 100\n          down: 40\n")); err == nil {
+		t.Error("a non-ops source must be rejected in phase 1")
+	}
+	if _, err := Parse(doc("      metrics:\n        - name: q\n          source: ops\n          up: 100\n          down: 40\n        - name: q\n          source: ops\n          up: 50\n          down: 10\n")); err == nil {
+		t.Error("a duplicate metric name must be rejected")
+	}
+}

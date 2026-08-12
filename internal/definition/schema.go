@@ -398,6 +398,25 @@ type Scaling struct {
 	BreachForSecs      int     `yaml:"breach_for_secs,omitempty"`    // sustain window before acting (default 60)
 	CooldownUpSecs     int     `yaml:"cooldown_up_secs,omitempty"`   // min seconds between scale-ups (default 60)
 	CooldownDownSecs   int     `yaml:"cooldown_down_secs,omitempty"` // min seconds between scale-downs (default 300; >= up)
+	// Metrics are OPTIONAL custom scaling signals in ADDITION to CPU/mem. Each reads a per-service
+	// number from a source (Phase 1: the service's own ops interface) and scales UP when the
+	// per-replica value is at/above `up`, permits DOWN below `down` (up>down is the dead band).
+	// For a service-TOTAL like a queue depth the value is divided by the running replica count, so
+	// setting `up` to the desired queue-per-replica gives target-tracking through the same engine.
+	Metrics []ScalingMetric `yaml:"metrics,omitempty"`
+}
+
+// ScalingMetric is one custom autoscaling signal (see Scaling.Metrics).
+type ScalingMetric struct {
+	Name   string  `yaml:"name"`   // signal name / display label (unique within the service)
+	Source string  `yaml:"source"` // "ops" — read from the service's ops interface (Phase 1)
+	// Select picks which ops value to read. "" = the BACKLOG (sum of pending counters across every
+	// queue, EXCLUDING cumulative lifetime totals like completed/failed so a monotonic counter
+	// can't cause a runaway). A name sums the counters of a queue OR counter called that (as-is —
+	// naming a cumulative counter is your explicit choice).
+	Select string `yaml:"select,omitempty"`
+	Up     float64 `yaml:"up"`               // scale up when the per-replica value is >= this
+	Down   float64 `yaml:"down"`             // permit scale-down when the per-replica value is < this
 }
 
 // ScheduledTask runs one declared service's command on a fixed interval. The service's
@@ -721,6 +740,23 @@ func (s *Spec) validateScaling() error {
 		}{{"up_cpu_pct", sc.UpCPUPct}, {"down_cpu_pct", sc.DownCPUPct}, {"up_mem_pct", sc.UpMemPct}, {"down_mem_pct", sc.DownMemPct}} {
 			if p.v < 0 || p.v > 100 {
 				return fmt.Errorf("scaling %q: %s must be within 0–100", sc.Service, p.name)
+			}
+		}
+		// Custom scaling signals (additive; CPU/mem above are unchanged).
+		metricNames := map[string]bool{}
+		for _, mt := range sc.Metrics {
+			if !svcRe.MatchString(mt.Name) {
+				return fmt.Errorf("scaling %q: a custom metric needs a name [a-z0-9_-]", sc.Service)
+			}
+			if metricNames[mt.Name] {
+				return fmt.Errorf("scaling %q: duplicate custom metric %q", sc.Service, mt.Name)
+			}
+			metricNames[mt.Name] = true
+			if mt.Source != "ops" {
+				return fmt.Errorf("scaling %q metric %q: source must be \"ops\" (read from the service's ops interface)", sc.Service, mt.Name)
+			}
+			if mt.Down < 0 || mt.Up <= mt.Down {
+				return fmt.Errorf("scaling %q metric %q: up must be above down (dead band) and down must be >= 0", sc.Service, mt.Name)
 			}
 		}
 	}

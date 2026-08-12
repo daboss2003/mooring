@@ -129,3 +129,81 @@ func TestNeverBelowMinOrAboveMax(t *testing.T) {
 		t.Error("must not scale above max")
 	}
 }
+
+// Custom signals extend the same engine: a signal above its up threshold drives up (OR), a
+// signal at/above its down threshold blocks down (AND), and a MISSING signal blocks down but
+// never drives up (hold-safe). CPU/mem cold throughout so only the custom signal is in play.
+func TestCustomSignalScaling(t *testing.T) {
+	p := testCtlPolicy()
+	p.Signals = []SignalPolicy{{Name: "queue", Up: 100, Down: 40}} // per-replica queue depth
+	base := State{Replicas: 2, BreachSince: 940, LastChange: 0}    // breach already sustained, no cooldown
+
+	// Queue per-replica at 150 (> up 100) with cold CPU/mem → scale UP.
+	m := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Value: 150, Present: true}}}
+	if d := Decide(base, m, p, 5, 1000); d.Action != ActUp {
+		t.Fatalf("queue above up threshold should scale up, got %s (%s)", d.Action, d.Reason)
+	}
+
+	// Cold CPU/mem AND queue below down (30 < 40) → scale DOWN allowed.
+	down := State{Replicas: 3, LastChange: 0}
+	mLow := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Value: 30, Present: true}}}
+	if d := Decide(down, mLow, p, 5, 1000); d.Action != ActDown {
+		t.Errorf("cold + queue below down should scale down, got %s", d.Action)
+	}
+
+	// Queue in the dead band (60, between down 40 and up 100) → HOLD (no up, and down blocked).
+	mMid := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Value: 60, Present: true}}}
+	if d := Decide(down, mMid, p, 5, 1000); d.Action != ActNone {
+		t.Errorf("queue in the dead band should hold, got %s", d.Action)
+	}
+
+	// MISSING signal (probe down): must NOT scale up, and must BLOCK scale-down even though
+	// CPU/mem are cold — we can't confirm the queue drained, so we hold capacity.
+	mMissing := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Present: false}}}
+	if d := Decide(down, mMissing, p, 5, 1000); d.Action != ActNone {
+		t.Errorf("a missing custom signal must block scale-down (hold), got %s", d.Action)
+	}
+}
+
+func TestCustomSignalValidation(t *testing.T) {
+	p := testCtlPolicy()
+	p.Signals = []SignalPolicy{{Name: "queue", Up: 100, Down: 40}}
+	if ok, _ := p.Valid(); !ok {
+		t.Fatal("a valid custom signal should pass")
+	}
+	for _, mut := range []func(p *Policy){
+		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "", Up: 10, Down: 1}} },          // no name
+		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 40, Down: 40}} },         // up not above down
+		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 10, Down: -1}} },         // negative
+		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 10, Down: 1}, {Name: "q", Up: 20, Down: 2}} }, // dup
+	} {
+		p := testCtlPolicy()
+		mut(&p)
+		if ok, _ := p.Valid(); ok {
+			t.Error("an invalid custom signal policy must be rejected")
+		}
+	}
+}
+
+// Raising min for an ALREADY-RUNNING service must grow it to the new floor immediately (the bug:
+// it was only applied on first sight, so a raised min was silently ignored under low load).
+func TestMinFloorEnforcedEveryTick(t *testing.T) {
+	p := testCtlPolicy()
+	p.Min = 3 // operator just raised min from (say) 2 to 3
+	// Service currently at 2, cold load (no CPU/mem breach), no cooldown blocking.
+	d := Decide(State{Replicas: 2, LastChange: 0}, cold, p, 5, 10_000)
+	if d.Action != ActUp || d.Target != 3 {
+		t.Fatalf("raising min must grow to the floor: got %s target=%d (%s)", d.Action, d.Target, d.Reason)
+	}
+	// At the floor with cold load → steady (no thrash back down below min).
+	if d := Decide(State{Replicas: 3, LastChange: 0}, cold, p, 5, 10_000); d.Action != ActNone {
+		t.Errorf("at min with cold load should hold, got %s", d.Action)
+	}
+	// Min above the capacity ceiling: grow as far as capacity allows, then refuse (never silent).
+	if d := Decide(State{Replicas: 2, LastChange: 0}, cold, p, 2 /*ceiling*/, 10_000); d.Action != ActUp || d.Target != 2 {
+		// ceiling 2 == cur 2 → can't grow → refuse
+		if d.Action != ActRefused {
+			t.Errorf("min above capacity should grow-then-refuse, got %s target=%d", d.Action, d.Target)
+		}
+	}
+}

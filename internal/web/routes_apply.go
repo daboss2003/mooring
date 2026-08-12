@@ -443,6 +443,10 @@ func scalingPolicyRow(sc definition.Scaling) scale.PolicyRow {
 			cdDown = cdUp
 		}
 	}
+	var metrics []scale.MetricSpec
+	for _, mt := range sc.Metrics {
+		metrics = append(metrics, scale.MetricSpec{Name: mt.Name, Source: mt.Source, Select: mt.Select, Up: mt.Up, Down: mt.Down})
+	}
 	return scale.PolicyRow{
 		Policy: scale.Policy{
 			Min: min, Max: max,
@@ -453,5 +457,6 @@ func scalingPolicyRow(sc definition.Scaling) scale.PolicyRow {
 		Enabled:       sc.Enabled,
 		PerReplicaMem: uint64(sc.PerReplicaMemMiB) << 20,
 		PerReplicaCPU: uint64(sc.PerReplicaCPUMilli),
+		Metrics:       metrics,
 	}
 }

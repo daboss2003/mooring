@@ -18,11 +18,36 @@ const (
 )
 
 // Metrics is the per-service signal: per-replica CPU MEAN and mem MAX aggregated
-// across the running replicas (plan §8A), plus whether every replica is healthy.
+// across the running replicas (plan §8A), plus whether every replica is healthy, plus
+// any CUSTOM signals (e.g. queue depth from the ops probe) already aggregated to a
+// per-replica value by the watcher.
 type Metrics struct {
 	CPUMeanPct float64
 	MemMaxPct  float64
 	AllHealthy bool
+	Signals    []Signal // custom per-service signals, keyed by name
+}
+
+// Signal is one custom metric input for a tick, already aggregated by the watcher to the
+// per-replica value the thresholds compare against (so a service-TOTAL like queue depth is
+// divided by the running replica count → target-tracking falls out of the same threshold
+// compare). Present=false means the metric was unavailable this tick (probe down / degraded);
+// a missing signal must never drive a scale-up and must BLOCK scale-down (we can't confirm the
+// load has dropped), so the service holds rather than shedding capacity blind.
+type Signal struct {
+	Name    string
+	Value   float64
+	Present bool
+}
+
+// SignalPolicy is one custom signal's scale rule: a per-replica up threshold (scale up when the
+// per-replica value is at/above Up) and a down threshold (below which it permits scale-down).
+// Up>Down is the per-signal dead band. For a target-tracking metric like queue depth, Up is the
+// target queue-per-replica.
+type SignalPolicy struct {
+	Name string
+	Up   float64
+	Down float64
 }
 
 // Policy is the operator's scaling policy for one service.
@@ -35,6 +60,7 @@ type Policy struct {
 	BreachForSecs    int64
 	CooldownUpSecs   int64
 	CooldownDownSecs int64
+	Signals          []SignalPolicy // custom signals (additive; CPU/mem unchanged)
 }
 
 // deadBand is the minimum gap required between an up and the matching down
@@ -61,9 +87,25 @@ func (p Policy) Valid() (bool, string) {
 		return false, "breach_for must be positive (anti-flap time window)"
 	case p.CooldownDownSecs < p.CooldownUpSecs:
 		return false, "down cooldown must be >= up cooldown (down-lazy)"
-	default:
-		return true, ""
 	}
+	// Custom signals: a per-signal dead band (up strictly above down — a fixed 20-point gap is
+	// meaningless across scales like 300ms vs 100 queued, so we require only up>down and let the
+	// operator size the gap), non-negative thresholds, a name, and no duplicates.
+	seen := map[string]bool{}
+	for _, s := range p.Signals {
+		switch {
+		case s.Name == "":
+			return false, "a custom scaling signal needs a name"
+		case seen[s.Name]:
+			return false, "duplicate custom scaling signal " + s.Name
+		case s.Down < 0 || s.Up < 0:
+			return false, "custom signal " + s.Name + " thresholds must be >= 0"
+		case s.Up <= s.Down:
+			return false, "custom signal " + s.Name + " up threshold must be above its down threshold (dead band)"
+		}
+		seen[s.Name] = true
+	}
+	return true, ""
 }
 
 // State is the persisted controller state for one service. Replicas is the DESIRED
@@ -103,8 +145,42 @@ func Decide(st State, m Metrics, p Policy, ceiling int, now int64) Decision {
 		return Decision{Target: hardMax, Action: ActDown, Reason: "over the host-capacity ceiling", Next: ns}
 	}
 
+	// Min floor, enforced EVERY tick: a raised min (or a service otherwise below its floor) grows
+	// toward min immediately — regardless of load or cooldown — but never past the capacity ceiling.
+	// This is what makes "increase min" take effect for an ALREADY-RUNNING service; the first-sight
+	// desired() only seeds min for a brand-new one. If capacity can't fund the min, refuse + alert
+	// rather than silently ignore the operator's floor.
+	if cur < p.Min {
+		target := p.Min
+		if target > hardMax {
+			target = hardMax // capacity may not allow the full min; grow as far as it can
+		}
+		if target > cur {
+			ns := st
+			ns.Replicas = target
+			ns.LastChange = now
+			ns.BreachSince = 0
+			return Decision{Target: target, Action: ActUp, Reason: "below min replicas", Next: ns}
+		}
+		return Decision{Target: cur, Action: ActRefused, Reason: "cannot reach min replicas: no host capacity", Next: st}
+	}
+
 	wantUp := m.CPUMeanPct >= p.UpCPUPct || m.MemMaxPct >= p.UpMemPct
 	wantDown := m.CPUMeanPct < p.DownCPUPct && m.MemMaxPct < p.DownMemPct && m.AllHealthy
+
+	// Custom signals extend the SAME hysteresis engine: a PRESENT signal at/above its up
+	// threshold also wants up (OR). For down, EVERY policy signal must be present AND below its
+	// down threshold (AND) — a missing signal (probe down) blocks scale-down so we never shed
+	// capacity we can't measure; it never contributes to scale-up.
+	for _, sp := range p.Signals {
+		s, ok := signalByName(m.Signals, sp.Name)
+		if ok && s.Present && s.Value >= sp.Up {
+			wantUp = true
+		}
+		if !ok || !s.Present || s.Value >= sp.Down {
+			wantDown = false
+		}
+	}
 
 	if wantUp {
 		ns := st
@@ -150,4 +226,14 @@ func Decide(st State, m Metrics, p Policy, ceiling int, now int64) Decision {
 
 func hold(ns State, reason string) Decision {
 	return Decision{Target: ns.Replicas, Action: ActNone, Reason: reason, Next: ns}
+}
+
+// signalByName finds a custom signal by name in the tick's metrics.
+func signalByName(sigs []Signal, name string) (Signal, bool) {
+	for _, s := range sigs {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return Signal{}, false
 }

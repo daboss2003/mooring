@@ -10,7 +10,68 @@ import (
 	"github.com/daboss2003/mooring/internal/alertstore"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/monitor"
+	"github.com/daboss2003/mooring/internal/ops"
 )
+
+// customSignal reads one custom metric spec into a per-replica controller Signal. Phase 1 sources
+// only "ops" (queue depth from the app's ops probe).
+//
+// Present distinguishes "can't measure" from "measured zero", which the controller treats very
+// differently (absent → HOLD; zero → permits scale-down). It is Present:false ONLY when the probe
+// itself is unavailable — no ops interface, a degraded/errored (BASIC) response, or running==0. A
+// HEALTHY (RICH) response whose selector matches nothing means the queue DRAINED / was delisted →
+// value 0, Present:true, so an idle worker can actually scale back down (fixing the "drained queue
+// disappears → pinned forever" trap).
+func customSignal(app *monitor.App, spec MetricSpec, running int) Signal {
+	sig := Signal{Name: spec.Name}
+	if spec.Source != "ops" || app == nil || app.Ops == nil || running <= 0 {
+		return sig // probe unavailable → hold
+	}
+	res := app.Ops
+	if res.Mode != ops.RICH || res.Err != "" {
+		return sig // probe degraded / errored → hold (can't measure the backlog)
+	}
+	sig.Value = float64(sumQueue(res, spec.Select)) / float64(running) // service-total → per-replica
+	sig.Present = true
+	return sig
+}
+
+// cumulativeCounter reports whether an ops queue counter name is a monotonic LIFETIME total rather
+// than current backlog. These are EXCLUDED from the unfiltered (select:"") sum so a counter like
+// `completed` — which only ever grows — can't drive an unstoppable ramp to the capacity ceiling.
+func cumulativeCounter(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "completed", "failed", "done", "processed", "total", "errored", "succeeded", "dead", "prioritized_completed":
+		return true
+	}
+	return false
+}
+
+// sumQueue sums the ops queue counts selected by sel. sel=="" sums the BACKLOG — every counter
+// EXCEPT cumulative lifetime totals (completed/failed/…), so a monotonic counter can't cause a
+// runaway. A non-empty sel is the operator's explicit choice: counters under a queue whose Name==sel
+// OR counters whose Name==sel (summed as-is — if they name a cumulative counter, that's on them).
+// A selector that matches nothing returns 0 (the caller has already confirmed a healthy probe, so
+// "no match" means drained, not missing).
+func sumQueue(res *ops.Result, sel string) int64 {
+	var total int64
+	for _, q := range res.Queues {
+		for _, c := range q.Counts {
+			switch {
+			case sel == "":
+				if !cumulativeCounter(c.Name) {
+					total += c.Value
+				}
+			case q.Name == sel || c.Name == sel:
+				total += c.Value
+			}
+		}
+	}
+	if total < 0 { // an app reporting a negative count can't drag the signal below zero
+		total = 0
+	}
+	return total
+}
 
 // Scaler performs the actual replica change for a service (static-argv
 // `docker compose up -d --no-deps --no-recreate --scale <svc>=<n>`). The watcher
@@ -234,6 +295,16 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		metrics.CPUMeanPct = g.cpuSum / float64(g.running)
 	}
 	metrics.MemMaxPct = g.memMaxPct
+	// Custom signals (Phase 1: queue depth from the app's ops probe), each aggregated to a
+	// per-replica value. Absent data (no ops interface, probe degraded, unknown selector) yields
+	// Present:false, which the controller treats as HOLD — never scale up on missing data, never
+	// shed capacity we can't measure.
+	if len(p.Metrics) > 0 {
+		app := snap.AppByProject(k.App)
+		for _, spec := range p.Metrics {
+			metrics.Signals = append(metrics.Signals, customSignal(app, spec, g.running))
+		}
+	}
 
 	d := Decide(st, metrics, p.Policy, ceiling, now)
 	switch d.Action {
