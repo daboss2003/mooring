@@ -25,11 +25,21 @@ install -d -o mooring -g mooring -m 0700 /var/lib/mooring
 install -d -o mooring -g mooring -m 0700 /var/lib/mooring-apps
 install -d -o mooring -g mooring -m 0700 /var/lib/caddy
 
-# Pick up the shipped unit.
+# Pick up the shipped unit. On an UPGRADE of an already-configured install, keep boot-start
+# ENABLED and bring the new binary up — an update must NEVER silently disable boot-start or leave
+# the service stopped (the presence of /etc/mooring/config.yaml means Mooring is already set up, so
+# this is an upgrade/reinstall, not a first install). A fresh install has no config yet and is left
+# for the operator to enable after writing config.yaml (see the steps printed below).
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
+    if [ -f /etc/mooring/config.yaml ]; then
+        systemctl enable mooring >/dev/null 2>&1 || true
+        systemctl restart mooring >/dev/null 2>&1 || true
+    fi
 fi
 
+# Only print the first-run setup steps on a FRESH install (no config yet) — not on every upgrade.
+if [ ! -f /etc/mooring/config.yaml ]; then
 cat <<'EOF'
 
 Mooring installed. Next steps (over SSH):
@@ -45,3 +55,4 @@ Mooring installed. Next steps (over SSH):
 
 Docs: https://github.com/daboss2003/mooring/tree/main/docs
 EOF
+fi
