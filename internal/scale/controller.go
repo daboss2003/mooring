@@ -168,16 +168,22 @@ func Decide(st State, m Metrics, p Policy, ceiling int, now int64) Decision {
 	wantUp := m.CPUMeanPct >= p.UpCPUPct || m.MemMaxPct >= p.UpMemPct
 	wantDown := m.CPUMeanPct < p.DownCPUPct && m.MemMaxPct < p.DownMemPct && m.AllHealthy
 
-	// Custom signals extend the SAME hysteresis engine: a PRESENT signal at/above its up
-	// threshold also wants up (OR). For down, EVERY policy signal must be present AND below its
-	// down threshold (AND) — a missing signal (probe down) blocks scale-down so we never shed
-	// capacity we can't measure; it never contributes to scale-up.
+	// Custom signals extend the SAME hysteresis engine. Three states per policy signal:
+	//   - NOT emitted this tick (absent from m.Signals) → the source can't measure it here at all
+	//     (e.g. a source:edge metric on a host with no managed edge) → truly INERT: neither up nor
+	//     down. It must NOT block scale-down, or a metric that can never apply would pin the service.
+	//   - emitted but Present:false (probe down / edge blind) → BLOCKS scale-down, so we never shed
+	//     capacity we currently can't measure. Never contributes to scale-up.
+	//   - emitted and Present → at/above up wants up (OR); at/above down blocks down (AND).
 	for _, sp := range p.Signals {
 		s, ok := signalByName(m.Signals, sp.Name)
-		if ok && s.Present && s.Value >= sp.Up {
+		if !ok {
+			continue // not emitted this tick → inert
+		}
+		if s.Present && s.Value >= sp.Up {
 			wantUp = true
 		}
-		if !ok || !s.Present || s.Value >= sp.Down {
+		if !s.Present || s.Value >= sp.Down {
 			wantDown = false
 		}
 	}

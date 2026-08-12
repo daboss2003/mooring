@@ -6,9 +6,43 @@ package edge
 // (SBD-7). Only the fields Mooring uses are modelled; everything else is omitted.
 
 type caddyConfig struct {
-	Admin *caddyAdmin `json:"admin"`
-	Apps  caddyApps   `json:"apps"`
+	Admin   *caddyAdmin   `json:"admin"`
+	Logging *caddyLogging `json:"logging,omitempty"`
+	Apps    caddyApps     `json:"apps"`
 }
+
+// caddyLogging defines named log sinks. Mooring uses it (only when a service opts into an edge
+// metric) to split the edge's output: the default logger keeps Caddy's own logs + errors on
+// STDERR (→ journald), while a dedicated `mooring_access` logger writes the per-request access log
+// as JSON to STDOUT, which the supervisor captures and feeds to the latency aggregator — so access
+// logs never flood journald and are consumed in-process.
+type caddyLogging struct {
+	Logs map[string]caddyLog `json:"logs,omitempty"`
+}
+
+type caddyLog struct {
+	Writer  caddyLogWriter   `json:"writer"`
+	Encoder *caddyLogEncoder `json:"encoder,omitempty"`
+	Include []string         `json:"include,omitempty"`
+	Exclude []string         `json:"exclude,omitempty"`
+}
+
+type caddyLogWriter struct {
+	Output string `json:"output"` // "stdout" | "stderr"
+}
+
+type caddyLogEncoder struct {
+	Format string `json:"format"` // "json" | "console"
+}
+
+// caddyServerLogs enables a server's access logging and names the logger it flows to.
+type caddyServerLogs struct {
+	DefaultLoggerName string `json:"default_logger_name,omitempty"`
+}
+
+// accessLoggerName is the logger the edge server's access log flows to; the namespace Caddy uses
+// is "http.log.access.<name>".
+const accessLoggerName = "mooring_access"
 
 type caddyAdmin struct {
 	Listen        string            `json:"listen"`
@@ -35,8 +69,9 @@ type caddyHTTP struct {
 }
 
 type caddyServer struct {
-	Listen []string     `json:"listen"`
-	Routes []caddyRoute `json:"routes"`
+	Listen []string         `json:"listen"`
+	Logs   *caddyServerLogs `json:"logs,omitempty"`
+	Routes []caddyRoute     `json:"routes"`
 }
 
 type caddyRoute struct {

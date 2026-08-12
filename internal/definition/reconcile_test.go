@@ -271,12 +271,30 @@ spec:
 	if _, err := Parse(doc("      metrics:\n        - name: queue\n          source: ops\n          select: jobs\n          up: 100\n          down: 40\n")); err != nil {
 		t.Fatalf("valid queue metric rejected: %v", err)
 	}
-	// Rejections: up<=down (dead band), non-ops source (phase 1), duplicate name.
+	// A valid edge latency metric parses (source:edge with a fixed selector).
+	if _, err := Parse(doc("      metrics:\n        - name: latency\n          source: edge\n          select: p95_latency_ms\n          up: 800\n          down: 300\n")); err != nil {
+		t.Fatalf("valid edge p95 metric rejected: %v", err)
+	}
+	if _, err := Parse(doc("      metrics:\n        - name: rate\n          source: edge\n          select: req_per_sec\n          up: 50\n          down: 10\n")); err != nil {
+		t.Fatalf("valid edge req_per_sec metric rejected: %v", err)
+	}
+	// Multiple signals on ONE service are fine (the list is additive) — e.g. BOTH edge selectors at
+	// once, distinguished by name. Scale-up fires if EITHER breaches (OR); scale-down needs BOTH calm.
+	if _, err := Parse(doc("      metrics:\n        - name: latency\n          source: edge\n          select: p95_latency_ms\n          up: 800\n          down: 300\n        - name: rate\n          source: edge\n          select: req_per_sec\n          up: 50\n          down: 10\n")); err != nil {
+		t.Fatalf("two edge metrics (p95 + req_per_sec) on one service rejected: %v", err)
+	}
+	// Rejections: up<=down (dead band), unknown source, edge with a bad/missing selector, duplicate name.
 	if _, err := Parse(doc("      metrics:\n        - name: queue\n          source: ops\n          up: 40\n          down: 40\n")); err == nil {
 		t.Error("up <= down must be rejected")
 	}
 	if _, err := Parse(doc("      metrics:\n        - name: queue\n          source: prometheus\n          up: 100\n          down: 40\n")); err == nil {
-		t.Error("a non-ops source must be rejected in phase 1")
+		t.Error("an unknown source must be rejected")
+	}
+	if _, err := Parse(doc("      metrics:\n        - name: latency\n          source: edge\n          select: cpu\n          up: 100\n          down: 40\n")); err == nil {
+		t.Error("source:edge with an unknown selector must be rejected")
+	}
+	if _, err := Parse(doc("      metrics:\n        - name: latency\n          source: edge\n          up: 100\n          down: 40\n")); err == nil {
+		t.Error("source:edge with no selector must be rejected")
 	}
 	if _, err := Parse(doc("      metrics:\n        - name: q\n          source: ops\n          up: 100\n          down: 40\n        - name: q\n          source: ops\n          up: 50\n          down: 10\n")); err == nil {
 		t.Error("a duplicate metric name must be rejected")

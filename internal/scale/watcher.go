@@ -36,6 +36,50 @@ func customSignal(app *monitor.App, spec MetricSpec, running int) Signal {
 	return sig
 }
 
+// Edge-metric selectors (source:edge): the two edge-measured values a policy can scale on.
+const (
+	selEdgeP95 = "p95_latency_ms" // service p95 request latency (ms), absolute
+	selEdgeRPS = "req_per_sec"    // service request rate (req/s), tracked per replica
+)
+
+// edgeSignal reads one source:edge metric spec into a controller Signal from the edge's rolling
+// latency/rate aggregator. The value is measured by Mooring's own edge (not self-reported by the
+// app), so the app can't fabricate it — though, like any latency/rate signal, a client shaping
+// traffic still influences it. Returns (signal, include): include=false OMITS the signal entirely
+// (it neither votes up nor pins down) when there is no managed edge to measure with.
+//
+// The subtle case is ABSENCE of samples for this service, which must be split two ways:
+//   - edge is LIVE (delivering logs for some service) but this one is silent → genuinely idle → a
+//     MEASURED 0 (Present) so an idle service can scale down.
+//   - edge is NOT live (enable-time lag, a broken/stalled capture) → we are BLIND → HOLD
+//     (Present:false), because the low-CPU/mem I/O-bound services this feature exists for would
+//     otherwise be wrongly shed on data we simply don't have (CPU/mem can't protect them — they run
+//     cool by definition).
+func (w *Watcher) edgeSignal(spec MetricSpec, k Key, running int) (Signal, bool) {
+	if w.cfg.EdgeStats == nil || running <= 0 {
+		return Signal{}, false // no managed edge (or no replicas) → OMIT: inert, never pins scaling
+	}
+	sig := Signal{Name: spec.Name}
+	p95, rps, present := w.cfg.EdgeStats(k.App, k.Service)
+	if !present {
+		if w.cfg.EdgeLive == nil || !w.cfg.EdgeLive() {
+			return sig, true // blind → HOLD (Present:false)
+		}
+		sig.Present = true // edge live, this service silent → measured 0 (permits scale-down)
+		return sig, true
+	}
+	switch spec.Select {
+	case selEdgeP95:
+		sig.Value = p95 // service-level latency; absolute (adding replicas lowers it)
+	case selEdgeRPS:
+		sig.Value = rps / float64(running) // service-total rate → per-replica
+	default:
+		return Signal{}, false // unknown selector (schema rejects this) → OMIT, defense in depth
+	}
+	sig.Present = true
+	return sig, true
+}
+
 // cumulativeCounter reports whether an ops queue counter name is a monotonic LIFETIME total rather
 // than current backlog. These are EXCLUDED from the unfiltered (select:"") sum so a counter like
 // `completed` — which only ever grows — can't drive an unstoppable ramp to the capacity ceiling.
@@ -114,7 +158,17 @@ type Config struct {
 	WritePlaneOK bool
 	HostCPUMilli uint64                                        // total host CPU (milli); 0 disables the CPU budget
 	IsCandidate  func(app, service string) (ServiceSpec, bool) // C1–C6 from compose; nil → trust the policy opt-in
-	Now          func() int64
+	// EdgeStats returns the edge-measured p95 latency (ms) and request rate (req/s) for a service
+	// over the rolling window, plus whether ANY request was sampled in it. It backs source:edge
+	// metrics. nil = no managed edge on this host → source:edge metrics are OMITTED (inert), so they
+	// neither help nor pin scaling.
+	EdgeStats func(app, service string) (p95Ms, reqPerSec float64, present bool)
+	// EdgeLive reports whether the edge is delivering access logs at all right now (any service).
+	// It lets edgeSignal tell a genuinely-idle service (edge live, no samples → may scale down) from
+	// a blind window (enable-time lag / broken capture → HOLD, never shed on data we don't have).
+	// Wired together with EdgeStats (both set, or both nil).
+	EdgeLive func() bool
+	Now      func() int64
 }
 
 // Watcher is the auto-scaling controller loop (plan §8A).
@@ -302,7 +356,14 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 	if len(p.Metrics) > 0 {
 		app := snap.AppByProject(k.App)
 		for _, spec := range p.Metrics {
-			metrics.Signals = append(metrics.Signals, customSignal(app, spec, g.running))
+			switch spec.Source {
+			case "edge":
+				if sig, ok := w.edgeSignal(spec, k, g.running); ok {
+					metrics.Signals = append(metrics.Signals, sig)
+				}
+			default:
+				metrics.Signals = append(metrics.Signals, customSignal(app, spec, g.running))
+			}
 		}
 	}
 

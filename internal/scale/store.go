@@ -33,7 +33,7 @@ type PolicyRow struct {
 // the policy as JSON.
 type MetricSpec struct {
 	Name   string  `json:"name"`
-	Source string  `json:"source"` // "ops" (Phase 1)
+	Source string  `json:"source"` // "ops" (app queue depth) | "edge" (Mooring-measured latency / req-rate)
 	Select string  `json:"select,omitempty"`
 	Up     float64 `json:"up"`
 	Down   float64 `json:"down"`
@@ -136,6 +136,26 @@ func (s *Store) EnabledPolicies() (map[Key]PolicyRow, error) {
 		out[k] = pr
 	}
 	return out, rows.Err()
+}
+
+// HasEdgeMetric reports whether ANY enabled scaling policy uses a source:edge metric. The edge
+// reconciler consults this each cycle to decide whether to render Caddy's per-request access log
+// (which feeds the latency aggregator) — so an edge with no such metric never pays for access
+// logging, and enabling one takes effect on the next reconcile with no restart. A query error is
+// treated as false (fail-safe: don't turn on logging we can't justify).
+func (s *Store) HasEdgeMetric() bool {
+	pols, err := s.EnabledPolicies()
+	if err != nil {
+		return false
+	}
+	for _, pr := range pols {
+		for _, m := range pr.Metrics {
+			if m.Source == "edge" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // PolicyFor returns the policy for one service (enabled flag included), or ok=false.

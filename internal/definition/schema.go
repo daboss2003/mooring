@@ -399,24 +399,28 @@ type Scaling struct {
 	CooldownUpSecs     int     `yaml:"cooldown_up_secs,omitempty"`   // min seconds between scale-ups (default 60)
 	CooldownDownSecs   int     `yaml:"cooldown_down_secs,omitempty"` // min seconds between scale-downs (default 300; >= up)
 	// Metrics are OPTIONAL custom scaling signals in ADDITION to CPU/mem. Each reads a per-service
-	// number from a source (Phase 1: the service's own ops interface) and scales UP when the
-	// per-replica value is at/above `up`, permits DOWN below `down` (up>down is the dead band).
-	// For a service-TOTAL like a queue depth the value is divided by the running replica count, so
-	// setting `up` to the desired queue-per-replica gives target-tracking through the same engine.
+	// number from a source and scales UP when the value is at/above `up`, permits DOWN below `down`
+	// (up>down is the dead band). Two sources: "ops" (queue depth from the app's own ops interface)
+	// and "edge" (latency / request-rate MEASURED by Mooring's edge — for an I/O-bound service whose
+	// CPU/mem stay low under load). For a service-TOTAL like queue depth or req/s the value is divided
+	// by the running replica count, so setting `up` to the desired per-replica target gives
+	// target-tracking through the same engine.
 	Metrics []ScalingMetric `yaml:"metrics,omitempty"`
 }
 
 // ScalingMetric is one custom autoscaling signal (see Scaling.Metrics).
 type ScalingMetric struct {
-	Name   string  `yaml:"name"`   // signal name / display label (unique within the service)
-	Source string  `yaml:"source"` // "ops" — read from the service's ops interface (Phase 1)
-	// Select picks which ops value to read. "" = the BACKLOG (sum of pending counters across every
-	// queue, EXCLUDING cumulative lifetime totals like completed/failed so a monotonic counter
-	// can't cause a runaway). A name sums the counters of a queue OR counter called that (as-is —
-	// naming a cumulative counter is your explicit choice).
-	Select string `yaml:"select,omitempty"`
-	Up     float64 `yaml:"up"`               // scale up when the per-replica value is >= this
-	Down   float64 `yaml:"down"`             // permit scale-down when the per-replica value is < this
+	Name   string `yaml:"name"`   // signal name / display label (unique within the service)
+	Source string `yaml:"source"` // "ops" (app's ops interface) | "edge" (Mooring-measured at the edge)
+	// Select picks which value to read.
+	//   source: ops  → "" = the BACKLOG (sum of pending counters across every queue, EXCLUDING
+	//                  cumulative lifetime totals like completed/failed so a monotonic counter can't
+	//                  cause a runaway). A name sums the counters of a queue OR counter called that.
+	//   source: edge → "p95_latency_ms" (service p95 request latency; absolute) or "req_per_sec"
+	//                  (request rate, tracked per replica). Measured by the edge — the app can't fake it.
+	Select string  `yaml:"select,omitempty"`
+	Up     float64 `yaml:"up"`   // scale up when the (per-replica, for totals) value is >= this
+	Down   float64 `yaml:"down"` // permit scale-down when the value is < this
 }
 
 // ScheduledTask runs one declared service's command on a fixed interval. The service's
@@ -752,8 +756,16 @@ func (s *Spec) validateScaling() error {
 				return fmt.Errorf("scaling %q: duplicate custom metric %q", sc.Service, mt.Name)
 			}
 			metricNames[mt.Name] = true
-			if mt.Source != "ops" {
-				return fmt.Errorf("scaling %q metric %q: source must be \"ops\" (read from the service's ops interface)", sc.Service, mt.Name)
+			switch mt.Source {
+			case "ops":
+				// Select is free-form: "" = backlog, else a queue/counter name (validated at read time).
+			case "edge":
+				// Mooring-measured signals from the edge access log; the selector is a fixed enum.
+				if mt.Select != "p95_latency_ms" && mt.Select != "req_per_sec" {
+					return fmt.Errorf("scaling %q metric %q: source \"edge\" needs select: p95_latency_ms or req_per_sec", sc.Service, mt.Name)
+				}
+			default:
+				return fmt.Errorf("scaling %q metric %q: source must be \"ops\" (app's ops interface) or \"edge\" (Mooring-measured latency/req-rate)", sc.Service, mt.Name)
 			}
 			if mt.Down < 0 || mt.Up <= mt.Down {
 				return fmt.Errorf("scaling %q metric %q: up must be above down (dead band) and down must be >= 0", sc.Service, mt.Name)

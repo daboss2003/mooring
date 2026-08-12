@@ -109,8 +109,13 @@ type Reconciler struct {
 	// It is invoked OUTSIDE the reconcile lock (it does slow socket-proxy I/O) — see
 	// Reconcile. nil disables pool discovery entirely.
 	poolFn   func(ctx context.Context, routes []Route) map[string][]string
-	mu       sync.Mutex // serializes the render→Load→lastGood commit (atomic, last-wins)
-	lastGood []byte
+	// accessLog reports whether the edge should emit the per-request access log this render (turned
+	// on only while some enabled scaling policy uses a source:edge metric, so an edge with no such
+	// metric pays nothing). Consulted per reconcile so it reacts to a deploy WITHOUT a restart. nil
+	// = never (the default). See BaseConfig.AccessLog.
+	accessLog func() bool
+	mu        sync.Mutex // serializes the render→Load→lastGood commit (atomic, last-wins)
+	lastGood  []byte
 }
 
 // PoolKey identifies the upstream a route's replica pool is computed for — its owning
@@ -133,6 +138,21 @@ func (r *Reconciler) SetCertHosts(fn func() []CertHost) { r.certHosts = fn }
 // dial; Render re-validates every member regardless (SBD-4 backstop).
 func (r *Reconciler) SetPoolDiscoverer(fn func(ctx context.Context, routes []Route) map[string][]string) {
 	r.poolFn = fn
+}
+
+// SetAccessLog registers the predicate that decides, per reconcile, whether to render the edge's
+// per-request access log (STDOUT JSON, consumed in-process for edge-measured autoscaling). It is
+// consulted on every reconcile so enabling a source:edge metric takes effect on the next cycle
+// (≤ the refresh cadence) with no restart. nil (the default) means never emit it.
+func (r *Reconciler) SetAccessLog(fn func() bool) { r.accessLog = fn }
+
+// renderBase returns the base config for this reconcile, applying the reactive access-log decision.
+func (r *Reconciler) renderBase() BaseConfig {
+	base := r.base
+	if r.accessLog != nil {
+		base.AccessLog = r.accessLog()
+	}
+	return base
 }
 
 // ReconcilePool satisfies scale.EdgeReconciler: after the auto-scaler changes a
@@ -191,7 +211,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 			routes[i].Pool = pool
 		}
 	}
-	cfg, err := Render(r.base, routes, r.certOnly())
+	cfg, err := Render(r.renderBase(), routes, r.certOnly())
 	if err != nil {
 		return fmt.Errorf("edge: render: %w", err) // unsafe route → never applied
 	}
@@ -217,7 +237,7 @@ func (r *Reconciler) RevertToLastGood(ctx context.Context) error {
 	cfg := r.lastGood
 	if cfg == nil {
 		var err error
-		if cfg, err = Render(r.base, nil, nil); err != nil {
+		if cfg, err = Render(r.renderBase(), nil, nil); err != nil {
 			return err
 		}
 	}

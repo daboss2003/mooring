@@ -68,6 +68,11 @@ type BaseConfig struct {
 	// that sets dns01. Any default-CA subject at/under a wildcard's Domain is served by that
 	// wildcard (dropped from per-name HTTP-01 issuance). Empty slice = all per-name HTTP-01.
 	Wildcards []WildcardCert
+	// AccessLog, when true, makes the edge emit a per-request JSON access log to STDOUT (captured
+	// in-process by the supervisor for the latency aggregator) while keeping Caddy's own logs +
+	// errors on STDERR (→ journald). Enabled only when a scaled service opts into an edge metric,
+	// so most edges pay nothing for it.
+	AccessLog bool
 }
 
 // WildcardCert is one *.<Domain> DNS-01 wildcard: a namespace apex + the DNS provider
@@ -270,13 +275,25 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 	// SBD-4: default unmatched Host → 404 (never proxy, no catch-all).
 	httpRoutes = append(httpRoutes, caddyRoute{Handle: []caddyHandler{{Handler: "static_response", StatusCode: 404}}})
 
+	edgeServer := caddyServer{Listen: []string{":443", ":80"}, Routes: httpRoutes}
 	cfg := caddyConfig{
 		Admin: admin,
 		Apps: caddyApps{
-			HTTP: caddyHTTP{Servers: map[string]caddyServer{
-				"edge": {Listen: []string{":443", ":80"}, Routes: httpRoutes},
-			}},
+			HTTP: caddyHTTP{Servers: map[string]caddyServer{"edge": edgeServer}},
 		},
+	}
+	// Opt-in per-request access log (for edge-measured autoscaling signals). Access → STDOUT (JSON,
+	// captured in-process); the default logger keeps Caddy's own logs + errors on STDERR/journald
+	// and EXCLUDES the access namespace so requests don't double-log to journald.
+	if base.AccessLog {
+		srv := cfg.Apps.HTTP.Servers["edge"]
+		srv.Logs = &caddyServerLogs{DefaultLoggerName: accessLoggerName}
+		cfg.Apps.HTTP.Servers["edge"] = srv
+		accessNS := "http.log.access." + accessLoggerName
+		cfg.Logging = &caddyLogging{Logs: map[string]caddyLog{
+			"default":        {Writer: caddyLogWriter{Output: "stderr"}, Exclude: []string{accessNS}},
+			accessLoggerName: {Writer: caddyLogWriter{Output: "stdout"}, Encoder: &caddyLogEncoder{Format: "json"}, Include: []string{accessNS}},
+		}}
 	}
 	// SBD-3: ACME issuing ONLY for the configured subjects; on_demand omitted (off).
 	// No subjects → no automation policy (base serves nothing — the safe recovery floor).

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"net"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -29,6 +30,7 @@ import (
 	"github.com/daboss2003/mooring/internal/docker"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/edge"
+	"github.com/daboss2003/mooring/internal/edgemetrics"
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
@@ -418,6 +420,7 @@ func cmdServe(args []string) error {
 		}
 	}
 	var edgeRecon *edge.Reconciler
+	var edgeAgg *edgemetrics.Aggregator // edge-measured latency/req-rate for source:edge autoscaling (nil unless the edge is owned)
 	edgeReason := ""
 	if cfg.Edge.Mode == config.EdgeManaged {
 		base := edge.BaseConfig{
@@ -465,6 +468,43 @@ func cmdServe(args []string) error {
 				return out
 			})
 			sup := &edge.Supervisor{CaddyBin: "caddy", AdminListen: base.AdminListen, Log: log}
+
+			// Edge-measured autoscaling signals (source:edge). The edge emits a per-request access
+			// log to STDOUT (only while some enabled policy uses a source:edge metric — the reactive
+			// predicate below), the supervisor captures it in-process, and a rolling per-service
+			// window feeds p95-latency / req-rate to the scaler. Access logs never touch journald;
+			// Caddy's own logs + errors stay on STDERR. A request with a bogus Host header can't be
+			// attributed to any service (the index only knows real routes), so it's dropped.
+			edgeAgg = edgemetrics.New(30 * time.Second)
+			edgeIdx := edgemetrics.NewHostIndex()
+			refreshEdgeIdx := func() {
+				if routes, lerr := edgeRoutes.List(); lerr == nil {
+					edgeIdx.Set(edgeAccessRoutes(routes))
+				}
+			}
+			refreshEdgeIdx() // seed before the child starts logging
+			sup.AccessLine = edgemetrics.NewCollector(edgeAgg, edgeIdx).Ingest
+			// Turn Caddy's access log on/off per reconcile based on whether any enabled policy uses a
+			// source:edge metric — so enabling one takes effect on the next cycle without a restart,
+			// and an edge with none pays nothing.
+			edgeRecon.SetAccessLog(scalingStore.HasEdgeMetric)
+			// Keep the host→service attribution index fresh (a deploy/route edit changes it); same
+			// 15s cadence as the edge pool refresh.
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				t := time.NewTicker(15 * time.Second)
+				defer t.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-t.C:
+						refreshEdgeIdx()
+					}
+				}
+			}()
+
 			// Boot floor WITHOUT the DNS-01 wildcard policy: if the operator's caddy lacks the
 			// DNS provider module, it must fail the first (transactional) reconcile — not the
 			// boot — so a missing module never bricks the whole edge (:80/:443 + all HTTP-01
@@ -627,6 +667,14 @@ func cmdServe(args []string) error {
 	// path (srv via RunHeld); Edge re-renders the edge config after a scale change so
 	// the new/removed replica is added to / dropped from the route's live dial pool.
 	// Joined before the deferred db.Close.
+	var edgeStats func(app, service string) (float64, float64, bool)
+	var edgeLive func() bool
+	if edgeAgg != nil { // managed edge owned → source:edge metrics can be measured
+		edgeStats = func(app, service string) (float64, float64, bool) {
+			return edgeAgg.Stats(edgemetrics.Key{App: app, Service: service})
+		}
+		edgeLive = edgeAgg.Live
+	}
 	scaler := scale.New(scale.Config{
 		Store:        scalingStore,
 		Alerts:       shAlerts,
@@ -638,6 +686,11 @@ func cmdServe(args []string) error {
 		Interval:     cfg.Monitor.PollInterval.D(),
 		WritePlaneOK: writeAllowed,
 		HostCPUMilli: uint64(runtime.NumCPU() * 1000),
+		// Edge-measured latency/req-rate for source:edge metrics, wired ONLY when the managed edge is
+		// owned (edgeAgg != nil). When it isn't, both are nil → the scaler OMITS source:edge signals
+		// entirely (inert — never pins scaling), rather than reading them as phantom zero-load.
+		EdgeStats: edgeStats,
+		EdgeLive:  edgeLive,
 		// Runtime candidacy re-check (C3/C4) from docker inspect, every tick: a
 		// service that gains a shared RW volume or now runs a stateful image loses
 		// candidacy and is scaled back to the floor (closes a post-enable compose
@@ -765,6 +818,32 @@ func protectManagedProxy(cfg *config.Config) {
 
 // edgeCAs maps the configured private CAs to the edge render's CA type (the trusted-root
 // PEM is passed by FILE PATH — Caddy reads it for the CA's own https).
+// edgeAccessRoutes maps the enabled edge routes to the access-log attribution table (host + path
+// prefix → service). A route's Upstream is a "service:port" selector, so its host part is the
+// compose service name — the same (App=AppID, Service) key the scaler uses. Disabled routes and any
+// with an empty service are skipped.
+func edgeAccessRoutes(routes []edge.Route) []edgemetrics.Route {
+	out := make([]edgemetrics.Route, 0, len(routes))
+	for _, rt := range routes {
+		if !rt.Enabled {
+			continue
+		}
+		svc := rt.Upstream
+		if h, _, err := net.SplitHostPort(rt.Upstream); err == nil {
+			svc = h
+		}
+		if svc == "" {
+			continue
+		}
+		out = append(out, edgemetrics.Route{
+			Host:       rt.Hostname,
+			PathPrefix: rt.PathPrefix,
+			Key:        edgemetrics.Key{App: rt.AppID, Service: svc},
+		})
+	}
+	return out
+}
+
 func edgeCAs(cfg *config.Config) []edge.CA {
 	if len(cfg.Edge.CAs) == 0 {
 		return nil

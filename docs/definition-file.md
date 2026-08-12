@@ -538,6 +538,55 @@ A deploy persists each policy (unset thresholds default to 80/40, with a positiv
 
 > Authoring `scaling` for a stateful service is not a knob you can force — it is rejected at candidacy. Brokers/DBs are precisely the `config_files` / `cert_binding` apps of §7.4, not scaling candidates. See [Auto-scaling](./scaling-and-self-healing.md).
 
+#### Custom scaling signals (`metrics`)
+
+CPU and memory aren't always the load that matters. A worker's real backlog is its **queue depth**; an I/O-bound API can sit at low CPU while its **latency** climbs. Add `metrics` to a scaling policy to scale on those directly — **in addition** to CPU/mem (they still apply). Each metric scales **up** when its value is at or above `up` and **permits scale-down** below `down` (`up` must be above `down` — the per-signal dead band). Scale-down stays **conjunctive**: a service scales down only when CPU **and** memory **and** every custom metric are all below their down thresholds and it's healthy, so a busy signal alone keeps capacity up.
+
+```yaml
+scaling:
+  - service: api
+    enabled: true
+    min: 1
+    max: 8
+    up_cpu_pct: 80             # CPU still applies…
+    down_cpu_pct: 40
+    per_replica_mem_mib: 256
+    metrics:
+      - name: latency          # …but this API is I/O-bound — scale on p95 latency
+        source: edge           # MEASURED by Mooring's edge (the app can't fake it)
+        select: p95_latency_ms
+        up: 800                # add a replica when p95 ≥ 800 ms
+        down: 300              # allow shrinking when p95 < 300 ms
+  - service: worker
+    enabled: true
+    min: 1
+    max: 10
+    up_cpu_pct: 85
+    down_cpu_pct: 30
+    per_replica_mem_mib: 128
+    metrics:
+      - name: backlog          # a queue worker — scale on jobs waiting
+        source: ops            # read from the service's ops interface
+        select: ""             # "" = the whole backlog (pending counters, minus lifetime totals)
+        up: 100                # target ~100 queued jobs per replica
+        down: 20
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `name` | string | Signal name (unique within the service), `[a-z0-9_-]`. |
+| `source` | string | `ops` — a per-service number from the app's [ops interface](./app-ops-interface.md); or `edge` — latency / request-rate **measured by Mooring's own edge** (the app can't self-report fake numbers; it reflects real traffic). |
+| `select` | string | **`source: ops`** — `""` sums the **backlog** (pending counters across every queue, **excluding** cumulative lifetime totals like `completed`/`failed` so a monotonic counter can't cause a runaway), or a **queue/counter name** to track just that. **`source: edge`** — `p95_latency_ms` (service p95 request latency) or `req_per_sec` (request rate). |
+| `up` / `down` | float | Scale up at/above `up`; permit scale-down below `down`. |
+
+**Per-replica for totals.** A service-**total** signal (queue depth, `req_per_sec`) is divided by the running replica count before comparison, so `up` is the target **per replica** — set `up: 100` and Mooring tracks toward ~100 queued jobs each. `p95_latency_ms` is an absolute service latency (adding replicas lowers it), so it's compared as-is.
+
+**`source: edge` needs the managed edge.** The signal comes from the edge's own per-request measurements — it only produces data for a service fronted by an [`edge.route`](#specedgeroutes) on Mooring's [managed edge](./edge-and-tls.md). Turn a metric on and the edge starts measuring within one reconcile (~15 s) — no restart. On a server that **doesn't** run the managed edge, an `edge` metric is simply **ignored** (it never affects scaling). When the edge is delivering logs but a service has no recent traffic, that reads as **idle** so it still scales down; while the edge is *not yet* delivering logs (just enabled, or a capture hiccup) the metric **holds** rather than guessing — Mooring never sheds a service it can't currently measure.
+
+> **It measures real traffic.** Like any latency- or rate-based autoscaling, an `edge` signal reflects whatever requests reach the edge — a flood of cheap requests can move p95 or the rate. The app can't *fabricate* the numbers (Mooring measures them, not the app), but they aren't a security boundary; pair sensible `up`/`down` thresholds with the CPU/mem triggers, which always apply.
+
+> **Why this exists.** A common failure: an API that's slow because it waits on a database or an upstream sits at ~20 % CPU, so CPU-based scaling never fires while requests pile up. `source: edge` + `p95_latency_ms` scales on the symptom that actually matters.
+
 ### `spec.scheduled_tasks` (cron jobs)
 
 Run a service's command on an interval — a nightly database cleanup, a periodic report, a cache warm. Each task points at a **declared service whose `command:` is the job**. That service becomes **scheduled-only**: Mooring generates it into the compose but gives it a profile so `up` never starts it as a long-running container. On each interval Mooring runs it as a **fresh one-shot** `docker compose run --rm` container that removes itself when the command exits — never an exec into a running container, and never a shell. The one-shot gets the app's environment, secrets, and network, so it can reach the app's database by service name.

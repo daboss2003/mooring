@@ -207,3 +207,22 @@ func TestMinFloorEnforcedEveryTick(t *testing.T) {
 		}
 	}
 }
+
+func TestOmittedSignalIsInert(t *testing.T) {
+	p := testCtlPolicy()
+	p.Signals = []SignalPolicy{{Name: "edge_lat", Up: 800, Down: 300}} // mirrored from the policy…
+
+	// …but the signal is OMITTED from m.Signals entirely (no managed edge to measure it). It must be
+	// INERT: cold CPU/mem must still be allowed to scale DOWN (regression — it used to pin/ratchet).
+	down := State{Replicas: 3, LastChange: 0}
+	m := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: nil}
+	if d := Decide(down, m, p, 5, 1000); d.Action != ActDown {
+		t.Errorf("an omitted (unmeasurable) signal must be inert, allowing scale-down; got %s (%s)", d.Action, d.Reason)
+	}
+
+	// And an omitted signal must never drive scale-up on its own.
+	up := State{Replicas: 2, BreachSince: 940, LastChange: 0}
+	if d := Decide(up, m, p, 5, 1000); d.Action == ActUp {
+		t.Errorf("an omitted signal must not drive scale-up; got %s", d.Action)
+	}
+}

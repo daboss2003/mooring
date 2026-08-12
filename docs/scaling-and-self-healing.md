@@ -18,6 +18,8 @@ Auto-scaling adjusts how many copies (**replicas**) of a service run, based on l
 
 **You're alerted if it can't scale up.** If it declines to scale because the server is constrained, it can alert you — that's your cue the box needs more resources.
 
+**Scale on more than CPU/memory.** CPU and memory aren't always the load that matters — a queue worker's real pressure is its **backlog**, and an I/O-bound API can crawl at low CPU while its **latency** climbs. You can add **custom signals** to a policy that scale on those directly (in addition to CPU/mem): a **queue depth** from the app's [ops interface](./app-ops-interface.md), or **p95 latency / request rate measured by Mooring's edge** (which the app can't fake). This is the fix when CPU-based scaling never fires because your slow endpoint is waiting on a database, not burning CPU. See [`spec.scaling` → custom scaling signals](./definition-file.md#custom-scaling-signals-metrics).
+
 You configure min/max replicas, per-replica memory and CPU, and the up/down thresholds on the service's **Auto-scaling** panel. **The auto-scaling policy is an exception to the read-only dashboard** — it is operational tuning you set live, per service, without a redeploy.
 
 > The same policy can also be expressed in the app's `mooring.yaml` under [`spec.scaling`](./definition-file.md#specscaling) (one entry per service), so it lives with the rest of the app's definition. A deploy applies what the file declares; the dashboard panel is for tuning it afterward. Either way the policy lands in the same place — there is no separate "canonical" copy to keep in sync.
