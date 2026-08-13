@@ -7,6 +7,7 @@
   {{if $.Error}}<div class="error" role="alert">{{$.Error}}</div>{{end}}
   {{template "git_subnav" .}}
   {{$proj := .Project}}
+  {{$firstPage := .FirstPage}}
   {{if .Versions}}
   <section class="panel">
     <p class="muted">Rolling back re-checks out and redeploys that commit — <strong>build services rebuild</strong>; pull-image services reuse their pinned image. Progress streams below.</p>
@@ -17,19 +18,26 @@
         <tr>
           <td class="mono">{{template "ts" $v.CreatedAt}}</td>
           <td class="mono">{{if $v.Commit}}{{shortSha $v.Commit}}{{else}}—{{end}}</td>
-          <td>{{$v.Note}}{{if not $i}} <span class="muted">(current)</span>{{end}}</td>
+          <td>{{$v.Note}}{{if and $firstPage (not $i)}} <span class="muted">(current)</span>{{end}}</td>
           <td class="row-actions">
             {{if $v.Commit}}<button type="button" class="btn btn-sm btn-ghost lc-btn" data-lc-confirm="Roll back {{$proj}} to {{shortSha $v.Commit}}? This recreates its containers." data-lc-url="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/rollback">Roll back to this</button>{{end}}
-            {{if $i}}<form method="post" action="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/delete" class="inline" data-confirm="Delete this deploy from history? It only trims the list — disk from old build images is reclaimed separately on the Server tab."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">delete</button></form>{{end}}
+            {{if not (and $firstPage (not $i))}}<form method="post" action="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/delete" class="inline" data-confirm="Delete this deploy from history? It only trims the list — disk from old build images is reclaimed separately on the Server tab."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">delete</button></form>{{end}}
           </td>
         </tr>
         {{end}}
       </tbody>
     </table></div>
+    {{if or .VersionsPrevURL .VersionsNextURL}}
+    <div class="pager mt1">
+      {{if .VersionsPrevURL}}<a class="btn btn-sm btn-ghost" href="{{.VersionsPrevURL}}">← Newer</a>{{end}}
+      {{if .VersionsNextURL}}<a class="btn btn-sm btn-ghost" href="{{.VersionsNextURL}}">Older →</a>{{end}}
+    </div>
+    {{end}}
   </section>
-  <pre id="deploy-output" class="stream" hidden></pre>
   {{else}}
-  <section class="panel"><p class="muted">No deploys yet — deploy from the Overview and history shows up here.</p></section>
+  <section class="panel">
+    <p class="muted">No deploys on this page.{{if .VersionsPrevURL}} <a href="{{.VersionsPrevURL}}">← Newer</a>{{else}} Deploy from the Overview and history shows up here.{{end}}</p>
+  </section>
   {{end}}
   {{end}}
 </main>

@@ -49,6 +49,49 @@ func TestStoreRoundTripAndCurrent(t *testing.T) {
 	}
 }
 
+// ListPage returns one page of history (newest first), reports hasMore accurately, and never
+// bleeds one slug's rows into another's page.
+func TestStoreListPage(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	const total = 25
+	for i := 0; i < total; i++ {
+		if _, err := s.SaveCanonical(ctx, base(), "v", ""); err != nil {
+			t.Fatalf("save %d: %v", i, err)
+		}
+	}
+
+	// Page 1 of 20: full page + an older page exists.
+	p1, more1, err := s.ListPage("shop", 20, 0)
+	if err != nil || len(p1) != 20 || !more1 {
+		t.Fatalf("page1: len=%d more=%v err=%v, want 20 rows + hasMore", len(p1), more1, err)
+	}
+	// Newest first, and the id sequence descends across the page.
+	if p1[0].ID <= p1[19].ID {
+		t.Errorf("page must be newest-first: first id %d should exceed last id %d", p1[0].ID, p1[19].ID)
+	}
+
+	// Page 2: the remaining 5, no further page.
+	p2, more2, err := s.ListPage("shop", 20, 20)
+	if err != nil || len(p2) != 5 || more2 {
+		t.Fatalf("page2: len=%d more=%v err=%v, want 5 rows + no more", len(p2), more2, err)
+	}
+	// Page 2 continues strictly below page 1 (no overlap, no gap).
+	if p2[0].ID != p1[19].ID-1 {
+		t.Errorf("page2 first id %d should be one below page1 last id %d", p2[0].ID, p1[19].ID)
+	}
+
+	// A slug with no history yields an empty page, not an error.
+	if rows, more, err := s.ListPage("ghost", 20, 0); err != nil || len(rows) != 0 || more {
+		t.Errorf("empty slug: len=%d more=%v err=%v, want 0/false/nil", len(rows), more, err)
+	}
+
+	// Defensive: non-positive limit falls back to a default page size (no unbounded query).
+	if rows, _, err := s.ListPage("shop", 0, 0); err != nil || len(rows) != 20 {
+		t.Errorf("limit<=0 should default to 20, got len=%d err=%v", len(rows), err)
+	}
+}
+
 // A git-deploy version records the commit it shipped (a rollback target); a dashboard edit
 // records none. CommitForVersion is slug-scoped so a cross-app id never resolves.
 func TestStoreCommitProvenance(t *testing.T) {

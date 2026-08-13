@@ -207,6 +207,11 @@ type gitView struct {
 	CanReinstallKey     bool                     // OAuth-connected github repo → offer "reinstall deploy key" (repairs a drifted key)
 	Tab                 string                   // active git sub-page: overview | history | connection | automation (for the sub-nav)
 	CSRFToken           string                   // carried on the view so shared partials (git_repo_form) can reach it (inside a partial, $ is the arg, not root)
+	// Deploy-history pagination (History sub-page only). Versions holds ONE page; the URLs are "" when
+	// there is no newer/older page. FirstPage marks page 1 so the newest row shows "(current)".
+	VersionsPrevURL string
+	VersionsNextURL string
+	FirstPage       bool
 }
 
 func shortSha(s string) string {
@@ -300,9 +305,6 @@ func (s *Server) gitPageView(r *http.Request, project string) *gitView {
 			gv.WebhookToken = t
 		}
 	}
-	if s.defStore != nil {
-		gv.Versions, _ = s.defStore.List(project) // newest first; rows with a Commit are rollback targets
-	}
 	return gv
 }
 
@@ -342,6 +344,28 @@ func (s *Server) handleGitHistory(w http.ResponseWriter, r *http.Request) {
 	if !gv.Configured { // nothing to show until a repo is connected
 		http.Redirect(w, r, "/apps/"+url.PathEscape(project)+"/git", http.StatusSeeOther)
 		return
+	}
+	// Paginate the deploy history (it grows unbounded — one row per deploy AND per dashboard tweak).
+	const pageSize = 20
+	page := 1
+	if p, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && p > 1 {
+		page = p
+	}
+	gv.FirstPage = page == 1
+	if s.defStore != nil {
+		rows, hasMore, err := s.defStore.ListPage(project, pageSize, (page-1)*pageSize)
+		if err == nil {
+			gv.Versions = rows
+			base := "/apps/" + url.PathEscape(project) + "/git/history"
+			if page == 2 {
+				gv.VersionsPrevURL = base
+			} else if page > 2 {
+				gv.VersionsPrevURL = base + "?page=" + strconv.Itoa(page-1)
+			}
+			if hasMore {
+				gv.VersionsNextURL = base + "?page=" + strconv.Itoa(page+1)
+			}
+		}
 	}
 	s.renderGitPage(w, r, "git_history.html", "Deploy history", gv, "history")
 }

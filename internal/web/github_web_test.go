@@ -10,6 +10,7 @@ import (
 
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/crypto"
+	"github.com/daboss2003/mooring/internal/definition"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/secret"
 	"github.com/daboss2003/mooring/internal/store"
@@ -42,7 +43,7 @@ func buildGitHubServer(t *testing.T) *testEnv {
 	}
 	t.Cleanup(func() { db.Close() })
 	cipher, _ := secret.NewCipher(make([]byte, 32), nil)
-	srv, err := New(cfg, Deps{DB: db, GitStore: gitstore.New(db, cipher)})
+	srv, err := New(cfg, Deps{DB: db, GitStore: gitstore.New(db, cipher), DefStore: definition.NewStore(db, make([]byte, 32))})
 	if err != nil {
 		t.Fatal(err)
 	}

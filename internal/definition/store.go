@@ -165,6 +165,38 @@ func (s *Store) List(slug string) ([]VersionMeta, error) {
 	return out, rows.Err()
 }
 
+// ListPage returns ONE page of history rows (newest first). It fetches limit+1 in a single query so
+// the caller can tell whether an older page exists without a separate COUNT (and without a nested
+// query — the single-conn DB forbids that); it returns at most limit rows plus hasMore.
+func (s *Store) ListPage(slug string, limit, offset int) (out []VersionMeta, hasMore bool, err error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := s.db.Query(`SELECT id, note, created_at, commit_sha FROM definition_versions WHERE slug=? ORDER BY id DESC LIMIT ? OFFSET ?`, slug, limit+1, offset)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var m VersionMeta
+		if err := rows.Scan(&m.ID, &m.Note, &m.CreatedAt, &m.Commit); err != nil {
+			return nil, false, err
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	if len(out) > limit {
+		hasMore = true
+		out = out[:limit]
+	}
+	return out, hasMore, nil
+}
+
 // CommitForVersion returns the git sha a specific version was deployed from, scoped to the
 // slug (so a cross-app id can never resolve). The commit is HMAC-VERIFIED against the row (a
 // DB tamper that repoints it surfaces ErrTampered — the rollback path must not deploy an

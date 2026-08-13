@@ -319,6 +319,7 @@ details.accordion > summary:hover { color: var(--primary); }
 .subnav a { padding: 0.5rem 0.85rem; color: var(--muted); text-decoration: none; font-weight: 600; font-size: 0.92rem; border-bottom: 2px solid transparent; margin-bottom: -1px; border-radius: 6px 6px 0 0; }
 .subnav a:hover { color: var(--fg); background: var(--primary-soft); }
 .subnav a.active { color: var(--fg); border-bottom-color: var(--primary); }
+.pager { display: flex; gap: 0.6rem; align-items: center; }
 
 /* ============================= buttons ============================= */
 .btn, button[type=submit] {
