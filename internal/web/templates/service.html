@@ -91,9 +91,7 @@
     </form>
     {{if and $p $p.Metrics}}
     <div class="stack mt1">
-      <p class="muted small"><strong>Custom scaling signals</strong> — in addition to CPU/mem above. These are authored in
-        <code>mooring.yaml</code> (<code>scaling[].metrics</code>) and applied on deploy, so they're shown read-only here;
-        edit them in the file. Scale-up fires if <em>any</em> signal breaches its up; scale-down needs <em>all</em> calm.</p>
+      <p class="muted small"><strong>Custom scaling signals</strong> from <code>mooring.yaml</code>, read-only here. Scales up if any signal is at/above its up; scales down when all are below down (with CPU/mem).</p>
       <div class="table-wrap"><table>
         <thead><tr><th>Name</th><th>Source</th><th>Select</th><th>Up</th><th>Down</th></tr></thead>
         <tbody>
@@ -104,9 +102,7 @@
       </table></div>
     </div>
     {{else if and $p $p.Enabled}}
-    <p class="muted small mt1">No custom scaling signals. To scale on queue depth or edge-measured latency/request-rate,
-      add <code>scaling[].metrics</code> in <code>mooring.yaml</code> and deploy — see the
-      <a href="https://github.com/daboss2003/mooring/blob/main/docs/definition-file.md#custom-scaling-signals-metrics">docs</a>.</p>
+    <p class="muted small mt1">No custom scaling signals. Add <code>scaling[].metrics</code> in <code>mooring.yaml</code> to scale on queue depth or edge latency (<a href="https://github.com/daboss2003/mooring/blob/main/docs/definition-file.md#custom-scaling-signals-metrics">docs</a>).</p>
     {{end}}
   </section>
   {{end}}

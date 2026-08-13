@@ -2,10 +2,8 @@
 {{template "nav" .}}
 <main class="wrap">
   <h1>Activity</h1>
-  <p class="muted">What Mooring and the things it manages have been up to — deploys, image builds &amp; scans, backups,
-    git fetches, and auto-scaling decisions — plus any warnings or errors. It's the in-dashboard view of Mooring's own
-    logs, so you don't have to <code class="mono">journalctl</code> over SSH. Repeats are grouped (with a count and
-    last-seen) and kept for about a day. Read-only — nothing here changes anything.</p>
+  <p class="muted">Recent warnings and errors from Mooring and the apps it manages — deploys, builds, scans, backups,
+    git fetches, and scaling. Repeats are grouped with a count and last-seen, kept ~24 hours.</p>
 
   {{if .Activity}}
   <section class="panel">
@@ -23,11 +21,10 @@
       {{end}}
       </tbody>
     </table></div>
-    <p class="muted small mt1">Warnings and errors only (the same events Mooring writes to the system journal). Older than ~24 h are dropped.</p>
   </section>
   {{else}}
   <section class="panel">
-    <p class="muted">No recent warnings or errors — Mooring is quiet. Operational events and any problems will appear here as they happen.</p>
+    <p class="muted">No recent warnings or errors — Mooring is quiet.</p>
   </section>
   {{end}}
 </main>

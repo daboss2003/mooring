@@ -54,11 +54,11 @@
     </form>
     {{if .CanReinstallKey}}
     <form method="post" action="/apps/{{pathEscape .Project}}/git/reconnect" class="inline mt1"
-          data-confirm="Reinstall this app's GitHub deploy key? It removes the old mooring:{{.Project}} key, installs a fresh one via the OAuth app, and updates the stored credential. Use this if fetches fail with 'repository or ref not found' even though the repo is fine.">
+          data-confirm="Reinstall the GitHub deploy key for {{.Project}}? Removes the old key and installs a fresh one via the OAuth app.">
       <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
       <button type="submit" class="btn-secondary">Reinstall deploy key</button>
     </form>
-    <p class="muted small">Connected via the GitHub OAuth app. If a fetch fails with <em>repository or ref not found</em> but the repo and branch are healthy, the installed deploy key has drifted from the stored one — reinstall it here (no token needed).</p>
+    <p class="muted small">Use if a fetch fails with <em>repository or ref not found</em> but the repo and branch are fine.</p>
     {{end}}
   </section>
 

@@ -2,7 +2,7 @@
 {{template "nav" .}}
 <main class="wrap">
   <h1>Server</h1>
-  <p class="muted">A read-only view of this host — what's using memory and disk, plus cleanup for old Mooring downloads. Nothing here can move or delete your files (the only exception is removing old <code>.deb</code> packages, which asks for your password again).</p>
+  <p class="muted">A read-only view of this host — memory, disk, and top processes — plus cleanup for old Mooring <code>.deb</code> downloads.</p>
   {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
 
   {{/* Live host meters + top processes — refreshed in place every 5s. */}}
