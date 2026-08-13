@@ -1,0 +1,34 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Activity</h1>
+  <p class="muted">What Mooring and the things it manages have been up to — deploys, image builds &amp; scans, backups,
+    git fetches, and auto-scaling decisions — plus any warnings or errors. It's the in-dashboard view of Mooring's own
+    logs, so you don't have to <code class="mono">journalctl</code> over SSH. Repeats are grouped (with a count and
+    last-seen) and kept for about a day. Read-only — nothing here changes anything.</p>
+
+  {{if .Activity}}
+  <section class="panel">
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Level</th><th>Event</th><th>Details</th><th class="num">Count</th><th>Last seen</th></tr></thead>
+      <tbody>
+      {{range .Activity}}
+        <tr>
+          <td>{{if eq .Level "ERROR"}}<span class="badge health-unhealthy">ERROR</span>{{else}}<span class="badge">{{.Level}}</span>{{end}}</td>
+          <td>{{.Msg}}</td>
+          <td class="mono muted wrap-cell">{{.Attrs}}</td>
+          <td class="num">{{if gt .Count 1}}&times;{{.Count}}{{else}}1{{end}}</td>
+          <td>{{template "ts" .Last}}{{if gt .Count 1}} <span class="muted small">(first {{template "ts" .First}})</span>{{end}}</td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    <p class="muted small mt1">Warnings and errors only (the same events Mooring writes to the system journal). Older than ~24 h are dropped.</p>
+  </section>
+  {{else}}
+  <section class="panel">
+    <p class="muted">No recent warnings or errors — Mooring is quiet. Operational events and any problems will appear here as they happen.</p>
+  </section>
+  {{end}}
+</main>
+{{template "bottom" .}}

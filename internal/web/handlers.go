@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/daboss2003/mooring/internal/envstore"
+	"github.com/daboss2003/mooring/internal/eventlog"
 	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/ops"
 )
@@ -76,6 +77,7 @@ type tmplData struct {
 	// allow-listed read-only file view.
 	Server      *serverView
 	ServerFiles *serverFilesView
+	Activity    []eventlog.Event // deduped operational events for the Activity tab
 
 	// UpdateBanner is the global self-update / security-advisory banner (nil = none),
 	// backfilled into every authenticated page by render().

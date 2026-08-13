@@ -5,9 +5,9 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
-	"net"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -32,6 +32,7 @@ import (
 	"github.com/daboss2003/mooring/internal/edge"
 	"github.com/daboss2003/mooring/internal/edgemetrics"
 	"github.com/daboss2003/mooring/internal/envstore"
+	"github.com/daboss2003/mooring/internal/eventlog"
 	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/hostmon"
@@ -62,12 +63,20 @@ func cmdServe(args []string) error {
 		return err
 	}
 
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	baseLogHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	log := slog.New(baseLogHandler)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err // fail-closed: refuse to boot
 	}
+
+	// Capture Mooring's own WARN/ERROR operational events (deploys, builds, scans, backups, git
+	// fetches, scale decisions) for the dashboard Activity tab — deduped, ~24h retention, backed by a
+	// JSONL file separate from the SQLite DB (never holds raw log volume in memory). Rewrap the logger
+	// so everything from here on is teed into the store as well as journald.
+	eventStore := eventlog.New(filepath.Join(cfg.DataDir, "events.jsonl"))
+	log = slog.New(eventlog.NewHandler(baseLogHandler, eventStore))
 
 	// Fail-closed: probe that the sandbox actually lets us write the dirs we need,
 	// BEFORE the first deploy/edge-start EROFS's lazily. A missing ReadWritePaths
@@ -430,7 +439,7 @@ func cmdServe(args []string) error {
 			CAs:            edgeCAs(cfg),
 			AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
 			AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
-			AdminUpstream:  cfg.AdminEdgeListen(), // the dedicated edge listener (not the SSH-tunnel bind)
+			AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
 		}
 		// Per-namespace DNS-01 wildcards. Install each DISTINCT provider's Caddy plugin (add-package
 		// accumulates modules into the binary), and include a namespace's wildcard in the rendered
@@ -581,6 +590,7 @@ func cmdServe(args []string) error {
 		Version:     Version,
 		UpdateCheck: updateChecker,
 		ImageScans:  scanStore,
+		EventLog:    eventStore,
 		Log:         log,
 		Monitor:     mon,
 		OpsStore:    opsStore,
@@ -609,6 +619,24 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// Persist the Activity event store on a cadence + at shutdown (the store dedups in bounded memory;
+	// the flush is a cheap atomic rewrite of the small deduped set). Joined before the deferred close.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				_ = eventStore.Flush() // final flush so a restart keeps recent activity
+				return
+			case <-t.C:
+				_ = eventStore.Flush()
+			}
+		}
+	}()
 
 	// Wire the auto-scaling edge pool (plan §8A): each edge reconcile now discovers the
 	// live replica endpoints for every route via the read-only socket-proxy and dials
