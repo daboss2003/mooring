@@ -43,7 +43,7 @@
     {{else if not .Debs}}
     <p class="muted">No Mooring <code>.deb</code> files found in <code class="mono">{{.DebCacheDir}}</code>.</p>
     {{else}}
-    <p class="muted">Found in <code class="mono">{{.DebCacheDir}}</code>. The version you're running ({{.Version}}) is kept and can't be deleted. Deleting asks for your password{{if .TOTPEnabled}} and 2FA code{{end}}.</p>
+    <p class="muted">Found in <code class="mono">{{.DebCacheDir}}</code>. The version you're running ({{.Version}}) is kept and can't be deleted — only superseded installer files can be removed.</p>
     <div class="table-scroll"><table class="grid">
       <thead><tr><th>File</th><th>Version</th><th>Arch</th><th class="num">Size</th><th>Action</th></tr></thead>
       <tbody>
@@ -55,16 +55,12 @@
           <td class="num">{{humanBytes .Size}}</td>
           <td>
             {{if .Running}}<span class="pill pill-ok">in use — kept</span>{{else}}
-            <details class="reauth">
-              <summary class="link">delete</summary>
-              <form method="post" action="/server/debs/delete" class="reauth-form">
-                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
-                <input type="hidden" name="name" value="{{.Name}}">
-                <label>Password <input type="password" name="password" autocomplete="off" required></label>
-                {{if $.Server.TOTPEnabled}}<label>2FA code <input type="text" name="totp" inputmode="numeric" autocomplete="off" required></label>{{end}}
-                <button type="submit" class="btn btn-danger btn-sm">Delete {{.Version}} ({{.Arch}})</button>
-              </form>
-            </details>
+            <form method="post" action="/server/debs/delete" class="inline"
+                  data-confirm="Delete {{.Name}}? This only removes the old installer file (never the running version).">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="name" value="{{.Name}}">
+              <button type="submit" class="btn btn-danger btn-sm">Delete</button>
+            </form>
             {{end}}
           </td>
         </tr>

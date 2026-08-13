@@ -187,7 +187,13 @@ func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 			v.Scans = scans
 		}
 	}
-	s.render(w, r, "server.html", tmplData{Title: "Server — Mooring", Server: v, Error: r.URL.Query().Get("err")})
+	s.render(w, r, "server.html", tmplData{
+		Title:     "Server — Mooring",
+		CSRFToken: CSRFToken(r.Context()), // WAS MISSING → the .deb delete form submitted an empty token → "invalid csrf token"
+		Username:  sessionUser(r),
+		Server:    v,
+		Error:     r.URL.Query().Get("err"),
+	})
 }
 
 // handleServerPartial is the live-polled fragment (host meters + process table).
@@ -284,21 +290,10 @@ func (s *Server) handleDebDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no deb_cache_dir configured", http.StatusForbidden)
 		return
 	}
-	if s.locked(r.Context(), peer, actor) {
-		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "deb_delete", Target: name, Outcome: audit.Deny, Level: audit.Security, Detail: "locked out"})
-		http.Error(w, "too many attempts — try again later", http.StatusTooManyRequests)
-		return
-	}
-	reauthOK := s.verifyOperatorPassword(r.Context(), actor, r.PostFormValue("password")) &&
-		s.verifyTOTPOnce(r.Context(), actor, r.PostFormValue("totp"))
-	if !reauthOK {
-		s.recordFailure(r.Context(), peer, actor)
-		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "deb_delete", Target: name, Outcome: audit.Deny, Level: audit.Security, Detail: "re-auth failed"})
-		s.redirectErr(w, r, "/server", "password or 2FA code incorrect — nothing deleted")
-		return
-	}
-	s.clearFailures(r.Context(), peer, actor)
-
+	// No password/TOTP step-up: this is a LOW-RISK cleanup already fenced by the route's admin session
+	// + CSRF. DeleteDeb can only remove a superseded mooring_<ver>_<arch>.deb sitting DIRECTLY in the
+	// configured cache dir — never the running version, no traversal, no symlink escape, regular files
+	// only — so it can't touch anything but an old installer the operator downloaded.
 	if err := serverinfo.DeleteDeb(s.cfg.Server.DebCacheDir, name, s.version); err != nil {
 		_ = s.audit.Log(r.Context(), audit.Event{Actor: actor, IP: peer, Action: "deb_delete", Target: name, Outcome: audit.Deny, Level: audit.Security, Detail: err.Error()})
 		s.redirectErr(w, r, "/server", "could not delete: "+err.Error())
