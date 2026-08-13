@@ -1,0 +1,13 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  {{with .Git}}
+  <p><a href="/apps/{{pathEscape .Project}}/git">← Repository</a></p>
+  <h1>Connection — {{.Project}}</h1>
+  {{if $.Error}}<div class="error" role="alert">{{$.Error}}</div>{{end}}
+  {{template "git_subnav" .}}
+  <p class="muted">Where Mooring fetches from and how it authenticates. Edit the repo URL, ref, credentials, or build policy here.</p>
+  {{template "git_repo_form" .}}
+  {{end}}
+</main>
+{{template "bottom" .}}

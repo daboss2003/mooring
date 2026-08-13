@@ -232,7 +232,7 @@ func (s *Server) handlePreviewToggle(w http.ResponseWriter, r *http.Request) {
 		Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "preview_toggle",
 		Target: project, Outcome: audit.OK, Level: audit.Security, Detail: fmt.Sprintf("enabled=%v", enabled),
 	})
-	http.Redirect(w, r, "/apps/"+project+"/git", http.StatusSeeOther)
+	http.Redirect(w, r, "/apps/"+project+"/git/automation", http.StatusSeeOther)
 }
 
 // handlePRWebhook is the GitHub `pull_request` webhook: allowlist- and auth-EXEMPT but gated by

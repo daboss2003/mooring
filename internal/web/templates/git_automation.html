@@ -1,0 +1,49 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  {{with .Git}}
+  <p><a href="/apps/{{pathEscape .Project}}/git">← Repository</a></p>
+  <h1>Automation — {{.Project}}</h1>
+  {{if $.Error}}<div class="error" role="alert">{{$.Error}}</div>{{end}}
+  {{template "git_subnav" .}}
+
+  <section class="panel">
+    <h2>Webhook <span class="muted">(trigger-only; never reads the payload)</span></h2>
+    {{if .WebhookToken}}
+    <div class="error" role="alert">Copy this webhook URL path now — it is shown only once:</div>
+    <p class="mono">/webhook/{{.WebhookToken}}</p>
+    {{else}}
+    <p class="muted">Webhook is <strong>{{if .HasWebhook}}configured{{else}}not configured{{end}}</strong>. Rotating issues a new URL + signing secret and invalidates the old one.</p>
+    {{end}}
+    <p class="muted">CI must sign each call (the body is ignored). With the shared secret:</p>
+    <pre class="mono">X-Mooring-Timestamp: &lt;unix-seconds&gt;
+X-Mooring-Nonce: &lt;random, unique per call&gt;
+X-Mooring-Signature: hex(HMAC-SHA256(secret, "&lt;timestamp&gt;.&lt;nonce&gt;"))</pre>
+    <p class="muted">A valid call fetches; it deploys only if <strong>auto-deploy</strong> is on and the fetch yields a clean fast-forward update.</p>
+    <form method="post" action="/apps/{{pathEscape .Project}}/git/webhook-rotate" class="inline">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <button type="submit">{{if .HasWebhook}}Rotate webhook{{else}}Create webhook{{end}}</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2>Preview environments <span class="muted">(a deploy per pull request)</span></h2>
+    <p class="muted">When on, a signed GitHub <code>pull_request</code> webhook spins up a throwaway copy of this app for each PR — its own subdomain, HTTPS from your <code>base_domain</code> wildcard — and tears it down when the PR closes. A preview inherits this app's env &amp; secrets, runs isolated, and can never affect production.</p>
+    <form method="post" action="/apps/{{pathEscape .Project}}/preview" class="inline" data-confirm="{{if .PreviewEnabled}}Turn OFF preview environments?{{else}}Turn ON preview environments? A signed GitHub webhook will then create and destroy preview apps unattended.{{end}}">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <input type="hidden" name="enabled" value="{{if .PreviewEnabled}}0{{else}}1{{end}}">
+      <button type="submit" class="btn btn-sm {{if .PreviewEnabled}}btn-ghost{{else}}btn-primary{{end}}">{{if .PreviewEnabled}}Disable previews{{else}}Enable previews{{end}}</button>
+      <span class="muted">Currently <strong>{{if .PreviewEnabled}}enabled{{else}}disabled{{end}}</strong>.</span>
+    </form>
+    {{if .PreviewEnabled}}
+    <p class="muted mt1">Add a webhook in your GitHub repo (Settings → Webhooks), using this app's webhook secret (rotate above to get one):</p>
+    <pre class="mono">Payload URL:  https://&lt;your-admin-host&gt;/webhook/pr/&lt;your-webhook-token&gt;
+Content type: application/json
+Secret:       &lt;this app's webhook secret&gt;
+Events:       Pull requests only</pre>
+    <p class="muted small">Requires <code>edge.base_domain</code> (previews live at <code>&lt;app&gt;-pr&lt;n&gt;.&lt;base_domain&gt;</code>). An app that exposes a fixed <code>hostname:</code> instead of a subdomain can't have previews.</p>
+    {{end}}
+  </section>
+  {{end}}
+</main>
+{{template "bottom" .}}

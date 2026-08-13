@@ -519,6 +519,9 @@ func (s *Server) Handler() http.Handler {
 	// Add a mooring.*.yaml found in a connected repo (but not yet deployed) as its own app.
 	mux.HandleFunc("POST /git/add-definition", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleAddDefinition))))
 	mux.HandleFunc("GET /apps/{project}/git", s.requireAuth(s.withCSRFToken(s.handleGitGet)))
+	mux.HandleFunc("GET /apps/{project}/git/history", s.requireAuth(s.withCSRFToken(s.handleGitHistory)))
+	mux.HandleFunc("GET /apps/{project}/git/connection", s.requireAuth(s.withCSRFToken(s.handleGitConnection)))
+	mux.HandleFunc("GET /apps/{project}/git/automation", s.requireAuth(s.withCSRFToken(s.handleGitAutomation)))
 	mux.HandleFunc("POST /apps/{project}/git", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitSave))))
 	mux.HandleFunc("POST /apps/{project}/git/fetch", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleGitFetch))))
 	mux.HandleFunc("POST /apps/{project}/git/reconnect", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitHubReconnect))))

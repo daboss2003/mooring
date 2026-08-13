@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -204,6 +205,8 @@ type gitView struct {
 	Versions            []definition.VersionMeta // deploy/edit history; rows with a Commit are rollback targets
 	PreviewEnabled      bool                     // per-PR preview environments opt-in
 	CanReinstallKey     bool                     // OAuth-connected github repo → offer "reinstall deploy key" (repairs a drifted key)
+	Tab                 string                   // active git sub-page: overview | history | connection | automation (for the sub-nav)
+	CSRFToken           string                   // carried on the view so shared partials (git_repo_form) can reach it (inside a partial, $ is the arg, not root)
 }
 
 func shortSha(s string) string {
@@ -237,7 +240,7 @@ func (s *Server) handleGitNew(w http.ResponseWriter, r *http.Request) {
 		CSRFToken:     CSRFToken(r.Context()),
 		Username:      sessionUser(r),
 		GitHubEnabled: s.githubEnabled(),
-		Git:           &gitView{Configured: false, BuildPolicy: "never", Ref: "refs/heads/main", ComposePath: "docker-compose.yml"},
+		Git:           &gitView{Configured: false, BuildPolicy: "never", Ref: "refs/heads/main", ComposePath: "docker-compose.yml", CSRFToken: CSRFToken(r.Context())},
 	})
 }
 
@@ -267,70 +270,110 @@ func (s *Server) gitViewFor(ctx context.Context, project string) *gitView {
 	return gv
 }
 
+// gitPageView builds the FULL git page view model — the base summary (gitViewFor) plus the fields
+// only the git sub-pages need: deploy history, preview-envs state, the reinstall-key eligibility, and
+// the one-time webhook-token flash. A project with no git config comes back Configured=false so the
+// Overview can show the connect form.
+func (s *Server) gitPageView(r *http.Request, project string) *gitView {
+	gv := s.gitViewFor(r.Context(), project)
+	if gv == nil { // not connected yet — a minimal view for the connect form
+		return &gitView{
+			Project: project, BuildPolicy: "never", Ref: "refs/heads/main",
+			ComposePath: "docker-compose.yml", WriteDisabledReason: s.writeDisabledReason(),
+		}
+	}
+	if cfg, ok, err := s.gitStore.Get(project); err == nil && ok {
+		gv.DockerfilePath = cfg.DockerfilePath
+		gv.PreviewEnabled = cfg.PreviewEnabled
+		// Reinstall-key is offered only when the OAuth app is set up AND this app points at a
+		// github.com repo (the reconnect handler re-checks the OAuth authorization).
+		if s.githubEnabled() {
+			if _, _, gok := parseGitHubRepo(cfg.RepoURL); gok {
+				gv.CanReinstallKey = true
+			}
+		}
+	}
+	// Consume the one-time rotated-token flash (opaque handle in the URL; the secret only ever lived
+	// server-side). Shown on the Automation sub-page after a rotate.
+	if h := r.URL.Query().Get("wh"); h != "" {
+		if t, ok := s.webhookFlash.take(h, project); ok {
+			gv.WebhookToken = t
+		}
+	}
+	if s.defStore != nil {
+		gv.Versions, _ = s.defStore.List(project) // newest first; rows with a Commit are rollback targets
+	}
+	return gv
+}
+
+// renderGitPage renders one of the four git sub-pages with the shared view + active tab.
+func (s *Server) renderGitPage(w http.ResponseWriter, r *http.Request, tmpl, title string, gv *gitView, tab string) {
+	gv.Tab = tab
+	gv.CSRFToken = CSRFToken(r.Context())
+	s.render(w, r, tmpl, tmplData{
+		Title:     title + " — " + gv.Project,
+		CSRFToken: CSRFToken(r.Context()),
+		Username:  sessionUser(r),
+		Project:   gv.Project,
+		Git:       gv,
+	})
+}
+
+// handleGitGet is the git Overview: connection status + the pending-update/deploy flow (and, for a
+// not-yet-connected app, the connect form). The deploy history, connection settings, and webhook/
+// preview automation each live on their own sub-page (mirrors Alerts → Channels/Rules).
 func (s *Server) handleGitGet(w http.ResponseWriter, r *http.Request) {
 	if s.gitStore == nil {
 		http.Error(w, "gitops unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	project := r.PathValue("project")
-	cfg, ok, err := s.gitStore.Get(project)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	s.renderGitPage(w, r, "git.html", "Repository", s.gitPageView(r, project), "overview")
+}
+
+// handleGitHistory is the Deploy-history sub-page (rollback + trim).
+func (s *Server) handleGitHistory(w http.ResponseWriter, r *http.Request) {
+	if s.gitStore == nil {
+		http.Error(w, "gitops unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	gv := &gitView{
-		Project:             project,
-		BuildPolicy:         "never",
-		Ref:                 "refs/heads/main",
-		ComposePath:         "docker-compose.yml",
-		WriteDisabledReason: s.writeDisabledReason(),
+	project := r.PathValue("project")
+	gv := s.gitPageView(r, project)
+	if !gv.Configured { // nothing to show until a repo is connected
+		http.Redirect(w, r, "/apps/"+url.PathEscape(project)+"/git", http.StatusSeeOther)
+		return
 	}
-	if ok {
-		gv.Configured = true
-		gv.RepoURL = cfg.RepoURL
-		gv.Ref = cfg.Ref
-		gv.ComposePath = cfg.ComposePath
-		gv.DockerfilePath = cfg.DockerfilePath
-		gv.BuildPolicy = cfg.BuildPolicy
-		gv.AutoDeploy = cfg.AutoDeploy
-		gv.CredKind = cfg.CredKind
-		gv.HasWebhook = cfg.HasWebhook
-		gv.DeployedCommit = cfg.DeployedCommit
-		gv.StagedCommit = cfg.StagedCommit
-		gv.UpdateState = cfg.UpdateState
-		gv.CommitsBehind = cfg.CommitsBehind
-		gv.LastFetchError = cfg.LastFetchError
-		if cfg.LastFetchAt > 0 {
-			gv.LastFetchAt = cfg.LastFetchAt
-		}
-		// Consume the one-time rotated-token flash (opaque handle in the URL, the
-		// secret only ever lived server-side).
-		if h := r.URL.Query().Get("wh"); h != "" {
-			if t, ok := s.webhookFlash.take(h, project); ok {
-				gv.WebhookToken = t
-			}
-		}
-		gv.Diff = s.buildDiff(r.Context(), project, cfg)
-		gv.PreviewEnabled = cfg.PreviewEnabled
-		// Offer the deploy-key reinstall only when the OAuth app is set up AND this app points at a
-		// github.com repo (the reconnect handler re-checks the OAuth authorization). This is the
-		// supported repair for a drifted OAuth deploy key.
-		if s.githubEnabled() {
-			if _, _, gok := parseGitHubRepo(cfg.RepoURL); gok {
-				gv.CanReinstallKey = true
-			}
-		}
-		if s.defStore != nil {
-			gv.Versions, _ = s.defStore.List(project) // newest first; rows with a Commit are rollback targets
-		}
+	s.renderGitPage(w, r, "git_history.html", "Deploy history", gv, "history")
+}
+
+// handleGitConnection is the Connection sub-page: repo URL / ref / credentials / build + reinstall key.
+func (s *Server) handleGitConnection(w http.ResponseWriter, r *http.Request) {
+	if s.gitStore == nil {
+		http.Error(w, "gitops unavailable", http.StatusServiceUnavailable)
+		return
 	}
-	s.render(w, r, "git.html", tmplData{
-		Title:     "Repository — " + project,
-		CSRFToken: CSRFToken(r.Context()),
-		Username:  sessionUser(r),
-		Project:   project,
-		Git:       gv,
-	})
+	project := r.PathValue("project")
+	gv := s.gitPageView(r, project)
+	if !gv.Configured {
+		http.Redirect(w, r, "/apps/"+url.PathEscape(project)+"/git", http.StatusSeeOther)
+		return
+	}
+	s.renderGitPage(w, r, "git_connection.html", "Connection", gv, "connection")
+}
+
+// handleGitAutomation is the Automation sub-page: webhook + preview environments.
+func (s *Server) handleGitAutomation(w http.ResponseWriter, r *http.Request) {
+	if s.gitStore == nil {
+		http.Error(w, "gitops unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	project := r.PathValue("project")
+	gv := s.gitPageView(r, project)
+	if !gv.Configured {
+		http.Redirect(w, r, "/apps/"+url.PathEscape(project)+"/git", http.StatusSeeOther)
+		return
+	}
+	s.renderGitPage(w, r, "git_automation.html", "Automation", gv, "automation")
 }
 
 // buildDiff renders the sanitized, capped pending-update preview between the
@@ -401,7 +444,7 @@ func (s *Server) handleGitSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "git_save", Target: project, Outcome: audit.OK, Level: audit.Security})
-	http.Redirect(w, r, "/apps/"+project+"/git", http.StatusSeeOther)
+	http.Redirect(w, r, "/apps/"+project+"/git/connection", http.StatusSeeOther)
 }
 
 func (s *Server) handleGitWebhookRotate(w http.ResponseWriter, r *http.Request) {
@@ -424,7 +467,7 @@ func (s *Server) handleGitWebhookRotate(w http.ResponseWriter, r *http.Request) 
 	// Hand the token to the next render via a one-time server-side flash; the
 	// redirect carries only an opaque single-use handle (never the secret itself).
 	handle := s.webhookFlash.put(project, token)
-	http.Redirect(w, r, "/apps/"+project+"/git?wh="+handle, http.StatusSeeOther)
+	http.Redirect(w, r, "/apps/"+project+"/git/automation?wh="+handle, http.StatusSeeOther)
 }
 
 // --- fetch flow (read-plane) ---
@@ -695,7 +738,7 @@ func (s *Server) handleVersionDelete(w http.ResponseWriter, r *http.Request) {
 		Actor: actor, IP: peer,
 		Action: "version_delete", Target: project + " v" + strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security,
 	})
-	http.Redirect(w, r, "/apps/"+project+"/git", http.StatusSeeOther)
+	http.Redirect(w, r, "/apps/"+project+"/git/history", http.StatusSeeOther)
 }
 
 // deployRepoApp promotes ONE reviewed commit sha. The CALLER must hold the
