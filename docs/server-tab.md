@@ -69,10 +69,11 @@ and they pile up. The Server tab can delete the old ones for you — safely:
    newest first. The **version you're running is marked "in use — kept" and can never
    be deleted.**
 
-3. Click **delete** on an old one. Because this removes a file, it asks for your
-   **password** (and your **2FA code** if enabled) — the same re-authentication used
-   for deleting an app — behind the same brute-force lockout. Every delete is
-   recorded in the **Audit log**.
+3. Click **delete** on an old one. It removes just that file — no password re-prompt
+   (this is a low-risk cleanup, not a destructive app action), and every delete is
+   recorded in the **Audit log**. It can only ever remove a superseded
+   `mooring_<version>_linux_(amd64|arm64).deb` sitting directly in that folder — never
+   the running version, and never anything reached by a path or symlink trick.
 
 The cleanup only ever matches files named exactly `mooring_<version>_linux_(amd64|arm64).deb`
 in that one folder. It cannot see or touch anything else, including system packages.
@@ -149,10 +150,14 @@ socket (that's the core of how Mooring talks to Docker safely). So:
 - **Your own code** is checked by reading your project's dependency files (`package-lock.json`,
   `go.sum`, and the like), which is where most of an app's vulnerabilities actually live.
 
-You'll find the results under **Server → Vulnerabilities**: how many Critical / High / Medium /
-Low issues each app has, and the worst ones spelled out with the version that fixes them.
-Anything **High or Critical** also sends you an alert. To clear a finding, update the flagged
-package (bump a dependency, or update the base image) and redeploy.
+You'll find the results in a **Vulnerabilities** section on the Server page itself: how many
+Critical / High / Medium / Low issues each app has, and the worst ones spelled out with the
+version that fixes them. Anything **High or Critical** also sends you an alert. To clear a
+finding, update the flagged package (bump a dependency, or update the base image) and redeploy.
+
+The scanner runs the pinned Trivy image with no Docker socket, dropped capabilities, and
+`no-new-privileges`; its vulnerability database is cached in a persistent volume so it isn't
+re-downloaded every scan.
 
 One heads-up: scanning is a bit heavy. The first run downloads a vulnerability database (a few
 hundred MB) and each scan uses some CPU and memory. On a small server you might prefer to turn

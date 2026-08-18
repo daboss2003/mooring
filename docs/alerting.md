@@ -1,6 +1,6 @@
 # Alerts
 
-Mooring can tell you when something needs your attention — an app going down, a server running hot, a certificate failing to renew — and it can even tell you when **Mooring itself** goes dark. Alerting is **off until you turn it on**, and adds nothing to a running system until you do.
+Mooring can tell you when something needs your attention — an app going down, a server running hot or low on disk, a service stuck restarting — and it can even tell you when **Mooring itself** goes dark. Alerting is **off until you turn it on**, and adds nothing to a running system until you do.
 
 See also: [Scaling & self-healing](./scaling-and-self-healing.md) · [Backups & recovery](./backup-and-recovery.md)
 
@@ -28,16 +28,16 @@ Everything else is managed in the dashboard — no files or config to hand-edit.
 
 ## What it watches
 
-- **Your servers** — CPU, memory, disk, and load.
+- **Your servers** — CPU, memory, and disk.
 - **Your apps** — containers going down, becoming unhealthy, or restart-looping; a dependency an app reports as down.
-- **The platform** — crashed or out-of-memory containers, a failing certificate, a full disk, low memory headroom.
+- **The platform** — crashed or out-of-memory containers, a restart storm, low memory headroom, a full disk.
 
 ## How it decides what to send
 
 Some apps already alert on their own. Mooring is smart about this:
 
 - **App alerts defer to apps that cover themselves.** If an app already pages you about its own health, Mooring won't double-page. The one exception is a **down safety net**: if an app actually goes *down* or unreachable, Mooring always alerts — so "the app went dark" never results in silence.
-- **Platform alerts always fire.** Crashes, out-of-memory kills, certificate or edge failures, a full disk — these are never deferred, because a crash-looping app can't be trusted to report its own death.
+- **Platform alerts always fire.** Container crashes, out-of-memory kills, restart storms, a full disk — these are never deferred, because a crash-looping app can't be trusted to report its own death.
 
 You set this up as **rules** on the **Rules** page (Alerts → Rules): pick what to watch (e.g. host CPU, container down, restart storm), an optional scope (all apps, or one app), a threshold, how long it must hold before alerting, the severity, and which channel to send to (a dropdown of your channels, or all enabled).
 

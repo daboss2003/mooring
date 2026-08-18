@@ -10,7 +10,7 @@ See also: [Deploy your first app](./first-steps.md) · [Secrets & config files](
 
 In the dashboard, click **Connect repo**. Two ways in:
 
-**Connect with GitHub (one click).** If GitHub is set up (see below), click **Connect with GitHub**, authorize, and pick a repo. Mooring creates a read-only deploy key for it automatically — you copy nothing.
+**Connect with GitHub (one click).** If GitHub is set up (see below), click **Connect with GitHub**, authorize, and pick a repo. If the repo has **more than one branch**, Mooring asks which branch to deploy (defaulting to the repo's default branch) so its first fetch reads `mooring.yaml` from the branch you mean — a single-branch repo skips the question. Mooring creates a read-only deploy key for the repo automatically — you copy nothing.
 
 **Connect any repo.** Provide:
 
@@ -42,6 +42,20 @@ You'll find this on the app's page (a **Repository & updates** panel) and on the
 > **Want instant deploys?** By default Mooring checks every couple of minutes. If you want a push to be picked up immediately, you can add an optional **webhook** — but it's not required. And if you want truly hands-off releases, turn on **auto-deploy** (off by default): Mooring then deploys a new commit for you, through the same checks, when it's a clean fast-forward. The background check on its own only ever *fetches* — it never deploys.
 
 > **Self-healing a stuck container.** If a deploy is interrupted mid-recreate (most often the box runs out of memory and the OOM killer steps in), Docker can leave a half-renamed container occupying a service's name — and every later redeploy then fails with `the container name "…" is already in use`. Mooring now recovers automatically: it reclaims **that app's own** stuck container (verified by its compose project label — never another app's or a system container) and retries the deploy once, logging a line like *"reclaimed stuck container credlock-worker-1 … — retrying the deploy."* If the culprit is a container Mooring can't prove is yours (a foreign or manually-run one), it leaves it and tells you to `docker rm -f` it. When a deploy was OOM-killed, the log points you at the real fix (add RAM or lower the service's `mem_limit`) so it doesn't keep recurring.
+
+## Deploy history & rolling back
+
+Every git deploy is recorded. On the Repository page, the **Deploy history** sub-page lists each past version — when it shipped, its commit, and what changed — newest first, 20 to a page.
+
+**Roll back to a previous deploy.** Each past deploy has a **Roll back to this** button. A rollback runs the *same* pipeline as a forward deploy — check out that commit, re-validate, bring the app up — just aimed at an earlier commit, so it's as safe as any deploy. Build services rebuild from that commit; pull-image services reuse their pinned image. Only past *git* deploys are rollback targets: a dashboard-only change (a scaling tweak, say — which also shows up in the list) has no commit and isn't one.
+
+**Trim the history.** Delete an old entry to keep the list tidy. The current live version can't be deleted, and deleting only removes the history row — it doesn't reclaim disk (superseded build images are reclaimed on the [Server tab](./server-tab.md)).
+
+## Starting and stopping services
+
+From an app's page you can **start, stop, restart, or redeploy** the whole app; from a service's own page you can do the same to a **single service** — so you can take one service down without touching the rest.
+
+A manual **Stop is a hold.** The stopped service — or, for an app-level stop, *every* service — stays down: Mooring's [self-healing](./scaling-and-self-healing.md) and auto-scaler both leave a held service alone instead of restarting it. So a service you deliberately stop stays stopped rather than bouncing back up. **Start**, **Restart**, or **Redeploy** releases the hold and brings it back. (A service that *crashes* on its own is different — self-healing does try to recover that.)
 
 ## Deleting an app
 

@@ -14,18 +14,25 @@ That's the whole on-ramp. After that, you live in the dashboard.
 
 ## Guides
 
-- **[Deploy from a Git repo](./gitops.md)** — connect a repo and Mooring watches it for new commits. You click Deploy.
-- **[Domains, HTTPS & the edge](./edge-and-tls.md)** — how one hostname becomes a live HTTPS site, automatically.
+- **[Deploy from a Git repo](./gitops.md)** — connect a repo (or GitHub in one click), pick a branch, and Mooring watches it for new commits. You click Deploy — and can roll back.
+- **[Domains, HTTPS & the edge](./edge-and-tls.md)** — how one hostname becomes a live HTTPS site, automatically — wildcard certificates and non-HTTP (TCP/UDP) services included.
 - **[Secrets & config files](./config-files-and-secrets.md)** — keep passwords and API keys safe, and template config files at deploy.
 - **[Import an existing `.env`](./env-import.md)** — bring what you already have.
-- **[Scaling & self-healing](./scaling-and-self-healing.md)** — keep apps healthy under load, safely.
+- **[Scaling & self-healing](./scaling-and-self-healing.md)** — keep apps responsive under load and recover crashed ones, safely.
 - **[Alerts](./alerting.md)** — get told when something needs you (off until you turn it on).
-- **[Backups & recovery](./backup-and-recovery.md)** — protect your data and recover onto a fresh server.
+- **[Backups & recovery](./backup-and-recovery.md)** — scheduled, encrypted snapshots to disk or S3, and a safe restore onto a fresh server.
+
+## Operations
+
+- **[The Server tab](./server-tab.md)** — live host metrics and processes, image vulnerability scanning, disk reclamation, and keeping Mooring itself up to date.
+- **[The Activity tab](./activity.md)** — Mooring's own recent events (deploys, builds, backups, scans, self-heal) in one place, instead of grepping `journalctl`.
+- **[An app's ops interface](./app-ops-interface.md)** — richer health, queues, and metrics for apps that expose them.
 
 ## Reference
 
-- **[The `mooring.yaml` file](./definition-file.md)** — the file that describes an app (the single source of truth). You write it in the app's repo and deploy; the dashboard reads it (read-only for the app's structure).
-- **[Running many apps on one server](./host-file.md)** — server-wide settings and coordination.
+- **[The `mooring.yaml` file](./definition-file.md)** — the file that describes an app: services, domains, secrets, scaling, self-healing, scheduled tasks, backups, and preview environments. The single source of truth.
+- **[Server settings & many apps](./host-file.md)** — server-wide settings and running several apps on one server.
+- **[The HTTP API](./api.md)** — the scoped, token-authenticated `/api/v1` for automation and scripts.
 - **[Command-line reference](./cli.md)** — for installation and the occasional power-user task. You rarely need it.
 - **[How it works & why it's safe](./architecture.md)** · **[Security](./security.md)** — the engineering details, if you're curious or evaluating.
 

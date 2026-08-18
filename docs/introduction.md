@@ -41,12 +41,18 @@ That's a running app with a public HTTPS address. Mooring reads the file, pulls 
 
 ## What's included
 
-- **A dashboard** to deploy your connected repos, view logs, restart services, and roll back changes.
-- **Automatic HTTPS** — declare a domain in `mooring.yaml` and Mooring issues and renews the certificate and routes traffic to it.
-- **Git deploys** — connect a repository and Mooring watches it for new commits (fetch-only — it never pushes to your repo).
-- **Secrets management** — store credentials encrypted and inject them into your apps at runtime.
-- **Health monitoring** — live CPU, memory, and disk for your server and each app.
-- **Scaling and self-healing** — optional automation to keep apps responsive and running.
+- **A dashboard** to deploy your connected repos, view logs, start / stop / restart / redeploy per app or service, and roll back to a previous deploy.
+- **Automatic HTTPS** — declare a domain in `mooring.yaml` and Mooring issues and renews the certificate and routes traffic to it, including wildcard certificates via DNS-01.
+- **Git deploys** — connect a repository (including one-click **Connect with GitHub**, which installs a read-only deploy key). Mooring watches for new commits and shows what changed; you click Deploy. Fetch-only — it never pushes.
+- **Several apps from one repo** — keep `mooring.yaml` plus variants like `mooring.staging.yaml`, and deploy each as its own app.
+- **Secrets & config files** — store credentials encrypted and reference them by name; render config files at deploy without secrets ever touching your repo.
+- **Scaling & self-healing** — optional, conservative automation that keeps stateless services responsive under load and recovers crashed ones (and pages you when it can't).
+- **Alerting** — optional email / webhook / Slack / Discord / Telegram (or a Mooring-hosted ntfy), with quiet hours and an external dead-man's switch. Off until you turn it on.
+- **Backups** — scheduled, encrypted snapshots of your apps' data and Mooring's own state, to local disk or S3, with a safe restore onto a fresh server.
+- **Scheduled tasks** — run a service's command on an interval as a fresh one-shot container (cron, without leaving anything running).
+- **Preview environments** — spin up a throwaway copy of an app per pull request on its own subdomain, torn down automatically.
+- **Team access** — add operators with owner / deployer / viewer roles, plus scoped API tokens for automation.
+- **Health & upkeep** — live CPU / memory / disk for the host and every app, an Activity tab of recent events, and an optional Server tab with image vulnerability scanning, disk reclamation, and a self-update / security-advisory check.
 
 ## How you'll work
 

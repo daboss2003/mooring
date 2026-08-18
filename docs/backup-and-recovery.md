@@ -46,6 +46,7 @@ backups:
   enabled: true
   schedule: 24h        # how often (default 24h; 1h floor)
   retention: 7         # keep the newest N snapshots per volume
+  helper_image: busybox:1.36   # optional: the small image (with `tar`) used to read a volume
   # optional: also ship each snapshot off-box to any S3-compatible store
   s3:
     bucket: my-mooring-backups
@@ -54,6 +55,8 @@ backups:
     access_key_id: "…"
     secret_access_key: "…"
     prefix: "mooring/"                       # optional key prefix
+    path_style: true                         # default true; needed by most S3-compatible endpoints (MinIO/R2/B2)
+    insecure: false                          # allow plain http:// (e.g. a private MinIO on the LAN); default https
 ```
 
 Once enabled, Mooring discovers every app's Docker **data volumes** and, on the schedule, snapshots each one: a read-only `tar` of the volume streamed through **gzip + AES-256-GCM** into a `.mbk` file under `<data_dir>/backups/`, kept to your retention count, and — when `s3` is set — uploaded off-box too. It rides the same one-docker-child slot as deploys and *skips* (never queues) when a deploy is running, so backups never slow a deploy. A failed backup raises an alert. The snapshots appear on the **Backups** page alongside your Mooring-state backups.

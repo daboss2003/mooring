@@ -162,6 +162,23 @@ abuse class:
   will not silently keep trying.
 - **Key custody.** Certificate private keys stay in the proxy's data dir, owned by the proxy user,
   mode `0600`. Mooring does **not** read HTTP-vhost private keys.
+- **Wildcard certificates via DNS-01.** Point one wildcard DNS record (`*.example.com` → this box)
+  and set `edge.dns01` with your provider and an API token, and Mooring issues a **single wildcard
+  certificate** for the whole namespace — no per-hostname issuance or rate limits, and it works for
+  names that aren't HTTP-reachable. Mooring **installs the matching Caddy DNS-provider module for
+  you** (`caddy add-package`) — you never run `xcaddy` or build a binary. This is what gives every
+  app subdomain and every [preview environment](./gitops.md#preview-environments-a-deploy-per-pull-request)
+  instant HTTPS. Without `dns01`, each hostname gets its own certificate over HTTP validation.
+
+### Subdomain namespaces (colocating apps under one apex)
+
+Set `edge.base_domain` and a route or cert binding can use the **subdomain shorthand** — `subdomain: mqtt`
+expands to `mqtt.example.com` — so you point one wildcard DNS record at the box and every declared
+subdomain just resolves. To run more than one apex on the same server (say a **prod** and a **staging**
+namespace side by side), add named `edge.base_domains`; each app opts into one by name and keeps the
+shorthand under its own apex without route collisions. Both namespaces and the private CAs list
+(`edge.cas`, for issuing off an internal CA instead of the public one) are declared **only** in the
+root-of-trust `config.yaml` — an app references a name and can never introduce a new apex or issuer.
 
 ---
 
@@ -391,13 +408,22 @@ spec:
 #   keyfile  /etc/mosquitto/certs/tls.key
 ```
 
-### `tcp-passthrough` / `tcp-terminate` (L4, opt-in, default off)
+### Layer-4 (TCP/UDP) load balancing (opt-in, default off)
 
-A layer-4 plugin lets the same proxy route extra TCP ports by SNI. **The cost, stated plainly:** the
-L4 plugin is **not** in the stock binary, so enabling it means a **custom build** — which breaks the
-"swap one binary" simplicity and makes you own its CVE cadence. It is gated by `edge.l4_enabled`
-(**default false**), digest-pinned, and in the SBOM/scan cadence. Prefer `cert-only` + cert-sync
-unless you specifically need SNI-routed L4.
+For a **non-HTTP** service — a database port, a game server, DNS, MQTT — Mooring can put a public
+TCP or UDP port in front of it with its own managed **Layer-4 load balancer**: a supervised child
+**nginx** `stream` proxy. There's no custom Mooring build — the stock binary drives it; you just
+turn it on with `edge.l4_enabled: true` and have an `nginx` binary on the host (optionally pinned
+with `edge.l4_nginx_digest`).
+
+Apps declare listeners under [`spec.edge.l4_routes`](./definition-file.md#specedgel4_routes-tcpudp-load-balancing):
+each route sets a public `listen` port, a `protocol` (`tcp`/`udp`), the internal `service` + `port`
+to reach, and an optional method (`round_robin` default, `least_conn`, or `hash_client_ip`). The LB
+owns the public port and fans traffic across the service's **live internal replicas** — discovered
+from the running containers, so a scaled or self-healed service's pool stays current, and a route
+with no live replica is skipped rather than blackholed. You point at a **service and port**, never a
+literal address, and control-plane ports (80/443, 9000/2019/2375) are refused as listeners. For TLS
+you usually keep the certificate at the app and use `cert-only` sync; L4 just moves the raw stream.
 
 ---
 
@@ -462,8 +488,14 @@ edge:
   mode: managed                 # "managed" (default) | "external" (config-file-only escape hatch)
   acme_email: ops@example.com   # REQUIRED in managed mode — fail-closed if empty
   acme_ca: https://acme-v02.api.letsencrypt.org/directory   # single pinned issuer, no fallback
+  base_domain: example.com      # optional: enables the `subdomain:` shorthand; point *.example.com here
+  dns01:                        # optional: one wildcard cert for the namespace (module auto-installed)
+    provider: cloudflare
+    api_token: "<dns-provider-token>"
+  # base_domains: [...]         # optional: additional NAMED namespaces (prod + staging on one box)
+  # cas: [...]                  # optional: extra named issuers (private/internal CAs) to opt into
   apply_probe_window: 20s       # health-probe window after each apply (default 20s)
-  l4_enabled: false             # layer-4 SNI routing — requires a CUSTOM build; default off
+  l4_enabled: false             # managed L4 (TCP/UDP) load balancer via child nginx; needs nginx on host; default off
 
 admin:
   # Optional. If unset, the admin UI is reachable only via SSH tunnel / port-forward to 127.0.0.1:9000
@@ -482,6 +514,10 @@ trusted_proxies:
 | `edge.acme_email` | *(empty)* | **Required** in `managed` mode; onboarding refuses to complete without it. |
 | `edge.acme_ca` | *(your CA)* | Single pinned issuer. **No fallback** — a fallback would diverge cert paths and break shared-cert readers. |
 | `edge.apply_probe_window` | `20s` | Window for the post-apply health probe (incl. the negative from-internet test) before auto-rollback. |
-| `edge.l4_enabled` | `false` | Enabling L4 SNI routing requires a **custom proxy build**; you own its CVE cadence. |
+| `edge.base_domain` | *(unset)* | Namespace apex for the `subdomain:` shorthand; point `*.<base_domain>` DNS at the box. |
+| `edge.dns01` | *(unset)* | `{provider, api_token}` → one **wildcard** cert for the namespace via DNS-01; the Caddy provider module is auto-installed. |
+| `edge.base_domains` | *(none)* | Additional **named** namespaces (e.g. prod + staging on one box); an app opts into one by name. |
+| `edge.cas` | *(none)* | Extra named issuers (private/internal CAs) a route or cert binding can select by name. |
+| `edge.l4_enabled` | `false` | Turns on the managed Layer-4 (TCP/UDP) load balancer — a supervised child **nginx** `stream` proxy. Needs `nginx` on the host; optionally pin it with `edge.l4_nginx_digest`. |
 | `admin.hostname` | *(unset)* | When unset, no admin vhost is served at all (SBD-1). |
 | `trusted_proxies` | *(none)* | **Required for `external` boot:** a specific edge IP, `≤ /24`, not a bridge CIDR; boot also probes that `:9000` is unreachable from non-loopback. |

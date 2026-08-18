@@ -22,6 +22,8 @@ Auto-scaling adjusts how many copies (**replicas**) of a service run, based on l
 
 You configure min/max replicas, per-replica memory and CPU, and the up/down thresholds on the service's **Auto-scaling** panel. **The auto-scaling policy is an exception to the read-only dashboard** — it is operational tuning you set live, per service, without a redeploy.
 
+**Nudge replicas by hand.** On the same panel you can step a scalable service's replica count **+1 / −1** on demand — to pre-warm before a spike you know is coming, or to shed a copy. It's bounded by the same limits as an automatic decision (never below min, above max, or past what the host can fund), and it's a **temporary boost, not a pin**: the service rejoins normal auto-scaling and can be scaled back down again under sustained low load. Only a service that already has auto-scaling enabled can be nudged.
+
 > The same policy can also be expressed in the app's `mooring.yaml` under [`spec.scaling`](./definition-file.md#specscaling) (one entry per service), so it lives with the rest of the app's definition. A deploy applies what the file declares; the dashboard panel is for tuning it afterward. Either way the policy lands in the same place — there is no separate "canonical" copy to keep in sync.
 
 > Never enable this for a database, message broker, or anything that owns data — those are meant to run as a single instance.
@@ -30,9 +32,11 @@ You configure min/max replicas, per-replica memory and CPU, and the up/down thre
 
 The self-healing supervisor watches your services and **recovers ones that crash or get stuck** — restarting a failed container, and escalating if a restart isn't enough. It only ever *reduces* pressure or holds steady; it never adds load.
 
+**How it escalates.** For a crashed or unhealthy service it climbs a short ladder — **restart**, then **recreate** (which also re-renders the service's config files and re-syncs its certificates, healing config drift), and, only if you opt in on a box with enough RAM, **redeploy**. Each rung is tried at most once per window, with back-off between attempts. Two cases short-circuit the ladder because retrying wouldn't help: a service being **OOM-killed repeatedly** (it needs more memory, not another restart), and a restart that would need memory the host can't spare (Mooring **pages you instead of acting**). It also covers the **deploy path** — if an interrupted recreate strands a container holding a service's name, Mooring reclaims that app's own stuck container and retries once (see [self-healing a stuck container](./gitops.md#how-updates-work)).
+
 When it **can't** recover a service after trying, it stops retrying (to avoid a crash-loop hammering the box), **flags the service on the Incidents screen**, and alerts you. That's the "self-healing gave up" state — you investigate, fix the underlying problem, and click **clear & retry** to let Mooring try again.
 
-**Planned downtime:** if you're taking a service down on purpose, mark it as expected-down for a window so the supervisor doesn't fight you trying to bring it back.
+**Stopping a service on purpose won't fight you.** When you **Stop** a service (or a whole app), Mooring records a *hold*: the supervisor and the auto-scaler both leave it down and won't restart it. A held service stays stopped until you **Start**, **Restart**, or **Redeploy** it — so planned downtime is just Stop, with no window to set or expire. (See [Starting and stopping services](./gitops.md#starting-and-stopping-services).)
 
 Self-healing is conservative for the same reason auto-scaling is: a recovery action that needs to recreate a container runs only when there's room, so healing one app can't knock over the server.
 
