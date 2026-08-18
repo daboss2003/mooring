@@ -4,7 +4,7 @@
 
 This is a long page on purpose. If you operate a Mooring install, read at least [§1](#1-the-paramount-requirement) and [§5](#5-the-secure-by-default-baseline-sbd-18); if you author apps or routes in a `mooring.yaml`, also read [§3](#3-the-56-validator--one-allowlist-chokepoint); if you assess the risk of running Mooring at all, read [§6](#6-threat-model-trust-boundaries-and-attacker-classes) and [§9](#9-residual-risk-the-honest-part).
 
-See also: the project [README](../README.md), the [edge / Caddy docs](./edge-and-tls.md), the [provisioning modes](./gitops.md), the [configuration reference](./architecture.md), and the [operations runbook](./architecture.md).
+See also: the project [README](../README.md), the [edge / Caddy docs](./edge-and-tls.md), the [provisioning modes](./gitops.md), the [configuration reference](./host-file.md), and the [architecture overview](./architecture.md).
 
 ---
 
@@ -75,6 +75,20 @@ This is possible because Mooring is server-rendered (`html/template` + htmx + Al
 `POST /webhook/:token` is the **one** route exempt from the IP allowlist — because CI egress IPs are unpredictable. It is not unprotected: it is HMAC-verified (timing-safe), replay-protected (a signed timestamp + nonce inside the HMAC-covered body, provider-agnostic), per-token rate-limited, and single-flight debounced. The high-entropy token is **never logged**.
 
 Crucially, the webhook is **fetch-only and trigger-only**: it performs a `git fetch`, advances a staged ref, computes "commits behind," and sets `update_available`. It **never** reads the ref/sha/repo from the (attacker-influenced) payload, and **never** builds, re-validates, or redeploys. The actual deploy is a separate, manually-gated path. This removes the surprise-OOM vector that an auto-redeploy-on-push webhook would have. A webhook can **never** trigger setup-script execution. See [provisioning](./gitops.md) for the full auto-pull / manual-deploy model.
+
+### 2.5 Operators, roles, and the auth epoch
+
+Mooring supports more than one operator, all declared in the root-of-trust `config.yaml` (never a web signup). The `auth:` block is the primary **owner**; additional operators go in a `users:` list, each with a role:
+
+| Role | Can |
+|---|---|
+| **owner** | Everything — deploy, roll back, edit apps, **and** all Tier-1 actions: reveal/set secrets, mint API tokens, delete apps, change trust. |
+| **deployer** | Deploy, roll back, and edit an app's env / config files / scaling. **No** Tier-1 actions. |
+| **viewer** | Read-only. |
+
+Roles are enforced **server-side**, as a `requirePerm(view|deploy|admin)` gate that runs *after* authentication on every mutating route — never in the UI alone. The tier check is fail-closed: an unknown capability is denied.
+
+**The auth epoch — one credential change logs everyone out.** Mooring persists a fingerprint over the *entire* operator set — every user's username, password hash, TOTP secret, **and role**. On both **reload and restart**, it re-derives the fingerprint and, if it changed, **revokes every live session**. So changing any operator's password, rotating a TOTP, renaming a user, **changing a role, or adding/removing an operator** immediately invalidates all outstanding sessions — closing the "demote or disable a user but their existing session keeps working" gap, through either the reload *or* the restart path.
 
 ---
 
@@ -410,7 +424,7 @@ These ten principles are the spine the rest of the model hangs on:
 ## See also
 
 - [README](../README.md) — what Mooring is and how to install it.
-- [Configuration reference](./architecture.md) — every key in `config.yaml`, including `ip_allowlist`, `trusted_proxies`, and `edge.mode`.
+- [Configuration reference](./host-file.md#the-configyaml-reference) — every key in `config.yaml`, including `ip_allowlist`, `trusted_proxies`, and `edge.mode`.
 - [Managed edge / Caddy](./edge-and-tls.md) — the typed, generated edge config and the route model.
 - [Provisioning modes](./gitops.md) — the four input modes, the setup-script sandbox, and the git deploy fences.
 - [Operations runbook](./architecture.md) — key rotation, backups, and the IR runbook.
