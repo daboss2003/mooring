@@ -539,6 +539,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /github/connect", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitHubConnect))))
 	mux.HandleFunc("GET /github/callback", s.handleGitHubCallback)
 	mux.HandleFunc("GET /github/repos", s.requireAuth(s.withCSRFToken(s.handleGitHubRepos)))
+	mux.HandleFunc("POST /github/choose-branch", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitHubChooseBranch))))
 	mux.HandleFunc("POST /github/connect-repo", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleGitHubConnectRepo))))
 	mux.HandleFunc("POST /github/disconnect", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleGitHubDisconnect))))
 	// Managed edge (M11): per-app public routes (Caddy/ACME). The whole config is

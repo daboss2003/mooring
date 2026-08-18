@@ -1,0 +1,25 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  {{with .GitHubBranch}}
+  <p><a href="/github/repos">← Pick a repository</a></p>
+  <h1>Choose a branch</h1>
+  <p class="muted"><strong>{{.FullName}}</strong> has several branches. Pick the one Mooring should read
+    its <code>mooring.yaml</code> from and deploy — this avoids a first fetch reading the wrong branch.
+    You can change it later from the repository's Git settings.</p>
+  <section class="panel">
+    <form method="post" action="/github/connect-repo" class="stack">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <input type="hidden" name="full_name" value="{{.FullName}}">
+      {{$def := .Default}}
+      <label>Branch
+        <select name="branch" class="w-num-lg">
+          {{range .Branches}}<option value="{{.}}"{{if eq . $def}} selected{{end}}>{{.}}{{if eq . $def}} (default){{end}}</option>{{end}}
+        </select>
+      </label>
+      <button type="submit" class="btn btn-primary">Connect →</button>
+    </form>
+  </section>
+  {{end}}
+</main>
+{{template "bottom" .}}

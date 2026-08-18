@@ -25,10 +25,10 @@
           <td>{{if .Private}}<span class="pill">private</span>{{else}}<span class="pill pill-ok">public</span>{{end}}</td>
           <td class="mono">{{.DefaultBranch}}</td>
           <td>
-            <form method="post" action="/github/connect-repo" class="inline">
+            <form method="post" action="/github/choose-branch" class="inline">
               <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
               <input type="hidden" name="full_name" value="{{.FullName}}">
-              <input type="hidden" name="branch" value="{{.DefaultBranch}}">
+              <input type="hidden" name="default_branch" value="{{.DefaultBranch}}">
               <button type="submit" class="btn btn-primary btn-sm">Connect →</button>
             </form>
           </td>

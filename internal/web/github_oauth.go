@@ -32,6 +32,13 @@ type githubRepoView struct {
 	DefaultBranch string
 }
 
+// githubBranchView backs the "choose a branch" step, shown only when a picked repo has >1 branch.
+type githubBranchView struct {
+	FullName string
+	Default  string
+	Branches []string
+}
+
 func (s *Server) githubEnabled() bool {
 	return s.githubClient != nil && s.gitStore != nil && s.cfg.GitHub.Enabled()
 }
@@ -176,11 +183,69 @@ func (s *Server) handleGitHubConnectRepo(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "invalid repository", http.StatusBadRequest)
 		return
 	}
+	s.githubConnectRepo(w, r, owner, name, branch)
+}
+
+// handleGitHubChooseBranch (POST, auth+CSRF) sits between picking a repo and connecting it: if the
+// repo has MORE THAN ONE branch it asks which branch to deploy (defaulting to the repo's default
+// branch), so the first fetch never silently reads mooring.yaml from the wrong branch. With a single
+// branch — or if the branch list can't be read — it connects straight away on the default, so the
+// prompt only ever appears when it's actually a choice.
+func (s *Server) handleGitHubChooseBranch(w http.ResponseWriter, r *http.Request) {
+	if !s.githubEnabled() {
+		notFound(w)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	fullName := strings.TrimSpace(r.PostFormValue("full_name"))
+	def := strings.TrimSpace(r.PostFormValue("default_branch"))
+	if def == "" {
+		def = "main"
+	}
+	owner, name, ok := splitFullName(fullName)
+	if !ok {
+		http.Error(w, "invalid repository", http.StatusBadRequest)
+		return
+	}
 	conn, ok, err := s.gitStore.GitHubConn(r.Context())
 	if err != nil || !ok {
 		http.Redirect(w, r, "/git/new", http.StatusSeeOther)
 		return
 	}
+	branches, berr := s.githubClient.ListBranches(r.Context(), conn.Token, owner, name)
+	if berr != nil || len(branches) <= 1 {
+		// Only one branch, or we couldn't enumerate them — don't make the operator choose; connect
+		// on the default branch exactly as before.
+		s.githubConnectRepo(w, r, owner, name, def)
+		return
+	}
+	names := make([]string, 0, len(branches))
+	for _, b := range branches {
+		names = append(names, b.Name)
+	}
+	s.render(w, r, "github_branch.html", tmplData{
+		Title:        "Choose a branch — Mooring",
+		CSRFToken:    CSRFToken(r.Context()),
+		Username:     sessionUser(r),
+		GitHubBranch: &githubBranchView{FullName: fullName, Default: def, Branches: names},
+	})
+}
+
+// githubConnectRepo discovers the repo's mooring file(s) on the chosen branch (over HTTPS with the
+// OAuth token, since the per-slug deploy key isn't installed until the slug is known) and then:
+// 0 files → scaffold (slug derived from the repo name); 1 → connect; >1 → the chooser (one app per
+// file). The read-only deploy key is installed at finalize, named per the chosen slug. Shared by the
+// direct connect and the branch-chooser step.
+func (s *Server) githubConnectRepo(w http.ResponseWriter, r *http.Request, owner, name, branch string) {
+	conn, ok, err := s.gitStore.GitHubConn(r.Context())
+	if err != nil || !ok {
+		http.Redirect(w, r, "/git/new", http.StatusSeeOther)
+		return
+	}
+	fullName := owner + "/" + name
 
 	// Discover mooring files using the OAuth token over HTTPS.
 	repoURL := "https://github.com/" + owner + "/" + name + ".git"

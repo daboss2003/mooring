@@ -158,6 +158,37 @@ func (c *Client) ListRepos(ctx context.Context, token string) ([]Repo, error) {
 	return all, nil
 }
 
+// Branch is one repo branch (only the name is needed; the default branch is known from Repo).
+type Branch struct {
+	Name string `json:"name"`
+}
+
+// maxBranchPages bounds the branch listing (100/page) so a repo with a huge number of branches
+// can't make the connect flow unbounded.
+const maxBranchPages = 5
+
+// ListBranches returns a repo's branches (most useful for asking the operator which one to deploy
+// when there is more than one), bounded by maxBranchPages.
+func (c *Client) ListBranches(ctx context.Context, token, owner, repo string) ([]Branch, error) {
+	var all []Branch
+	for page := 1; page <= maxBranchPages; page++ {
+		req, err := c.authedGet(ctx, token,
+			"/repos/"+url.PathEscape(owner)+"/"+url.PathEscape(repo)+"/branches?per_page=100&page="+strconv.Itoa(page))
+		if err != nil {
+			return nil, err
+		}
+		var batch []Branch
+		if err := c.do(req, &batch); err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+		if len(batch) < 100 {
+			break
+		}
+	}
+	return all, nil
+}
+
 // CreateDeployKey installs a READ-ONLY deploy key on owner/repo. title is a human
 // label; pubLine is an authorized_keys line. It is idempotent-ish: GitHub rejects a
 // duplicate key with 422, which the caller can treat as already-installed.

@@ -87,6 +87,7 @@ type tmplData struct {
 	GitHubEnabled bool
 	GitHubLogin   string
 	GitHubRepos   []githubRepoView
+	GitHubBranch  *githubBranchView
 
 	// Supervisor (M13): per-service FSM phase, e.g. "CIRCUIT_OPEN", for the app view.
 	Supervisor map[string]string

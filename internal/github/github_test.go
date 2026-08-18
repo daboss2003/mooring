@@ -109,6 +109,34 @@ func TestViewerAndListRepos(t *testing.T) {
 	}
 }
 
+func TestListBranches(t *testing.T) {
+	var sawPath, sawAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawPath, sawAuth = r.URL.Path, r.Header.Get("Authorization")
+		if r.URL.Path == "/repos/octocat/app/branches" {
+			_, _ = w.Write([]byte(`[{"name":"main"},{"name":"develop"},{"name":"release/1.x"}]`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	c := New(srv.Client(), srv.URL, srv.URL)
+
+	branches, err := c.ListBranches(context.Background(), "gho_X", "octocat", "app")
+	if err != nil {
+		t.Fatalf("list branches: %v", err)
+	}
+	if len(branches) != 3 || branches[0].Name != "main" || branches[2].Name != "release/1.x" {
+		t.Errorf("branch parse wrong: %+v", branches)
+	}
+	if sawPath != "/repos/octocat/app/branches" {
+		t.Errorf("path = %q", sawPath)
+	}
+	if sawAuth != "Bearer gho_X" {
+		t.Errorf("auth header = %q", sawAuth)
+	}
+}
+
 func TestCreateDeployKey(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/repos/octocat/app/keys" && r.Method == http.MethodPost {
