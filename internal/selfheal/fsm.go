@@ -26,6 +26,7 @@ const (
 	Recovered     Phase = "RECOVERED"
 	WaitingOnEdge Phase = "WAITING_ON_EDGE"
 	ExpectedDown  Phase = "EXPECTED_DOWN"
+	Held          Phase = "HELD" // operator hold: deliberately stopped / auto-restart paused
 )
 
 // Rung is one step of the remediation ladder, in escalating order.
@@ -61,6 +62,7 @@ type Observation struct {
 	ExitCode      int
 	WaitingOnEdge bool // a service still waiting on its edge-issued cert
 	ExpectedDown  bool // a VALID write-plane lease is held for this app
+	Held          bool // the operator has deliberately stopped/paused this service (never restart)
 }
 
 // oomKilled reports an OOM kill, counting exit-137 / at-limit kills too (plan §8.5),
@@ -167,6 +169,15 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 	f := prev // copy; we mutate the copy
 
 	// Suspensions take precedence — the supervisor must not "fix" what it doesn't own.
+	// An operator HOLD is the strongest: a deliberate stop / "pause auto-restart". Suspend
+	// remediation entirely and reset the failure accounting so the intentional-down state is
+	// never read as a crash loop. This is what lets the operator stop a bouncing service and
+	// have it STAY stopped instead of being restarted until the circuit trips.
+	if o.Held {
+		f.Phase = Held
+		f.UnhealthyStreak, f.HealthyStreak, f.DegradedSince = 0, 0, 0
+		return Decision{Next: f, Act: ActNone, Reason: "operator hold (auto-restart paused)"}
+	}
 	if o.ExpectedDown {
 		// A valid write-plane lease is held: the app is intentionally down. Reset the
 		// failure accounting so a deploy doesn't look like a crash loop.
@@ -186,7 +197,7 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 	if o.healthyNow() {
 		f.UnhealthyStreak = 0
 		f.DegradedSince = 0
-		if prev.Phase == Healthy || prev.Phase == ExpectedDown || prev.Phase == WaitingOnEdge {
+		if prev.Phase == Healthy || prev.Phase == ExpectedDown || prev.Phase == WaitingOnEdge || prev.Phase == Held {
 			f.Phase = Healthy
 			f.HealthyStreak = 0
 			return Decision{Next: f, Act: ActNone}

@@ -23,7 +23,8 @@
         <tr><td>Memory</td><td class="mono">{{humanBytes .MemBytes}}{{if .MemLimit}} / {{humanBytes .MemLimit}}{{end}}</td></tr>
         <tr><td>Restarts</td><td class="mono">{{.RestartCount}}</td></tr>
         {{end}}
-        {{if .Phase}}<tr><td>Self-heal</td><td>{{if eq .Phase "CIRCUIT_OPEN"}}<span class="badge badge-warn">circuit open — needs attention</span>{{else}}<span class="muted">{{.Phase}}</span>{{end}}</td></tr>{{end}}
+        {{if .Held}}<tr><td>Auto-restart</td><td><span class="badge badge-warn">held — stopped by operator, won't auto-restart</span></td></tr>
+        {{else if .Phase}}<tr><td>Self-heal</td><td>{{if eq .Phase "CIRCUIT_OPEN"}}<span class="badge badge-warn">circuit open — needs attention</span>{{else}}<span class="muted">{{.Phase}}</span>{{end}}</td></tr>{{end}}
         {{if .DesiredReplicas}}<tr><td>Desired replicas</td><td class="mono">{{.DesiredReplicas}}</td></tr>{{end}}
         {{if .StatusText}}<tr><td>Status</td><td class="muted">{{.StatusText}}</td></tr>{{end}}
       </tbody>
@@ -31,7 +32,16 @@
     <div class="queue-actions mt1">
       <button type="button" class="btn btn-sm lc-btn" data-log-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs{{if .ContainerID}}?copy={{pathEscape .ContainerID}}{{end}}">View logs</button>
       {{if and (not $.WriteDisabledReason) (not $.Protected)}}
+      {{if .Held}}
+      <button type="button" class="btn btn-sm btn-primary lc-btn" data-lc-confirm="Start the {{.Service}} service and resume auto-restart?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/start">Start</button>
+      {{else}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart the {{.Service}} service?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart">Restart</button>
+      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop just the {{.Service}} service? It stays stopped (auto-restart paused) until you start it — the rest of the app keeps running." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/stop">Stop</button>
+      {{if and .Policy .Policy.Enabled}}
+      <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/up" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Add one replica now — auto-scaling still manages it (sheds it under sustained no load, keeps it under load)">+1 replica</button></form>
+      <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/down" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Remove one replica now — never below the minimum">−1 replica</button></form>
+      {{end}}
+      {{end}}
       {{if eq .Phase "CIRCUIT_OPEN"}}
       <form method="post" action="/apps/{{pathEscape .Project}}/supervisor/clear" class="inline" data-confirm="Clear the self-heal circuit for {{.Service}} and let Mooring try again?">
         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><input type="hidden" name="service" value="{{.Service}}">

@@ -43,6 +43,28 @@ func TestExpectedDownSuspends(t *testing.T) {
 	}
 }
 
+func TestHeldSuspendsAndNeverRestarts(t *testing.T) {
+	// A held (operator-stopped) service is left down no matter how it looks — even mid-crash-loop.
+	o := Observation{Running: false, ExitCode: 1, Held: true}
+	d := Decide(FSM{Phase: Remediating, UnhealthyStreak: 9, Attempts: 2}, o, testPolicy(), 100)
+	if d.Act != ActNone || d.Next.Phase != Held {
+		t.Errorf("operator hold must suspend remediation, got act=%s phase=%s", d.Act, d.Next.Phase)
+	}
+	if d.Next.UnhealthyStreak != 0 || d.Next.DegradedSince != 0 {
+		t.Error("a hold must reset failure accounting (a deliberate stop isn't a crash loop)")
+	}
+	// Hold outranks an expected_down lease too (both set → still held, never restarted).
+	d = Decide(FSM{}, Observation{Running: false, Held: true, ExpectedDown: true}, testPolicy(), 100)
+	if d.Act != ActNone || d.Next.Phase != Held {
+		t.Errorf("hold must take precedence, got act=%s phase=%s", d.Act, d.Next.Phase)
+	}
+	// Releasing the hold on a now-healthy service returns straight to HEALTHY (no stabilization lag).
+	d = Decide(FSM{Phase: Held}, healthy, testPolicy(), 200)
+	if d.Act != ActNone || d.Next.Phase != Healthy {
+		t.Errorf("released + healthy must go to HEALTHY, got act=%s phase=%s", d.Act, d.Next.Phase)
+	}
+}
+
 func TestWaitingOnEdgeNeverRestarts(t *testing.T) {
 	o := Observation{Running: false, WaitingOnEdge: true}
 	d := Decide(FSM{}, o, testPolicy(), 100)

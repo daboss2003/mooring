@@ -112,6 +112,25 @@ func (s *Server) handleSupervisorClear(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/apps/"+project, http.StatusSeeOther)
 }
 
+// heldServices returns the set of operator-held service names for a project (a manual stop /
+// "pause auto-restart"). Read-only view for the app + service pages.
+func (s *Server) heldServices(project string) map[string]bool {
+	out := map[string]bool{}
+	if s.selfHeal == nil {
+		return out
+	}
+	all, err := s.selfHeal.ActiveHeld()
+	if err != nil {
+		return out
+	}
+	for k := range all {
+		if k.App == project {
+			out[k.Service] = true
+		}
+	}
+	return out
+}
+
 // supervisorStates returns the persisted FSM states for a project (read-only view).
 func (s *Server) supervisorStates(project string) map[string]string {
 	out := map[string]string{}

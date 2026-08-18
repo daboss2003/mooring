@@ -72,6 +72,50 @@ func TestExpectedDownLease(t *testing.T) {
 	}
 }
 
+func TestServiceHeld(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	a := Key{App: "shop", Service: "web"}
+	b := Key{App: "shop", Service: "worker"}
+	other := Key{App: "blog", Service: "web"}
+	for _, k := range []Key{a, b, other} {
+		if err := s.SetHeld(ctx, k, "op", 100); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held, err := s.ActiveHeld()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !held[a] || !held[b] || !held[other] {
+		t.Fatalf("all three should be held, got %v", held)
+	}
+	// ClearHeld is scoped to one service.
+	if err := s.ClearHeld(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	held, _ = s.ActiveHeld()
+	if held[a] || !held[b] || !held[other] {
+		t.Errorf("only shop/web should be released, got %v", held)
+	}
+	// ClearHeldApp releases every hold for one app but leaves other apps.
+	if err := s.ClearHeldApp(ctx, "shop"); err != nil {
+		t.Fatal(err)
+	}
+	held, _ = s.ActiveHeld()
+	if held[b] || !held[other] {
+		t.Errorf("all shop holds gone, blog untouched; got %v", held)
+	}
+	// A held service survives across a store reopen would be covered by DeleteApp cleanup:
+	if err := s.DeleteApp(ctx, "blog"); err != nil {
+		t.Fatal(err)
+	}
+	held, _ = s.ActiveHeld()
+	if len(held) != 0 {
+		t.Errorf("DeleteApp must also clear holds, got %v", held)
+	}
+}
+
 func TestClearAllExpectedDownFailClosed(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()

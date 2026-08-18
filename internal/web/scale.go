@@ -49,6 +49,48 @@ func (s *Server) Scale(ctx context.Context, appProject, service string, replicas
 	return s.runner.RunHeld(ctx, job, nil)
 }
 
+// SetReplicaNudger wires the scaler's manual ±replica entry point (set post-construction by
+// cmd_serve, like the circuit clearer, to avoid an import cycle with the watcher goroutine).
+func (s *Server) SetReplicaNudger(f func(app, service string, delta int)) { s.replicaNudger = f }
+
+// handleReplicaNudge applies a manual one-step replica change (dir=up/down → +1/−1) to a scalable
+// service. Only a service with an ENABLED scaling policy can be nudged — the scaler manages only
+// those, and the change is bounded by that policy + host capacity on the next tick, then rejoins
+// normal autoscaling. Auth+CSRF gated; protected projects refused; audited.
+func (s *Server) handleReplicaNudge(w http.ResponseWriter, r *http.Request) {
+	project := r.PathValue("project")
+	service := r.PathValue("service")
+	if s.cfg.IsProtectedProject(project) {
+		http.Error(w, "protected project", http.StatusForbidden)
+		return
+	}
+	var delta int
+	switch r.PathValue("dir") {
+	case "up":
+		delta = 1
+	case "down":
+		delta = -1
+	default:
+		http.Error(w, "unknown direction", http.StatusNotFound)
+		return
+	}
+	if s.scaling == nil {
+		http.Error(w, "scaling unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	// Only a scaler-managed (enabled-policy) service can be nudged; otherwise the tick would
+	// silently drop the request (it steps only enabled policies).
+	if pr, ok, err := s.scaling.PolicyFor(scale.Key{App: project, Service: service}); err != nil || !ok || !pr.Enabled {
+		http.Error(w, "auto-scaling is not enabled for this service", http.StatusBadRequest)
+		return
+	}
+	if s.replicaNudger != nil {
+		s.replicaNudger(project, service, delta)
+	}
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "scale_nudge_" + r.PathValue("dir"), Target: project + "/" + service, Outcome: audit.OK, Level: audit.Info})
+	http.Redirect(w, r, "/apps/"+url.PathEscape(project)+"/services/"+url.PathEscape(service), http.StatusSeeOther)
+}
+
 // handleScalingSave persists a per-service scaling policy. Enabling scaling is hard-
 // gated: a protected project, a stateful image (C4 — refused at the chokepoint, not
 // merely attested), or an invalid policy / missing reservation is rejected.

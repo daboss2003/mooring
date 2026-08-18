@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/alert"
@@ -168,6 +169,20 @@ type Config struct {
 	// a blind window (enable-time lag / broken capture → HOLD, never shed on data we don't have).
 	// Wired together with EdgeStats (both set, or both nil).
 	EdgeLive func() bool
+	// Held returns the set of operator-HELD services (a manual stop / "pause auto-restart"). A held
+	// service is skipped entirely each tick — never reconciled, scaled, or reserved-for — so a
+	// service the operator deliberately stopped is not relaunched by the scaler. Read once per tick.
+	// nil → nothing held.
+	Held func() map[Key]bool
+	// CircuitOpen returns services whose self-heal circuit is OPEN (self-heal gave up on a crash loop
+	// and is paging instead of restarting). The scaler must NOT relaunch them — reconciling a crashed
+	// replica back up would re-arm exactly the loop the breaker exists to stop. Read once per tick.
+	CircuitOpen func() map[Key]bool
+	// BusyApps returns apps holding a self-heal expected_down lease (an operator lifecycle/deploy
+	// action is in flight). The scaler skips their services meanwhile — it must not fight the write
+	// plane, and this also closes the brief window during an operator STOP before its hold row lands
+	// (self-heal holds the lease until after the hold is written). Read once per tick.
+	BusyApps func() map[string]bool
 	Now      func() int64
 }
 
@@ -176,6 +191,29 @@ type Watcher struct {
 	cfg     Config
 	states  map[Key]State
 	refused map[Key]bool // services with an open scale_refused_no_capacity alert
+
+	mu           sync.Mutex  // guards pendingNudge only (drained at tick start; never held during tick I/O)
+	pendingNudge map[Key]int // operator manual ±replica requests, applied at the next tick
+	nudges       map[Key]int // this tick's drained nudges (tick goroutine only)
+}
+
+// Nudge requests a manual one-step change (+1 / −1) to a service's desired replica count. It only
+// RECORDS the request under a short lock; the controller applies it at the start of the next tick,
+// so it uses fresh capacity data and never races the state map. A nudged service stays under normal
+// autoscaling afterward: it scales back down under sustained no-load (after the down-cooldown) and
+// up under load — the manual step is a boost the controller still manages, not a pin. Repeated
+// clicks before the next tick accumulate. A held or non-scalable service's nudge is a harmless no-op
+// (the tick simply never applies it).
+func (w *Watcher) Nudge(app, service string, delta int) {
+	if delta == 0 {
+		return
+	}
+	w.mu.Lock()
+	if w.pendingNudge == nil {
+		w.pendingNudge = map[Key]int{}
+	}
+	w.pendingNudge[Key{App: app, Service: service}] += delta
+	w.mu.Unlock()
 }
 
 // New builds a Watcher.
@@ -234,14 +272,45 @@ func (w *Watcher) Tick(ctx context.Context) {
 	// LATER service in the SAME tick is sized against it. Without this, two services
 	// scaling in one tick would each see the other's stale (pre-scale) desired and
 	// could jointly over-commit the host into an OOM.
+	// A service is SKIPPED entirely this tick — not reconciled, scaled, or reserved-for — when the
+	// operator held it, when self-heal gave up on it (circuit open), or while a lifecycle/deploy
+	// action is in flight for its app (expected_down lease). In every case something else owns the
+	// service's up/down state and the scaler must defer, so it never relaunches a service that is
+	// intentionally down.
+	var held, circuit map[Key]bool
+	var busy map[string]bool
+	if w.cfg.Held != nil {
+		held = w.cfg.Held()
+	}
+	if w.cfg.CircuitOpen != nil {
+		circuit = w.cfg.CircuitOpen()
+	}
+	if w.cfg.BusyApps != nil {
+		busy = w.cfg.BusyApps()
+	}
+	skip := func(k Key) bool { return held[k] || circuit[k] || busy[k.App] }
+
+	// Drain any operator manual ±replica requests for this tick (applied per service in stepService,
+	// using this tick's fresh capacity ceiling).
+	w.mu.Lock()
+	w.nudges = w.pendingNudge
+	w.pendingNudge = map[Key]int{}
+	w.mu.Unlock()
+
 	lb := &liveBudget{}
 	for k, p := range policies {
+		if skip(k) {
+			continue // don't reserve capacity for a service that's intentionally down
+		}
 		d := w.desired(k, groups[k], p)
 		lb.mem += uint64(d) * p.PerReplicaMem
 		lb.cpu += uint64(d) * p.PerReplicaCPU
 	}
 
 	for k, p := range policies {
+		if skip(k) {
+			continue // never reconcile/scale a service that is held, given-up-on, or mid-lifecycle
+		}
 		w.stepService(ctx, snap, k, p, groups[k], lb, now)
 	}
 }
@@ -294,11 +363,16 @@ func (w *Watcher) desired(k Key, g replicaGroup, p PolicyRow) int {
 	if st, ok := w.states[k]; ok && st.Replicas > 0 {
 		return st.Replicas
 	}
-	d := g.running
-	if d < p.Min {
-		d = p.Min
+	// First sight (no persisted state): seed from what's actually RUNNING, NOT clamped up to
+	// the floor. Clamping to p.Min here was a bug: it made Decide see cur==min and hold, so a
+	// service that a deploy launched with 1 replica but declares min:2 would sit at 1 forever
+	// (nothing else reconciles running→desired). Seeding the observed count lets Decide's
+	// min-floor branch see cur<min and grow it to the floor. Never seed 0 — a persisted 0 reads
+	// as "no state" and would re-seed every tick.
+	if g.running < 1 {
+		return 1
 	}
-	return d
+	return g.running
 }
 
 func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key, p PolicyRow, g replicaGroup, lb *liveBudget, now int64) {
@@ -344,6 +418,36 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		PolicyMax: p.Max, PerReplicaMemFloor: w.cfg.Reserves.PerReplicaMemFloor, NearOOMFreeBytes: w.cfg.Reserves.NearOOMFreeBytes,
 	})
 
+	// Manual ±replica nudge: an explicit one-step operator override, applied this tick and bounded by
+	// the SAME [min, policyMax, capacity-ceiling] limits as an automatic decision (a manual boost can
+	// never push the host past the capacity guard). LastChange is armed so the boost survives at least
+	// one down-cooldown before autoscaling may shed it. It then rejoins normal autoscaling.
+	if delta := w.nudges[k]; delta != 0 {
+		delete(w.nudges, k)
+		target := st.Replicas + delta
+		if target < p.Min {
+			target = p.Min
+		}
+		if p.Max > 0 && target > p.Max {
+			target = p.Max
+		}
+		if target > ceiling {
+			target = ceiling
+		}
+		if target < 1 {
+			target = 1
+		}
+		next := st
+		next.Replicas = target
+		next.LastChange = now
+		if g.running != target {
+			w.scaleGated(ctx, k, Decision{Target: target, Next: next, Reason: "manual scale"}, now)
+		} else {
+			w.save(ctx, k, next, now)
+		}
+		return
+	}
+
 	metrics := Metrics{AllHealthy: g.allHealthy}
 	if g.running > 0 {
 		metrics.CPUMeanPct = g.cpuSum / float64(g.running)
@@ -371,6 +475,17 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 	switch d.Action {
 	case ActNone:
 		w.resolveRefused(ctx, k) // load dropped → the refusal condition is gone
+		// Reconcile observed→desired. The controller only issues Scale on a Decide state
+		// transition, so a service whose RUNNING count is below its DESIRED — a deploy that
+		// launched fewer replicas than the floor, or a replica that died with no load change —
+		// would otherwise sit under-provisioned forever (this is the "desired 2 but only 1
+		// running" symptom). If we are steady but short of desired and capacity allows, re-assert
+		// desired. (A future manual "hold" on a service must also gate this, so a deliberately
+		// stopped replica is not relaunched.)
+		if g.running < d.Next.Replicas && d.Next.Replicas <= ceiling {
+			w.scaleGated(ctx, k, Decision{Target: d.Next.Replicas, Next: d.Next, Reason: "reconcile running→desired"}, now)
+			return
+		}
 		w.save(ctx, k, d.Next, now)
 	case ActUp, ActDown:
 		w.scaleGated(ctx, k, d, now)

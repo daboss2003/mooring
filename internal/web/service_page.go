@@ -29,6 +29,7 @@ type serviceView struct {
 	ContainerName             string    // e.g. myapp-api-2 — so the user sees which copy this is
 	Copies                    []copyRef // sibling replicas of this service, for the copy switcher
 	Phase                     string              // self-heal supervisor phase, e.g. CIRCUIT_OPEN
+	Held                      bool                // operator-held: stopped + auto-restart paused
 	DesiredReplicas           int                 // 0 when scaling isn't active
 	Policy                    *definition.Scaling // current scaling policy; nil = none yet
 	HasOps                    bool                // the service declares an enabled (non-basic) ops endpoint → live-poll its fragment
@@ -201,6 +202,7 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sv.Phase = s.supervisorStates(project)[service]
+	sv.Held = s.heldServices(project)[service]
 	sv.DesiredReplicas = s.scalingDesired(project)[service]
 
 	// Per-service ops: probe THIS service's ops endpoint (from the canonical) on demand,

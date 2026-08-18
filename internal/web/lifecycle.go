@@ -15,6 +15,7 @@ import (
 	"github.com/daboss2003/mooring/internal/compose"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/monitor"
+	"github.com/daboss2003/mooring/internal/selfheal"
 )
 
 // actionArgs maps a lifecycle action to its static `docker compose` argv. Only
@@ -142,6 +143,12 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(ctx, depID, code, outcome)
+	if runErr == nil {
+		// A successful stop HOLDS the service(s) so the self-heal supervisor + auto-scaler leave
+		// them down (a manual stop stays stopped); start/restart/redeploy RELEASES the hold. Uses a
+		// detached context — the request ctx may already be cancelled now the stream has ended.
+		s.applyHoldForAction(project, service, action, actor, app)
+	}
 	level := audit.Info
 	auditOutcome := audit.OK
 	if runErr != nil {
@@ -158,6 +165,53 @@ func serviceSuffix(service string) string {
 		return ""
 	}
 	return " -- " + service
+}
+
+// applyHoldForAction records/releases operator holds after a successful lifecycle action, so a
+// manual stop stays stopped (self-heal + auto-scaler skip a held service) and any start-intent
+// releases it. A per-service action scopes to that service; an app-level action covers every
+// service. No-op when self-heal is absent. Detached, bounded context (the request may be gone).
+func (s *Server) applyHoldForAction(project, service, action, actor string, app *monitor.App) {
+	if s.selfHeal == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	now := time.Now().Unix()
+	switch action {
+	case "stop":
+		if service != "" {
+			_ = s.selfHeal.SetHeld(ctx, selfheal.Key{App: project, Service: service}, actor, now)
+			return
+		}
+		for _, svc := range distinctServiceNames(app) { // app-level stop holds every service
+			_ = s.selfHeal.SetHeld(ctx, selfheal.Key{App: project, Service: svc}, actor, now)
+		}
+	case "start", "restart", "redeploy":
+		if service != "" {
+			_ = s.selfHeal.ClearHeld(ctx, selfheal.Key{App: project, Service: service})
+			return
+		}
+		_ = s.selfHeal.ClearHeldApp(ctx, project) // app-level start/redeploy releases every hold
+	}
+}
+
+// distinctServiceNames returns the unique service names of an app's live containers (a scaled
+// service has many copies sharing one name).
+func distinctServiceNames(app *monitor.App) []string {
+	if app == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, svc := range app.Services {
+		if svc.Service == "" || seen[svc.Service] {
+			continue
+		}
+		seen[svc.Service] = true
+		out = append(out, svc.Service)
+	}
+	return out
 }
 
 // validateAppCompose reads the app's compose config file(s) and runs each through

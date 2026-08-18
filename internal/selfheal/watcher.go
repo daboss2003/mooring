@@ -116,6 +116,7 @@ func (w *Watcher) Tick(ctx context.Context) {
 	now := w.cfg.Now()
 	w.drainClears(ctx, now)
 	leases, _ := w.cfg.Store.ActiveExpectedDown(now)
+	held, _ := w.cfg.Store.ActiveHeld() // operator-held services: suspend remediation (never restart)
 
 	// Headroom: free host memory this tick. If host metrics are unavailable the
 	// headroom gate is disabled (floor 0) — the §0 gate + semaphore still apply.
@@ -139,6 +140,7 @@ func (w *Watcher) Tick(ctx context.Context) {
 				OOMKilled:    svc.OOMKilled,
 				ExitCode:     svc.ExitCode,
 				ExpectedDown: leases[app.Project],
+				Held:         held[key],
 				// WaitingOnEdge is refined once the cert inventory lands (M19); until
 				// then it is conservatively false (never suppress a real failure).
 				WaitingOnEdge: false,

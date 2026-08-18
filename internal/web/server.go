@@ -140,42 +140,43 @@ type Server struct {
 	templates      *template.Template
 	log            *slog.Logger
 	verifySem      chan struct{}
-	apiVerifySem   chan struct{}                 // separate argon2 pool for /api/v1 (never starves login)
-	apiDummyHash   string                        // decoy argon2id hash (token params) for timing parity
-	mon            *monitor.Monitor              // read-plane snapshots (may be nil)
-	opsStore       *ops.ConfigStore              // ops config (may be nil)
-	prober         *ops.Prober                   // ops queue actions (may be nil)
-	runner         *dockerexec.Runner            // write-plane exec (may be nil)
-	docker         *docker.Client                // read-plane log streaming (may be nil)
-	envStore       *envstore.Store               // encrypted env store (may be nil)
-	cfgStore       *cfgstore.Store               // managed config files + cert bindings (may be nil)
-	gitStore       *gitstore.Store               // repo-path GitOps (may be nil)
-	provStore      *provstore.Store              // provisioned apps (modes 1/2; may be nil)
-	setupStore     *setupstore.Store             // setup scripts (Mode 3; may be nil)
-	alertStore     *alertstore.Store             // alerting channels/rules/state (may be nil)
-	cronStore      *cronstore.Store              // scheduled-task last-run bookkeeping (may be nil)
-	edgeRoutes     *edge.RouteStore              // managed-edge routes (may be nil)
-	edgeRecon      *edge.Reconciler              // edge config reconciler (nil when edge unowned)
-	edgeReason     string                        // why the edge isn't owned (banner)
-	l4Routes       *l4.RouteStore                // managed L4 (TCP/UDP) routes (nil when L4 LB disabled)
-	l4Reconcile    func(context.Context) error   // push the L4 route set to the LB (nil when disabled)
-	defStore       *definition.Store             // canonical mooring.yaml (source of truth; may be nil)
-	selfHeal       *selfheal.Store               // supervisor FSM + expected_down leases (may be nil)
-	scaling        *scale.Store                  // auto-scaling policies + state (may be nil)
-	circuitClearer func(project, service string) // supervisor clear-circuit (set post-construction)
-	apiTokens      *apitoken.Store               // scoped API tokens (M19; nil → /api/v1 disabled)
-	backups        *backupstore.Store            // encrypted Mooring-state backups (may be nil)
-	githubClient   *github.Client                // GitHub connect (M20; nil → feature off)
-	dockerSem      *dockerexec.Semaphore         // global one-docker-child semaphore (may be nil)
-	setupConfirm   *confirmStore                 // single-use setup confirm tokens
-	caddyCertRoot  string                        // edge cert store root (cert_bindings sync); default below
-	lastActive     atomic.Int64                  // unix-nano of the last focused-dashboard heartbeat (git-poll gate)
-	webhookRL      *rateLimiter                  // per-token webhook rate limit
-	webhookSeen    *nonceCache                   // webhook replay (timestamp+nonce) defense
-	webhookFlash   *tokenFlash                   // one-time rotated-token hand-off (never in URL)
-	discoFlash     *discoveryFlash               // short-lived multi-file connect stash (creds never round-trip the browser)
-	gitDeploy      *dockerexec.Semaphore         // single-flight repo deploy (1 at a time)
-	logStreams     chan struct{}                 // concurrency cap on live log streams
+	apiVerifySem   chan struct{}                        // separate argon2 pool for /api/v1 (never starves login)
+	apiDummyHash   string                               // decoy argon2id hash (token params) for timing parity
+	mon            *monitor.Monitor                     // read-plane snapshots (may be nil)
+	opsStore       *ops.ConfigStore                     // ops config (may be nil)
+	prober         *ops.Prober                          // ops queue actions (may be nil)
+	runner         *dockerexec.Runner                   // write-plane exec (may be nil)
+	docker         *docker.Client                       // read-plane log streaming (may be nil)
+	envStore       *envstore.Store                      // encrypted env store (may be nil)
+	cfgStore       *cfgstore.Store                      // managed config files + cert bindings (may be nil)
+	gitStore       *gitstore.Store                      // repo-path GitOps (may be nil)
+	provStore      *provstore.Store                     // provisioned apps (modes 1/2; may be nil)
+	setupStore     *setupstore.Store                    // setup scripts (Mode 3; may be nil)
+	alertStore     *alertstore.Store                    // alerting channels/rules/state (may be nil)
+	cronStore      *cronstore.Store                     // scheduled-task last-run bookkeeping (may be nil)
+	edgeRoutes     *edge.RouteStore                     // managed-edge routes (may be nil)
+	edgeRecon      *edge.Reconciler                     // edge config reconciler (nil when edge unowned)
+	edgeReason     string                               // why the edge isn't owned (banner)
+	l4Routes       *l4.RouteStore                       // managed L4 (TCP/UDP) routes (nil when L4 LB disabled)
+	l4Reconcile    func(context.Context) error          // push the L4 route set to the LB (nil when disabled)
+	defStore       *definition.Store                    // canonical mooring.yaml (source of truth; may be nil)
+	selfHeal       *selfheal.Store                      // supervisor FSM + expected_down leases (may be nil)
+	scaling        *scale.Store                         // auto-scaling policies + state (may be nil)
+	circuitClearer func(project, service string)        // supervisor clear-circuit (set post-construction)
+	replicaNudger  func(app, service string, delta int) // scaler manual ±replica (set post-construction)
+	apiTokens      *apitoken.Store                      // scoped API tokens (M19; nil → /api/v1 disabled)
+	backups        *backupstore.Store                   // encrypted Mooring-state backups (may be nil)
+	githubClient   *github.Client                       // GitHub connect (M20; nil → feature off)
+	dockerSem      *dockerexec.Semaphore                // global one-docker-child semaphore (may be nil)
+	setupConfirm   *confirmStore                        // single-use setup confirm tokens
+	caddyCertRoot  string                               // edge cert store root (cert_bindings sync); default below
+	lastActive     atomic.Int64                         // unix-nano of the last focused-dashboard heartbeat (git-poll gate)
+	webhookRL      *rateLimiter                         // per-token webhook rate limit
+	webhookSeen    *nonceCache                          // webhook replay (timestamp+nonce) defense
+	webhookFlash   *tokenFlash                          // one-time rotated-token hand-off (never in URL)
+	discoFlash     *discoveryFlash                      // short-lived multi-file connect stash (creds never round-trip the browser)
+	gitDeploy      *dockerexec.Semaphore                // single-flight repo deploy (1 at a time)
+	logStreams     chan struct{}                        // concurrency cap on live log streams
 	sec            atomic.Pointer[secState]
 	footprintOnce  sync.Once                    // lazily builds the Server-tab disk-footprint cache
 	footprintC     *footprintCache              // cached on-disk footprint (off-request refresh)
@@ -469,6 +470,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apps/{project}/services/{service}/{action}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleServiceAction))))
 	mux.HandleFunc("POST /apps/{project}/supervisor/clear", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleSupervisorClear))))
 	mux.HandleFunc("POST /apps/{project}/scaling", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleScalingSave))))
+	mux.HandleFunc("POST /apps/{project}/services/{service}/replicas/{dir}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleReplicaNudge))))
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs", s.requireAuth(s.handleServiceLogs))
 	// withCSRFToken so the live-polled ops fragment carries a CSRF token for its
 	// per-service queue-action forms (re-injected on every poll, never stale).

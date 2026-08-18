@@ -107,6 +107,195 @@ func TestWatcherScalesUpUnderLoad(t *testing.T) {
 	}
 }
 
+// A brand-new service that a deploy launched with 1 replica but declares min:2 must be grown to
+// its floor on first sight, even with NO load and NO prior scaling state. Regression for the
+// first-sight seed clamping desired up to min (which made Decide hold at min and never launch the
+// second replica), leaving the service silently stuck at 1.
+func TestWatcherFirstSightReachesMin(t *testing.T) {
+	st := testStore(t)
+	pr := PolicyRow{
+		Policy:        Policy{Min: 2, Max: 5, UpCPUPct: 80, DownCPUPct: 40, UpMemPct: 80, DownMemPct: 40, BreachForSecs: 60, CooldownUpSecs: 60, CooldownDownSecs: 300},
+		Enabled:       true,
+		PerReplicaMem: 256 << 20, // plenty of room on an 8 GiB host
+		PerReplicaCPU: 100,
+	}
+	if err := st.SavePolicy(context.Background(), Key{App: "shop", Service: "web"}, pr); err != nil {
+		t.Fatal(err)
+	}
+	var snap *monitor.Snapshot
+	var clock int64
+	sc := &fakeScaler{}
+	w := newWatcher(t, st, &snap, &clock, sc, nil)
+	snap = snapWeb(1, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw) // 1 replica, cold CPU, no load
+	clock = 1000
+	w.Tick(context.Background())
+	if sc.count() == 0 || sc.last() != 2 {
+		t.Fatalf("first-sight min:2 with 1 running (no load) must scale to 2, got calls=%v", sc.calls)
+	}
+	// And it settles at 2 — no further scaling once the floor is met.
+	snap = snapWeb(2, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw)
+	before := sc.count()
+	for i := 0; i < 3; i++ {
+		clock = 1000 + int64(i+1)*100
+		w.Tick(context.Background())
+	}
+	if sc.count() != before {
+		t.Errorf("once at the floor with no load, it must hold at 2, got extra calls=%v", sc.calls[before:])
+	}
+}
+
+// A service already PERSISTED at desired=2 but only 1 running (e.g. it got stuck under the old
+// first-sight seed bug, or a replica died with no load change) must be reconciled back up to its
+// desired even with no load — the controller re-asserts running→desired. Regression for
+// "desired 2 but only one running".
+func TestWatcherReconcilesRunningBelowDesired(t *testing.T) {
+	st := testStore(t)
+	pr := PolicyRow{
+		Policy:        Policy{Min: 2, Max: 5, UpCPUPct: 80, DownCPUPct: 40, UpMemPct: 80, DownMemPct: 40, BreachForSecs: 60, CooldownUpSecs: 60, CooldownDownSecs: 300},
+		Enabled:       true,
+		PerReplicaMem: 256 << 20, // plenty of room on an 8 GiB host
+		PerReplicaCPU: 100,
+	}
+	if err := st.SavePolicy(context.Background(), Key{App: "shop", Service: "web"}, pr); err != nil {
+		t.Fatal(err)
+	}
+	var snap *monitor.Snapshot
+	var clock int64 = 1000
+	sc := &fakeScaler{}
+	w := newWatcher(t, st, &snap, &clock, sc, nil)
+	// The recovered in-memory state carries desired=2 (what Run() loads on startup for a service
+	// that was scaled/stuck at 2) while only 1 replica is actually running.
+	w.states[Key{App: "shop", Service: "web"}] = State{Replicas: 2}
+	snap = snapWeb(1, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw) // 1 running, no load
+	w.Tick(context.Background())
+	if sc.count() == 0 || sc.last() != 2 {
+		t.Fatalf("running(1) below desired(2) with capacity must re-assert Scale(2), got calls=%v", sc.calls)
+	}
+	// Once the snapshot reflects 2 running, it settles — no repeated scaling.
+	snap = snapWeb(2, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw)
+	before := sc.count()
+	for i := 0; i < 3; i++ {
+		clock = 1000 + int64(i+1)*100
+		w.Tick(context.Background())
+	}
+	if sc.count() != before {
+		t.Errorf("with running==desired==2 and no load it must hold, got extra calls=%v", sc.calls[before:])
+	}
+}
+
+// A service the operator has HELD (a manual stop) must be skipped entirely by the scaler — never
+// reconciled back up, even when running is below its desired floor. Regression for the held flag
+// gating the reconcile so a deliberately-stopped service is not relaunched.
+func TestWatcherSkipsHeldService(t *testing.T) {
+	st := testStore(t)
+	pr := PolicyRow{
+		Policy:        Policy{Min: 2, Max: 5, UpCPUPct: 80, DownCPUPct: 40, UpMemPct: 80, DownMemPct: 40, BreachForSecs: 60, CooldownUpSecs: 60, CooldownDownSecs: 300},
+		Enabled:       true,
+		PerReplicaMem: 256 << 20,
+		PerReplicaCPU: 100,
+	}
+	if err := st.SavePolicy(context.Background(), Key{App: "shop", Service: "web"}, pr); err != nil {
+		t.Fatal(err)
+	}
+	var snap *monitor.Snapshot
+	var clock int64 = 1000
+	sc := &fakeScaler{}
+	w := newWatcher(t, st, &snap, &clock, sc, nil)
+	w.cfg.Held = func() map[Key]bool { return map[Key]bool{{App: "shop", Service: "web"}: true} }
+	w.states[Key{App: "shop", Service: "web"}] = State{Replicas: 2} // desired 2, but held
+	snap = snapWeb(0, 0, 0, 512<<20, 8*GiBw, 1*GiBw)               // stopped: 0 running
+	for i := 0; i < 4; i++ {
+		clock = 1000 + int64(i)*100
+		w.Tick(context.Background())
+	}
+	if sc.count() != 0 {
+		t.Errorf("a held service must never be scaled/reconciled, got calls=%v", sc.calls)
+	}
+}
+
+// A manual +1/−1 nudge steps a service's replicas up and down within its policy/capacity bounds,
+// applied on the next tick.
+func TestWatcherManualNudge(t *testing.T) {
+	st := testStore(t)
+	enablePolicy(t, st, 256<<20) // min 1, max 5, plenty of room
+	var snap *monitor.Snapshot
+	var clock int64 = 1000
+	sc := &fakeScaler{}
+	w := newWatcher(t, st, &snap, &clock, sc, nil)
+	snap = snapWeb(1, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw) // 1 running, no load
+
+	w.Nudge("shop", "web", 1)
+	w.Tick(context.Background())
+	if sc.last() != 2 {
+		t.Fatalf("manual +1 should scale 1→2, got calls=%v", sc.calls)
+	}
+
+	snap = snapWeb(2, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw) // docker now runs 2
+	clock = 2000
+	w.Nudge("shop", "web", -1)
+	w.Tick(context.Background())
+	if sc.last() != 1 {
+		t.Fatalf("manual −1 should scale 2→1, got calls=%v", sc.calls)
+	}
+
+	// A nudge never breaks the min floor: −1 at the floor is clamped to min.
+	snap = snapWeb(1, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw)
+	clock = 3000
+	before := sc.count()
+	w.Nudge("shop", "web", -1)
+	w.Tick(context.Background())
+	if sc.count() != before {
+		t.Errorf("−1 at the min floor must be a no-op, got extra calls=%v", sc.calls[before:])
+	}
+}
+
+// The scaler must NOT relaunch a service that self-heal has given up on (circuit open) or one whose
+// app has a lifecycle action in flight (expected_down lease) — otherwise the reconcile re-arms a
+// crash loop, or undoes an operator stop before its hold row lands. Both are skipped like a hold.
+func TestWatcherDefersToSelfHeal(t *testing.T) {
+	mk := func() (*Store, **monitor.Snapshot, *int64, *fakeScaler, *Watcher) {
+		st := testStore(t)
+		pr := PolicyRow{
+			Policy:        Policy{Min: 2, Max: 5, UpCPUPct: 80, DownCPUPct: 40, UpMemPct: 80, DownMemPct: 40, BreachForSecs: 60, CooldownUpSecs: 60, CooldownDownSecs: 300},
+			Enabled:       true,
+			PerReplicaMem: 256 << 20,
+			PerReplicaCPU: 100,
+		}
+		if err := st.SavePolicy(context.Background(), Key{App: "shop", Service: "web"}, pr); err != nil {
+			t.Fatal(err)
+		}
+		var snap *monitor.Snapshot
+		var clock int64 = 1000
+		sc := &fakeScaler{}
+		w := newWatcher(t, st, &snap, &clock, sc, nil)
+		w.states[Key{App: "shop", Service: "web"}] = State{Replicas: 2} // desired 2, but only 1 running
+		snap = snapWeb(1, 3, 40<<20, 512<<20, 8*GiBw, 1*GiBw)
+		return st, &snap, &clock, sc, w
+	}
+
+	// Circuit open → the scaler leaves it alone (no relaunch of the crashed replica).
+	_, _, clk, sc, w := mk()
+	w.cfg.CircuitOpen = func() map[Key]bool { return map[Key]bool{{App: "shop", Service: "web"}: true} }
+	for i := 0; i < 4; i++ {
+		*clk = 1000 + int64(i)*100
+		w.Tick(context.Background())
+	}
+	if sc.count() != 0 {
+		t.Errorf("a circuit-open service must not be reconciled/relaunched, got calls=%v", sc.calls)
+	}
+
+	// Lifecycle action in flight (busy app) → skipped too.
+	_, _, clk2, sc2, w2 := mk()
+	w2.cfg.BusyApps = func() map[string]bool { return map[string]bool{"shop": true} }
+	for i := 0; i < 4; i++ {
+		*clk2 = 1000 + int64(i)*100
+		w2.Tick(context.Background())
+	}
+	if sc2.count() != 0 {
+		t.Errorf("a service whose app is mid-lifecycle must not be scaled, got calls=%v", sc2.calls)
+	}
+}
+
 func TestWatcherRefusesAtCapacity(t *testing.T) {
 	st := testStore(t)
 	// Huge per-replica reservation: an 8 GiB host can fund only ~1 → ceiling==current.

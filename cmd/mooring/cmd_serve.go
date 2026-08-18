@@ -719,6 +719,42 @@ func cmdServe(args []string) error {
 		// entirely (inert — never pins scaling), rather than reading them as phantom zero-load.
 		EdgeStats: edgeStats,
 		EdgeLive:  edgeLive,
+		// Operator-held services (a manual per-service stop / app stop) are skipped by the scaler
+		// so a deliberately-stopped replica is not relaunched. Read once per tick from the same
+		// service_held table the self-heal supervisor consults.
+		Held: func() map[scale.Key]bool {
+			out := map[scale.Key]bool{}
+			if h, err := selfHealStore.ActiveHeld(); err == nil {
+				for k := range h {
+					out[scale.Key{App: k.App, Service: k.Service}] = true
+				}
+			}
+			return out
+		},
+		// A self-heal circuit-open service has been given up on (a crash loop the breaker stopped);
+		// the scaler must not relaunch it and re-arm the loop.
+		CircuitOpen: func() map[scale.Key]bool {
+			out := map[scale.Key]bool{}
+			if all, err := selfHealStore.LoadAll(); err == nil {
+				for k, f := range all {
+					if f.Phase == selfheal.CircuitOpen {
+						out[scale.Key{App: k.App, Service: k.Service}] = true
+					}
+				}
+			}
+			return out
+		},
+		// Apps with an active expected_down lease have an operator lifecycle/deploy action in flight;
+		// the scaler defers to the write plane (and this closes the stop→hold-write gap).
+		BusyApps: func() map[string]bool {
+			out := map[string]bool{}
+			if leases, err := selfHealStore.ActiveExpectedDown(time.Now().Unix()); err == nil {
+				for app := range leases {
+					out[app] = true
+				}
+			}
+			return out
+		},
 		// Runtime candidacy re-check (C3/C4) from docker inspect, every tick: a
 		// service that gains a shared RW volume or now runs a stateful image loses
 		// candidacy and is scaled back to the floor (closes a post-enable compose
@@ -746,6 +782,7 @@ func cmdServe(args []string) error {
 			CPUReserveMilli:    500,
 		},
 	})
+	srv.SetReplicaNudger(func(app, service string, delta int) { scaler.Nudge(app, service, delta) })
 	wg.Add(1)
 	go func() { defer wg.Done(); scaler.Run(ctx) }()
 

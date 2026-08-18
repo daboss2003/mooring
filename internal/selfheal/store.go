@@ -74,7 +74,10 @@ func (s *Store) DeleteApp(ctx context.Context, app string) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM app_selfheal WHERE project=?`, app); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `DELETE FROM expected_down WHERE app=?`, app)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM expected_down WHERE app=?`, app); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `DELETE FROM service_held WHERE app=?`, app)
 	return err
 }
 
@@ -82,6 +85,50 @@ func (s *Store) DeleteApp(ctx context.Context, app string) error {
 // will act on it again (the operator's "I fixed the underlying problem" button).
 func (s *Store) ClearCircuit(ctx context.Context, k Key, now int64) error {
 	return s.Save(ctx, k, FSM{Phase: Healthy}, now)
+}
+
+// --- operator holds (a service deliberately kept down / auto-restart paused) ---
+
+// SetHeld marks a service as operator-held: while held, the supervisor suspends remediation and
+// the auto-scaler skips it, so a manually-stopped service is never auto-restarted. Durable —
+// survives a reboot (unlike an expected_down lease) — until ClearHeld/ClearHeldApp releases it.
+func (s *Store) SetHeld(ctx context.Context, k Key, actor string, now int64) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO service_held(app, service, held_by, held_at) VALUES(?,?,?,?)
+		 ON CONFLICT(app, service) DO UPDATE SET held_by=excluded.held_by, held_at=excluded.held_at`,
+		k.App, k.Service, actor, now)
+	return err
+}
+
+// ClearHeld releases one service's hold (an explicit start/resume).
+func (s *Store) ClearHeld(ctx context.Context, k Key) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM service_held WHERE app=? AND service=?`, k.App, k.Service)
+	return err
+}
+
+// ClearHeldApp releases every hold for an app (an app-level start/redeploy, or teardown).
+func (s *Store) ClearHeldApp(ctx context.Context, app string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM service_held WHERE app=?`, app)
+	return err
+}
+
+// ActiveHeld returns the set of currently-held services. Read once per tick by both the
+// supervisor and the auto-scaler (the table is tiny and indexed by its primary key).
+func (s *Store) ActiveHeld() (map[Key]bool, error) {
+	rows, err := s.db.Query(`SELECT app, service FROM service_held`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[Key]bool{}
+	for rows.Next() {
+		var k Key
+		if err := rows.Scan(&k.App, &k.Service); err != nil {
+			return nil, err
+		}
+		out[k] = true
+	}
+	return out, rows.Err()
 }
 
 // --- expected_down leases ---
