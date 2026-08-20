@@ -63,16 +63,16 @@ type Config struct {
 	TrustProxy     bool     `yaml:"trust_proxy"`
 	TrustedProxies []string `yaml:"trusted_proxies"`
 
-	Auth       AuthConfig   `yaml:"auth"`
-	ExtraUsers []UserConfig `yaml:"users"` // additional operators beyond the auth owner (RBAC)
-	Edge       EdgeConfig   `yaml:"edge"`
-	Admin   AdminConfig   `yaml:"admin"`
-	Session SessionConfig `yaml:"session"`
-	Cookie  CookieConfig  `yaml:"cookie"`
-	Docker  DockerConfig  `yaml:"docker"`
-	Monitor MonitorConfig `yaml:"monitor"`
-	Git     GitConfig     `yaml:"git"`
-	GitHub  GitHubConfig  `yaml:"github"`
+	Auth       AuthConfig    `yaml:"auth"`
+	ExtraUsers []UserConfig  `yaml:"users"` // additional operators beyond the auth owner (RBAC)
+	Edge       EdgeConfig    `yaml:"edge"`
+	Admin      AdminConfig   `yaml:"admin"`
+	Session    SessionConfig `yaml:"session"`
+	Cookie     CookieConfig  `yaml:"cookie"`
+	Docker     DockerConfig  `yaml:"docker"`
+	Monitor    MonitorConfig `yaml:"monitor"`
+	Git        GitConfig     `yaml:"git"`
+	GitHub     GitHubConfig  `yaml:"github"`
 
 	CaddyEditor       EditorBlock     `yaml:"caddy_editor"`
 	ComposeValidation EditorBlock     `yaml:"compose_validation"`
@@ -561,6 +561,20 @@ func (c *Config) AdminEdgeListen() string {
 type DockerConfig struct {
 	ProxyAddr     string `yaml:"proxy_addr"`
 	ExternalProxy bool   `yaml:"external_proxy"`
+	// WritePlaneMinMB overrides the §0 write-plane resource floor (checked against RAM + swap). 0 =
+	// the built-in default (1000 MB). Lower it to run the write plane on a smaller box at your own
+	// risk — on-box image builds still need real headroom, but pull-image deploys and lifecycle
+	// actions are cheap. A negative/absurd value is ignored.
+	WritePlaneMinMB int `yaml:"write_plane_min_mb"`
+}
+
+// WritePlaneFloorBytes returns the operator's write-plane floor override in bytes, or 0 to use the
+// built-in default. A non-positive value means "unset".
+func (d DockerConfig) WritePlaneFloorBytes() uint64 {
+	if d.WritePlaneMinMB <= 0 {
+		return 0
+	}
+	return uint64(d.WritePlaneMinMB) << 20
 }
 
 // MonitorConfig tunes the read-plane poller (plan §4 read plane).

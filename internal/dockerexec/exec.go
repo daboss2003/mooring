@@ -17,8 +17,8 @@ import (
 	"time"
 )
 
-// ErrWritePlaneDisabled is returned when the host is below the §0 resource gate.
-var ErrWritePlaneDisabled = errors.New("dockerexec: write plane disabled (host below the 1 GB resource gate)")
+// ErrWritePlaneDisabled is returned when the host is below the §0 resource gate (RAM + swap).
+var ErrWritePlaneDisabled = errors.New("dockerexec: write plane disabled (host below the RAM+swap resource gate)")
 
 // ErrBusy is returned when the one-docker-child semaphore could not be acquired.
 var ErrBusy = errors.New("dockerexec: another docker operation is in progress")
@@ -69,17 +69,27 @@ type Job struct {
 	Service     string   // optional; appended after a "--" terminator
 }
 
-// minWritePlaneRAM is the §0 write-plane resource gate.
-const minWritePlaneRAM = 1 << 30 // 1 GiB
+// defaultWritePlaneFloor is the §0 write-plane resource gate, against RAM + swap. It is 900 MiB, NOT
+// 1 GiB: a VPS sold as "1 GB" reports MemTotal a little under 1 GiB (~970–1015 MiB) after the kernel's
+// reservation, and the old 1-GiB floor tripped on essentially every genuine 1 GB box. 900 MiB sits
+// comfortably below that, and swap counts on top — so a 1 GB box (with or without swap) clears it,
+// while a truly tiny (≤ 512 MiB, no swap) box is still gated unless the operator overrides.
+const defaultWritePlaneFloor = 900 << 20 // 900 MiB
 
-// WritePlaneGate decides whether the write plane is armed from the host's total
-// RAM. memTotal==0 means unknown (non-Linux dev) → armed, with a caveat note.
-func WritePlaneGate(memTotal uint64) (bool, string) {
+// WritePlaneGate decides whether the write plane is armed from the host's addressable memory
+// (RAM + swap). memTotal==0 means unknown (non-Linux dev) → armed, with a caveat note. floorBytes
+// overrides the default floor when non-zero (operator's `docker.write_plane_min_mb`), so an operator
+// who accepts the risk can run on a smaller box. Counting swap is what lets a 1 GB + swap VPS deploy.
+func WritePlaneGate(memTotal, swapTotal, floorBytes uint64) (bool, string) {
 	if memTotal == 0 {
-		return true, "host RAM unknown; write plane armed (ensure ≥ 1 GB on the real host)"
+		return true, "host RAM unknown; write plane armed (ensure enough RAM/swap on the real host)"
 	}
-	if memTotal < minWritePlaneRAM {
-		return false, "host has < 1 GB RAM; the write plane is disabled (§0 resource gate)"
+	floor := floorBytes
+	if floor == 0 {
+		floor = defaultWritePlaneFloor
+	}
+	if memTotal+swapTotal < floor {
+		return false, "host has less than 1 GB of RAM + swap; the write plane is disabled (§0 resource gate). Add swap, or lower docker.write_plane_min_mb if you accept the risk. Note: on-box image builds still need real headroom."
 	}
 	return true, ""
 }

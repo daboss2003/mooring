@@ -146,11 +146,13 @@ Every Mooring capability falls into one of two planes, and the boundary between 
 
 The read plane is everything that *observes*: container status via the socket-proxy, one-shot CPU/mem stats, host RAM/disk/CPU sampling, log streaming, App Ops Interface polling, git **fetch**, the alert evaluator, the self-healing *watcher* (detection only), and the scaling *controller* (decision only). None of it can write to Docker. All of it runs comfortably below 1 GB of RAM.
 
-### Write plane (gated on ≥ 1 GB RAM)
+### Write plane (gated on ~1 GB of RAM + swap)
 
-The write plane is everything that *changes the host*: `docker compose up/pull/build`, redeploy, on-box image builds, managed config-file materialization, and the setup-script sandbox. **These are gated on a host with ≥ 1 GB RAM.**
+The write plane is everything that *changes the host*: `docker compose up/pull/build`, redeploy, on-box image builds, managed config-file materialization, and the setup-script sandbox. **These are gated on a host with roughly 1 GB of addressable memory — RAM plus swap.**
 
-This is a safety gate because of how a small box fails. A `docker compose pull` or a sandbox run that OOMs a tiny host can cascade the *whole* host into a crash-loop — and the proxy/edge dies first, taking the dashboard offline exactly when you need it. The build plan calls this out as a class of real outage (see the [VPS constraints](./backup-and-recovery.md) for the small-host story). On a small or near-OOM host, write-plane operations are disabled **but the edge still serves** its minimum-safe base.
+This is a safety gate because of how a small box fails. A `docker compose pull` or a sandbox run that OOMs a tiny host can cascade the *whole* host into a crash-loop — and the proxy/edge dies first, taking the dashboard offline exactly when you need it. On a box below the floor, write-plane operations are disabled **but the edge still serves** its minimum-safe base.
+
+**Swap counts, and the floor is decimal-GB.** The floor is ~900 MiB checked against **RAM + swap**, not a strict 1 GiB against RAM alone — because a VPS sold as "1 GB" reports a little under 1 GiB and would otherwise be locked out. So a 1 GB VPS (with or without swap) can deploy; a 1 GB **+ swap** box has comfortable headroom even for on-box builds (which lean on swap). A genuinely tiny box (≤ 512 MB, no swap) stays gated — but an operator who accepts the risk can lower the floor with `docker.write_plane_min_mb`. Note that on-box image builds still want real headroom regardless; pull-image deploys and lifecycle actions are cheap.
 
 ### Three controls keep any plane from OOM-killing the control plane
 

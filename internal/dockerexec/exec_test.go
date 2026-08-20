@@ -49,13 +49,26 @@ func TestJobArgvIncludesEnvFile(t *testing.T) {
 }
 
 func TestWritePlaneGate(t *testing.T) {
-	if ok, _ := WritePlaneGate(2 << 30); !ok {
+	if ok, _ := WritePlaneGate(2<<30, 0, 0); !ok {
 		t.Error("2 GiB should arm the write plane")
 	}
-	if ok, reason := WritePlaneGate(512 << 20); ok || reason == "" {
-		t.Errorf("512 MiB should disable write plane, got ok=%v", ok)
+	// A genuine "1 GB" VPS reports MemTotal a little under 1 GiB — it must NOT trip the gate.
+	if ok, _ := WritePlaneGate(987<<20, 0, 0); !ok {
+		t.Error("a real 1 GB box (987 MiB, no swap) must arm — the floor is decimal-GB, not 1 GiB")
 	}
-	if ok, _ := WritePlaneGate(0); !ok {
+	// Swap counts: a small box with swap clears the floor.
+	if ok, _ := WritePlaneGate(700<<20, 1<<30, 0); !ok {
+		t.Error("700 MiB RAM + 1 GiB swap should arm (swap counts toward the gate)")
+	}
+	// Genuinely tiny (no swap) is still gated by default.
+	if ok, reason := WritePlaneGate(512<<20, 0, 0); ok || reason == "" {
+		t.Errorf("512 MiB, no swap should disable the write plane, got ok=%v", ok)
+	}
+	// The operator override lets a small box arm at their own risk.
+	if ok, _ := WritePlaneGate(512<<20, 0, 400<<20); !ok {
+		t.Error("a 400 MB floor override should arm a 512 MiB box")
+	}
+	if ok, _ := WritePlaneGate(0, 0, 0); !ok {
 		t.Error("unknown RAM (0) should arm with a caveat (dev)")
 	}
 }

@@ -24,6 +24,15 @@ func readMem() (total, used uint64, err error) {
 	return parseMemInfo(string(data))
 }
 
+// readSwapTotal returns total swap in bytes (0 if none / unreadable — swap is optional).
+func readSwapTotal() uint64 {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return 0
+	}
+	return parseSwapTotal(string(data))
+}
+
 func readLoad1() (float64, error) {
 	data, err := os.ReadFile("/proc/loadavg")
 	if err != nil {

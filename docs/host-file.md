@@ -104,6 +104,8 @@ admin:
 docker:
   proxy_addr: "127.0.0.1:2375"        # the read-only socket-proxy Mooring manages by default
   external_proxy: false               # true = you run your own proxy at proxy_addr
+  write_plane_min_mb: 0               # 0 = default (~900 MiB of RAM+swap gates the write plane);
+                                      # lower it to run on a tiny box at your own risk (builds need headroom)
 
 # --- Read plane & git polling ---
 monitor:

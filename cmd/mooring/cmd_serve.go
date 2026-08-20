@@ -140,13 +140,13 @@ func cmdServe(args []string) error {
 	wg.Add(1)
 	go func() { defer wg.Done(); mon.Run(ctx) }()
 
-	// Write plane (M4): the §0 ≥1 GB resource gate + the global one-docker-child
+	// Write plane (M4): the §0 resource gate (RAM + swap) + the global one-docker-child
 	// semaphore + static-argv exec wrapper.
-	var memTotal uint64
+	var memTotal, swapTotal uint64
 	if hs, herr := hostSampler.Sample(); herr == nil {
-		memTotal = hs.MemTotal
+		memTotal, swapTotal = hs.MemTotal, hs.SwapTotal
 	}
-	writeAllowed, writeReason := dockerexec.WritePlaneGate(memTotal)
+	writeAllowed, writeReason := dockerexec.WritePlaneGate(memTotal, swapTotal, cfg.Docker.WritePlaneFloorBytes())
 	if !writeAllowed {
 		log.Warn("write plane disabled", "reason", writeReason)
 	} else if writeReason != "" {

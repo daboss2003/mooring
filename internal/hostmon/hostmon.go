@@ -20,6 +20,7 @@ type Sample struct {
 	Load1      float64
 	MemTotal   uint64
 	MemUsed    uint64
+	SwapTotal  uint64 // total swap in bytes (0 if none); counted toward the write-plane resource gate
 	DiskTotal  uint64
 	DiskUsed   uint64
 }
@@ -57,7 +58,7 @@ func (s *Sampler) Sample() (Sample, error) {
 	}
 	return Sample{
 		CPUPercent: cpu, Load1: load1,
-		MemTotal: memTotal, MemUsed: memUsed,
+		MemTotal: memTotal, MemUsed: memUsed, SwapTotal: readSwapTotal(),
 		DiskTotal: diskTotal, DiskUsed: diskUsed,
 	}, nil
 }
@@ -138,6 +139,19 @@ func parseMemInfo(data string) (total, used uint64, err error) {
 		memAvail = memTotal
 	}
 	return memTotal, memTotal - memAvail, nil
+}
+
+// parseSwapTotal extracts SwapTotal (bytes) from /proc/meminfo contents; 0 if absent.
+func parseSwapTotal(data string) uint64 {
+	for _, line := range strings.Split(data, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == "SwapTotal:" {
+			if v, err := strconv.ParseUint(fields[1], 10, 64); err == nil {
+				return v * 1024
+			}
+		}
+	}
+	return 0
 }
 
 // parseLoadAvg parses the 1-minute load from /proc/loadavg.
