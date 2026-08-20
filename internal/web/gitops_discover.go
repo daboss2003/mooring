@@ -271,7 +271,17 @@ func (s *Server) handleGitConnect(w http.ResponseWriter, r *http.Request) {
 	files, derr := s.discoverMooringFiles(r.Context(), repoURL, ref, gc)
 	s.gitDeploy.Release()
 	if derr != nil {
-		s.renderConnectError(w, r, "could not read the repository: "+derr.Error())
+		// The classified message is intentionally coarse; log the real (redacted, credential-free)
+		// git stderr so the operator can see the actual cause (e.g. "Permission denied (publickey)").
+		s.log.Warn("git connect: could not read repository", "repo", repoURL, "cred_kind", credKind, "err", derr.Error(), "git_stderr", git.RawStderr(derr))
+		msg := "could not read the repository: " + derr.Error()
+		switch credKind {
+		case "ssh":
+			msg += " — for a deploy key: paste the PRIVATE key (not the .pub), make sure it has no passphrase, and add its public half to the repo's Settings → Deploy keys."
+		case "token":
+			msg += " — the token needs read access to THIS repository (and, if your org enforces SSO, an SSO-authorized token)."
+		}
+		s.renderConnectError(w, r, msg)
 		return
 	}
 

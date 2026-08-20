@@ -88,11 +88,14 @@ func (r *Repo) clearStaleLocks() {
 func credEnv(credDir, repoURL string, creds Creds) ([]string, error) {
 	if creds.SSHKey != "" {
 		keyPath := filepath.Join(credDir, "id")
-		if err := os.WriteFile(keyPath, []byte(ensureTrailingNL(creds.SSHKey)), 0o600); err != nil {
+		// Normalize line endings: a private key pasted into a browser <textarea> is submitted with
+		// CRLF (per the HTML form spec), and OpenSSH rejects a key file containing '\r' as "invalid
+		// format" — which surfaces as an opaque "authentication failed". Strip CR to LF.
+		if err := os.WriteFile(keyPath, []byte(ensureTrailingNL(stripCR(creds.SSHKey))), 0o600); err != nil {
 			return nil, err
 		}
 		khPath := filepath.Join(credDir, "known_hosts")
-		if err := os.WriteFile(khPath, []byte(creds.KnownHosts), 0o600); err != nil {
+		if err := os.WriteFile(khPath, []byte(stripCR(creds.KnownHosts)), 0o600); err != nil {
 			return nil, err
 		}
 		// StrictHostKeyChecking=yes with a pinned known_hosts; empty known_hosts
@@ -101,9 +104,11 @@ func credEnv(credDir, repoURL string, creds Creds) ([]string, error) {
 			shJoin(keyPath), shJoin(khPath))
 		return []string{"GIT_SSH_COMMAND=" + sshCmd}, nil
 	}
-	if creds.Token != "" {
+	if tok := strings.TrimSpace(creds.Token); tok != "" {
 		tokPath := filepath.Join(credDir, "token")
-		if err := os.WriteFile(tokPath, []byte(creds.Token), 0o600); err != nil {
+		// TrimSpace: the askpass helper cat's this file as the password, so a trailing newline/CR
+		// (e.g. a token pasted into a <textarea>) would be sent as part of the credential and rejected.
+		if err := os.WriteFile(tokPath, []byte(tok), 0o600); err != nil {
 			return nil, err
 		}
 		askPath := filepath.Join(credDir, "askpass")
@@ -329,6 +334,12 @@ func ensureTrailingNL(s string) string {
 	}
 	return s + "\n"
 }
+
+// stripCR removes carriage returns from pasted credential material. A private key or known_hosts
+// pasted into a browser <textarea> is submitted with CRLF line endings (per the HTML form spec),
+// and OpenSSH rejects a key file containing '\r' as "invalid format" — which then surfaces as an
+// opaque "authentication failed". Normalizing to LF fixes it.
+func stripCR(s string) string { return strings.ReplaceAll(s, "\r", "") }
 
 // shJoin single-quotes a path for safe embedding in GIT_SSH_COMMAND.
 func shJoin(p string) string { return "'" + strings.ReplaceAll(p, "'", `'\''`) + "'" }
