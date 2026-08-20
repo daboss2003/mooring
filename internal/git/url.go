@@ -47,6 +47,25 @@ func ValidateRepoURL(raw string) error {
 	return nil
 }
 
+// RepoScheme returns a repo URL's transport ("https" or "ssh"), or "" if it can't be determined.
+// Callers use it to match a credential type to the URL (an SSH key can't auth an https:// URL).
+func RepoScheme(raw string) string {
+	_, scheme, _, err := repoHost(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return scheme
+}
+
+// RepoHostName returns a repo URL's host (e.g. "github.com"), or "" if it can't be determined.
+func RepoHostName(raw string) string {
+	host, _, _, err := repoHost(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	return host
+}
+
 // repoHost extracts (host, scheme, hasPassword) from an https or ssh/scp URL.
 func repoHost(raw string) (host, scheme string, hasPassword bool, err error) {
 	// scp-like syntax: [user@]host:path (no scheme, no slashes before the colon)

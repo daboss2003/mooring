@@ -15,6 +15,7 @@ import (
 	"github.com/daboss2003/mooring/internal/crypto"
 	"github.com/daboss2003/mooring/internal/definition"
 	"github.com/daboss2003/mooring/internal/git"
+	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
 )
 
@@ -239,6 +240,29 @@ func (s *Server) handleGitConnect(w http.ResponseWriter, r *http.Request) {
 		credKind = "" // public repo
 	}
 
+	// The credential kind must match the URL's transport, or the fetch fails with a confusing
+	// "authentication failed" — an SSH key can't authenticate an https:// URL, and an HTTPS token
+	// can't authenticate an ssh:// one. And an SSH connection pins the server's host key, so it needs
+	// a Known-hosts line. Catch both up front with an actionable message.
+	switch scheme := git.RepoScheme(repoURL); {
+	case credKind == "ssh" && scheme == "https":
+		s.renderConnectError(w, r, "you chose an SSH deploy key, but the repository URL is an https:// URL. Use an SSH URL (git@github.com:org/repo.git) with the key, or switch the credential kind to an HTTPS token.")
+		return
+	case credKind == "token" && scheme == "ssh":
+		s.renderConnectError(w, r, "you chose an HTTPS token, but the repository URL is an ssh:// URL (git@…). Use an https:// URL with the token, or switch the credential kind to an SSH deploy key.")
+		return
+	case credKind == "ssh" && gc.SSHKey != "" && gc.KnownHosts == "":
+		// github.com's host key is pinned — fill it in for the common case; any other host needs the
+		// operator to paste a Known-hosts line, or SSH host-key verification fails.
+		if strings.EqualFold(git.RepoHostName(repoURL), "github.com") {
+			gc.KnownHosts, knownHosts = github.KnownHosts, github.KnownHosts
+		} else {
+			h := git.RepoHostName(repoURL)
+			s.renderConnectError(w, r, "an SSH deploy key needs a Known hosts line to verify the server. Paste the host key for "+h+" (e.g. the output of `ssh-keyscan "+h+"`) into the Known hosts field.")
+			return
+		}
+	}
+
 	// Serialize the discovery fetch with any in-flight deploy/fetch (shared git lock).
 	if !s.gitDeploy.TryAcquire() {
 		http.Error(w, "a git operation is already in progress; try again shortly", http.StatusConflict)
@@ -362,13 +386,18 @@ func (s *Server) finishConnect(w http.ResponseWriter, r *http.Request, slug, rep
 
 // renderConnectError re-renders the connect form with an error banner.
 func (s *Server) renderConnectError(w http.ResponseWriter, r *http.Request, msg string) {
+	// The connect form (git_repo_form) is rendered under {{with .Git}}, so it reads the CSRF token
+	// from the gitView, NOT the root tmplData. It MUST be set here or the re-rendered form carries an
+	// empty token and the operator's next submit fails with "invalid csrf token" (requireCSRF already
+	// forwarded the valid token into the context on this POST).
+	token := CSRFToken(r.Context())
 	s.render(w, r, "git.html", tmplData{
 		Title:         "Connect a repository",
-		CSRFToken:     CSRFToken(r.Context()),
+		CSRFToken:     token,
 		Username:      sessionUser(r),
 		GitHubEnabled: s.githubEnabled(),
 		Error:         msg,
-		Git:           &gitView{Configured: false, BuildPolicy: "never", Ref: "refs/heads/main", ComposePath: "docker-compose.yml"},
+		Git:           &gitView{Configured: false, BuildPolicy: "never", Ref: "refs/heads/main", ComposePath: "docker-compose.yml", CSRFToken: token},
 	})
 }
 
