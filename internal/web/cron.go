@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/alert"
@@ -137,5 +138,41 @@ func (s *Server) runScheduledTask(ctx context.Context, slug string, task definit
 			})
 		}
 	}
-	_ = s.audit.Log(bg, audit.Event{Actor: "scheduler", Action: "scheduled_task", Target: slug + "/" + task.Name, Outcome: outcome, Level: audit.Security})
+	// Record WHY in the audit Detail — previously always blank, which made a failed scheduled task's
+	// incident row structurally unable to show a reason (the error was captured only in the alert +
+	// log). Lead with the task's last output line (usually the actual error, e.g. a permission
+	// denial), sanitized + bounded; fall back to a classified reason when it printed nothing.
+	detail := "service " + task.Service
+	if runErr != nil {
+		detail += ": " + cronFailReason(lastLine, rctx.Err())
+	}
+	_ = s.audit.Log(bg, audit.Event{Actor: "scheduler", Action: "scheduled_task", Target: slug + "/" + task.Name, Outcome: outcome, Level: audit.Security, Detail: detail})
+}
+
+// cronFailReason builds a concise, single-line audit reason for a failed scheduled task: the task's
+// last output line if it produced one (that is where the real error usually is), else a classified
+// reason for the empty-output cases. CR/LF/NUL are flattened and the string is length-bounded so it
+// can't break the audit row.
+func cronFailReason(lastLine string, ctxErr error) string {
+	r := strings.TrimSpace(lastLine)
+	if r == "" {
+		switch ctxErr {
+		case context.DeadlineExceeded:
+			return fmt.Sprintf("timed out after %s", cronTaskTimeout)
+		case context.Canceled:
+			return "cancelled (Mooring shutting down)"
+		default:
+			return "run failed"
+		}
+	}
+	r = strings.Map(func(rn rune) rune {
+		if rn == '\r' || rn == '\n' || rn == 0 {
+			return ' '
+		}
+		return rn
+	}, r)
+	if len(r) > 300 {
+		r = r[:300] + "…"
+	}
+	return r
 }
