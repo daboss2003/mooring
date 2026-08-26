@@ -905,9 +905,10 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return fmt.Errorf("write generated compose: %w", err)
 	}
-	if err := s.writeGeneratedDockerfiles(ctx, repo, sha, rd, def, onLine); err != nil {
+	nonrootSvcs, dfErr := s.writeGeneratedDockerfiles(ctx, repo, sha, rd, def, onLine)
+	if dfErr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("generate Dockerfile: %w", err)
+		return fmt.Errorf("generate Dockerfile: %w", dfErr)
 	}
 	// Pre-create bind-mount source dirs (Mooring-owned, confined) so Docker doesn't
 	// create a missing one as root.
@@ -959,6 +960,13 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	newDigests := s.managedDigests(rd, def)
 	changed := changedServices(readDigestState(rd), newDigests)
 
+	// Heal data-volume ownership BEFORE `up`. A named volume left owned by a since-drifted build UID
+	// (or the one-time UID-pin transition) would otherwise leave the app silently unable to write its
+	// own data — Docker only copies ownership onto an EMPTY volume, so a non-empty one keeps its stale
+	// owner. Reconciled only for build services that run as the pinned non-root UID; best-effort, never
+	// blocks the deploy. See internal/builder.NonrootUID.
+	reconciledVols := s.reconcileVolumeOwnership(ctx, slug, def, nonrootSvcs, onLine)
+
 	// (5) docker compose up under the gate + one-docker-child semaphore.
 	action := []string{"up", "-d", "--remove-orphans"}
 	if defHasBuild(def) {
@@ -981,6 +989,11 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(bg, depID, code, outcome)
 	if runErr != nil {
+		// The `up` failed, so the OLD containers are still running. Roll any volume ownership we
+		// changed back to its prior UID, or that still-running old container (a different UID) would
+		// be left unable to write its own data until a deploy eventually succeeds. Detached context so
+		// it runs even if the request was cancelled.
+		s.rollbackVolumeOwnership(bg, reconciledVols, onLine)
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		s.streamOOMHint(ctx, slug, declared, onLine)
 		return fmt.Errorf("docker compose up failed: %w", runErr)

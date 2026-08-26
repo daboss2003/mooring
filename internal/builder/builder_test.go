@@ -150,6 +150,36 @@ func TestRejectsBadVersionAndPackages(t *testing.T) {
 	}
 }
 
+// The non-root user must be pinned to an explicit high UID (10001), never the implicit `useradd -r`
+// system UID that silently shifts when a package is added — the UID-drift fix.
+func TestNonrootPinnedUID(t *testing.T) {
+	df, err := Generate(Spec{Language: "node", Version: "20", Start: []string{"node", "x"}, Nonroot: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(df, "10001") {
+		t.Errorf("a non-root build must pin UID 10001, got:\n%s", df)
+	}
+	if strings.Contains(df, "useradd -r") || strings.Contains(df, "adduser -S") {
+		t.Errorf("the implicit system-UID form must be gone:\n%s", df)
+	}
+	if !RunsAsNonroot(df) {
+		t.Error("a build that emits USER app must report RunsAsNonroot=true")
+	}
+}
+
+func TestRunsAsNonroot(t *testing.T) {
+	if !RunsAsNonroot("FROM alpine:3\nCOPY . .\nUSER app\n") {
+		t.Error("a Dockerfile with USER app must be non-root")
+	}
+	if RunsAsNonroot("FROM php:8-apache\n# apache drops to www-data itself\n") {
+		t.Error("a Dockerfile with no USER app (php) must be root")
+	}
+	if RunsAsNonroot("FROM x\nUSER appserver\n") {
+		t.Error("USER appserver must not match the exact `USER app` directive")
+	}
+}
+
 func TestNonrootOff(t *testing.T) {
 	df, err := Generate(Spec{Language: "node", Start: []string{"node", "x"}, Nonroot: false}, nil)
 	if err != nil {

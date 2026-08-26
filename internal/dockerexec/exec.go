@@ -7,11 +7,14 @@ package dockerexec
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -205,6 +208,66 @@ func (r *Runner) PruneBuildCacheHeld(ctx context.Context, keep string, onLine fu
 
 func (r *Runner) pruneBuildCacheHeld(ctx context.Context, keep string, onLine func(string)) error {
 	return r.runArgv(ctx, "", []string{"builder", "prune", "-a", "-f", r.keepStorageFlag(ctx), keep}, onLine)
+}
+
+// reconcileHelperImage is the tiny throwaway image (busybox has stat + chown) used to read and fix a
+// data volume's ownership. Pinned to the same version as the backup helper.
+const reconcileHelperImage = "busybox:1.36"
+
+// ReconcileVolumeOwner ensures a named docker volume's root is owned by uid (recursively), but only
+// when it currently differs — STAT-FIRST, so an already-correct volume costs one cheap helper-container
+// run and no tree walk. It exists to heal the UID-drift class: a build image's user UID could shift
+// when a package was added, and since Docker copies ownership onto a volume only while it is empty, a
+// shifted UID left the app unable to write its own data. Running just before `up`, this restores the
+// volume to the image's (now pinned) UID. Runs throwaway helper containers with STATIC argv (never a
+// shell) under the §0 write gate + one-docker-child semaphore, like a deploy. `volName` is a
+// compose-derived name and `uid` a fixed number — both are discrete argv elements. Returns whether it
+// chowned. Best-effort by contract: the caller logs failures and never fails a deploy on them.
+func (r *Runner) ReconcileVolumeOwner(ctx context.Context, volName string, uid int, onLine func(string)) (prevUID int, changed bool, err error) {
+	if !r.writeAllowed {
+		return 0, false, ErrWritePlaneDisabled
+	}
+	if uid <= 0 || !validVolumeName(volName) {
+		return 0, false, fmt.Errorf("reconcile: invalid volume %q or uid %d", volName, uid)
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return 0, false, err
+	}
+	defer r.sem.Release()
+
+	// Read the current owner UID of the volume root (read-only mount; --network none — no network is
+	// needed to stat/chown, only the volume is exposed, so the blast radius is that one volume).
+	var out bytes.Buffer
+	statArgv := []string{"run", "--rm", "--network", "none", "-v", volName + ":/v:ro", reconcileHelperImage, "stat", "-c", "%u", "/v"}
+	if err := r.runStreamHeld(ctx, statArgv, &out, func(string) {}); err != nil {
+		return 0, false, err
+	}
+	cur, err := strconv.Atoi(strings.TrimSpace(out.String()))
+	if err != nil {
+		return 0, false, fmt.Errorf("reconcile: could not read owner of volume %q: %v", volName, err)
+	}
+	if cur == uid {
+		return cur, false, nil // already correct — the common case, no tree walk
+	}
+	chownArgv := []string{"run", "--rm", "--network", "none", "-v", volName + ":/v", reconcileHelperImage, "chown", "-R", fmt.Sprintf("%d:%d", uid, uid), "/v"}
+	if err := r.runStreamHeld(ctx, chownArgv, io.Discard, onLine); err != nil {
+		return cur, false, err // chown failed — ownership is unchanged (still cur)
+	}
+	return cur, true, nil // returns the PRIOR owner so the caller can roll back if the deploy then fails
+}
+
+// validVolumeName bounds a docker volume name to the safe character set docker itself allows
+// ([a-zA-Z0-9][a-zA-Z0-9_.-]*), so a compose-derived name can never smuggle an argv/option.
+func validVolumeName(s string) bool {
+	if s == "" || len(s) > 255 || strings.HasPrefix(s, "-") {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '.' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // RunStream execs `docker <argv...>` and streams its RAW stdout bytes to `stdout` (an

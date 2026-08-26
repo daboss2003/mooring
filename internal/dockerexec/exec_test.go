@@ -48,6 +48,19 @@ func TestJobArgvIncludesEnvFile(t *testing.T) {
 	}
 }
 
+func TestValidVolumeName(t *testing.T) {
+	for _, ok := range []string{"shop_data", "app-1_db", "a.b_c", "X9"} {
+		if !validVolumeName(ok) {
+			t.Errorf("%q should be a valid volume name", ok)
+		}
+	}
+	for _, bad := range []string{"", "-x", "a b", "a;b", "a/b", "a$b", "a\nb", "--rm"} {
+		if validVolumeName(bad) {
+			t.Errorf("%q must be rejected (argv/option smuggling)", bad)
+		}
+	}
+}
+
 func TestWritePlaneGate(t *testing.T) {
 	if ok, _ := WritePlaneGate(2<<30, 0, 0); !ok {
 		t.Error("2 GiB should arm the write plane")

@@ -150,15 +150,20 @@ func (s *Server) loadRepoDefinition(ctx context.Context, repo *git.Repo, sha, sl
 // service and writes it under the run dir at builder.DockerfilePath (confined,
 // symlink-safe). Detection (language: auto) reads the repo's top-level file list at
 // the pinned commit.
-func (s *Server) writeGeneratedDockerfiles(ctx context.Context, repo *git.Repo, sha, rd string, def *definition.Definition, onLine func(string)) error {
+// writeGeneratedDockerfiles generates + writes each build service's Dockerfile and returns the set
+// of service names whose generated image runs as the pinned non-root UID (from the actual generated
+// Dockerfile, so an auto-detected php build that runs as www-data is correctly excluded). The caller
+// uses that set to reconcile only those services' data-volume ownership to the pinned UID.
+func (s *Server) writeGeneratedDockerfiles(ctx context.Context, repo *git.Repo, sha, rd string, def *definition.Definition, onLine func(string)) (map[string]bool, error) {
 	if defHasBuild(def) {
 		// CRITICAL: the build context is the run dir, which also holds .mooring/
 		// (rendered config + secret VALUES). Exclude it so `COPY . .` can never bake
 		// a secret into an image layer.
 		if err := ensureDockerignore(rd); err != nil {
-			return fmt.Errorf("write .dockerignore: %w", err)
+			return nil, fmt.Errorf("write .dockerignore: %w", err)
 		}
 	}
+	nonrootSvcs := map[string]bool{}
 	var files []string
 	names := make([]string, 0, len(def.Spec.Compose.Services))
 	for n := range def.Spec.Compose.Services {
@@ -173,7 +178,7 @@ func (s *Server) writeGeneratedDockerfiles(ctx context.Context, repo *git.Repo, 
 		if files == nil {
 			var err error
 			if files, err = repo.LsFiles(ctx, sha); err != nil {
-				return fmt.Errorf("list repo files: %w", err)
+				return nil, fmt.Errorf("list repo files: %w", err)
 			}
 		}
 		// Auto-detection (language: auto) reads the files in the service's build dir
@@ -181,19 +186,126 @@ func (s *Server) writeGeneratedDockerfiles(ctx context.Context, repo *git.Repo, 
 		// Node repo detects correctly.
 		dockerfile, err := builder.Generate(buildSpecFor(name, svc), filesInDir(files, svc.Build.Dir))
 		if err != nil {
-			return fmt.Errorf("service %q: %w", name, err)
+			return nil, fmt.Errorf("service %q: %w", name, err)
+		}
+		if builder.RunsAsNonroot(dockerfile) {
+			nonrootSvcs[name] = true
 		}
 		dest := filepath.Join(rd, filepath.FromSlash(builder.DockerfilePath(name)))
 		if !confinedUnder(dest, rd) {
-			return fmt.Errorf("service %q: generated Dockerfile path escapes the run dir", name)
+			return nil, fmt.Errorf("service %q: generated Dockerfile path escapes the run dir", name)
 		}
 		// Symlink-safe write (temp + rename; ancestors checked) — see atomicWrite.
 		if err := atomicWrite(dest, []byte(dockerfile), 0o644, rd); err != nil {
-			return fmt.Errorf("service %q: write Dockerfile: %w", name, err)
+			return nil, fmt.Errorf("service %q: write Dockerfile: %w", name, err)
 		}
 		onLine("generated Dockerfile for " + name)
 	}
-	return nil
+	return nonrootSvcs, nil
+}
+
+// reconciledVol records a volume whose ownership reconcileVolumeOwnership changed, and the UID it
+// previously had — so the deploy can roll it back if the subsequent `up` fails.
+type reconciledVol struct {
+	name    string
+	prevUID int
+}
+
+// reconcileVolumeOwnership restores each eligible named, writable data volume to the pinned non-root
+// UID before `up` — healing the UID-drift class (see internal/builder.NonrootUID). A volume is
+// eligible ONLY when EVERY service that mounts it runs as the pinned UID (nonrootSvcs, derived from
+// the real generated Dockerfile so an auto-detected php/root build is excluded): a volume shared with
+// a service that runs as a different UID (a stock postgres at 999, php at www-data) is left
+// untouched, so we never rewrite a co-consumer's ownership. Read-only-only volumes are skipped
+// (nothing writes them). BEST-EFFORT — a reconcile failure is logged and never fails the deploy. It
+// returns the volumes it actually changed (with their prior UID) so the caller can roll ownership
+// back if the deploy then fails (otherwise a chowned volume + a failed `up` would leave the still-
+// running OLD container unable to write its own data).
+func (s *Server) reconcileVolumeOwnership(ctx context.Context, slug string, def *definition.Definition, nonrootSvcs map[string]bool, onLine func(string)) []reconciledVol {
+	if s.runner == nil || len(nonrootSvcs) == 0 {
+		return nil
+	}
+	var changed []reconciledVol
+	for _, volShort := range eligibleReconcileVolumes(def, nonrootSvcs) {
+		volName := slug + "_" + volShort // compose's default naming: <project>_<volume>
+		prev, did, err := s.runner.ReconcileVolumeOwner(ctx, volName, builder.NonrootUID, onLine)
+		if err != nil {
+			s.log.Warn("volume ownership reconcile failed (continuing deploy)", "app", slug, "volume", volName, "err", err)
+			continue
+		}
+		if did {
+			changed = append(changed, reconciledVol{name: volName, prevUID: prev})
+			onLine(fmt.Sprintf("• healed UID drift: reconciled volume %s to uid %d", volName, builder.NonrootUID))
+			s.log.Info("reconciled volume ownership", "app", slug, "volume", volName, "from_uid", prev, "to_uid", builder.NonrootUID)
+		}
+	}
+	return changed
+}
+
+// eligibleReconcileVolumes returns the short names of named volumes safe to reconcile to the pinned
+// non-root UID: writable (something writes it), and mounted ONLY by services that run as that UID
+// (all consumers ∈ nonrootSvcs). A volume shared with a service that runs as a different UID (a stock
+// postgres at 999, php at www-data, a root build) is EXCLUDED, so the chown never rewrites a
+// co-consumer's ownership. Pure + sorted for deterministic order and unit testing.
+func eligibleReconcileVolumes(def *definition.Definition, nonrootSvcs map[string]bool) []string {
+	type volUse struct {
+		consumers map[string]bool
+		writable  bool
+	}
+	uses := map[string]*volUse{}
+	for name, svc := range def.Spec.Compose.Services {
+		for _, v := range svc.Volumes {
+			if v.Name == "" { // a run-dir bind, not a named volume
+				continue
+			}
+			u := uses[v.Name]
+			if u == nil {
+				u = &volUse{consumers: map[string]bool{}}
+				uses[v.Name] = u
+			}
+			u.consumers[name] = true
+			if !v.ReadOnly {
+				u.writable = true
+			}
+		}
+	}
+	var out []string
+	for volShort, u := range uses {
+		if !u.writable {
+			continue // never written → no drift to heal
+		}
+		allPinned, anyPinned := true, false
+		for c := range u.consumers {
+			if nonrootSvcs[c] {
+				anyPinned = true
+			} else {
+				allPinned = false
+			}
+		}
+		if anyPinned && allPinned {
+			out = append(out, volShort)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// rollbackVolumeOwnership restores volumes reconcileVolumeOwnership changed back to their prior UID —
+// called when the deploy's `up` fails, so a chowned volume plus a still-running OLD container never
+// leaves that container unable to write its own data. Best-effort + detached (a cancelled deploy
+// still rolls back).
+func (s *Server) rollbackVolumeOwnership(ctx context.Context, changed []reconciledVol, onLine func(string)) {
+	if s.runner == nil {
+		return
+	}
+	for _, v := range changed {
+		if _, _, err := s.runner.ReconcileVolumeOwner(ctx, v.name, v.prevUID, onLine); err != nil {
+			s.log.Warn("volume ownership rollback failed", "volume", v.name, "to_uid", v.prevUID, "err", err)
+			continue
+		}
+		onLine(fmt.Sprintf("• deploy failed — rolled volume %s ownership back to uid %d", v.name, v.prevUID))
+		s.log.Info("rolled back volume ownership after failed deploy", "volume", v.name, "to_uid", v.prevUID)
+	}
 }
 
 // buildSpecFor projects a definition build onto the builder spec (non-root defaults on).

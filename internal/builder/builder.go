@@ -223,19 +223,45 @@ func cmdLine(start []string) (string, error) {
 	return "CMD [" + strings.Join(parts, ", ") + "]", nil
 }
 
-// nonrootAlpine / nonrootDebian add an unprivileged user + USER directive.
+// NonrootUID / NonrootUser are the FIXED identity every non-root build runs as. The UID is pinned to
+// an explicit high value rather than left to `useradd -r` / `adduser -S`, which allocate a SYSTEM UID
+// counting DOWN from 999 — so the app's UID was an accident of how many accounts the base image and
+// the `packages:` list created first, and adding one OS package could silently shift it. Docker only
+// copies ownership onto an EMPTY named volume, so a shifted UID left an app unable to write its own
+// data (silent, permanent). 10001 sits above the system range and above the conventional first human
+// UID (1000) on both Debian and Alpine, so no package or host account can collide with it.
+const (
+	NonrootUID  = 10001
+	NonrootUser = "app"
+)
+
+// nonrootAlpine / nonrootDebian add an unprivileged user pinned to NonrootUID + the USER directive.
 func nonrootAlpine() []string {
 	return []string{
-		"RUN addgroup -S app && adduser -S app -G app && chown -R app:app /app",
+		"RUN addgroup -g 10001 app && adduser -D -H -u 10001 -G app app && chown -R app:app /app",
 		"USER app",
 	}
 }
 
 func nonrootDebian() []string {
 	return []string{
-		"RUN groupadd -r app && useradd -r -g app app && chown -R app:app /app",
+		"RUN groupadd -g 10001 app && useradd -u 10001 -g app -M -d /app app && chown -R app:app /app",
 		"USER app",
 	}
+}
+
+// RunsAsNonroot reports whether a GENERATED Dockerfile ends up running as the pinned non-root user —
+// i.e. it emitted the `USER app` directive. It reads the actual generated output, so a build with no
+// non-root user (php/apache drops to www-data itself and never gets `USER app`, even when detected
+// from `language: auto`) is correctly reported as false. Used to decide which volumes may be
+// ownership-reconciled to NonrootUID without breaking a container that runs as something else.
+func RunsAsNonroot(dockerfile string) bool {
+	for _, ln := range strings.Split(dockerfile, "\n") {
+		if strings.TrimSpace(ln) == "USER "+NonrootUser {
+			return true
+		}
+	}
+	return false
 }
 
 // join assembles non-empty lines into a Dockerfile.
