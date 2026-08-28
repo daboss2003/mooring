@@ -172,6 +172,42 @@ server:
 yourself. Getting at those would mean handing the scanner the Docker socket, which would undo
 Mooring's security model — so it doesn't.)
 
+## When a newer image is available
+
+When you deploy an app from a Git repo, Mooring watches the repo and tells you when there are new
+commits to deploy. But plenty of services don't come from your code — they run a pinned public
+image like `image: postgres:16` or `image: redis:7`. Those get new releases too (a security patch
+to Postgres, a new Redis point release), and nothing tells you.
+
+The **Image updates** section on the Server page closes that gap. For every service that runs a
+pinned image, Mooring periodically asks the image's registry what digest that tag points to now,
+and compares it with the digest you actually pulled. When they differ, the service is flagged
+**"update available"** — a newer image has been published for that tag, and redeploying the app
+will pull it. It also sends you one alert (not every time it checks — only when a genuinely new
+digest appears). It's on by default and checks once a day (registry tags move slowly, and this
+keeps well under Docker Hub's rate limits).
+
+A few things worth knowing:
+
+- **It never updates anything on its own.** Just like the Git "update available", this only tells
+  you — you redeploy when it suits you. (Mooring never auto-deploys.)
+- **It only checks pinned public images.** Services you build from Git already get "update
+  available" from the repo poller, and a service pinned to an exact digest (`image: postgres@sha256:…`)
+  can't move, so both are skipped.
+- **It stays true to Mooring's security model.** The registry digest isn't reachable through
+  Mooring's read-only Docker proxy (by design), so this check runs the same way a deploy does — on
+  the `docker` command line, with metadata-only calls that read the manifest without pulling any
+  image layers, using whatever registry logins the host already has. If a registry is unreachable
+  or the image is private and the host isn't logged in, the check quietly records that it couldn't
+  look and moves on — it never alerts on a failed check.
+
+To turn it off:
+
+```yaml
+server:
+  image_update_check_enabled: false
+```
+
 ## All the Server-tab config keys
 
 Everything on this page works with sensible defaults, so most people never touch this. But if you
@@ -187,6 +223,10 @@ server:
   # App vulnerability scanning — ON by default; set false on a small server if it's too heavy.
   image_scan_enabled: false
   image_scan_interval: 24h         # how often to re-scan (default 24h)
+
+  # Image-update detection for pull-image services — ON by default; set false to disable.
+  image_update_check_enabled: false
+  image_update_interval: 24h       # how often to re-check the registry (default 24h)
 
   # Automatic Docker build-cache reclamation — ON by default. After each build-deploy Mooring
   # runs `docker builder prune --keep-storage` so the generated multi-stage builds' single-use

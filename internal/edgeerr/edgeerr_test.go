@@ -6,6 +6,44 @@ import (
 	"time"
 )
 
+func TestRateBuckets(t *testing.T) {
+	now := int64(10000)
+	s := newWithClock(filepath.Join(t.TempDir(), "e.jsonl"), func() time.Time { return time.Unix(now, 0) })
+	// api errors: two land in the same 300s bucket (9500, 9550), one 5xx in a later bucket (9900).
+	s.Record(Entry{At: now - 500, App: "shop", Service: "api", Host: "h", Prefix: "/api", Status: 404})
+	s.Record(Entry{At: now - 450, App: "shop", Service: "api", Host: "h", Prefix: "/api", Status: 502})
+	s.Record(Entry{At: now - 100, App: "shop", Service: "api", Host: "h", Prefix: "/api", Status: 500})
+	// a DIFFERENT service's error must never leak into api's buckets.
+	s.Record(Entry{At: now - 100, App: "shop", Service: "web", Host: "h", Prefix: "", Status: 500})
+
+	b := s.RateBuckets("shop", "api", 300, now-900) // 300s buckets over the last 15m
+	if len(b) == 0 {
+		t.Fatal("expected buckets")
+	}
+	// Buckets are contiguous and boundary-aligned; the series must be non-decreasing in T.
+	var total, total5xx int
+	for i, x := range b {
+		total += x.Count
+		total5xx += x.Count5xx
+		if i > 0 && x.T <= b[i-1].T {
+			t.Fatalf("buckets not ordered: %d then %d", b[i-1].T, x.T)
+		}
+	}
+	if total != 3 || total5xx != 2 {
+		t.Errorf("api totals across buckets: count=%d (want 3), 5xx=%d (want 2)", total, total5xx)
+	}
+	// Two errors fell in one 300s bucket — at least one bucket must hold 2.
+	max := 0
+	for _, x := range b {
+		if x.Count > max {
+			max = x.Count
+		}
+	}
+	if max < 2 {
+		t.Errorf("expected a bucket with 2 errors, max was %d", max)
+	}
+}
+
 func TestStoreRoutesAndFilter(t *testing.T) {
 	s := newWithClock(filepath.Join(t.TempDir(), "e.jsonl"), func() time.Time { return time.Unix(10000, 0) })
 	// Appended in ascending time order (as real requests arrive); the store returns newest first.

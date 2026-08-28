@@ -31,6 +31,7 @@
     </table></div>
     <div class="queue-actions mt1">
       <button type="button" class="btn btn-sm lc-btn" data-log-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs{{if .ContainerID}}?copy={{pathEscape .ContainerID}}{{end}}">View logs</button>
+      <a class="btn btn-sm" href="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs/history" title="Search this service's retained logs">Log history</a>
       {{if and (not $.WriteDisabledReason) (not $.Protected)}}
       {{if .Held}}
       <button type="button" class="btn btn-sm btn-primary lc-btn" data-lc-confirm="Start the {{.Service}} service and resume auto-restart?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/start">Start</button>
@@ -50,6 +51,31 @@
       {{end}}
       {{end}}
     </div>
+  </section>
+
+  {{/* Per-service trend charts (CPU / memory / edge error-rate over time). These live OUTSIDE any
+       poll fragment so their SVG DOM persists; app.js refreshes them from the service's metrics
+       endpoint on its own timer. */}}
+  <section class="panel">
+    <h2>Trends <span class="muted">(recent history)</span></h2>
+    <div class="chart-grid" data-service-metrics data-metrics-url="/partials/service/{{pathEscape .Project}}/{{pathEscape .Service}}/metrics.json">
+      <div class="chart-card">
+        <div class="chart-head"><span class="chart-label">CPU</span><span class="chart-now" data-chart-now="svc-cpu">—</span></div>
+        <svg class="chart c-cpu" data-chart="svc-cpu" aria-label="CPU usage over time"></svg>
+        <div class="chart-empty" data-chart-empty="svc-cpu">Collecting data…</div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><span class="chart-label">Memory</span><span class="chart-now" data-chart-now="svc-mem">—</span></div>
+        <svg class="chart c-mem" data-chart="svc-mem" aria-label="Memory usage over time"></svg>
+        <div class="chart-empty" data-chart-empty="svc-mem">Collecting data…</div>
+      </div>
+      <div class="chart-card">
+        <div class="chart-head"><span class="chart-label">Edge errors <span class="muted">(5m)</span></span><span class="chart-now" data-chart-now="svc-err">—</span></div>
+        <svg class="chart c-disk" data-chart="svc-err" aria-label="Edge error count over time"></svg>
+        <div class="chart-empty" data-chart-empty="svc-err">Collecting data…</div>
+      </div>
+    </div>
+    <p class="muted small">CPU and memory are the average across this service's copies, kept for {{.MetricsRetentionText}}. Edge errors are 4xx/5xx seen at the managed edge over the last 24h (empty if this service isn't edge-fronted).</p>
   </section>
 
   <div id="deploy-tools" class="stream-tools" hidden>

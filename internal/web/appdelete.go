@@ -227,6 +227,15 @@ func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) 
 	if s.imageScans != nil {
 		add("vuln scans", s.imageScans.Delete(ctx, slug))
 	}
+	if s.imageUpdates != nil {
+		add("image updates", s.imageUpdates.Delete(ctx, slug))
+	}
+	if s.serviceLogs != nil {
+		s.serviceLogs.Delete(slug) // in-memory/file store; no error
+		s.serviceLogs.Flush()      // persist the deletion NOW — this teardown is meant to erase the app's
+		//                            captured output, so a crash before the periodic flush must not leave it
+		//                            on disk and searchable after restart.
+	}
 	if s.alertStore != nil {
 		add("alerts", s.alertStore.DeleteApp(ctx, slug))
 	}

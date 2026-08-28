@@ -16,6 +16,8 @@ Mooring's managed edge (Caddy) sees every request. The Errors tab records the on
 
 This is the **edge's view** of each request. It shows *which* routes are erroring and *how* — not the app's internal stack trace, which lives in the app's own container logs (the edge never sees it). A request whose `Host` matches no route is dropped, so scanner noise and bogus-Host 404s never get attributed to your services.
 
+If you've turned on [log history](./service-trends-and-logs.md#log-history--search), each erroring request also shows an **app logs ↗** link that jumps to that service's own logs *around the time of the error* — so you can go straight from "this route is failing" to the app's own error/stack.
+
 Entries are kept for **24 hours**, then pruned — this is a recent-errors view, not an archive. It lives in its own file, separate from Mooring's database, so it never slows the dashboard.
 
 ## The "this route keeps erroring" alert

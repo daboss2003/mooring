@@ -110,6 +110,11 @@ type tmplData struct {
 	EventOutcome  string
 	EventQuery    string
 	EventOlderURL string // "" when there is no older page
+
+	// Service log search (opt-in): the per-service retained-log page, and a flag the Errors tab
+	// reads to decide whether to offer a "logs around this error" deep-link.
+	ServiceLog        *serviceLogView
+	ServiceLogEnabled bool
 }
 
 type eventRow struct {

@@ -38,6 +38,7 @@ import (
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/hostmon"
 	"github.com/daboss2003/mooring/internal/imagescan"
+	"github.com/daboss2003/mooring/internal/imageupdate"
 	"github.com/daboss2003/mooring/internal/l4"
 	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/ntfy"
@@ -50,6 +51,7 @@ import (
 	"github.com/daboss2003/mooring/internal/sandbox"
 	"github.com/daboss2003/mooring/internal/scale"
 	"github.com/daboss2003/mooring/internal/selfheal"
+	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/setupstore"
 	"github.com/daboss2003/mooring/internal/socketproxy"
 	"github.com/daboss2003/mooring/internal/store"
@@ -80,6 +82,20 @@ func cmdServe(args []string) error {
 	log = slog.New(eventlog.NewHandler(baseLogHandler, eventStore))
 	// Per-route edge error log (4xx/5xx), fed by the edge access-log stream when the edge is managed.
 	edgeErrStore := edgeerr.New(filepath.Join(cfg.DataDir, "edge-errors.jsonl"))
+	// Retained per-service log capture (OPT-IN): only constructed when enabled, since it persists the
+	// app's own stdout/stderr to disk. nil (feature off) makes the Logs page show how to turn it on.
+	var serviceLogStore *servicelog.Store
+	serviceLogPath := filepath.Join(cfg.DataDir, "service-logs.jsonl")
+	if cfg.Server.ServiceLogOn() {
+		serviceLogStore = servicelog.New(serviceLogPath, log)
+	} else {
+		// Opt-out must PURGE previously-captured app output, not freeze it on disk. With the store never
+		// constructed, nothing else prunes or deletes this file, so its (possibly secret-bearing) contents
+		// would outlive the 48h TTL indefinitely — the opposite of what turning the feature off intends.
+		// Remove it (best-effort) on boot when the feature is off.
+		_ = os.Remove(serviceLogPath)
+		_ = os.Remove(serviceLogPath + ".tmp")
+	}
 
 	// Fail-closed: probe that the sandbox actually lets us write the dirs we need,
 	// BEFORE the first deploy/edge-start EROFS's lazily. A missing ReadWritePaths
@@ -312,6 +328,39 @@ func cmdServe(args []string) error {
 		wg.Add(1)
 		go func() { defer wg.Done(); scanRunner.Run(ctx) }()
 		log.Info("image vulnerability scanning enabled", "interval", iv)
+	}
+
+	// Image-update detection (ON by default) for PULL-IMAGE services: compare each service's
+	// locally-pulled digest with the registry's current digest for its tag and surface "update
+	// available" on the Server tab (+ one alert). It runs on the write-plane `docker` CLI with
+	// metadata-only commands (the registry digest is unreachable over the read-plane socket-proxy on
+	// purpose) and rides the one-docker-child slot via TryAcquire, so it never delays a deploy.
+	imageUpdateStore := imageupdate.NewStore(db)
+	if cfg.Server.ImageUpdateCheckOn() {
+		iv := cfg.Server.ImageUpdateInterval.D()
+		if iv <= 0 {
+			iv = 24 * time.Hour
+		}
+		updTargetsFn := func(context.Context) []imageupdate.Target {
+			var out []imageupdate.Target
+			apps, _ := gitStore.List()
+			for _, app := range apps {
+				def, err := defStore.Current(app.Project)
+				if err != nil || def == nil {
+					continue
+				}
+				for name, svc := range def.Spec.Compose.Services {
+					if svc.Build == nil && svc.Image != "" {
+						out = append(out, imageupdate.Target{Project: app.Project, Service: name, Ref: svc.Image})
+					}
+				}
+			}
+			return out
+		}
+		updRunner := imageupdate.NewRunner(runner, imageUpdateStore, alertStore, updTargetsFn, iv, log)
+		wg.Add(1)
+		go func() { defer wg.Done(); updRunner.Run(ctx) }()
+		log.Info("image-update detection enabled", "interval", iv)
 	}
 
 	// Disk-pressure auto-reclaim (ON by default). When disk usage crosses the threshold,
@@ -606,37 +655,39 @@ func cmdServe(args []string) error {
 	}
 
 	srv, err := web.New(cfg, web.Deps{
-		DB:          db,
-		ConfigPath:  *configPath,
-		Version:     Version,
-		UpdateCheck: updateChecker,
-		ImageScans:  scanStore,
-		EventLog:    eventStore,
-		EdgeErrors:  edgeErrStore,
-		Log:         log,
-		Monitor:     mon,
-		OpsStore:    opsStore,
-		Prober:      prober,
-		Runner:      runner,
-		Docker:      dockerCli,
-		EnvStore:    envStore,
-		CfgStore:    cfgStore,
-		GitStore:    gitStore,
-		ProvStore:   provStore,
-		SetupStore:  setupStore,
-		AlertStore:  alertStore,
-		EdgeRoutes:  edgeRoutes,
-		EdgeRecon:   edgeRecon,
-		EdgeReason:  edgeReason,
-		L4Routes:    l4Routes,
-		L4Reconcile: l4Reconcile,
-		DefStore:    defStore,
-		SelfHeal:    selfHealStore,
-		Scaling:     scalingStore,
-		DockerSem:   dockerSem,
-		CronStore:   cronStore,
-		APITokens:   apiTokenStore,
-		Backups:     backupStore,
+		DB:           db,
+		ConfigPath:   *configPath,
+		Version:      Version,
+		UpdateCheck:  updateChecker,
+		ImageScans:   scanStore,
+		ImageUpdates: imageUpdateStore,
+		ServiceLogs:  serviceLogStore,
+		EventLog:     eventStore,
+		EdgeErrors:   edgeErrStore,
+		Log:          log,
+		Monitor:      mon,
+		OpsStore:     opsStore,
+		Prober:       prober,
+		Runner:       runner,
+		Docker:       dockerCli,
+		EnvStore:     envStore,
+		CfgStore:     cfgStore,
+		GitStore:     gitStore,
+		ProvStore:    provStore,
+		SetupStore:   setupStore,
+		AlertStore:   alertStore,
+		EdgeRoutes:   edgeRoutes,
+		EdgeRecon:    edgeRecon,
+		EdgeReason:   edgeReason,
+		L4Routes:     l4Routes,
+		L4Reconcile:  l4Reconcile,
+		DefStore:     defStore,
+		SelfHeal:     selfHealStore,
+		Scaling:      scalingStore,
+		DockerSem:    dockerSem,
+		CronStore:    cronStore,
+		APITokens:    apiTokenStore,
+		Backups:      backupStore,
 	})
 	if err != nil {
 		return err
@@ -654,13 +705,48 @@ func cmdServe(args []string) error {
 			case <-ctx.Done():
 				_ = eventStore.Flush() // final flush so a restart keeps recent activity
 				edgeErrStore.Flush()
+				if serviceLogStore != nil {
+					serviceLogStore.Flush()
+				}
 				return
 			case <-t.C:
 				_ = eventStore.Flush()
 				edgeErrStore.Flush()
+				if serviceLogStore != nil {
+					serviceLogStore.Flush()
+				}
 			}
 		}
 	}()
+
+	// Retained per-service log capture (opt-in). A manager tails every running, non-protected service
+	// container's stdout/stderr through the read-only socket-proxy — the SAME stream the live tail uses
+	// — teeing it into the bounded servicelog store. It reconciles off the monitor snapshot (attach new
+	// containers, drop vanished ones) on a 15s cadence, like the edge-pool discovery refresher.
+	if serviceLogStore != nil {
+		logTargets := func() []servicelog.Target {
+			snap := mon.Snapshot()
+			if snap == nil {
+				return nil
+			}
+			var out []servicelog.Target
+			for _, app := range snap.Apps {
+				if cfg.IsProtectedProject(app.Project) {
+					continue // never retain Mooring's own infra (proxy/edge) output
+				}
+				for _, svc := range app.Services {
+					if svc.Running() && svc.ContainerID != "" {
+						out = append(out, servicelog.Target{ContainerID: svc.ContainerID, App: app.Project, Service: svc.Service})
+					}
+				}
+			}
+			return out
+		}
+		logMgr := servicelog.NewManager(serviceLogStore, dockerCli, log)
+		wg.Add(1)
+		go func() { defer wg.Done(); logMgr.Run(ctx, 15*time.Second, logTargets) }()
+		log.Info("service log capture enabled")
+	}
 
 	// Wire the auto-scaling edge pool (plan §8A): each edge reconcile now discovers the
 	// live replica endpoints for every route via the read-only socket-proxy and dials

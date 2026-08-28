@@ -39,7 +39,7 @@ const perRouteEntryCap = 100
 // handleErrors renders the Errors tab: every route that has returned a 4xx/5xx in the last 24h,
 // grouped by app, each expandable to its recent errors with a text filter. Read-only; auth-gated.
 func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
-	d := tmplData{Title: "Errors — Mooring", Username: sessionUser(r)}
+	d := tmplData{Title: "Errors — Mooring", Username: sessionUser(r), ServiceLogEnabled: s.cfg.Server.ServiceLogOn() && s.serviceLogs != nil}
 	if s.edgeErrors != nil {
 		byApp := map[string]*errorsAppView{}
 		var order []string

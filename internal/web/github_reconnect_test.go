@@ -22,10 +22,10 @@ func TestParseGitHubRepo(t *testing.T) {
 		{"https://github.com/octocat/app.git", "octocat", "app", true},
 		{"https://github.com/octocat/app", "octocat", "app", true},
 		{"ssh://git@github.com/octocat/app.git", "octocat", "app", true},
-		{"git@gitlab.com:octocat/app.git", "", "", false},          // not github
-		{"https://evil.com/github.com/x/y.git", "", "", false},     // not github host
-		{"git@github.com:octocat/../secrets.git", "", "", false},   // traversal
-		{"git@github.com:onlyone.git", "", "", false},              // no owner/name split
+		{"git@gitlab.com:octocat/app.git", "", "", false},        // not github
+		{"https://evil.com/github.com/x/y.git", "", "", false},   // not github host
+		{"git@github.com:octocat/../secrets.git", "", "", false}, // traversal
+		{"git@github.com:onlyone.git", "", "", false},            // no owner/name split
 		{"", "", "", false},
 	}
 	for _, c := range cases {

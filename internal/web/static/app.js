@@ -491,12 +491,14 @@
     for (var k in attrs) n.setAttribute(k, attrs[k]);
     return n;
   }
-  // drawArea renders a 0..100 (%) series into an <svg> as a grid + gradient area +
-  // line. The line uses non-scaling-stroke so it stays crisp under the stretched
-  // viewBox. Returns true when it drew real data, false when the series was empty.
-  function drawArea(svg, values) {
+  // drawArea renders a series into an <svg> as a grid + gradient area + line. The y-axis spans
+  // 0..max (max defaults to 100 for the % charts; the per-service memory/error charts pass the
+  // window peak so a ms/count series scales sensibly). The line uses non-scaling-stroke so it stays
+  // crisp under the stretched viewBox. Returns true when it drew real data, false when empty.
+  function drawArea(svg, values, max) {
     while (svg.firstChild) svg.removeChild(svg.firstChild);
     var W = 300, H = 140;
+    var top = (max && max > 0) ? max : 100;
     svg.setAttribute("viewBox", "0 0 " + W + " " + H);
     svg.setAttribute("preserveAspectRatio", "none");
     [0.25, 0.5, 0.75].forEach(function (g) {
@@ -506,7 +508,7 @@
     if (!values || values.length < 2) return false;
     var n = values.length;
     function x(i) { return (i / (n - 1)) * W; }
-    function y(v) { var c = v < 0 ? 0 : (v > 100 ? 100 : v); return H - (c / 100) * H; }
+    function y(v) { var c = v < 0 ? 0 : (v > top ? top : v); return H - (c / top) * H; }
     // A vertical gradient for the area fill (its own id per chart).
     var gid = "grad-" + (svg.getAttribute("data-chart") || "x");
     var defs = el("defs");
@@ -536,7 +538,7 @@
       if (g) svg.removeChild(g);
       svg.__hovering = false;
       var vals = svg.__vals;
-      if (nowEl) nowEl.textContent = (vals && vals.length) ? Math.round(vals[vals.length - 1]) + "%" : "—";
+      if (nowEl) nowEl.textContent = (vals && vals.length) ? (svg.__fmt ? svg.__fmt(vals[vals.length - 1]) : Math.round(vals[vals.length - 1]) + "%") : "—";
     };
     svg.addEventListener("mousemove", function (e) {
       var vals = svg.__vals;
@@ -551,11 +553,15 @@
       if (!g) { g = el("line", { class: "hover-guide", "vector-effect": "non-scaling-stroke" }); svg.appendChild(g); }
       g.setAttribute("x1", gx); g.setAttribute("y1", 0); g.setAttribute("x2", gx); g.setAttribute("y2", H);
       svg.__hovering = true;
-      if (nowEl) nowEl.textContent = vals[idx].toFixed(1) + "%";
+      if (nowEl) nowEl.textContent = svg.__fmt ? svg.__fmt(vals[idx]) : vals[idx].toFixed(1) + "%";
     });
     svg.addEventListener("mouseleave", restore);
   }
-  var charts = document.querySelectorAll("[data-chart]");
+  // The host charts (Overview/Server) — everything with [data-chart] that is NOT inside a
+  // per-service metrics grid (those are refreshed by their own block below, from their own URL).
+  var charts = Array.prototype.filter.call(document.querySelectorAll("[data-chart]"), function (svg) {
+    return !(svg.closest && svg.closest("[data-service-metrics]"));
+  });
   if (charts.length) {
     charts.forEach(setupChartHover);
     var refreshCharts = function () {
@@ -585,6 +591,58 @@
     };
     onFocusedNow(refreshCharts);
     setInterval(refreshCharts, 5000);
+  }
+
+  // ---- per-service trend charts (service page) ----
+  // CPU% + memory + edge error-rate over time, fetched from the service's own metrics endpoint.
+  // Self-contained (its own URL + peak-scaling), so it never collides with the host charts above.
+  var svcWrap = document.querySelector("[data-service-metrics]");
+  if (svcWrap) {
+    var svcUrl = svcWrap.getAttribute("data-metrics-url");
+    var svcCharts = svcWrap.querySelectorAll("[data-chart]");
+    svcCharts.forEach(setupChartHover);
+    var fmtMiB = function (mib) { return mib >= 1024 ? (mib / 1024).toFixed(2) + " GiB" : Math.round(mib) + " MiB"; };
+    var svcFmt = {
+      "svc-cpu": function (v) { return Math.round(v) + "%"; },
+      "svc-mem": function (v) { return fmtMiB(v); },
+      "svc-err": function (v) { return Math.round(v) + (Math.round(v) === 1 ? " error" : " errors"); },
+    };
+    svcCharts.forEach(function (svg) {
+      var f = svcFmt[svg.getAttribute("data-chart")];
+      if (f) svg.__fmt = f;
+    });
+    var refreshSvc = function () {
+      if (!dashFocused()) return;
+      fetch(svcUrl, { credentials: "same-origin", redirect: "error", headers: { "X-Requested-With": "fetch" } })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (data) {
+          if (!data) return;
+          var pts = data.points || [], errs = data.errors || [];
+          var series = {
+            "svc-cpu": { vals: pts.map(function (p) { return p.cpu; }), max: 100 },
+            "svc-mem": { vals: pts.map(function (p) { return p.memBytes / 1048576; }), max: 0 },
+            "svc-err": { vals: errs.map(function (b) { return b.count; }), max: 0 },
+          };
+          svcCharts.forEach(function (svg) {
+            var key = svg.getAttribute("data-chart");
+            var s = series[key];
+            if (!s) return;
+            var mx = s.max;
+            if (mx === 0) { mx = 1; for (var i = 0; i < s.vals.length; i++) if (s.vals[i] > mx) mx = s.vals[i]; }
+            var drew = drawArea(svg, s.vals, mx);
+            svg.__vals = drew ? s.vals : null;
+            var empty = svcWrap.querySelector('[data-chart-empty="' + key + '"]');
+            if (empty) empty.style.display = drew ? "none" : "";
+            var now = svcWrap.querySelector('[data-chart-now="' + key + '"]');
+            if (now && !svg.__hovering) {
+              now.textContent = (drew && s.vals.length && svg.__fmt) ? svg.__fmt(s.vals[s.vals.length - 1]) : "—";
+            }
+          });
+        })
+        .catch(function () { /* transient */ });
+    };
+    onFocusedNow(refreshSvc);
+    setInterval(refreshSvc, 5000);
   }
 
   // ---- per-route error-log filter (Errors tab) ----

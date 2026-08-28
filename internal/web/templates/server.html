@@ -114,6 +114,40 @@
   </section>
   {{end}}
 
+  {{/* Image updates for pull-image services (on by default). */}}
+  {{with .Server}}
+  <section class="panel">
+    <h2>Image updates <span class="muted">(pull-image services)</span></h2>
+    {{if not .ImageUpdateEnabled}}
+    <p class="muted">Off. To be told when a newer image is published for a service that runs a pinned image (e.g. <code>image: postgres:16</code>), set <code>server.image_update_check_enabled: true</code> in <code>/etc/mooring/config.yaml</code>. Mooring compares the pulled digest with the registry's current digest for that tag and, when they differ, flags it here (and alerts once). Services you build from git already get "update available" from the repo poller.</p>
+    {{else if not .ImageUpdates}}
+    <p class="muted">Enabled — results appear here after the first check completes (a few minutes after start, then on schedule). Only services running a pinned image (not built from git, not digest-pinned) are checked.</p>
+    {{else}}
+    {{if not .HasImageUpdates}}<p class="muted">All checked services are running the latest image for their tag.</p>{{end}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>App</th><th>Service</th><th>Image</th><th>Status</th><th>Checked</th></tr></thead>
+      <tbody>
+        {{range .ImageUpdates}}
+        <tr class="{{if .UpdateAvailable}}is-warn{{end}}">
+          <td>{{.Project}}</td>
+          <td>{{.Service}}</td>
+          <td class="mono">{{.ImageRef}}</td>
+          <td>
+            {{if .UpdateAvailable}}<span class="pill pill-warn">update available</span> <span class="muted">redeploy to pull</span>
+            {{else if .Error}}<span class="muted">{{.Error}}</span>
+            {{else if .LatestDigest}}<span class="muted">up to date</span>
+            {{else}}<span class="muted">checking…</span>{{end}}
+          </td>
+          <td class="mono">{{if .CheckedAt}}{{template "ts" .CheckedAt}}{{else}}—{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    <p class="muted">"Update available" means the image's tag now points to a newer digest in its registry. Mooring never pulls automatically — redeploy the app to pull it.</p>
+    {{end}}
+  </section>
+  {{end}}
+
   {{/* Read-only file view (opt-in). */}}
   {{with .Server}}
   <section class="panel">

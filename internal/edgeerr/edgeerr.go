@@ -146,6 +146,67 @@ func (s *Store) Errors(app, host, prefix, q string, limit int) []Entry {
 	return out
 }
 
+// ErrorBucket is one fixed time-window of a service's edge errors — the error-rate history series
+// for the per-service metrics charts.
+type ErrorBucket struct {
+	T        int64 `json:"t"`        // bucket start (unix seconds)
+	Count    int   `json:"count"`    // total 4xx + 5xx in the bucket
+	Count5xx int   `json:"count5xx"` // server (5xx) errors only
+}
+
+// maxRateBuckets bounds the returned series so a tiny bucket over a long window can't allocate an
+// unbounded slice (a self-DoS guard, like the rest of this store).
+const maxRateBuckets = 5000
+
+// RateBuckets returns one app+service's edge-error counts bucketed into fixed windows from `since`
+// (unix seconds; <=0 or in the future ⇒ the full 24h TTL) to now, oldest first, aggregating ALL of
+// the service's routes. Empty windows are returned as zeros so the series is continuous. Derived
+// purely from the in-memory entries (no SQLite), like Routes.
+func (s *Store) RateBuckets(app, service string, bucketSecs, since int64) []ErrorBucket {
+	if s == nil {
+		return nil
+	}
+	if bucketSecs <= 0 {
+		bucketSecs = 60
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked()
+	now := s.now().Unix()
+	if since <= 0 || since > now {
+		since = now - int64(defaultTTL/time.Second)
+	}
+	start := since - (since % bucketSecs) // align to a bucket boundary
+	n := int((now-start)/bucketSecs) + 1
+	if n <= 0 {
+		return nil
+	}
+	if n > maxRateBuckets {
+		// Keep the most-recent window rather than the oldest.
+		start = now - int64(maxRateBuckets-1)*bucketSecs
+		start -= start % bucketSecs
+		n = maxRateBuckets
+	}
+	out := make([]ErrorBucket, n)
+	for i := range out {
+		out[i].T = start + int64(i)*bucketSecs
+	}
+	for _, e := range s.entries {
+		if e.App != app || e.Service != service || e.At < start {
+			continue
+		}
+		idx := int((e.At - start) / bucketSecs)
+		if idx < 0 || idx >= n {
+			continue
+		}
+		out[idx].Count++
+		if e.Status >= 500 {
+			out[idx].Count5xx++
+		}
+	}
+	return out
+}
+
 // entryHaystack is the lower-cased text an error is matched against for the filter.
 func entryHaystack(e Entry) string {
 	return strings.ToLower(e.Method + " " + e.Path + " " + strconv.Itoa(e.Status) + " " + e.RemoteIP)

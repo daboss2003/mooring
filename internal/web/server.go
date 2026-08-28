@@ -38,12 +38,14 @@ import (
 	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/imagescan"
+	"github.com/daboss2003/mooring/internal/imageupdate"
 	"github.com/daboss2003/mooring/internal/l4"
 	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/ops"
 	"github.com/daboss2003/mooring/internal/provstore"
 	"github.com/daboss2003/mooring/internal/scale"
 	"github.com/daboss2003/mooring/internal/selfheal"
+	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/session"
 	"github.com/daboss2003/mooring/internal/setupstore"
 	"github.com/daboss2003/mooring/internal/store"
@@ -97,37 +99,39 @@ const loginBodyLimit = 64 << 10
 // degrades gracefully (e.g. nil mon → "collecting…"; nil runner → write plane
 // shown disabled).
 type Deps struct {
-	DB          *store.DB
-	ConfigPath  string               // for SIGHUP allowlist+auth reload
-	Version     string               // the running Mooring build version (for the Server tab's .deb cleanup)
-	UpdateCheck *updatecheck.Checker // self-update / security-advisory posture (nil when disabled)
-	ImageScans  *imagescan.Store     // per-app Trivy scan results (surface on the Server tab)
-	EventLog    *eventlog.Store      // deduped operational events for the Activity tab (may be nil)
-	EdgeErrors  *edgeerr.Store       // per-route edge 4xx/5xx error log (may be nil)
-	Log         *slog.Logger
-	Monitor     *monitor.Monitor
-	OpsStore    *ops.ConfigStore
-	Prober      *ops.Prober
-	Runner      *dockerexec.Runner
-	Docker      *docker.Client
-	EnvStore    *envstore.Store
-	CfgStore    *cfgstore.Store
-	GitStore    *gitstore.Store
-	ProvStore   *provstore.Store
-	SetupStore  *setupstore.Store
-	AlertStore  *alertstore.Store
-	EdgeRoutes  *edge.RouteStore
-	EdgeRecon   *edge.Reconciler            // nil when the edge isn't owned (external/unavailable)
-	EdgeReason  string                      // why the edge isn't owned (banner), "" when owned
-	L4Routes    *l4.RouteStore              // managed L4 (TCP/UDP) routes (nil when L4 LB disabled)
-	L4Reconcile func(context.Context) error // push the L4 route set to the nginx-stream LB (nil when disabled)
-	DefStore    *definition.Store           // canonical mooring.yaml store (source of truth; may be nil)
-	SelfHeal    *selfheal.Store             // supervisor FSM + expected_down leases (may be nil)
-	Scaling     *scale.Store                // auto-scaling policies + state (may be nil)
-	DockerSem   *dockerexec.Semaphore       // global one-docker-child semaphore (shared with Runner)
-	APITokens   *apitoken.Store             // scoped read/deploy API tokens (M19; may be nil → /api/v1 disabled)
-	Backups     *backupstore.Store          // encrypted Mooring-state backups (may be nil)
-	CronStore   *cronstore.Store            // scheduled-task last-run bookkeeping (may be nil → cron disabled)
+	DB           *store.DB
+	ConfigPath   string               // for SIGHUP allowlist+auth reload
+	Version      string               // the running Mooring build version (for the Server tab's .deb cleanup)
+	UpdateCheck  *updatecheck.Checker // self-update / security-advisory posture (nil when disabled)
+	ImageScans   *imagescan.Store     // per-app Trivy scan results (surface on the Server tab)
+	ImageUpdates *imageupdate.Store   // per-service pull-image update state (surface on the Server tab; may be nil)
+	ServiceLogs  *servicelog.Store    // retained per-service container logs for search (opt-in; may be nil)
+	EventLog     *eventlog.Store      // deduped operational events for the Activity tab (may be nil)
+	EdgeErrors   *edgeerr.Store       // per-route edge 4xx/5xx error log (may be nil)
+	Log          *slog.Logger
+	Monitor      *monitor.Monitor
+	OpsStore     *ops.ConfigStore
+	Prober       *ops.Prober
+	Runner       *dockerexec.Runner
+	Docker       *docker.Client
+	EnvStore     *envstore.Store
+	CfgStore     *cfgstore.Store
+	GitStore     *gitstore.Store
+	ProvStore    *provstore.Store
+	SetupStore   *setupstore.Store
+	AlertStore   *alertstore.Store
+	EdgeRoutes   *edge.RouteStore
+	EdgeRecon    *edge.Reconciler            // nil when the edge isn't owned (external/unavailable)
+	EdgeReason   string                      // why the edge isn't owned (banner), "" when owned
+	L4Routes     *l4.RouteStore              // managed L4 (TCP/UDP) routes (nil when L4 LB disabled)
+	L4Reconcile  func(context.Context) error // push the L4 route set to the nginx-stream LB (nil when disabled)
+	DefStore     *definition.Store           // canonical mooring.yaml store (source of truth; may be nil)
+	SelfHeal     *selfheal.Store             // supervisor FSM + expected_down leases (may be nil)
+	Scaling      *scale.Store                // auto-scaling policies + state (may be nil)
+	DockerSem    *dockerexec.Semaphore       // global one-docker-child semaphore (shared with Runner)
+	APITokens    *apitoken.Store             // scoped read/deploy API tokens (M19; may be nil → /api/v1 disabled)
+	Backups      *backupstore.Store          // encrypted Mooring-state backups (may be nil)
+	CronStore    *cronstore.Store            // scheduled-task last-run bookkeeping (may be nil → cron disabled)
 }
 
 // Server holds everything the request pipeline needs. Construct with New.
@@ -184,6 +188,8 @@ type Server struct {
 	footprintC     *footprintCache              // cached on-disk footprint (off-request refresh)
 	updateCheck    *updatecheck.Checker         // self-update / security-advisory posture (may be nil)
 	imageScans     *imagescan.Store             // per-app Trivy scan results (may be nil)
+	imageUpdates   *imageupdate.Store           // per-service pull-image update state (may be nil)
+	serviceLogs    *servicelog.Store            // retained per-service logs for search (opt-in; may be nil)
 	eventLog       *eventlog.Store              // deduped operational events for the Activity tab (may be nil)
 	edgeErrors     *edgeerr.Store               // per-route edge 4xx/5xx error log (may be nil)
 	pendingApps    atomic.Pointer[[]pendingApp] // undeployed mooring.*.yaml siblings found in connected repos
@@ -205,6 +211,8 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		version:       d.Version,
 		updateCheck:   d.UpdateCheck,
 		imageScans:    d.ImageScans,
+		imageUpdates:  d.ImageUpdates,
+		serviceLogs:   d.ServiceLogs,
 		eventLog:      d.EventLog,
 		edgeErrors:    d.EdgeErrors,
 		db:            d.DB,
@@ -480,9 +488,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apps/{project}/scaling", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleScalingSave))))
 	mux.HandleFunc("POST /apps/{project}/services/{service}/replicas/{dir}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleReplicaNudge))))
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs", s.requireAuth(s.handleServiceLogs))
+	// Retained log SEARCH (opt-in): the service's captured stdout/stderr history, filterable.
+	mux.HandleFunc("GET /apps/{project}/services/{service}/logs/history", s.requireAuth(s.handleServiceLogHistory))
 	// withCSRFToken so the live-polled ops fragment carries a CSRF token for its
 	// per-service queue-action forms (re-injected on every poll, never stale).
 	mux.HandleFunc("GET /partials/service/{project}/{service}/ops", s.requireAuth(s.withCSRFToken(s.handleServiceOpsPartial)))
+	// Per-service metric history (CPU/memory + error-rate) for the trend charts on the service page.
+	mux.HandleFunc("GET /partials/service/{project}/{service}/metrics.json", s.requireAuth(s.handleServiceMetricsHistory))
 	// Per-service queue actions: routed to THIS service's own ops endpoint (not the
 	// project-level target). More specific than /services/{service}/{action}.
 	mux.HandleFunc("POST /apps/{project}/services/{service}/queues/{queue}/{action}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleServiceQueueAction))))

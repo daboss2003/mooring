@@ -13,6 +13,7 @@ import (
 	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/hostmon"
 	"github.com/daboss2003/mooring/internal/imagescan"
+	"github.com/daboss2003/mooring/internal/imageupdate"
 	"github.com/daboss2003/mooring/internal/serverinfo"
 )
 
@@ -52,6 +53,20 @@ type serverView struct {
 	// image vulnerability scans (opt-in): per-app Trivy results, worst-first.
 	ScanEnabled bool
 	Scans       []imagescan.AppScan
+
+	// image-update detection (on by default): per pull-image service, updates-available first.
+	ImageUpdateEnabled bool
+	ImageUpdates       []imageupdate.Row
+}
+
+// HasImageUpdates reports whether any checked service currently has a newer image available.
+func (v *serverView) HasImageUpdates() bool {
+	for _, u := range v.ImageUpdates {
+		if u.UpdateAvailable {
+			return true
+		}
+	}
+	return false
 }
 
 // hostmonSampleView mirrors hostmon.Sample for the template (kept local so the
@@ -185,6 +200,12 @@ func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 	if s.imageScans != nil {
 		if scans, err := s.imageScans.List(r.Context()); err == nil {
 			v.Scans = scans
+		}
+	}
+	v.ImageUpdateEnabled = s.cfg.Server.ImageUpdateCheckOn()
+	if s.imageUpdates != nil {
+		if ups, err := s.imageUpdates.List(r.Context()); err == nil {
+			v.ImageUpdates = ups
 		}
 	}
 	s.render(w, r, "server.html", tmplData{

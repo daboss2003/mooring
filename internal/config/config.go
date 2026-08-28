@@ -130,6 +130,18 @@ type ServerConfig struct {
 	// Re-scanning unchanged images matters — new CVEs are disclosed daily.
 	ImageScanInterval Duration `yaml:"image_scan_interval"`
 
+	// ImageUpdateCheckEnabled controls periodic image-update detection for PULL-IMAGE app services
+	// (a service that runs `image: postgres:16` rather than a git build). Mooring compares the
+	// locally-pulled digest with the registry's current digest for that tag and, when they differ,
+	// surfaces "update available" on the Server tab (and alerts once). It is the image-side analog of
+	// the git poller's "update available". ON by default (a *bool: unset = on); set false to disable.
+	// The check runs on the write-plane `docker` CLI with metadata-only commands (no layer pull) and
+	// uses the host's configured registry auth — it never touches the read-plane socket-proxy.
+	ImageUpdateCheckEnabled *bool `yaml:"image_update_check_enabled"`
+	// ImageUpdateInterval is how often to re-check (default 24h; clamped to a 1h floor). Registry tags
+	// move slowly and Docker Hub rate-limits anonymous pulls, so keep this in hours.
+	ImageUpdateInterval Duration `yaml:"image_update_interval"`
+
 	// DiskGCEnabled controls disk-pressure auto-reclaim: when disk usage crosses
 	// DiskGCThreshold, Mooring reclaims DANGLING docker images + build cache (the superseded
 	// builds that pile up as apps redeploy) and alerts. ON by default; safe because it only
@@ -146,6 +158,14 @@ type ServerConfig struct {
 	// *bool: unset = on). It costs one JSON parse per request; set it false on a very high-traffic
 	// edge that doesn't want that, or if the edge isn't managed (then it does nothing anyway).
 	RouteErrorLogEnabled *bool `yaml:"route_error_log_enabled"`
+
+	// ServiceLogEnabled controls capturing + retaining each running service's own container output
+	// (stdout/stderr) so the operator can SEARCH a service's recent logs (the Logs tab on the service
+	// page), not only live-tail. It is OFF by default (a *bool: unset = off) — unlike the Errors tab,
+	// this writes the app's OWN output to disk, which may contain secrets/tokens/PII the app prints; so
+	// it is opt-in. When on, output is kept in a 0600 file in the data dir on a short TTL (48h), bounded
+	// per service, and readable only by an authenticated operator (the same audience as the live tail).
+	ServiceLogEnabled *bool `yaml:"service_log_enabled"`
 
 	// BuildCacheKeepEnabled controls automatic reclamation of Docker/BuildKit build cache
 	// after a build-deploy. Mooring's generated multi-stage Dockerfiles emit a unique,
@@ -173,6 +193,17 @@ func (s ServerConfig) ImageScanOn() bool {
 // RouteErrorLogOn reports whether the per-route edge error log is enabled (default on).
 func (s ServerConfig) RouteErrorLogOn() bool {
 	return s.RouteErrorLogEnabled == nil || *s.RouteErrorLogEnabled
+}
+
+// ImageUpdateCheckOn reports whether image-update detection is enabled (default on).
+func (s ServerConfig) ImageUpdateCheckOn() bool {
+	return s.ImageUpdateCheckEnabled == nil || *s.ImageUpdateCheckEnabled
+}
+
+// ServiceLogOn reports whether per-service log capture/retention is enabled. It defaults OFF (opt-in)
+// because it persists the app's own output to disk — see ServiceLogEnabled.
+func (s ServerConfig) ServiceLogOn() bool {
+	return s.ServiceLogEnabled != nil && *s.ServiceLogEnabled
 }
 
 // DiskGCOn reports whether disk-pressure auto-reclaim is enabled (default ON). When disk

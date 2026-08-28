@@ -149,7 +149,11 @@ server:
   version_check_interval: 6h
   image_scan_enabled: true            # Trivy vulnerability scanning (heavy — turn off on a tiny box)
   image_scan_interval: 24h
+  image_update_check_enabled: true    # detect newer images for pull-image services (Server tab); on by default
+  image_update_interval: 24h          # how often to re-check the registry (1h floor)
   route_error_log_enabled: true       # the per-route edge error log (Errors tab); on by default
+  service_log_enabled: false          # capture+retain each service's stdout/stderr for search; OFF by default
+                                      # (writes app output to disk — opt-in; see docs/service-trends-and-logs.md)
   disk_gc_enabled: true               # reclaim dangling images + build cache when disk is tight
   disk_gc_threshold: 75               # % disk usage that triggers it (50–95)
   build_cache_keep_enabled: true      # trim BuildKit cache after each build-deploy

@@ -1,0 +1,70 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  {{with .ServiceLog}}
+  <p><a href="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}">← {{.Service}}</a></p>
+  <h1>{{.Service}} logs <span class="muted">— {{.Project}}</span></h1>
+
+  {{if not .Enabled}}
+  <section class="panel">
+    <p class="muted">Retained log search is <strong>off</strong>. When on, Mooring captures each running service's
+      output (stdout/stderr) into a searchable, time-bounded history — so you can find the error behind an
+      Errors-tab entry without live-tailing. It's opt-in because it writes the app's own output to disk (which may
+      contain secrets the app prints); it's kept in a <code>0600</code> file in the data dir on a short TTL and is
+      readable only by a signed-in operator. To enable it, set in <code>/etc/mooring/config.yaml</code>:</p>
+    <pre class="stream">server:
+  service_log_enabled: true</pre>
+    <p class="muted small">You can still <a href="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}">live-tail</a> the service any time — that never writes to disk.</p>
+  </section>
+  {{else}}
+  <section class="panel">
+    <form method="get" class="row" style="flex-wrap:wrap;align-items:flex-end;gap:.75rem">
+      {{if .At}}<input type="hidden" name="at" value="{{.At}}">{{end}}
+      <label style="flex:1 1 16rem">Filter
+        <input type="text" name="q" value="{{.Query}}" placeholder="Type words — a line must contain them all" autocomplete="off" spellcheck="false" class="w-full">
+      </label>
+      {{if not .At}}
+      <label>Range
+        <select name="range">
+          <option value="15m"{{if eq .Range "15m"}} selected{{end}}>Last 15 min</option>
+          <option value="1h"{{if eq .Range "1h"}} selected{{end}}>Last hour</option>
+          <option value="6h"{{if eq .Range "6h"}} selected{{end}}>Last 6 hours</option>
+          <option value="24h"{{if eq .Range "24h"}} selected{{end}}>Last 24 hours</option>
+          <option value="all"{{if eq .Range "all"}} selected{{end}}>All retained</option>
+        </select>
+      </label>
+      {{end}}
+      {{if .Copies}}
+      <label>Copy
+        <select name="copy">
+          <option value="">All copies</option>
+          {{range .Copies}}<option value="{{.}}"{{if eq . $.ServiceLog.Copy}} selected{{end}}>{{.}}</option>{{end}}
+        </select>
+      </label>
+      {{end}}
+      <button type="submit" class="btn btn-sm">Search</button>
+    </form>
+    {{if .At}}<p class="muted small mt1">Showing logs around <span class="mono">{{template "ts" .At}}</span> (from an Errors entry). <a href="?range=1h">Clear — show recent instead</a>.</p>{{end}}
+  </section>
+
+  <section class="panel">
+    {{if .Lines}}
+    {{if .Capped}}<p class="muted small">Showing the most recent {{len .Lines}} matching lines — narrow the filter or range to see more.</p>{{end}}
+    <div class="err-lines mono">
+      {{range .Lines}}
+      <div class="err-line">
+        <span class="err-t muted">{{template "ts" .At}}</span>
+        {{if .Copy}}<span class="muted small">{{.Copy}}</span>{{end}}
+        <span class="err-p">{{.Text}}</span>
+      </div>
+      {{end}}
+    </div>
+    {{else}}
+    <p class="muted">No retained log lines match. Logs appear here once the service is running and producing output
+      (captured going forward — retained for about two days). If you just enabled capture, give it a moment.</p>
+    {{end}}
+  </section>
+  {{end}}
+  {{end}}
+</main>
+{{template "bottom" .}}

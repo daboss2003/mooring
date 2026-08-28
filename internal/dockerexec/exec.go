@@ -335,6 +335,26 @@ func (r *Runner) runStreamHeld(ctx context.Context, argv []string, stdout io.Wri
 	return waitErr
 }
 
+// CaptureTry runs `docker <argv...>` and returns its captured stdout, WITHOUT ever queuing: if the
+// one-docker-child slot is held it returns ErrBusy immediately (skip-don't-queue, like the
+// cron/backup/GC paths) so a slow child — e.g. a registry round-trip — can never stall a deploy that
+// is waiting on the slot. stderr is discarded (metadata reads don't need it). Static argv only
+// (Mooring-authored, never operator input); runs under the §0 write gate and reaps the process group
+// on ctx cancel. The caller MUST bound ctx with a timeout. Used by the image-update checker to read
+// the local + registry image digests (`docker image inspect` / `docker buildx imagetools inspect`).
+func (r *Runner) CaptureTry(ctx context.Context, argv []string) (string, error) {
+	if !r.writeAllowed {
+		return "", ErrWritePlaneDisabled
+	}
+	if !r.sem.TryAcquire() {
+		return "", ErrBusy
+	}
+	defer r.sem.Release()
+	var out bytes.Buffer
+	err := r.runStreamHeld(ctx, argv, &out, nil)
+	return out.String(), err
+}
+
 // RunStreamStdin execs `docker <argv...>` feeding `stdin` to the child's STDIN (e.g. a
 // decrypted+gunzipped tar stream piped into a `docker run -i … tar -x` restore sidecar),
 // while stdout+stderr are line-truncated to onLine. Static argv only (Mooring-authored); runs

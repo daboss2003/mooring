@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/audit"
@@ -25,15 +26,28 @@ type serviceView struct {
 	CPUPercent                float64
 	MemBytes, MemLimit        uint64
 	RestartCount              int
-	ContainerID               string    // the SPECIFIC copy being shown (a scaled service has many)
-	ContainerName             string    // e.g. myapp-api-2 — so the user sees which copy this is
-	Copies                    []copyRef // sibling replicas of this service, for the copy switcher
+	ContainerID               string              // the SPECIFIC copy being shown (a scaled service has many)
+	ContainerName             string              // e.g. myapp-api-2 — so the user sees which copy this is
+	Copies                    []copyRef           // sibling replicas of this service, for the copy switcher
 	Phase                     string              // self-heal supervisor phase, e.g. CIRCUIT_OPEN
 	Held                      bool                // operator-held: stopped + auto-restart paused
 	DesiredReplicas           int                 // 0 when scaling isn't active
 	Policy                    *definition.Scaling // current scaling policy; nil = none yet
 	HasOps                    bool                // the service declares an enabled (non-basic) ops endpoint → live-poll its fragment
 	Ops                       *ops.Result         // live ops probe (RICH queues/metrics); nil if no ops endpoint or unreachable
+	MetricsRetentionText      string              // how long CPU/mem history is kept, e.g. "7 days" (from monitor.metrics_retention)
+}
+
+// metricsRetentionText renders a metrics-retention duration for the service page's trends note.
+func metricsRetentionText(d time.Duration) string {
+	switch h := d.Hours(); {
+	case h >= 48:
+		return strconv.Itoa(int(h/24)) + " days"
+	case h >= 1:
+		return strconv.Itoa(int(h)) + " hours"
+	default:
+		return "a short window"
+	}
 }
 
 // copyRef identifies one replica (copy) of a scaled service for the per-service page's copy
@@ -204,6 +218,7 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 	sv.Phase = s.supervisorStates(project)[service]
 	sv.Held = s.heldServices(project)[service]
 	sv.DesiredReplicas = s.scalingDesired(project)[service]
+	sv.MetricsRetentionText = metricsRetentionText(s.cfg.Monitor.MetricsRetention.D())
 
 	// Per-service ops: probe THIS service's ops endpoint (from the canonical) on demand,
 	// so its RICH queues / metric cards render on its own page. (The live poll fragment

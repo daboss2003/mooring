@@ -25,12 +25,12 @@ var authExempt = map[string]bool{
 	"GET /healthz":             true,
 	"POST /webhook/{token}":    true, // HMAC + replay + rate-limit gated instead
 	"POST /webhook/pr/{token}": true, // GitHub HMAC (X-Hub-Signature-256) gated instead
-	"GET /login":            true,
-	"POST /login":           true,
-	"POST /logout":          true,
-	"GET /session/status":   true, // non-refreshing liveness probe; returns 204/401 itself, no session data
-	"GET /static/theme.css": true,
-	"GET /static/":          true, // embedded asset FileServer (behind the allowlist)
+	"GET /login":               true,
+	"POST /login":              true,
+	"POST /logout":             true,
+	"GET /session/status":      true, // non-refreshing liveness probe; returns 204/401 itself, no session data
+	"GET /static/theme.css":    true,
+	"GET /static/":             true, // embedded asset FileServer (behind the allowlist)
 	// OAuth callback: a cross-site navigation back from github.com, so the Strict
 	// session cookie isn't sent. Authenticated instead by the single-use Lax OAuth
 	// state cookie that only an authenticated+CSRF'd /github/connect could have set.

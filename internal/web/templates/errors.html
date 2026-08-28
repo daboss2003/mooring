@@ -20,6 +20,7 @@
         {{if .CountHour}}<span class="badge badge-warn">{{.CountHour}} in the last hour</span>{{end}}
         {{if .Count5xx}}<span class="muted small">({{.Count5xx}} server 5xx)</span>{{end}}
       </summary>
+      {{$app := .App}}{{$svc := .Service}}
       <div class="err-body">
         <input type="text" class="stream-filter err-filter" placeholder="Filter these errors — type one or more words (a line must contain them all)" aria-label="Filter errors" autocomplete="off" spellcheck="false">
         <div class="err-lines mono">
@@ -30,6 +31,7 @@
             <span class="err-p">{{.Path}}</span>
             <span class="badge {{if ge .Status 500}}health-unhealthy{{else}}badge-warn{{end}}">{{.Status}}</span>
             <span class="muted small">{{.RemoteIP}} · {{printf "%.0f" .DurMs}}ms</span>
+            {{if $.ServiceLogEnabled}}<a class="muted small" href="/apps/{{pathEscape $app}}/services/{{pathEscape $svc}}/logs/history?at={{.At}}" title="See this service's own logs around this time">app logs ↗</a>{{end}}
           </div>
           {{end}}
           {{if not .Entries}}<div class="muted small">No recent requests captured for this route.</div>{{end}}
