@@ -160,11 +160,10 @@ type ServerConfig struct {
 	RouteErrorLogEnabled *bool `yaml:"route_error_log_enabled"`
 
 	// ServiceLogEnabled controls capturing + retaining each running service's own container output
-	// (stdout/stderr) so the operator can SEARCH a service's recent logs (the Logs tab on the service
-	// page), not only live-tail. It is OFF by default (a *bool: unset = off) — unlike the Errors tab,
-	// this writes the app's OWN output to disk, which may contain secrets/tokens/PII the app prints; so
-	// it is opt-in. When on, output is kept in a 0600 file in the data dir on a short TTL (48h), bounded
-	// per service, and readable only by an authenticated operator (the same audience as the live tail).
+	// (stdout/stderr) for the per-service log search. ON by default (a *bool: unset = on). Output is
+	// kept in a 0600 file in the data dir with a 48h TTL, bounded per service, readable only by an
+	// authenticated operator. It writes the app's own output to disk, which may contain secrets the app
+	// prints; set false to disable, which also removes the capture file on the next start.
 	ServiceLogEnabled *bool `yaml:"service_log_enabled"`
 
 	// BuildCacheKeepEnabled controls automatic reclamation of Docker/BuildKit build cache
@@ -200,10 +199,9 @@ func (s ServerConfig) ImageUpdateCheckOn() bool {
 	return s.ImageUpdateCheckEnabled == nil || *s.ImageUpdateCheckEnabled
 }
 
-// ServiceLogOn reports whether per-service log capture/retention is enabled. It defaults OFF (opt-in)
-// because it persists the app's own output to disk — see ServiceLogEnabled.
+// ServiceLogOn reports whether per-service log capture/retention is enabled (default on).
 func (s ServerConfig) ServiceLogOn() bool {
-	return s.ServiceLogEnabled != nil && *s.ServiceLogEnabled
+	return s.ServiceLogEnabled == nil || *s.ServiceLogEnabled
 }
 
 // DiskGCOn reports whether disk-pressure auto-reclaim is enabled (default ON). When disk

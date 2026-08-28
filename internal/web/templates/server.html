@@ -119,7 +119,7 @@
   <section class="panel">
     <h2>Image updates <span class="muted">(pull-image services)</span></h2>
     {{if not .ImageUpdateEnabled}}
-    <p class="muted">Off. To be told when a newer image is published for a service that runs a pinned image (e.g. <code>image: postgres:16</code>), set <code>server.image_update_check_enabled: true</code> in <code>/etc/mooring/config.yaml</code>. Mooring compares the pulled digest with the registry's current digest for that tag and, when they differ, flags it here (and alerts once). Services you build from git already get "update available" from the repo poller.</p>
+    <p class="muted">Disabled. Set <code>server.image_update_check_enabled: true</code> in <code>/etc/mooring/config.yaml</code> to check whether services that run a pinned image (e.g. <code>image: postgres:16</code>) have a newer image in their registry. Services built from git use the repo poller's "update available" instead.</p>
     {{else if not .ImageUpdates}}
     <p class="muted">Enabled — results appear here after the first check completes (a few minutes after start, then on schedule). Only services running a pinned image (not built from git, not digest-pinned) are checked.</p>
     {{else}}

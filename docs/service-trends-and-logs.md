@@ -1,81 +1,63 @@
-# A service's trends & logs
+# Service trends & logs
 
-Each service has its own page (open an app, then click a service). Beyond its live status and
-controls, that page gives you two ways to see what the service has been *doing over time* — trend
-charts and a searchable log history — so you can answer "is this getting worse?" and "what actually
-broke?" without SSHing in.
+Each service has its own page (open an app, then a service). Alongside its status and controls, the
+page shows trend charts and a searchable log history.
 
-See also: [The Errors tab](./errors.md) · [Scaling & self-healing](./scaling-and-self-healing.md) · [The Server tab](./server-tab.md)
+See also: [Errors](./errors.md) · [Scaling & self-healing](./scaling-and-self-healing.md) · [Server tab](./server-tab.md)
 
 ---
 
 ## Trend charts
 
-Under **Trends** on the service page you get three small charts that fill in as data is collected and
-refresh on their own:
+The **Trends** section shows three charts, refreshed in place:
 
-- **CPU** — the service's CPU use over time (%).
-- **Memory** — the service's memory use over time.
-- **Edge errors** — how many 4xx/5xx responses the managed edge returned for this service, in
-  5-minute buckets.
+- **CPU** — CPU use over time (%).
+- **Memory** — memory use over time.
+- **Edge errors** — 4xx/5xx responses the managed edge returned for the service, in 5-minute buckets.
 
-Hover any chart to read the exact value at a point in time. For a **scaled** service (several copies),
-CPU and memory are the *average across its copies*, so the trend reads the same whether it's running
-one replica or five.
+Hover a chart to read the value at a point in time. For a scaled service, CPU and memory are the
+average across its running copies.
 
-Where the numbers come from:
+Data sources:
 
-- **CPU and memory** are the same per-container readings Mooring already records for the Overview, kept
-  for as long as your metrics retention says (`monitor.metrics_retention`, **7 days** by default). The
-  page notes the current window.
-- **Edge errors** come from the same edge error log that powers the [Errors tab](./errors.md), so the
-  error trend covers the **last 24 hours**. If a service isn't fronted by the managed edge (or simply
-  hasn't errored), that chart is a flat zero — which is exactly the reassuring answer.
+- **CPU and memory** come from the per-container metrics Mooring records for the Overview, retained
+  for `monitor.metrics_retention` (default 7 days).
+- **Edge errors** come from the same edge error log as the [Errors tab](./errors.md), so the series
+  covers the last 24 hours. A service not fronted by the managed edge shows a flat zero.
 
-Nothing here needs configuring; the charts appear on every service page.
+No configuration is required; the charts appear on every service page.
 
 ## Log history & search
 
-The live **View logs** button tails a service's output right now. That's perfect in the moment, but
-it's gone when you close it — so it can't tell you what a service printed *at 3am when it fell over*.
+**View logs** live-tails a service's output and retains nothing. **Log history** searches captured
+output.
 
-**Log history** (the button next to **View logs**) fixes that: when enabled, Mooring captures each
-running service's own output (stdout/stderr) into a searchable, time-bounded history. On that page you
-can:
+When log capture is enabled, Mooring records each running service's stdout/stderr into a searchable
+history. The Log history page supports:
 
-- **filter by text** — type words; a line must contain them all (the same way you filter logs
-  elsewhere);
-- **pick a time range** — last 15 minutes / hour / 6 hours / 24 hours / all retained;
-- **narrow to one copy** of a scaled service, or merge all copies together (the default);
+- **text filter** — a line must contain every word entered;
+- **time range** — 15 minutes, 1 hour, 6 hours, 24 hours, or all retained;
+- **copy filter** — one replica of a scaled service, or all merged (the default).
 
-and, from the [Errors tab](./errors.md), click **app logs ↗** on any erroring request to jump straight
-to that service's logs *around the time of the error* — closing the loop from "which route is failing"
-(the edge's view) to "why" (the app's own error/stack, which the edge never sees).
+Each 4xx/5xx entry on the [Errors](./errors.md) page has an **app logs** link that opens the service's
+logs around that entry's timestamp.
 
-Logs are captured **going forward** from when a service starts running, and kept for about **two days**,
-then expire. They live in their own file, separate from Mooring's database, so this never slows the
-dashboard. Each service keeps a bounded amount of recent output, and a service that floods its logs is
-rate-limited (with a "*… N lines dropped*" marker) so it can neither crowd out other services nor fill
-the disk.
+Capture begins when a service starts running and keeps output for 48 hours. It is stored in a separate
+file from Mooring's database. Each service retains a bounded number of recent lines; lines beyond a
+per-second rate limit are dropped and replaced with a `… N lines dropped` marker.
 
-### Turning it on
+## Configuration
 
-Log retention is **off by default**, on purpose. Unlike the Errors tab — which only records the edge's
-*request metadata* (method, path, status, IP) — this writes the **app's own output** to disk, and app
-logs can contain secrets, tokens, or personal data that the app prints. So it's opt-in, and when on:
+Log capture is **on by default**. The capture file is `0600` in Mooring's data directory and is
+readable only by an authenticated operator. It writes the app's own output to disk, so it can contain
+any secrets the app prints.
 
-- the capture file is `0600` (owner-only) in Mooring's root-only data directory;
-- entries expire on the short TTL above;
-- reading it needs an authenticated operator — the same audience that can already live-tail.
-
-To turn it on, set in `/etc/mooring/config.yaml` and reload:
+To disable it, set in `/etc/mooring/config.yaml` and reload:
 
 ```yaml
 server:
-  service_log_enabled: true
+  service_log_enabled: false
 ```
 
-Because logs are only captured while it's on, turn it on *before* you need it — you can't retroactively
-capture what a service printed while capture was off. On a very high-traffic box you might leave it off
-(or turn it on only while chasing a specific problem). The live tail always works regardless, and never
-writes to disk.
+When disabled, Mooring removes the capture file on the next start. Only output produced while capture
+is enabled is retained.

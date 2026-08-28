@@ -28,7 +28,7 @@ That's the whole on-ramp. After that, you live in the dashboard.
 - **[The Activity tab](./activity.md)** — Mooring's own recent events (deploys, builds, backups, scans, self-heal) in one place, instead of grepping `journalctl`.
 - **[Scheduled tasks](./scheduled-tasks.md)** — what your cron jobs are doing right now (with live CPU/memory) and their recent run history, results, and logs.
 - **[Errors](./errors.md)** — every route that returned a 4xx/5xx at the edge in the last 24h, grouped by app and filterable, with an alert when a route keeps erroring.
-- **[A service's trends & logs](./service-trends-and-logs.md)** — per-service CPU/memory/error-rate charts over time, and opt-in searchable log history that closes the loop from an Errors entry to the app's own output.
+- **[Service trends & logs](./service-trends-and-logs.md)** — per-service CPU/memory/error-rate charts over time, and searchable log history with a link from any Errors entry to the service's own output.
 - **[An app's ops interface](./app-ops-interface.md)** — richer health, queues, and metrics for apps that expose them.
 
 ## Reference

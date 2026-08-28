@@ -172,36 +172,28 @@ server:
 yourself. Getting at those would mean handing the scanner the Docker socket, which would undo
 Mooring's security model — so it doesn't.)
 
-## When a newer image is available
+## Image updates
 
-When you deploy an app from a Git repo, Mooring watches the repo and tells you when there are new
-commits to deploy. But plenty of services don't come from your code — they run a pinned public
-image like `image: postgres:16` or `image: redis:7`. Those get new releases too (a security patch
-to Postgres, a new Redis point release), and nothing tells you.
+The **Image updates** section lists services that run a pinned image (for example `image: postgres:16`)
+and whether a newer image is available for that tag.
 
-The **Image updates** section on the Server page closes that gap. For every service that runs a
-pinned image, Mooring periodically asks the image's registry what digest that tag points to now,
-and compares it with the digest you actually pulled. When they differ, the service is flagged
-**"update available"** — a newer image has been published for that tag, and redeploying the app
-will pull it. It also sends you one alert (not every time it checks — only when a genuinely new
-digest appears). It's on by default and checks once a day (registry tags move slowly, and this
-keeps well under Docker Hub's rate limits).
+For each such service, Mooring reads the image's current digest from its registry and compares it
+with the pulled digest. When they differ, the service is marked **update available**; redeploying the
+app pulls the newer image. Mooring sends one alert per new digest and never redeploys on its own.
 
-A few things worth knowing:
+The check is **on by default** and runs every 24 hours (`server.image_update_interval`).
 
-- **It never updates anything on its own.** Just like the Git "update available", this only tells
-  you — you redeploy when it suits you. (Mooring never auto-deploys.)
-- **It only checks pinned public images.** Services you build from Git already get "update
-  available" from the repo poller, and a service pinned to an exact digest (`image: postgres@sha256:…`)
-  can't move, so both are skipped.
-- **It stays true to Mooring's security model.** The registry digest isn't reachable through
-  Mooring's read-only Docker proxy (by design), so this check runs the same way a deploy does — on
-  the `docker` command line, with metadata-only calls that read the manifest without pulling any
-  image layers, using whatever registry logins the host already has. If a registry is unreachable
-  or the image is private and the host isn't logged in, the check quietly records that it couldn't
-  look and moves on — it never alerts on a failed check.
+Scope and behavior:
 
-To turn it off:
+- Only services that run a pinned image are checked. Services built from Git use the repo poller's
+  "update available" instead; a service pinned to a digest (`image: postgres@sha256:…`) is skipped.
+- The registry digest is read with `docker` metadata-only commands (`docker image inspect`,
+  `docker buildx imagetools inspect`). It uses the host's existing registry logins and does not pull
+  image layers.
+- A registry that is unreachable, or a private image the host is not logged in to, records the error
+  for that service and does not alert.
+
+To disable it:
 
 ```yaml
 server:

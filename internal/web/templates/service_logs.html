@@ -7,14 +7,13 @@
 
   {{if not .Enabled}}
   <section class="panel">
-    <p class="muted">Retained log search is <strong>off</strong>. When on, Mooring captures each running service's
-      output (stdout/stderr) into a searchable, time-bounded history — so you can find the error behind an
-      Errors-tab entry without live-tailing. It's opt-in because it writes the app's own output to disk (which may
-      contain secrets the app prints); it's kept in a <code>0600</code> file in the data dir on a short TTL and is
-      readable only by a signed-in operator. To enable it, set in <code>/etc/mooring/config.yaml</code>:</p>
+    <p class="muted">Retained log search is off (<code>server.service_log_enabled: false</code>). Enable it to capture
+      each running service's stdout/stderr into a searchable history. The capture file is <code>0600</code> in the
+      data dir with a 48-hour retention and holds the app's own output, which may contain secrets the app prints.
+      Set in <code>/etc/mooring/config.yaml</code> and reload:</p>
     <pre class="stream">server:
   service_log_enabled: true</pre>
-    <p class="muted small">You can still <a href="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}">live-tail</a> the service any time — that never writes to disk.</p>
+    <p class="muted small">The live <a href="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}">log tail</a> works regardless and writes nothing to disk.</p>
   </section>
   {{else}}
   <section class="panel">
@@ -60,8 +59,8 @@
       {{end}}
     </div>
     {{else}}
-    <p class="muted">No retained log lines match. Logs appear here once the service is running and producing output
-      (captured going forward — retained for about two days). If you just enabled capture, give it a moment.</p>
+    <p class="muted">No retained log lines match. Lines appear once the service is running and producing output;
+      capture begins from when it is enabled and is retained for 48 hours.</p>
     {{end}}
   </section>
   {{end}}
