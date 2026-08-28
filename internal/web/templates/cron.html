@@ -1,0 +1,72 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Scheduled tasks</h1>
+  <p class="muted">Cron jobs your apps declare in <code>mooring.yaml</code> (<code>spec.scheduled_tasks</code>). See what's
+    running right now — with live CPU/memory and the app that owns it — and the recent run history with results and
+    logs (kept 7 days).</p>
+
+  <section class="panel">
+    <h2>Running now</h2>
+    <div data-poll-url="/partials/cron/running" data-poll-interval="4000">
+      {{template "cron_running" .}}
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Run history</h2>
+    {{if .CronHistory}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>When</th><th>App</th><th>Task</th><th>Result</th><th>Duration</th><th></th></tr></thead>
+      <tbody>
+      {{range .CronHistory}}
+        <tr>
+          <td class="mono">{{template "ts" .StartedAt}}</td>
+          <td class="mono">{{.Slug}}</td>
+          <td>{{.Task}} <span class="muted small">({{.Service}})</span></td>
+          <td>
+            {{if not .Finished}}<span class="badge">running…</span>
+            {{else if .OK}}<span class="badge health-healthy">ok</span>
+            {{else}}<span class="badge health-unhealthy">failed{{if .ExitCode}} (exit {{.ExitCode}}){{end}}</span>{{end}}
+            {{if .Detail}}<div class="muted small wrap-cell">{{.Detail}}</div>{{end}}
+          </td>
+          <td class="mono">{{if .DurationText}}{{.DurationText}}{{else}}—{{end}}</td>
+          <td><a class="link" href="/cron/runs/{{.ID}}">logs</a></td>
+        </tr>
+      {{end}}
+      </tbody>
+    </table></div>
+    {{if or .CronPrevURL .CronNextURL}}
+    <div class="pager mt1">
+      {{if .CronPrevURL}}<a class="btn btn-sm btn-ghost" href="{{.CronPrevURL}}">← Newer</a>{{end}}
+      {{if .CronNextURL}}<a class="btn btn-sm btn-ghost" href="{{.CronNextURL}}">Older →</a>{{end}}
+    </div>
+    {{end}}
+    {{else}}
+    <p class="muted">No scheduled-task runs yet. Declare tasks with <code>spec.scheduled_tasks</code> in <code>mooring.yaml</code> and they'll show up here after they run.</p>
+    {{end}}
+  </section>
+</main>
+{{template "bottom" .}}
+
+{{/* The "running now" section, shared by the page (inline) and the live-poll fragment. */}}
+{{define "cron_running"}}
+{{if .CronRunning}}
+<div class="table-scroll"><table class="grid">
+  <thead><tr><th>App</th><th>Task</th><th>Running for</th><th class="num">CPU</th><th class="num">Memory</th></tr></thead>
+  <tbody>
+  {{range .CronRunning}}
+    <tr>
+      <td class="mono">{{.Slug}}</td>
+      <td>{{.Task}} <span class="muted small">({{.Service}})</span></td>
+      <td class="mono">{{.ElapsedText}}</td>
+      <td class="num mono">{{if .HasStats}}{{pct1 .CPUPercent}}%{{else}}<span class="muted">—</span>{{end}}</td>
+      <td class="num mono">{{if .HasStats}}{{humanBytes .MemUsed}}{{if .MemLimit}} / {{humanBytes .MemLimit}}{{end}}{{else}}<span class="muted">measuring…</span>{{end}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table></div>
+{{else}}
+<p class="muted">Nothing running right now.</p>
+{{end}}
+{{end}}

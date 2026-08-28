@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/daboss2003/mooring/internal/cronstore"
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/eventlog"
 	"github.com/daboss2003/mooring/internal/monitor"
@@ -78,6 +79,13 @@ type tmplData struct {
 	Server      *serverView
 	ServerFiles *serverFilesView
 	Activity    []eventlog.Event // deduped operational events for the Activity tab
+
+	// Scheduled-tasks (cron) tab.
+	CronRunning []cronRunningView
+	CronHistory []cronHistoryView
+	CronPrevURL string
+	CronNextURL string
+	CronRun     *cronstore.HistoryRow // one run's log view
 
 	// UpdateBanner is the global self-update / security-advisory banner (nil = none),
 	// backfilled into every authenticated page by render().

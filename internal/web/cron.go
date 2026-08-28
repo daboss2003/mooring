@@ -18,9 +18,32 @@ import (
 // cronBaseInterval is how often the scheduler wakes to check which tasks are due.
 const cronBaseInterval = time.Minute
 
-// cronTaskTimeout caps a single scheduled-task run (a stuck job can't hold the docker slot
-// forever — the process group is reaped on timeout).
-const cronTaskTimeout = 30 * time.Minute
+// A single scheduled-task run is capped by its per-task timeout (spec.scheduled_tasks[].timeout,
+// default 30m via ScheduledTask.TimeoutD) — a stuck job can't hold the docker slot forever; the
+// process group is reaped on timeout.
+
+// cronHistoryTTL is how long a finished run (and its captured log) is kept on the Scheduled-tasks tab.
+const cronHistoryTTL = 7 * 24 * time.Hour
+
+// cronLog accumulates a scheduled task's output, bounded to the last cronLogKeep bytes (the tail —
+// where the error usually is), so a chatty task can't blow up memory or the stored log.
+const cronLogKeep = 64 << 10
+
+type cronLog struct {
+	lines []string
+	bytes int
+}
+
+func (b *cronLog) add(l string) {
+	b.lines = append(b.lines, l)
+	b.bytes += len(l) + 1
+	for b.bytes > cronLogKeep && len(b.lines) > 1 {
+		b.bytes -= len(b.lines[0]) + 1
+		b.lines = b.lines[1:]
+	}
+}
+
+func (b *cronLog) String() string { return strings.Join(b.lines, "\n") }
 
 // RunCron is the scheduled-task (cron) loop: each minute it checks every app's scheduled_tasks
 // and runs any that are DUE (its interval has elapsed since the last run) as a fresh one-shot
@@ -34,6 +57,9 @@ func (s *Server) RunCron(ctx context.Context) {
 	if s.cronStore == nil || s.gitStore == nil || s.defStore == nil || s.runner == nil || s.dockerSem == nil {
 		return
 	}
+	// A one-shot cron container cannot survive a restart, so any run still flagged "running" is a
+	// phantom from a prior crash/shutdown — clear it so the "running now" view is honest.
+	_ = s.cronStore.ReconcileRunningOnBoot(context.WithoutCancel(ctx), time.Now().Unix())
 	select {
 	case <-time.After(90 * time.Second): // let boot settle
 	case <-ctx.Done():
@@ -52,6 +78,8 @@ func (s *Server) RunCron(ctx context.Context) {
 }
 
 func (s *Server) cronTick(ctx context.Context) {
+	// Trim run history + logs past the TTL (indexed delete; usually a no-op).
+	_ = s.cronStore.PruneHistory(context.WithoutCancel(ctx), time.Now().Add(-cronHistoryTTL).Unix())
 	if ok, _ := s.runner.WriteAllowed(); !ok {
 		return
 	}
@@ -109,15 +137,22 @@ func (s *Server) runScheduledTask(ctx context.Context, slug string, task definit
 		Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile,
 		Action: []string{"run", "--rm", "--no-deps"}, Service: task.Service,
 	}
-	// Bind the run to the SERVER ctx (+ a cap) so a Mooring shutdown reaps a hung task instead
-	// of blocking the graceful stop for the whole timeout. Bookkeeping writes use a detached
-	// context so the outcome is still recorded even as the server ctx cancels.
+	// Bind the run to the SERVER ctx (+ the task's cap) so a Mooring shutdown reaps a hung task
+	// instead of blocking the graceful stop for the whole timeout. Bookkeeping writes use a detached
+	// context so the outcome is still recorded even as the server ctx cancels. The timeout is
+	// per-task (spec.scheduled_tasks[].timeout), defaulting to 30m — a task holds the single docker
+	// slot for its whole run, so the ceiling bounds how long it can block deploys/other tasks.
 	bg := context.WithoutCancel(ctx)
-	rctx, cancel := context.WithTimeout(ctx, cronTaskTimeout)
+	timeout := task.TimeoutD()
+	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Record the run start (a "running" row) so the Scheduled-tasks tab shows it live.
+	runID, _ := s.cronStore.StartRun(bg, slug, task.Name, task.Service, now)
+
 	var lastLine string
-	runErr := s.runner.RunHeld(rctx, job, func(l string) { lastLine = l })
+	var lg cronLog
+	runErr := s.runner.RunHeld(rctx, job, func(l string) { lastLine = l; lg.add(l) })
 	ok := runErr == nil
 	if runErr != nil {
 		// `run --rm` auto-removes on a clean exit, but a KILLED CLI (timeout/shutdown) can't —
@@ -126,6 +161,13 @@ func (s *Server) runScheduledTask(ctx context.Context, slug string, task definit
 		s.runner.ReapOneOffHeld(bg, slug)
 	}
 	_ = s.cronStore.Record(bg, slug, task.Name, now, ok)
+	detail := "service " + task.Service
+	exitCode := 0
+	if runErr != nil {
+		detail += ": " + cronFailReason(lastLine, rctx.Err(), timeout)
+		exitCode, _ = classifyExit(runErr)
+	}
+	_ = s.cronStore.FinishRun(bg, runID, time.Now().Unix(), ok, exitCode, detail, lg.String())
 	outcome := audit.OK
 	if runErr != nil {
 		outcome = audit.Error
@@ -138,27 +180,21 @@ func (s *Server) runScheduledTask(ctx context.Context, slug string, task definit
 			})
 		}
 	}
-	// Record WHY in the audit Detail — previously always blank, which made a failed scheduled task's
-	// incident row structurally unable to show a reason (the error was captured only in the alert +
-	// log). Lead with the task's last output line (usually the actual error, e.g. a permission
-	// denial), sanitized + bounded; fall back to a classified reason when it printed nothing.
-	detail := "service " + task.Service
-	if runErr != nil {
-		detail += ": " + cronFailReason(lastLine, rctx.Err())
-	}
+	// Record WHY in the audit Detail too (the same concise reason recorded on the run). Previously
+	// always blank, which made a failed task's incident row unable to show a reason.
 	_ = s.audit.Log(bg, audit.Event{Actor: "scheduler", Action: "scheduled_task", Target: slug + "/" + task.Name, Outcome: outcome, Level: audit.Security, Detail: detail})
 }
 
-// cronFailReason builds a concise, single-line audit reason for a failed scheduled task: the task's
-// last output line if it produced one (that is where the real error usually is), else a classified
-// reason for the empty-output cases. CR/LF/NUL are flattened and the string is length-bounded so it
-// can't break the audit row.
-func cronFailReason(lastLine string, ctxErr error) string {
+// cronFailReason builds a concise, single-line reason for a failed scheduled task: the task's last
+// output line if it produced one (that is where the real error usually is), else a classified reason
+// for the empty-output cases (timeout uses the actual per-task cap). CR/LF/NUL are flattened and the
+// string is length-bounded so it can't break the audit row.
+func cronFailReason(lastLine string, ctxErr error, timeout time.Duration) string {
 	r := strings.TrimSpace(lastLine)
 	if r == "" {
 		switch ctxErr {
 		case context.DeadlineExceeded:
-			return fmt.Sprintf("timed out after %s", cronTaskTimeout)
+			return fmt.Sprintf("timed out after %s", timeout)
 		case context.Canceled:
 			return "cancelled (Mooring shutting down)"
 		default:

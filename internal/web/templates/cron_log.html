@@ -1,0 +1,26 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  {{with .CronRun}}
+  <p><a href="/cron">← Scheduled tasks</a></p>
+  <h1>{{.Task}} <span class="muted">— {{.Slug}}</span></h1>
+  <section class="panel">
+    <div class="table-scroll"><table class="grid"><tbody>
+      <tr><td>App</td><td class="mono">{{.Slug}}</td></tr>
+      <tr><td>Service</td><td class="mono">{{.Service}}</td></tr>
+      <tr><td>Started</td><td>{{template "ts" .StartedAt}}</td></tr>
+      <tr><td>Result</td><td>
+        {{if not .Finished}}<span class="badge">running…</span>
+        {{else if .OK}}<span class="badge health-healthy">ok</span>
+        {{else}}<span class="badge health-unhealthy">failed{{if .ExitCode}} (exit {{.ExitCode}}){{end}}</span>{{end}}
+      </td></tr>
+      {{if .Detail}}<tr><td>Detail</td><td class="muted wrap-cell">{{.Detail}}</td></tr>{{end}}
+    </tbody></table></div>
+  </section>
+  <section class="panel">
+    <h2>Output <span class="muted small">(last 64 KB captured, kept 7 days)</span></h2>
+    {{if .Log}}<pre class="stream mono">{{.Log}}</pre>{{else}}<p class="muted">No output was captured for this run.</p>{{end}}
+  </section>
+  {{end}}
+</main>
+{{template "bottom" .}}

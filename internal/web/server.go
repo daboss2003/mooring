@@ -437,6 +437,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /incidents", s.requireAuth(s.withCSRFToken(s.handleIncidents)))
 	// Server tab: read-only host inspection (monitor/processes/disk) + gated .deb cleanup.
 	mux.HandleFunc("GET /activity", s.requireAuth(s.withCSRFToken(s.handleActivity)))
+	mux.HandleFunc("GET /cron", s.requireAuth(s.withCSRFToken(s.handleCron)))
+	mux.HandleFunc("GET /cron/runs/{id}", s.requireAuth(s.withCSRFToken(s.handleCronRunLog)))
+	mux.HandleFunc("GET /partials/cron/running", s.requireAuth(s.handleCronRunning))
 	mux.HandleFunc("GET /server", s.requireAuth(s.withCSRFToken(s.handleServer)))
 	mux.HandleFunc("GET /partials/server", s.requireAuth(s.handleServerPartial))
 	mux.HandleFunc("GET /server/files", s.requireAuth(s.withCSRFToken(s.handleServerFiles)))

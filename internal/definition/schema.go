@@ -116,8 +116,8 @@ type Spec struct {
 	// started by `up` (a profile) — Mooring runs it as a fresh one-shot `compose run --rm`
 	// container on each tick. No exec into a running container; no shell.
 	ScheduledTasks []ScheduledTask `yaml:"scheduled_tasks,omitempty"`
-	Git          *Git          `yaml:"git,omitempty"`
-	Setup        *Setup        `yaml:"setup,omitempty"`
+	Git            *Git            `yaml:"git,omitempty"`
+	Setup          *Setup          `yaml:"setup,omitempty"`
 }
 
 // Compose is GENERATED-ONLY: Mooring owns the compose. `source` defaults to and may
@@ -430,7 +430,8 @@ type ScalingMetric struct {
 type ScheduledTask struct {
 	Name    string `yaml:"name"`
 	Service string `yaml:"service"`
-	Every   string `yaml:"every"` // interval (e.g. "24h", "15m"); floored at 1m
+	Every   string `yaml:"every"`             // interval (e.g. "24h", "15m"); floored at 1m
+	Timeout string `yaml:"timeout,omitempty"` // max run time (e.g. "1h"); default 30m, floored at 1m, capped at 24h
 }
 
 // validateScheduledTasks checks each task names a valid, declared service, has a unique name,
@@ -495,8 +496,38 @@ func (s *Spec) validateScheduledTasks() error {
 		if err != nil || d <= 0 {
 			return fmt.Errorf("scheduled_task %q: every %q is not a valid positive duration (e.g. 24h, 15m)", t.Name, t.Every)
 		}
+		if t.Timeout != "" {
+			to, terr := time.ParseDuration(t.Timeout)
+			if terr != nil || to <= 0 {
+				return fmt.Errorf("scheduled_task %q: timeout %q is not a valid positive duration (e.g. 1h, 45m)", t.Name, t.Timeout)
+			}
+			if to > 24*time.Hour {
+				return fmt.Errorf("scheduled_task %q: timeout %q exceeds the 24h ceiling (a task holds the single docker slot for its whole run)", t.Name, t.Timeout)
+			}
+		}
 	}
 	return nil
+}
+
+// TimeoutD returns the task's run-time cap: its declared timeout (floored at 1m, capped at 24h) or
+// the 30m default when unset/invalid. A task holds the single docker slot for its run, so the cap
+// bounds how long it can block deploys/other tasks.
+func (t ScheduledTask) TimeoutD() time.Duration {
+	const def, floor, ceil = 30 * time.Minute, time.Minute, 24 * time.Hour
+	if t.Timeout == "" {
+		return def
+	}
+	d, err := time.ParseDuration(t.Timeout)
+	if err != nil || d <= 0 {
+		return def
+	}
+	if d < floor {
+		return floor
+	}
+	if d > ceil {
+		return ceil
+	}
+	return d
 }
 
 // ScheduledServiceSet returns the set of service names that are scheduled-only (referenced by
