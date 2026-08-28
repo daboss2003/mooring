@@ -586,4 +586,25 @@
     onFocusedNow(refreshCharts);
     setInterval(refreshCharts, 5000);
   }
+
+  // ---- per-route error-log filter (Errors tab) ----
+  // Each `.err-filter` input hides the `.err-line` rows in its accordion's `.err-body` that don't
+  // contain EVERY typed word. Delegated on document, so it also covers accordions opened later.
+  // Reads textContent only (CSP/XSS-safe).
+  document.addEventListener("input", function (e) {
+    var input = e.target;
+    if (!input.classList || !input.classList.contains("err-filter")) return;
+    var body = input.closest ? input.closest(".err-body") : null;
+    if (!body) return;
+    var terms = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    var lines = body.querySelectorAll(".err-line");
+    for (var i = 0; i < lines.length; i++) {
+      var txt = lines[i].textContent.toLowerCase();
+      var ok = true;
+      for (var j = 0; j < terms.length; j++) {
+        if (txt.indexOf(terms[j]) < 0) { ok = false; break; }
+      }
+      lines[i].style.display = ok ? "" : "none";
+    }
+  });
 })();

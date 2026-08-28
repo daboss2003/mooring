@@ -51,6 +51,13 @@ func (h *HostIndex) Set(routes []Route) {
 // is unknown — so unmatched/hostile traffic (a request with a bogus Host header that fell through to
 // Caddy's 404) is never attributed to any service.
 func (h *HostIndex) Lookup(host, path string) (Key, bool) {
+	key, _, ok := h.LookupRoute(host, path)
+	return key, ok
+}
+
+// LookupRoute is Lookup but also returns the matched route's path prefix — the route identity
+// (host + prefix) the per-route error log groups by. "" prefix means the whole-host route.
+func (h *HostIndex) LookupRoute(host, path string) (key Key, prefix string, ok bool) {
 	host = strings.ToLower(host)
 	h.mu.RLock()
 	routes := h.m[host]
@@ -63,9 +70,9 @@ func (h *HostIndex) Lookup(host, path string) (Key, bool) {
 		}
 	}
 	if !found {
-		return Key{}, false
+		return Key{}, "", false
 	}
-	return best.key, true
+	return best.key, best.prefix, true
 }
 
 // pathUnderPrefix reports whether reqPath is served by a route mounted at prefix ("" = the whole

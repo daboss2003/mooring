@@ -30,6 +30,7 @@ import (
 	"github.com/daboss2003/mooring/internal/docker"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/edge"
+	"github.com/daboss2003/mooring/internal/edgeerr"
 	"github.com/daboss2003/mooring/internal/edgemetrics"
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/eventlog"
@@ -77,6 +78,8 @@ func cmdServe(args []string) error {
 	// so everything from here on is teed into the store as well as journald.
 	eventStore := eventlog.New(filepath.Join(cfg.DataDir, "events.jsonl"))
 	log = slog.New(eventlog.NewHandler(baseLogHandler, eventStore))
+	// Per-route edge error log (4xx/5xx), fed by the edge access-log stream when the edge is managed.
+	edgeErrStore := edgeerr.New(filepath.Join(cfg.DataDir, "edge-errors.jsonl"))
 
 	// Fail-closed: probe that the sandbox actually lets us write the dirs we need,
 	// BEFORE the first deploy/edge-start EROFS's lazily. A missing ReadWritePaths
@@ -492,11 +495,29 @@ func cmdServe(args []string) error {
 				}
 			}
 			refreshEdgeIdx() // seed before the child starts logging
-			sup.AccessLine = edgemetrics.NewCollector(edgeAgg, edgeIdx).Ingest
-			// Turn Caddy's access log on/off per reconcile based on whether any enabled policy uses a
-			// source:edge metric — so enabling one takes effect on the next cycle without a restart,
-			// and an edge with none pays nothing.
-			edgeRecon.SetAccessLog(scalingStore.HasEdgeMetric)
+			// Each access-log line feeds BOTH the autoscaling metrics collector and the per-route
+			// error log (4xx/5xx). The line is json-parsed ONCE here and the parsed record handed to
+			// both — this runs on the single access-log drain goroutine, so it stays cheap.
+			metricsColl := edgemetrics.NewCollector(edgeAgg, edgeIdx)
+			var errAlerts edgeerr.Alerter
+			if cfg.Alerting.Enabled {
+				errAlerts = alertStore
+			}
+			errColl := edgeerr.NewCollector(edgeErrStore, edgeIdx, errAlerts)
+			sup.AccessLine = func(line []byte) {
+				rec, ok := edgemetrics.ParseAccessFull(line)
+				if !ok {
+					return
+				}
+				metricsColl.IngestRecord(rec)
+				errColl.IngestRecord(rec)
+			}
+			// Turn Caddy's access log on/off per reconcile: on when any enabled policy uses a
+			// source:edge metric OR the route error log is enabled (default). Enabling either takes
+			// effect on the next cycle without a restart; an edge with neither pays nothing.
+			edgeRecon.SetAccessLog(func() bool {
+				return scalingStore.HasEdgeMetric() || cfg.Server.RouteErrorLogOn()
+			})
 			// Keep the host→service attribution index fresh (a deploy/route edit changes it); same
 			// 15s cadence as the edge pool refresh.
 			wg.Add(1)
@@ -591,6 +612,7 @@ func cmdServe(args []string) error {
 		UpdateCheck: updateChecker,
 		ImageScans:  scanStore,
 		EventLog:    eventStore,
+		EdgeErrors:  edgeErrStore,
 		Log:         log,
 		Monitor:     mon,
 		OpsStore:    opsStore,
@@ -631,9 +653,11 @@ func cmdServe(args []string) error {
 			select {
 			case <-ctx.Done():
 				_ = eventStore.Flush() // final flush so a restart keeps recent activity
+				edgeErrStore.Flush()
 				return
 			case <-t.C:
 				_ = eventStore.Flush()
+				edgeErrStore.Flush()
 			}
 		}
 	}()

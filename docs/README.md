@@ -27,6 +27,7 @@ That's the whole on-ramp. After that, you live in the dashboard.
 - **[The Server tab](./server-tab.md)** — live host metrics and processes, image vulnerability scanning, disk reclamation, and keeping Mooring itself up to date.
 - **[The Activity tab](./activity.md)** — Mooring's own recent events (deploys, builds, backups, scans, self-heal) in one place, instead of grepping `journalctl`.
 - **[Scheduled tasks](./scheduled-tasks.md)** — what your cron jobs are doing right now (with live CPU/memory) and their recent run history, results, and logs.
+- **[Errors](./errors.md)** — every route that returned a 4xx/5xx at the edge in the last 24h, grouped by app and filterable, with an alert when a route keeps erroring.
 - **[An app's ops interface](./app-ops-interface.md)** — richer health, queues, and metrics for apps that expose them.
 
 ## Reference

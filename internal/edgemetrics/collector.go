@@ -19,16 +19,18 @@ func NewCollector(agg *Aggregator, idx *HostIndex) *Collector {
 // needs) and never panics, so it is safe to call directly from the supervisor's stdout scanner.
 // Unparseable / unattributable lines are no-ops.
 func (c *Collector) Ingest(line []byte) {
+	if rec, ok := ParseAccessFull(line); ok {
+		c.IngestRecord(rec)
+	}
+}
+
+// IngestRecord records an ALREADY-PARSED access record — so a caller that also feeds another consumer
+// (the per-route error log) can json-parse each line only once. Unattributable records are no-ops.
+func (c *Collector) IngestRecord(rec AccessRecord) {
 	if c == nil || c.agg == nil || c.idx == nil {
 		return
 	}
-	host, path, durMs, _, ok := ParseAccess(line)
-	if !ok {
-		return
+	if key, ok := c.idx.Lookup(rec.Host, rec.Path); ok {
+		c.agg.Record(key, rec.DurMs)
 	}
-	key, ok := c.idx.Lookup(host, path)
-	if !ok {
-		return
-	}
-	c.agg.Record(key, durMs)
 }

@@ -32,6 +32,7 @@ import (
 	"github.com/daboss2003/mooring/internal/docker"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/edge"
+	"github.com/daboss2003/mooring/internal/edgeerr"
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/eventlog"
 	"github.com/daboss2003/mooring/internal/github"
@@ -102,6 +103,7 @@ type Deps struct {
 	UpdateCheck *updatecheck.Checker // self-update / security-advisory posture (nil when disabled)
 	ImageScans  *imagescan.Store     // per-app Trivy scan results (surface on the Server tab)
 	EventLog    *eventlog.Store      // deduped operational events for the Activity tab (may be nil)
+	EdgeErrors  *edgeerr.Store       // per-route edge 4xx/5xx error log (may be nil)
 	Log         *slog.Logger
 	Monitor     *monitor.Monitor
 	OpsStore    *ops.ConfigStore
@@ -183,6 +185,7 @@ type Server struct {
 	updateCheck    *updatecheck.Checker         // self-update / security-advisory posture (may be nil)
 	imageScans     *imagescan.Store             // per-app Trivy scan results (may be nil)
 	eventLog       *eventlog.Store              // deduped operational events for the Activity tab (may be nil)
+	edgeErrors     *edgeerr.Store               // per-route edge 4xx/5xx error log (may be nil)
 	pendingApps    atomic.Pointer[[]pendingApp] // undeployed mooring.*.yaml siblings found in connected repos
 }
 
@@ -203,6 +206,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		updateCheck:   d.UpdateCheck,
 		imageScans:    d.ImageScans,
 		eventLog:      d.EventLog,
+		edgeErrors:    d.EdgeErrors,
 		db:            d.DB,
 		sessions:      session.New(d.DB, cfg.Session.IdleTimeout.D(), cfg.Session.AbsoluteTimeout.D()),
 		audit:         audit.New(d.DB, log),
@@ -437,6 +441,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /incidents", s.requireAuth(s.withCSRFToken(s.handleIncidents)))
 	// Server tab: read-only host inspection (monitor/processes/disk) + gated .deb cleanup.
 	mux.HandleFunc("GET /activity", s.requireAuth(s.withCSRFToken(s.handleActivity)))
+	mux.HandleFunc("GET /errors", s.requireAuth(s.withCSRFToken(s.handleErrors)))
 	mux.HandleFunc("GET /cron", s.requireAuth(s.withCSRFToken(s.handleCron)))
 	mux.HandleFunc("GET /cron/runs/{id}", s.requireAuth(s.withCSRFToken(s.handleCronRunLog)))
 	mux.HandleFunc("GET /partials/cron/running", s.requireAuth(s.handleCronRunning))

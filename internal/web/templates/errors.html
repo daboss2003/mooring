@@ -1,0 +1,50 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Errors</h1>
+  <p class="muted">Every route that returned a <strong>4xx or 5xx</strong> at the edge in the last 24 hours, grouped by app.
+    Expand a route to see the erroring requests — time, method, path, status, client IP, latency — and filter them.
+    This is the edge's view of each request, not the app's internal error text. A route with a sustained
+    <strong>5xx</strong> rate also raises an alert.</p>
+
+  {{if .ErrorApps}}
+  {{range .ErrorApps}}
+  <section class="panel">
+    <h2>{{.App}}</h2>
+    {{range .Routes}}
+    <details class="accordion">
+      <summary>
+        <span class="mono">{{.Host}}{{.RoutePath}}</span>
+        <span class="muted small">→ {{.Service}}</span>
+        <span class="badge {{if .Count5xx}}health-unhealthy{{end}}">{{.Count24h}} in 24h</span>
+        {{if .CountHour}}<span class="badge badge-warn">{{.CountHour}} in the last hour</span>{{end}}
+        {{if .Count5xx}}<span class="muted small">({{.Count5xx}} server 5xx)</span>{{end}}
+      </summary>
+      <div class="err-body">
+        <input type="text" class="stream-filter err-filter" placeholder="Filter these errors — type one or more words (a line must contain them all)" aria-label="Filter errors" autocomplete="off" spellcheck="false">
+        <div class="err-lines mono">
+          {{range .Entries}}
+          <div class="err-line">
+            <span class="err-t muted">{{template "ts" .At}}</span>
+            <span class="err-m">{{.Method}}</span>
+            <span class="err-p">{{.Path}}</span>
+            <span class="badge {{if ge .Status 500}}health-unhealthy{{else}}badge-warn{{end}}">{{.Status}}</span>
+            <span class="muted small">{{.RemoteIP}} · {{printf "%.0f" .DurMs}}ms</span>
+          </div>
+          {{end}}
+          {{if not .Entries}}<div class="muted small">No recent requests captured for this route.</div>{{end}}
+        </div>
+      </div>
+    </details>
+    {{end}}
+  </section>
+  {{end}}
+  {{else}}
+  <section class="panel">
+    <p class="muted">No route errors recorded in the last 24 hours. Routes appear here once one returns a 4xx or 5xx
+      (this needs the <strong>managed edge</strong>; the route error log is on by default and can be turned off with
+      <code>server.route_error_log_enabled: false</code>).</p>
+  </section>
+  {{end}}
+</main>
+{{template "bottom" .}}

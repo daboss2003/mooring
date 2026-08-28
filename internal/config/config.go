@@ -140,6 +140,13 @@ type ServerConfig struct {
 	// clamped to [50, 95]).
 	DiskGCThreshold int `yaml:"disk_gc_threshold"`
 
+	// RouteErrorLogEnabled controls the per-route edge error log (the Errors tab): when on, Mooring
+	// keeps the managed edge's access log flowing in-process and records each 4xx/5xx response per
+	// route (24h TTL), and alerts on a route with a sustained server-error rate. ON by default (a
+	// *bool: unset = on). It costs one JSON parse per request; set it false on a very high-traffic
+	// edge that doesn't want that, or if the edge isn't managed (then it does nothing anyway).
+	RouteErrorLogEnabled *bool `yaml:"route_error_log_enabled"`
+
 	// BuildCacheKeepEnabled controls automatic reclamation of Docker/BuildKit build cache
 	// after a build-deploy. Mooring's generated multi-stage Dockerfiles emit a unique,
 	// single-use runtime layer per deploy (`COPY --from=build /app /app` + the non-root
@@ -161,6 +168,11 @@ func (s ServerConfig) VersionCheckOn() bool {
 // ImageScanOn reports whether app vulnerability scanning is enabled (default on).
 func (s ServerConfig) ImageScanOn() bool {
 	return s.ImageScanEnabled == nil || *s.ImageScanEnabled
+}
+
+// RouteErrorLogOn reports whether the per-route edge error log is enabled (default on).
+func (s ServerConfig) RouteErrorLogOn() bool {
+	return s.RouteErrorLogEnabled == nil || *s.RouteErrorLogEnabled
 }
 
 // DiskGCOn reports whether disk-pressure auto-reclaim is enabled (default ON). When disk

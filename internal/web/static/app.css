@@ -320,6 +320,11 @@ details.accordion > summary:hover { color: var(--primary); }
 .subnav a:hover { color: var(--fg); background: var(--primary-soft); }
 .subnav a.active { color: var(--fg); border-bottom-color: var(--primary); }
 .pager { display: flex; gap: 0.6rem; align-items: center; }
+.err-body { margin-top: 0.5rem; }
+.err-lines { max-height: 22rem; overflow: auto; }
+.err-line { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.18rem 0; border-bottom: 1px solid var(--border); font-size: 0.85rem; white-space: nowrap; }
+.err-line .err-p { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; }
+details.accordion > summary .badge { margin-left: 0.4rem; }
 
 /* ============================= buttons ============================= */
 .btn, button[type=submit] {

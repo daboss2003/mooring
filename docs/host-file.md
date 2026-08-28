@@ -149,6 +149,7 @@ server:
   version_check_interval: 6h
   image_scan_enabled: true            # Trivy vulnerability scanning (heavy — turn off on a tiny box)
   image_scan_interval: 24h
+  route_error_log_enabled: true       # the per-route edge error log (Errors tab); on by default
   disk_gc_enabled: true               # reclaim dangling images + build cache when disk is tight
   disk_gc_threshold: 75               # % disk usage that triggers it (50–95)
   build_cache_keep_enabled: true      # trim BuildKit cache after each build-deploy

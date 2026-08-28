@@ -80,6 +80,9 @@ type tmplData struct {
 	ServerFiles *serverFilesView
 	Activity    []eventlog.Event // deduped operational events for the Activity tab
 
+	// Errors tab: per-route edge 4xx/5xx error log, grouped by app.
+	ErrorApps []errorsAppView
+
 	// Scheduled-tasks (cron) tab.
 	CronRunning []cronRunningView
 	CronHistory []cronHistoryView
