@@ -3,6 +3,7 @@ package web
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -28,11 +29,76 @@ type serviceLogView struct {
 	Capped           bool // hit the display cap (older matches exist — narrow the filter/range)
 }
 
-// serviceLogLineView is one retained log line for the template.
+// serviceLogLineView is one retained log line for the template. Level is a best-effort severity
+// ("error"|"warn"|"debug"|"") used only for color-coding.
 type serviceLogLineView struct {
-	At   int64
-	Copy string
-	Text string
+	At    int64
+	Copy  string
+	Text  string
+	Level string
+}
+
+var (
+	logErrTokens   = map[string]bool{"error": true, "err": true, "errors": true, "fatal": true, "panic": true, "critical": true, "crit": true, "alert": true, "emerg": true, "emergency": true, "exception": true, "severe": true, "failure": true}
+	logWarnTokens  = map[string]bool{"warn": true, "warning": true}
+	logDebugTokens = map[string]bool{"debug": true, "trace": true, "verbose": true}
+)
+
+// logLevel classifies a log line's severity for color-coding, from its level keyword or an HTTP
+// status code. Best-effort and conservative: it scans the line's alphanumeric tokens (so "level=error",
+// "[ERROR]", or a bare "502" all classify) and returns the highest severity found — "error", "warn",
+// "debug", or "" (none/normal). A 5xx status → error, a 4xx status → warn.
+func logLevel(text string) string {
+	var hasErr, hasWarn, hasDebug bool
+	var b strings.Builder
+	classify := func() {
+		if b.Len() == 0 {
+			return
+		}
+		t := b.String()
+		b.Reset()
+		switch {
+		case logErrTokens[t]:
+			hasErr = true
+		case logWarnTokens[t]:
+			hasWarn = true
+		case logDebugTokens[t]:
+			hasDebug = true
+		case len(t) == 3 && isDigits(t):
+			switch t[0] {
+			case '5':
+				hasErr = true
+			case '4':
+				hasWarn = true
+			}
+		}
+	}
+	for _, r := range strings.ToLower(text) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			classify()
+		}
+	}
+	classify()
+	switch {
+	case hasErr:
+		return "error"
+	case hasWarn:
+		return "warn"
+	case hasDebug:
+		return "debug"
+	}
+	return ""
+}
+
+func isDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
 }
 
 // rangePresetSeconds maps a time-range preset to a lookback in seconds (0 = no lower bound / "all").
@@ -100,7 +166,7 @@ func (s *Server) handleServiceLogHistory(w http.ResponseWriter, r *http.Request)
 	}
 
 	for _, l := range s.serviceLogs.Search(project, service, copyID, q, since, until, serviceLogDisplayCap) {
-		v.Lines = append(v.Lines, serviceLogLineView{At: l.At, Copy: l.Copy, Text: l.Text})
+		v.Lines = append(v.Lines, serviceLogLineView{At: l.At, Copy: l.Copy, Text: l.Text, Level: logLevel(l.Text)})
 	}
 	v.Capped = len(v.Lines) >= serviceLogDisplayCap
 	s.render(w, r, "service_logs.html", data)

@@ -716,6 +716,8 @@
       if (c) meta += "  ·  " + c.textContent.trim();
       lmMeta.textContent = meta;
       lmText.textContent = x ? x.textContent : line.textContent; // textContent is the FULL line (clip is visual only)
+      lmText.className = "stream"; // carry the line's severity color into the modal
+      ["lvl-error", "lvl-warn", "lvl-debug"].forEach(function (c) { if (line.classList.contains(c)) lmText.classList.add(c); });
       logModal.hidden = false;
     };
     var closeLogModal = function () { logModal.hidden = true; };

@@ -135,13 +135,15 @@ func (s *Store) appendLine(buf *svcBuf, l Line) {
 }
 
 // Search returns one service's captured lines, newest-first, filtered by an optional copy id, a
-// case-insensitive substring q, and an inclusive [since, until] time window (each <=0 disables that
-// bound), capped at limit. Marker (dropped-count) lines are only returned when no copy filter is set.
+// text query q, and an inclusive [since, until] time window (each <=0 disables that bound), capped at
+// limit. The query is word-AND: it is split on whitespace and a line must contain EVERY word (each a
+// case-insensitive substring, in any order) — so "statusCode 502" matches `{"statusCode":502}`. Marker
+// (dropped-count) lines are only returned when no copy filter is set.
 func (s *Store) Search(app, svc, copy, q string, since, until int64, limit int) []Line {
 	if limit <= 0 || limit > maxSearchLimit {
 		limit = defaultSearchN
 	}
-	q = strings.ToLower(strings.TrimSpace(q))
+	terms := strings.Fields(strings.ToLower(q))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked()
@@ -161,12 +163,27 @@ func (s *Store) Search(app, svc, copy, q string, since, until int64, limit int) 
 		if until > 0 && l.At > until {
 			continue
 		}
-		if q != "" && !strings.Contains(strings.ToLower(l.Text), q) {
+		if !matchesAll(l.Text, terms) {
 			continue
 		}
 		out = append(out, l)
 	}
 	return out
+}
+
+// matchesAll reports whether text contains every term (case-insensitive substring). No terms matches
+// everything.
+func matchesAll(text string, terms []string) bool {
+	if len(terms) == 0 {
+		return true
+	}
+	lt := strings.ToLower(text)
+	for _, t := range terms {
+		if !strings.Contains(lt, t) {
+			return false
+		}
+	}
+	return true
 }
 
 // Copies returns the distinct replica ids seen for a service (for the copy filter), sorted.

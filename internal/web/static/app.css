@@ -329,12 +329,22 @@ details.accordion > summary .badge { margin-left: 0.4rem; }
 /* Service log history: each captured line stays on ONE row (clipped with an ellipsis); clicking it
    opens a modal with the line's full content. */
 .log-lines { max-height: 64vh; overflow: auto; border: 1px solid var(--border); border-radius: 6px; padding: 0.3rem 0.6rem; }
-.log-line { display: flex; gap: 0.7rem; align-items: baseline; padding: 0.22rem 0.35rem; border-bottom: 1px solid var(--border); font-size: 0.85rem; white-space: nowrap; cursor: pointer; border-radius: 4px; }
+.log-line { display: flex; gap: 0.7rem; align-items: baseline; padding: 0.22rem 0.5rem; border-bottom: 1px solid var(--border); border-left: 3px solid transparent; font-size: 0.85rem; white-space: nowrap; cursor: pointer; border-radius: 4px; }
 .log-line:last-child { border-bottom: 0; }
 .log-line:hover { background: rgba(127, 127, 127, 0.12); }
 .log-line .log-t { flex: 0 0 auto; }
 .log-line .log-copy { flex: 0 0 auto; }
 .log-line .log-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* Severity color-coding (from the line's detected level / HTTP status). */
+.log-line.lvl-error { border-left-color: var(--error); }
+.log-line.lvl-warn { border-left-color: var(--warn); }
+.log-line.lvl-debug { border-left-color: var(--faint); }
+.log-line.lvl-error .log-text { color: var(--error); }
+.log-line.lvl-warn .log-text { color: var(--warn); }
+.log-line.lvl-debug .log-text { color: var(--faint); }
+#log-modal-text.lvl-error { color: var(--error); }
+#log-modal-text.lvl-warn { color: var(--warn); }
+#log-modal-text.lvl-debug { color: var(--faint); }
 
 /* Modal (log entry full view). Hidden by default via the [hidden] attribute. */
 .modal { position: fixed; inset: 0; z-index: 1000; }

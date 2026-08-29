@@ -52,7 +52,7 @@
     <p class="muted small">Click a line to see its full content.</p>
     <div class="log-lines mono">
       {{range .Lines}}
-      <div class="log-line" title="Click to see the full line">
+      <div class="log-line{{if .Level}} lvl-{{.Level}}{{end}}" title="Click to see the full line">
         <span class="log-t muted">{{template "ts" .At}}</span>
         {{if .Copy}}<span class="log-copy muted small">{{.Copy}}</span>{{end}}
         <span class="log-text">{{.Text}}</span>

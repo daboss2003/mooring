@@ -39,8 +39,14 @@ history. The Log history page supports:
 - **time range** — 15 minutes, 1 hour, 6 hours, 24 hours, or all retained;
 - **copy filter** — one replica of a scaled service, or all merged (the default).
 
-Each line is shown on a single row. Click a line (or focus it and press Enter) to open its full
-content in a dialog.
+Each line is shown on a single row. Click a line to open its full content in a dialog.
+
+Lines are color-coded by severity, detected from the line's level keyword (`error`, `warn`, `debug`,
+…) or an HTTP status code in it: error / 5xx in red, warning / 4xx in amber, debug dimmed, everything
+else normal.
+
+The text filter is word-AND: a line must contain every word, in any order — so `statusCode 502`
+matches a line containing both `statusCode` and `502`, even when they aren't adjacent.
 
 Each 4xx/5xx entry on the [Errors](./errors.md) page has an **app logs** link that opens the service's
 logs around that entry's timestamp.

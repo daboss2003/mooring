@@ -45,6 +45,29 @@ func TestRecordSearchAndCopyFilter(t *testing.T) {
 	}
 }
 
+func TestSearchIsWordAnd(t *testing.T) {
+	s := newTestStore(t, func() time.Time { return time.Unix(1000, 0) })
+	s.Record("shop", "api", "id", `{"level":"error","statusCode":502,"msg":"upstream down"}`)
+	s.Record("shop", "api", "id", `{"level":"info","statusCode":200,"msg":"ok"}`)
+
+	// The reported bug: "statusCode 502" (two words, in a line where they're not adjacent) must match.
+	if got := s.Search("shop", "api", "", "statusCode 502", 0, 0, 10); len(got) != 1 || got[0].Text[:20] != `{"level":"error","st` {
+		t.Fatalf("word-AND search should find the 502 line, got %+v", got)
+	}
+	// Order-independent: words can appear in any order.
+	if got := s.Search("shop", "api", "", "502 error", 0, 0, 10); len(got) != 1 {
+		t.Errorf("word order must not matter, got %d", len(got))
+	}
+	// All words required: a line missing one word does not match.
+	if got := s.Search("shop", "api", "", "statusCode 200 error", 0, 0, 10); len(got) != 0 {
+		t.Errorf("a line missing a required word must not match, got %d", len(got))
+	}
+	// Empty query returns everything.
+	if got := s.Search("shop", "api", "", "   ", 0, 0, 10); len(got) != 2 {
+		t.Errorf("blank query should return all, got %d", len(got))
+	}
+}
+
 func TestPerServiceRingDoesNotEvictOtherServices(t *testing.T) {
 	s := newTestStore(t, func() time.Time { return time.Unix(1000, 0) })
 	// One chatty service floods its own ring...
