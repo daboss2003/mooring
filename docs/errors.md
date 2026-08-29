@@ -12,7 +12,8 @@ Mooring's managed edge (Caddy) sees every request. The Errors tab records the on
 
 - an accordion per route, showing its error counts (**24h**, **last hour**, and how many were server **5xx**);
 - expand a route to see the erroring requests — **time, method, path, status, client IP, and latency** — newest first;
-- a **filter box** on each route: type words to narrow the list (e.g. `POST 500`, or a path fragment), the same way you filter logs elsewhere.
+- a **filter box** on each route: type words to narrow the list (e.g. `POST 500`, or a path fragment), the same way you filter logs elsewhere;
+- click a request to open a dialog with its full details (time, method, full path, status, client IP, latency, route) and a link to the service's own logs around that time.
 
 This is the **edge's view** of each request. It shows *which* routes are erroring and *how* — not the app's internal stack trace, which lives in the app's own container logs (the edge never sees it). A request whose `Host` matches no route is dropped, so scanner noise and bogus-Host 404s never get attributed to your services.
 

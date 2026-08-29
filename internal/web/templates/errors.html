@@ -11,6 +11,20 @@
   <div data-poll-url="/partials/errors" data-poll-interval="10000" data-poll-preserve>
     {{template "errorsbody" .}}
   </div>
+
+  {{/* Full-request view for one error entry (populated + shown by app.js on click). Outside the poll
+       fragment so it persists across live refreshes. */}}
+  <div class="ovl" id="err-modal" hidden>
+    <div class="ovl-backdrop" data-modal-close></div>
+    <div class="ovl-box" role="dialog" aria-modal="true" aria-label="Error request">
+      <div class="ovl-head">
+        <span class="ovl-title">Error request</span>
+        <button type="button" class="btn btn-sm" data-modal-close>Close</button>
+      </div>
+      <pre class="stream" id="err-modal-body"></pre>
+      <div class="ovl-foot"><a class="btn btn-sm" id="err-modal-logs" hidden href="#">View app logs around this time →</a></div>
+    </div>
+  </div>
 </main>
 {{template "bottom" .}}
 
@@ -28,12 +42,12 @@
       {{if .CountHour}}<span class="badge badge-warn">{{.CountHour}} in the last hour</span>{{end}}
       {{if .Count5xx}}<span class="muted small">({{.Count5xx}} server 5xx)</span>{{end}}
     </summary>
-    {{$app := .App}}{{$svc := .Service}}
+    {{$app := .App}}{{$svc := .Service}}{{$route := printf "%s%s" .Host .RoutePath}}
     <div class="err-body">
       <input type="text" class="stream-filter err-filter" placeholder="Filter these errors — type one or more words (a line must contain them all)" aria-label="Filter errors" autocomplete="off" spellcheck="false">
       <div class="err-lines mono">
         {{range .Entries}}
-        <div class="err-line">
+        <div class="err-line" title="Click for the full request" data-at="{{.At}}" data-method="{{.Method}}" data-path="{{.Path}}" data-status="{{.Status}}" data-ip="{{.RemoteIP}}" data-dur="{{printf "%.0f" .DurMs}}" data-app="{{$app}}" data-svc="{{$svc}}" data-route="{{$route}}"{{if $.ServiceLogEnabled}} data-logs="1"{{end}}>
           <span class="err-t muted">{{template "ts" .At}}</span>
           <span class="err-m">{{.Method}}</span>
           <span class="err-p" title="{{.Method}} {{.Path}}">{{.Path}}</span>

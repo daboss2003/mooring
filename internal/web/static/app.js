@@ -74,6 +74,46 @@
     for (var i = 0; i < terms.length; i++) { if (ll.indexOf(terms[i]) === -1) return false; }
     return true;
   }
+  // streamLevel classifies a log line's severity for color-coding — mirrors the server-side logLevel
+  // (internal/web/service_logs_page.go) so the live tail and the retained history color the same way.
+  // Scans alphanumeric tokens: a level keyword or a bare 5xx/4xx status classifies; "stderr"/"200ms"
+  // do not. Returns "error" | "warn" | "debug" | "".
+  var STREAM_ERR = { error: 1, err: 1, errors: 1, fatal: 1, panic: 1, critical: 1, crit: 1, alert: 1, emerg: 1, emergency: 1, exception: 1, severe: 1, failure: 1 };
+  var STREAM_WARN = { warn: 1, warning: 1 };
+  var STREAM_DEBUG = { debug: 1, trace: 1, verbose: 1 };
+  function streamLevel(line) {
+    var hasErr = false, hasWarn = false, hasDebug = false, lower = line.toLowerCase(), tok = "";
+    function classify() {
+      if (!tok) return;
+      // === 1 (not truthiness): a plain object inherits Object.prototype.constructor etc., so a bare
+      // STREAM_ERR["constructor"] lookup would be truthy and mis-color stack-trace lines.
+      if (STREAM_ERR[tok] === 1) hasErr = true;
+      else if (STREAM_WARN[tok] === 1) hasWarn = true;
+      else if (STREAM_DEBUG[tok] === 1) hasDebug = true;
+      else if (tok.length === 3 && /^[0-9]{3}$/.test(tok)) {
+        if (tok.charAt(0) === "5") hasErr = true;
+        else if (tok.charAt(0) === "4") hasWarn = true;
+      }
+      tok = "";
+    }
+    for (var i = 0; i < lower.length; i++) {
+      var ch = lower.charAt(i);
+      if ((ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9")) tok += ch;
+      else classify();
+    }
+    classify();
+    return hasErr ? "error" : hasWarn ? "warn" : hasDebug ? "debug" : "";
+  }
+  // streamLineEl builds one colorized line element (textContent only — never innerHTML, so a hostile
+  // log line can't inject markup).
+  function streamLineEl(line) {
+    var div = document.createElement("div");
+    div.className = "stream-line";
+    var lvl = streamLevel(line);
+    if (lvl) div.classList.add("lvl-" + lvl);
+    div.textContent = line;
+    return div;
+  }
   function updateStreamCount(pre) {
     var p = paneParts(pre);
     if (!p.count) return;
@@ -87,7 +127,14 @@
     var terms = paneTerms(pre);
     var shown = terms.length ? pre._lines.filter(function (l) { return lineMatches(l, terms); }) : pre._lines;
     pre._shown = shown.length;
-    pre.textContent = shown.length ? shown.join("\n") + "\n" : "";
+    if (pre._colorize) {
+      pre.textContent = "";
+      var frag = document.createDocumentFragment();
+      for (var i = 0; i < shown.length; i++) frag.appendChild(streamLineEl(shown[i]));
+      pre.appendChild(frag);
+    } else {
+      pre.textContent = shown.length ? shown.join("\n") + "\n" : "";
+    }
     pre.scrollTop = pre.scrollHeight;
     updateStreamCount(pre);
   }
@@ -112,7 +159,8 @@
     pre._lines.push(line);
     if (pre._lines.length === 1) pre.textContent = ""; // drop any pre-stream placeholder
     if (lineMatches(line, paneTerms(pre))) {
-      pre.textContent += line + "\n";
+      if (pre._colorize) pre.appendChild(streamLineEl(line));
+      else pre.textContent += line + "\n";
       pre.scrollTop = pre.scrollHeight;
       pre._shown++;
     }
@@ -207,12 +255,17 @@
       var logOut = document.getElementById("log-output");
       if (!logOut) return;
       if (logSource) logSource.close();
+      logOut._colorize = true; // color live log lines by severity (like the retained history)
       showStream(logOut);
       startStream(logOut); // reset buffer + reveal/wire the word-filter
       logOut.textContent = "… connecting to logs …";
       logSource = new EventSource(logURL);
       logSource.onmessage = function (e) { pushStreamLine(logOut, e.data); };
-      logSource.onerror = function () { logOut.textContent += "\n[log stream ended]\n"; logSource.close(); };
+      logSource.onerror = function () {
+        var end = document.createElement("div"); // append a node so the colored lines aren't flattened
+        end.className = "stream-line muted"; end.textContent = "[log stream ended]";
+        logOut.appendChild(end); logOut.scrollTop = logOut.scrollHeight; logSource.close();
+      };
       return;
     }
 
@@ -440,13 +493,23 @@
     var ms = parseInt(el.getAttribute("data-poll-interval") || "5000", 10);
     if (!url || ms < 1000) return;
     var preserve = el.hasAttribute("data-poll-preserve");
+    var preserveScroll = el.hasAttribute("data-poll-preserve-scroll");
     var pull = function () {
       if (!dashFocused()) return;
       // Don't yank the fragment out from under someone typing a filter in it.
       if (preserve && el.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
       fetch(url, { credentials: "same-origin", redirect: "error", headers: { "X-Requested-With": "fetch" } })
         .then(function (r) { return r.ok ? r.text() : null; })
-        .then(function (html) { if (html !== null) { if (preserve) swapPreserving(el, html); else el.innerHTML = html; localizeTimes(el); } })
+        .then(function (html) {
+          if (html === null) return;
+          var sc = preserveScroll ? el.scrollTop : 0;
+          var prevH = preserveScroll ? el.scrollHeight : 0;
+          if (preserve) swapPreserving(el, html); else el.innerHTML = html;
+          // The log list is newest-first, so new lines PREPEND. Pinned to the top (sc===0) → stay at
+          // top to see them; scrolled down → anchor by the height delta so the read content doesn't move.
+          if (preserveScroll) el.scrollTop = sc === 0 ? 0 : sc + (el.scrollHeight - prevH);
+          localizeTimes(el);
+        })
         .catch(function () { /* transient; try again next tick */ });
     };
     setInterval(pull, ms);
@@ -728,6 +791,47 @@
     });
     document.addEventListener("keydown", function (e) {
       if (e.key === "Escape" && !logModal.hidden) closeLogModal();
+    });
+  }
+
+  // ---- error-request modal (Errors tab): click a row to see the full request details (like the log
+  // modal). The inline "view app logs" link still navigates. ----
+  var errModal = document.getElementById("err-modal");
+  if (errModal) {
+    var emBody = document.getElementById("err-modal-body");
+    var emLogs = document.getElementById("err-modal-logs");
+    var pad = function (s, n) { s = String(s); while (s.length < n) s += " "; return s; };
+    var openErrModal = function (row) {
+      var at = parseInt(row.getAttribute("data-at"), 10);
+      var when = (at && !isNaN(at)) ? (TS_FMT ? TS_FMT.format(new Date(at * 1000)) : new Date(at * 1000).toLocaleString()) : "";
+      var app = row.getAttribute("data-app") || "", svc = row.getAttribute("data-svc") || "";
+      emBody.textContent = [
+        pad("Time", 9) + when,
+        pad("Method", 9) + (row.getAttribute("data-method") || ""),
+        pad("Path", 9) + (row.getAttribute("data-path") || ""),
+        pad("Status", 9) + (row.getAttribute("data-status") || ""),
+        pad("Client", 9) + (row.getAttribute("data-ip") || ""),
+        pad("Latency", 9) + (row.getAttribute("data-dur") || "0") + " ms",
+        pad("Route", 9) + (row.getAttribute("data-route") || "") + "  →  " + app + "/" + svc,
+      ].join("\n");
+      if (row.getAttribute("data-logs") === "1" && app && svc && at) {
+        emLogs.href = "/apps/" + encodeURIComponent(app) + "/services/" + encodeURIComponent(svc) + "/logs/history?at=" + at;
+        emLogs.hidden = false;
+      } else {
+        emLogs.hidden = true;
+      }
+      errModal.hidden = false;
+    };
+    var closeErrModal = function () { errModal.hidden = true; };
+    document.addEventListener("click", function (e) {
+      if (e.target.closest && e.target.closest("[data-modal-close]")) { closeErrModal(); return; }
+      if (e.target.closest && e.target.closest("#err-modal")) return; // clicks inside the box do nothing
+      if (e.target.closest && e.target.closest("a")) return;          // let the inline app-logs link navigate
+      var row = e.target.closest ? e.target.closest(".err-line") : null;
+      if (row && row.hasAttribute("data-at")) openErrModal(row);
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !errModal.hidden) closeErrModal();
     });
   }
 })();

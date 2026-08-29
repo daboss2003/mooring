@@ -43,7 +43,7 @@ Each line is shown on a single row. Click a line to open its full content in a d
 
 Lines are color-coded by severity, detected from the line's level keyword (`error`, `warn`, `debug`,
 …) or an HTTP status code in it: error / 5xx in red, warning / 4xx in amber, debug dimmed, everything
-else normal.
+else normal. The live **View logs** tail uses the same coloring.
 
 The text filter is word-AND: a line must contain every word, in any order — so `statusCode 502`
 matches a line containing both `statusCode` and `502`, even when they aren't adjacent.
@@ -51,9 +51,16 @@ matches a line containing both `statusCode` and `502`, even when they aren't adj
 Each 4xx/5xx entry on the [Errors](./errors.md) page has an **app logs** link that opens the service's
 logs around that entry's timestamp.
 
+The list updates live (every few seconds) unless you opened it from an Errors entry, which shows a
+fixed window around that request's time instead.
+
 Capture begins when a service starts running and keeps output for 48 hours. It is stored in a separate
-file from Mooring's database. Each service retains a bounded number of recent lines; lines beyond a
-per-second rate limit are dropped and replaced with a `… N lines dropped` marker.
+file from Mooring's database. Each service retains its most recent **2000 lines** (per copy); lines
+beyond a per-second rate limit are dropped and replaced with a `… N lines dropped` marker.
+
+For comparison, the live **View logs** tail shows roughly the last 300 lines from Docker and then
+streams new ones, but retains nothing — close it and it's gone. Log history is the retained,
+searchable copy (2000 lines per service, 48 hours).
 
 ## Configuration
 

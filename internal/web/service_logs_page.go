@@ -10,7 +10,7 @@ import (
 // serviceLogDisplayCap bounds how many retained lines the history page renders at once. It matches
 // the per-service ring size, so "All retained" shows everything kept for a single copy of the service
 // (the text filter + time range narrow within that).
-const serviceLogDisplayCap = 1000
+const serviceLogDisplayCap = 2000
 
 // deepLinkHalfWindow is the default ± seconds around an Errors-tab entry's timestamp when jumping to
 // the service's logs (?at=<unix> with no explicit &window=).
@@ -117,25 +117,18 @@ func rangePresetSeconds(preset string) int64 {
 	}
 }
 
-// handleServiceLogHistory renders one service's retained, searchable logs. Read-only, auth-gated. It
-// reads ONLY the in-memory/file-backed servicelog store — never the SQLite DB. A ?at=<unix> query
-// (from an Errors-tab entry) centers the window on that time; otherwise a ?range= preset applies.
-func (s *Server) handleServiceLogHistory(w http.ResponseWriter, r *http.Request) {
+// serviceLogView builds the retained-log view model from the request (q / range / copy / at). Shared
+// by the full page and the live-refresh rows fragment so the two can't drift. Reads ONLY the
+// in-memory/file-backed servicelog store — never the SQLite DB.
+func (s *Server) serviceLogView(r *http.Request) *serviceLogView {
 	project := r.PathValue("project")
 	service := r.PathValue("service")
 	v := &serviceLogView{
 		Project: project, Service: service,
 		Enabled: s.cfg.Server.ServiceLogOn() && s.serviceLogs != nil,
 	}
-	data := tmplData{
-		Title:      service + " logs — " + project,
-		Username:   sessionUser(r),
-		Project:    project,
-		ServiceLog: v,
-	}
 	if !v.Enabled {
-		s.render(w, r, "service_logs.html", data)
-		return
+		return v
 	}
 
 	q := r.URL.Query().Get("q")
@@ -169,5 +162,23 @@ func (s *Server) handleServiceLogHistory(w http.ResponseWriter, r *http.Request)
 		v.Lines = append(v.Lines, serviceLogLineView{At: l.At, Copy: l.Copy, Text: l.Text, Level: logLevel(l.Text)})
 	}
 	v.Capped = len(v.Lines) >= serviceLogDisplayCap
-	s.render(w, r, "service_logs.html", data)
+	return v
+}
+
+// handleServiceLogHistory renders one service's retained, searchable logs. Read-only, auth-gated. A
+// ?at=<unix> query (from an Errors-tab entry) centers the window on that time; otherwise a ?range=
+// preset applies and the list refreshes live from handleServiceLogRows.
+func (s *Server) handleServiceLogHistory(w http.ResponseWriter, r *http.Request) {
+	v := s.serviceLogView(r)
+	s.render(w, r, "service_logs.html", tmplData{
+		Title:      v.Service + " logs — " + v.Project,
+		Username:   sessionUser(r),
+		Project:    v.Project,
+		ServiceLog: v,
+	})
+}
+
+// handleServiceLogRows renders just the log-lines fragment for the page's live poll.
+func (s *Server) handleServiceLogRows(w http.ResponseWriter, r *http.Request) {
+	s.renderPartial(w, "servicelogrows", tmplData{ServiceLog: s.serviceLogView(r)})
 }

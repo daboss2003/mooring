@@ -38,7 +38,7 @@ type Line struct {
 
 const (
 	defaultTTL     = 48 * time.Hour
-	perServiceMax  = 1000 // recent lines kept PER service (its own ring; never evicts other services)
+	perServiceMax  = 2000 // recent lines kept PER service (its own ring; never evicts other services)
 	maxServices    = 48   // distinct services tracked (a box with more is extreme; new ones are dropped)
 	rateCapPerSec  = 200  // per-service lines/sec accepted; excess dropped + coalesced to a marker
 	maxLineBytes   = 8 << 10

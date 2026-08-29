@@ -346,15 +346,17 @@ details.accordion > summary .badge { margin-left: 0.4rem; }
 #log-modal-text.lvl-warn { color: var(--warn); }
 #log-modal-text.lvl-debug { color: var(--faint); }
 
-/* Modal (log entry full view). Hidden by default via the [hidden] attribute. */
-.modal { position: fixed; inset: 0; z-index: 1000; }
-.modal:not([hidden]) { display: flex; align-items: center; justify-content: center; padding: 1rem; }
-.modal-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.55); }
-.modal-box { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; width: 100%; max-width: min(920px, 94vw); max-height: 84vh; display: flex; flex-direction: column; box-shadow: 0 12px 44px rgba(0, 0, 0, 0.45); }
-.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); }
-.modal-title { font-weight: 600; }
-.modal-meta { padding: 0.55rem 0.9rem 0; }
-.modal-box .stream { margin: 0.55rem 0.9rem 0.9rem; flex: 1 1 auto; min-height: 0; max-height: none; overflow: auto; }
+/* Overlay dialog (log-entry full view). Namespaced .ovl* — NOT .modal, which the native
+   <dialog class="modal"> alert dialogs use (a .modal:not([hidden]) rule would force those open). */
+.ovl { position: fixed; inset: 0; z-index: 1000; }
+.ovl:not([hidden]) { display: flex; align-items: center; justify-content: center; padding: 1rem; }
+.ovl-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.55); }
+.ovl-box { position: relative; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; width: 100%; max-width: min(920px, 94vw); max-height: 84vh; display: flex; flex-direction: column; box-shadow: 0 12px 44px rgba(0, 0, 0, 0.45); }
+.ovl-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.7rem 0.9rem; border-bottom: 1px solid var(--border); }
+.ovl-title { font-weight: 600; }
+.ovl-meta { padding: 0.55rem 0.9rem 0; }
+.ovl-foot { padding: 0 0.9rem 0.9rem; }
+.ovl-box .stream { margin: 0.55rem 0.9rem 0.9rem; flex: 1 1 auto; min-height: 0; max-height: none; overflow: auto; }
 
 /* ============================= buttons ============================= */
 .btn, button[type=submit] {
@@ -403,6 +405,7 @@ dialog.modal form { padding: 1.4rem 1.5rem; max-width: none; }
 .kv-row label { flex: 1 1 12rem; }
 .check { display: flex; align-items: center; gap: 0.5rem; flex-direction: row; }
 .mt1 { margin-top: 1rem; }
+.mb1 { margin-bottom: 0.6rem; }
 .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; }
 .row label { margin-bottom: 0; }
 label { display: grid; gap: 0.35rem; font-size: 0.86rem; font-weight: 500; color: #cbd5e1; margin-bottom: 0.2rem; }
@@ -427,6 +430,14 @@ input:focus, select:focus, textarea:focus {
   font-size: 0.83rem; line-height: 1.5; color: #cdd9e5; max-height: 24rem; overflow: auto;
   white-space: pre-wrap; word-break: break-word;
 }
+/* One severity-colored line in a colorized stream (the live log tail). Inherits the pre's
+   pre-wrap/word-break; :empty keeps blank lines from collapsing. */
+.stream-line { white-space: pre-wrap; word-break: break-word; }
+.stream-line:empty { min-height: 1.5em; }
+.stream-line.lvl-error { color: var(--error); }
+.stream-line.lvl-warn { color: var(--warn); }
+.stream-line.lvl-debug { color: var(--faint); }
+
 /* "Close" button injected above an opened log/output/preview stream so it can be dismissed */
 .stream-close { display: block; width: fit-content; margin: 0.75rem 0 -0.25rem auto; }
 /* Stream filter toolbar: a word-filter input + a live "N / M matching" count, shown above

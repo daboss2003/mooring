@@ -491,6 +491,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs", s.requireAuth(s.handleServiceLogs))
 	// Retained log SEARCH (opt-in): the service's captured stdout/stderr history, filterable.
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs/history", s.requireAuth(s.handleServiceLogHistory))
+	mux.HandleFunc("GET /apps/{project}/services/{service}/logs/history/rows", s.requireAuth(s.handleServiceLogRows))
 	// withCSRFToken so the live-polled ops fragment carries a CSRF token for its
 	// per-service queue-action forms (re-injected on every poll, never stale).
 	mux.HandleFunc("GET /partials/service/{project}/{service}/ops", s.requireAuth(s.withCSRFToken(s.handleServiceOpsPartial)))
