@@ -76,11 +76,12 @@
   }
   // streamLevel classifies a log line's severity for color-coding — mirrors the server-side logLevel
   // (internal/web/service_logs_page.go) so the live tail and the retained history color the same way.
-  // Scans alphanumeric tokens: a level keyword or a bare 5xx/4xx status classifies; "stderr"/"200ms"
-  // do not. Returns "error" | "warn" | "debug" | "".
+  // A level keyword (whole-token) classifies; a status code counts only as a status FIELD's value, so a
+  // bare number like a responseTime is not mistaken for a 5xx. Returns "error" | "warn" | "debug" | "".
   var STREAM_ERR = { error: 1, err: 1, errors: 1, fatal: 1, panic: 1, critical: 1, crit: 1, alert: 1, emerg: 1, emergency: 1, exception: 1, severe: 1, failure: 1 };
   var STREAM_WARN = { warn: 1, warning: 1 };
   var STREAM_DEBUG = { debug: 1, trace: 1, verbose: 1 };
+  var STREAM_STATUS_RE = /status(?:_?code)?["']?[ \t]*[:=][ \t]*["']?([1-5][0-9][0-9])\b/g;
   function streamLevel(line) {
     var hasErr = false, hasWarn = false, hasDebug = false, lower = line.toLowerCase(), tok = "";
     function classify() {
@@ -90,10 +91,6 @@
       if (STREAM_ERR[tok] === 1) hasErr = true;
       else if (STREAM_WARN[tok] === 1) hasWarn = true;
       else if (STREAM_DEBUG[tok] === 1) hasDebug = true;
-      else if (tok.length === 3 && /^[0-9]{3}$/.test(tok)) {
-        if (tok.charAt(0) === "5") hasErr = true;
-        else if (tok.charAt(0) === "4") hasWarn = true;
-      }
       tok = "";
     }
     for (var i = 0; i < lower.length; i++) {
@@ -102,6 +99,12 @@
       else classify();
     }
     classify();
+    STREAM_STATUS_RE.lastIndex = 0;
+    var m;
+    while ((m = STREAM_STATUS_RE.exec(lower)) !== null) {
+      if (m[1].charAt(0) === "5") hasErr = true;
+      else if (m[1].charAt(0) === "4") hasWarn = true;
+    }
     return hasErr ? "error" : hasWarn ? "warn" : hasDebug ? "debug" : "";
   }
   // streamLineEl builds one colorized line element (textContent only — never innerHTML, so a hostile

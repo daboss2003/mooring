@@ -42,8 +42,10 @@ history. The Log history page supports:
 Each line is shown on a single row. Click a line to open its full content in a dialog.
 
 Lines are color-coded by severity, detected from the line's level keyword (`error`, `warn`, `debug`,
-…) or an HTTP status code in it: error / 5xx in red, warning / 4xx in amber, debug dimmed, everything
-else normal. The live **View logs** tail uses the same coloring.
+…) or a status field (`statusCode` / `status` = a 5xx/4xx value): error / 5xx in red, warning / 4xx in
+amber, debug dimmed, everything else normal. Only a status **field** counts — a bare number elsewhere
+(a response time, a byte count) is not mistaken for a status. The live **View logs** tail uses the
+same coloring.
 
 The text filter is word-AND: a line must contain every word, in any order — so `statusCode 502`
 matches a line containing both `statusCode` and `502`, even when they aren't adjacent.

@@ -2,6 +2,7 @@ package web
 
 import (
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -42,14 +43,23 @@ var (
 	logErrTokens   = map[string]bool{"error": true, "err": true, "errors": true, "fatal": true, "panic": true, "critical": true, "crit": true, "alert": true, "emerg": true, "emergency": true, "exception": true, "severe": true, "failure": true}
 	logWarnTokens  = map[string]bool{"warn": true, "warning": true}
 	logDebugTokens = map[string]bool{"debug": true, "trace": true, "verbose": true}
+	// logStatusRe matches an HTTP status code that is the VALUE OF A STATUS FIELD — status / statusCode
+	// / status_code = 4xx|5xx — so a bare 3-digit number elsewhere in the line (a response time, byte
+	// count, port) is NOT mistaken for a status. The key must be exactly status(code) followed by a real
+	// `:`/`=` (so statusTime / statusCount don't qualify), tolerating surrounding quotes/spaces for
+	// pretty-printed JSON. `[ \t]` (not `\s`) keeps this byte-identical to the JS mirror (RE2's `\s` is
+	// ASCII, JS's is Unicode); \b rejects a longer digit run.
+	logStatusRe = regexp.MustCompile(`status(?:_?code)?["']?[ \t]*[:=][ \t]*["']?([1-5][0-9][0-9])\b`)
 )
 
-// logLevel classifies a log line's severity for color-coding, from its level keyword or an HTTP
-// status code. Best-effort and conservative: it scans the line's alphanumeric tokens (so "level=error",
-// "[ERROR]", or a bare "502" all classify) and returns the highest severity found — "error", "warn",
-// "debug", or "" (none/normal). A 5xx status → error, a 4xx status → warn.
+// logLevel classifies a log line's severity for color-coding, from its level keyword or an HTTP status
+// code, returning the highest severity found — "error", "warn", "debug", or "" (none/normal). Level
+// keywords are matched on whole alphanumeric tokens (so "level=error"/"[ERROR]" classify but "stderr"
+// does not); a status code counts only when it is a status field's value (5xx → error, 4xx → warn).
 func logLevel(text string) string {
+	lower := strings.ToLower(text)
 	var hasErr, hasWarn, hasDebug bool
+
 	var b strings.Builder
 	classify := func() {
 		if b.Len() == 0 {
@@ -64,16 +74,9 @@ func logLevel(text string) string {
 			hasWarn = true
 		case logDebugTokens[t]:
 			hasDebug = true
-		case len(t) == 3 && isDigits(t):
-			switch t[0] {
-			case '5':
-				hasErr = true
-			case '4':
-				hasWarn = true
-			}
 		}
 	}
-	for _, r := range strings.ToLower(text) {
+	for _, r := range lower {
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
 			b.WriteRune(r)
 		} else {
@@ -81,6 +84,16 @@ func logLevel(text string) string {
 		}
 	}
 	classify()
+
+	for _, m := range logStatusRe.FindAllStringSubmatch(lower, -1) {
+		switch m[1][0] {
+		case '5':
+			hasErr = true
+		case '4':
+			hasWarn = true
+		}
+	}
+
 	switch {
 	case hasErr:
 		return "error"
@@ -90,15 +103,6 @@ func logLevel(text string) string {
 		return "debug"
 	}
 	return ""
-}
-
-func isDigits(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
-		}
-	}
-	return len(s) > 0
 }
 
 // rangePresetSeconds maps a time-range preset to a lookback in seconds (0 = no lower bound / "all").
