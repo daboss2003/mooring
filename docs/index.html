@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mooring docs — self-hosted PaaS for Docker</title>
+<meta name="description" content="Documentation for Mooring, a security-first self-hosted PaaS / control plane for Docker: install, deploy from Git, the mooring.yaml file, edge & TLS, alerting, backups, scaling, self-healing, and security.">
+<link rel="icon" type="image/svg+xml" href="../assets/logo.svg">
+<link rel="canonical" href="https://daboss2003.github.io/mooring/docs/">
+<link rel="stylesheet" href="//cdn.jsdelivr.net/npm/docsify@4/lib/themes/vue.css">
+<style>
+:root{
+  --theme-color:#6366f1; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+.sidebar{border-right:1px solid #eef0f5}
+.sidebar-nav li.active>a{color:#6366f1;border-right:2px solid #6366f1}
+.app-name-link{color:#12172b!important;font-weight:700}
+.markdown-section{max-width:52rem}
+.markdown-section h1,.markdown-section h2,.markdown-section h3{color:#12172b}
+.markdown-section code{color:#4f46e5;background:#eef0fe;font-family:var(--mono)}
+.markdown-section pre{background:#0d1330}
+.markdown-section pre>code{background:transparent;color:#dfe3f5}
+.markdown-section a{color:#4f46e5}
+.markdown-section table td,.markdown-section table th{border:1px solid #e7e9f2}
+.markdown-section blockquote{border-left:4px solid #6366f1;background:#f6f7fc}
+/* a "home" chip above the sidebar nav */
+.sidebar>.home-link{display:block;margin:0 0 6px;padding:6px 15px;font-size:13px;color:#6b7391}
+.sidebar>.home-link a{color:#4f46e5;text-decoration:none;font-weight:600}
+</style>
+</head>
+<body>
+<div id="app">Loading the docs…</div>
+<script>
+  window.$docsify = {
+    name: '⚓ Mooring',
+    nameLink: '/mooring/',
+    repo: 'https://github.com/daboss2003/mooring',
+    homepage: 'introduction.md',
+    loadSidebar: '_sidebar.md',
+    auto2top: true,
+    subMaxLevel: 2,
+    maxLevel: 3,
+    relativePath: true,
+    themeColor: '#6366f1',
+    search: {
+      placeholder: 'Search the docs…',
+      noData: 'No results.',
+      depth: 3,
+    },
+    // A "← Back to mooring.io" style link injected above the generated sidebar.
+    plugins: [
+      function (hook) {
+        hook.doneEach(function () {
+          var sb = document.querySelector('.sidebar');
+          if (sb && !sb.querySelector('.home-link')) {
+            var d = document.createElement('div');
+            d.className = 'home-link';
+            d.innerHTML = '<a href="../">← Mooring home</a>';
+            sb.insertBefore(d, sb.firstChild);
+          }
+        });
+      },
+    ],
+  }
+</script>
+<script src="//cdn.jsdelivr.net/npm/docsify@4"></script>
+<script src="//cdn.jsdelivr.net/npm/docsify@4/lib/plugins/search.min.js"></script>
+<script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-bash.min.js"></script>
+<script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-yaml.min.js"></script>
+<script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-go.min.js"></script>
+<script src="//cdn.jsdelivr.net/npm/prismjs@1/components/prism-json.min.js"></script>
+</body>
+</html>
