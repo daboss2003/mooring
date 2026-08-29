@@ -36,9 +36,10 @@ type errorEntryView struct {
 // narrows within them; the store keeps far more within the 24h TTL for the count rollups).
 const perRouteEntryCap = 100
 
-// handleErrors renders the Errors tab: every route that has returned a 4xx/5xx in the last 24h,
-// grouped by app, each expandable to its recent errors with a text filter. Read-only; auth-gated.
-func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
+// errorsData builds the Errors-tab view model: every route that has returned a 4xx/5xx in the last
+// 24h, grouped by app (alphabetical), each with its recent entries. Shared by the full page and the
+// live-refresh fragment so the two can't drift.
+func (s *Server) errorsData(r *http.Request) tmplData {
 	d := tmplData{Title: "Errors — Mooring", Username: sessionUser(r), ServiceLogEnabled: s.cfg.Server.ServiceLogOn() && s.serviceLogs != nil}
 	if s.edgeErrors != nil {
 		byApp := map[string]*errorsAppView{}
@@ -64,7 +65,18 @@ func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
 			d.ErrorApps = append(d.ErrorApps, *byApp[app])
 		}
 	}
-	s.render(w, r, "errors.html", d)
+	return d
+}
+
+// handleErrors renders the Errors tab. Read-only; auth-gated. The body refreshes live from
+// handleErrorsPartial.
+func (s *Server) handleErrors(w http.ResponseWriter, r *http.Request) {
+	s.render(w, r, "errors.html", s.errorsData(r))
+}
+
+// handleErrorsPartial renders just the Errors body fragment for the page's live poll.
+func (s *Server) handleErrorsPartial(w http.ResponseWriter, r *http.Request) {
+	s.renderPartial(w, "errorsbody", s.errorsData(r))
 }
 
 // routeDisplayPath renders a route's path prefix for display ("" = the whole host → "/").

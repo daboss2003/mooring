@@ -6,9 +6,10 @@ import (
 	"time"
 )
 
-// serviceLogDisplayCap bounds how many retained lines the history page renders at once (the store
-// keeps more within its TTL; the text filter + time range narrow to what's shown).
-const serviceLogDisplayCap = 500
+// serviceLogDisplayCap bounds how many retained lines the history page renders at once. It matches
+// the per-service ring size, so "All retained" shows everything kept for a single copy of the service
+// (the text filter + time range narrow within that).
+const serviceLogDisplayCap = 1000
 
 // deepLinkHalfWindow is the default ± seconds around an Errors-tab entry's timestamp when jumping to
 // the service's logs (?at=<unix> with no explicit &window=).

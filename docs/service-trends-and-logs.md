@@ -39,6 +39,9 @@ history. The Log history page supports:
 - **time range** — 15 minutes, 1 hour, 6 hours, 24 hours, or all retained;
 - **copy filter** — one replica of a scaled service, or all merged (the default).
 
+Each line is shown on a single row. Click a line (or focus it and press Enter) to open its full
+content in a dialog.
+
 Each 4xx/5xx entry on the [Errors](./errors.md) page has an **app logs** link that opens the service's
 logs around that entry's timestamp.
 

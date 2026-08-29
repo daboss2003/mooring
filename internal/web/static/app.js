@@ -401,15 +401,52 @@
   // refreshed by fetching that fragment and swapping its innerHTML. Same-origin,
   // GET-only, cookie-authenticated; CSP-safe (this file is script-src 'self').
   // Skipped while hidden; refreshes immediately on regaining focus.
+  // swapPreserving replaces a fragment's HTML while keeping interactive state that a blind swap would
+  // reset: which `<details data-key>` accordions are open, and each per-route filter's typed value
+  // (re-applied after the swap). Used for the Errors page live refresh (opt-in via data-poll-preserve).
+  function swapPreserving(el, html) {
+    var openKeys = {}, filterVals = {}, focusKey = null;
+    // Remember which route the keyboard is on (a focused <summary> or in-entry link), so the swap
+    // doesn't drop focus to <body>. (A focused INPUT is handled earlier by skipping the refresh.)
+    var ae = document.activeElement;
+    if (ae && el.contains(ae)) {
+      var fd = ae.closest ? ae.closest("details[data-key]") : null;
+      if (fd) focusKey = fd.getAttribute("data-key");
+    }
+    el.querySelectorAll("details[data-key]").forEach(function (d) {
+      var k = d.getAttribute("data-key");
+      if (d.open) openKeys[k] = true;
+      var inp = d.querySelector(".err-filter");
+      if (inp && inp.value) filterVals[k] = inp.value;
+    });
+    el.innerHTML = html;
+    localizeTimes(el); // localize BEFORE re-applying filters, so a time-substring filter matches the displayed text
+    el.querySelectorAll("details[data-key]").forEach(function (d) {
+      var k = d.getAttribute("data-key");
+      if (openKeys[k]) d.open = true;
+      if (filterVals[k] != null) {
+        var inp = d.querySelector(".err-filter");
+        if (inp) { inp.value = filterVals[k]; applyErrFilter(inp); }
+      }
+      if (focusKey && k === focusKey) {
+        var sm = d.querySelector("summary");
+        if (sm) { try { sm.focus({ preventScroll: true }); } catch (e) { sm.focus(); } }
+      }
+    });
+  }
+
   document.querySelectorAll("[data-poll-url]").forEach(function (el) {
     var url = el.getAttribute("data-poll-url");
     var ms = parseInt(el.getAttribute("data-poll-interval") || "5000", 10);
     if (!url || ms < 1000) return;
+    var preserve = el.hasAttribute("data-poll-preserve");
     var pull = function () {
       if (!dashFocused()) return;
+      // Don't yank the fragment out from under someone typing a filter in it.
+      if (preserve && el.contains(document.activeElement) && document.activeElement.tagName === "INPUT") return;
       fetch(url, { credentials: "same-origin", redirect: "error", headers: { "X-Requested-With": "fetch" } })
         .then(function (r) { return r.ok ? r.text() : null; })
-        .then(function (html) { if (html !== null) { el.innerHTML = html; localizeTimes(el); } })
+        .then(function (html) { if (html !== null) { if (preserve) swapPreserving(el, html); else el.innerHTML = html; localizeTimes(el); } })
         .catch(function () { /* transient; try again next tick */ });
     };
     setInterval(pull, ms);
@@ -647,11 +684,9 @@
 
   // ---- per-route error-log filter (Errors tab) ----
   // Each `.err-filter` input hides the `.err-line` rows in its accordion's `.err-body` that don't
-  // contain EVERY typed word. Delegated on document, so it also covers accordions opened later.
-  // Reads textContent only (CSP/XSS-safe).
-  document.addEventListener("input", function (e) {
-    var input = e.target;
-    if (!input.classList || !input.classList.contains("err-filter")) return;
+  // contain EVERY typed word. Delegated on document, so it also covers accordions opened later (and
+  // re-applied after a live refresh). Reads textContent only (CSP/XSS-safe).
+  function applyErrFilter(input) {
     var body = input.closest ? input.closest(".err-body") : null;
     if (!body) return;
     var terms = input.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
@@ -664,5 +699,33 @@
       }
       lines[i].style.display = ok ? "" : "none";
     }
+  }
+  document.addEventListener("input", function (e) {
+    if (e.target.classList && e.target.classList.contains("err-filter")) applyErrFilter(e.target);
   });
+
+  // ---- log-entry modal (service log history): a line stays clipped to one row; click it to read
+  // its FULL content in a modal. ----
+  var logModal = document.getElementById("log-modal");
+  if (logModal) {
+    var lmMeta = document.getElementById("log-modal-meta");
+    var lmText = document.getElementById("log-modal-text");
+    var openLogModal = function (line) {
+      var t = line.querySelector(".log-t"), c = line.querySelector(".log-copy"), x = line.querySelector(".log-text");
+      var meta = t ? t.textContent.trim() : "";
+      if (c) meta += "  ·  " + c.textContent.trim();
+      lmMeta.textContent = meta;
+      lmText.textContent = x ? x.textContent : line.textContent; // textContent is the FULL line (clip is visual only)
+      logModal.hidden = false;
+    };
+    var closeLogModal = function () { logModal.hidden = true; };
+    document.addEventListener("click", function (e) {
+      if (e.target.closest && e.target.closest("[data-modal-close]")) { closeLogModal(); return; }
+      var line = e.target.closest ? e.target.closest(".log-line") : null;
+      if (line) openLogModal(line);
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !logModal.hidden) closeLogModal();
+    });
+  }
 })();

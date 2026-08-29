@@ -18,6 +18,8 @@ This is the **edge's view** of each request. It shows *which* routes are errorin
 
 When [log history](./service-trends-and-logs.md#log-history--search) is enabled (the default), each erroring request has an **app logs** link to the service's own logs around that request's time.
 
+The page refreshes on its own every 10 seconds, so new errors appear without reloading. Accordions you have open and any filter text you have typed are preserved across a refresh.
+
 Entries are kept for **24 hours**, then pruned — this is a recent-errors view, not an archive. It lives in its own file, separate from Mooring's database, so it never slows the dashboard.
 
 ## The "this route keeps erroring" alert

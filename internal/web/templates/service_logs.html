@@ -49,12 +49,13 @@
   <section class="panel">
     {{if .Lines}}
     {{if .Capped}}<p class="muted small">Showing the most recent {{len .Lines}} matching lines — narrow the filter or range to see more.</p>{{end}}
-    <div class="err-lines mono">
+    <p class="muted small">Click a line to see its full content.</p>
+    <div class="log-lines mono">
       {{range .Lines}}
-      <div class="err-line">
-        <span class="err-t muted">{{template "ts" .At}}</span>
-        {{if .Copy}}<span class="muted small">{{.Copy}}</span>{{end}}
-        <span class="err-p">{{.Text}}</span>
+      <div class="log-line" title="Click to see the full line">
+        <span class="log-t muted">{{template "ts" .At}}</span>
+        {{if .Copy}}<span class="log-copy muted small">{{.Copy}}</span>{{end}}
+        <span class="log-text">{{.Text}}</span>
       </div>
       {{end}}
     </div>
@@ -63,6 +64,19 @@
       capture begins from when it is enabled and is retained for 48 hours.</p>
     {{end}}
   </section>
+
+  {{/* Full-content view for one log line (populated + shown by app.js on click). */}}
+  <div class="modal" id="log-modal" hidden>
+    <div class="modal-backdrop" data-modal-close></div>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-label="Log line">
+      <div class="modal-head">
+        <span class="modal-title">Log line</span>
+        <button type="button" class="btn btn-sm" data-modal-close>Close</button>
+      </div>
+      <div class="modal-meta muted small mono" id="log-modal-meta"></div>
+      <pre class="stream" id="log-modal-text"></pre>
+    </div>
+  </div>
   {{end}}
   {{end}}
 </main>
