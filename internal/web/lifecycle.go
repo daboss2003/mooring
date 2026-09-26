@@ -87,6 +87,53 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 		}
 	}
 
+	// Per-copy RESTART/START of a SCALED service: act on just the chosen container (`docker restart|start
+	// <id>`) instead of `compose restart|start <service>`, which cycles/starts EVERY copy. The replica
+	// count is unchanged, so — unlike a per-copy stop — no scaler coordination is needed. Runs on a
+	// detached context so a client disconnect can't SIGKILL it mid-restart.
+	if (action == "restart" || action == "start") && s.runner != nil {
+		if copyID := r.URL.Query().Get("copy"); copyID != "" {
+			if total, valid := serviceCopyStats(app, service, copyID); valid && total > 1 {
+				if allowed, reason := s.runner.WriteAllowed(); !allowed {
+					http.Error(w, reason, http.StatusForbidden)
+					return
+				}
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				clearWriteDeadline(w)
+				fl, _ := w.(http.Flusher)
+				onl := func(l string) {
+					fmt.Fprintln(w, l)
+					if fl != nil {
+						fl.Flush()
+					}
+				}
+				fmt.Fprintf(w, "$ docker %s %s\n", action, shortContainerID(copyID))
+				if fl != nil {
+					fl.Flush()
+				}
+				aCtx, aCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Minute)
+				defer aCancel()
+				defer s.leaseExpectedDown(aCtx, project)() // suppress self-heal during the intentional cycle
+				var e error
+				if action == "restart" {
+					e = s.runner.RestartContainers(aCtx, []string{copyID}, onl)
+				} else {
+					e = s.runner.StartContainers(aCtx, []string{copyID}, onl)
+				}
+				outcome := audit.OK
+				if e != nil {
+					outcome = audit.Error
+					fmt.Fprintf(w, "\n[failed: %v]\n", e)
+				} else {
+					fmt.Fprintln(w, "\n[done]")
+				}
+				_ = s.audit.Log(ctx, audit.Event{Actor: actor, IP: peer, Action: "lifecycle_" + action + "_copy", Target: project + "/" + service, Outcome: outcome, Level: audit.Info})
+				return
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering for live output
@@ -229,6 +276,34 @@ func (s *Server) applyHoldForAction(project, service, action, actor string, app 
 		}
 		_ = s.selfHeal.ClearHeldApp(ctx, project) // app-level start/redeploy releases every hold
 	}
+}
+
+// serviceCopyStats returns how many containers a service has (running OR stopped) and whether copyID
+// is one of them — used to decide between a per-copy restart/start (scaled, >1 copy) and the normal
+// whole-service action. Unlike replicaRunningCount it counts stopped copies too (a "start this copy"
+// targets a stopped one).
+func serviceCopyStats(app *monitor.App, service, copyID string) (total int, validCopy bool) {
+	if app == nil {
+		return 0, false
+	}
+	for _, svc := range app.Services {
+		if svc.Service != service {
+			continue
+		}
+		total++
+		if svc.ContainerID == copyID {
+			validCopy = true
+		}
+	}
+	return total, validCopy
+}
+
+// shortContainerID trims a container id to the conventional 12-char short form for display.
+func shortContainerID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // replicaRunningCount returns how many replicas of a service are currently running, and whether

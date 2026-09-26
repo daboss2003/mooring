@@ -512,6 +512,40 @@ func (r *Runner) RestartContainersHeld(ctx context.Context, ids []string, onLine
 	return r.runArgv(ctx, "", append([]string{"restart"}, ids...), onLine)
 }
 
+// RestartContainers restarts specific containers by id under the §0 gate + the one-docker-child
+// semaphore — for the operator's per-copy "Restart this copy" (a targeted `docker restart` instead of
+// `compose restart <service>`, which cycles every copy). Same no-scoping contract as RemoveContainers.
+func (r *Runner) RestartContainers(ctx context.Context, ids []string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.runArgv(ctx, "", append([]string{"restart"}, ids...), onLine)
+}
+
+// StartContainers starts specific stopped containers by id under the §0 gate + the one-docker-child
+// semaphore — for the operator's per-copy "Start this copy" (a targeted `docker start` instead of
+// `compose start <service>`, which starts every copy). Same no-scoping contract as RemoveContainers.
+func (r *Runner) StartContainers(ctx context.Context, ids []string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.runArgv(ctx, "", append([]string{"start"}, ids...), onLine)
+}
+
 // keepStorageFlag returns the correct "keep this much cache" flag for `docker builder
 // prune` on this host. Newer BuildKit renamed --keep-storage → --reserved-space (the old
 // name prints a deprecation warning and will be removed); older Docker only knows
