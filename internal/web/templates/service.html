@@ -37,7 +37,10 @@
       <button type="button" class="btn btn-sm btn-primary lc-btn" data-lc-confirm="Start the {{.Service}} service and resume auto-restart?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/start">Start</button>
       {{else}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart the {{.Service}} service?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart">Restart</button>
-      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop just the {{.Service}} service? It stays stopped (auto-restart paused) until you start it — the rest of the app keeps running." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/stop">Stop</button>
+      {{if gt (len .Copies) 1}}
+      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop just this copy ({{.ContainerName}})? The autoscaler removes it and keeps the other copies running." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/stop?copy={{pathEscape .ContainerID}}">Stop this copy</button>
+      {{end}}
+      <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop the {{.Service}} service{{if gt (len .Copies) 1}} (all copies){{end}}? It stays stopped (auto-restart paused) until you start it — the rest of the app keeps running." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/stop">Stop{{if gt (len .Copies) 1}} service{{end}}</button>
       {{if and .Policy .Policy.Enabled}}
       <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/up" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Add one replica now — auto-scaling still manages it (sheds it under sustained no load, keeps it under load)">+1 replica</button></form>
       <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/down" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Remove one replica now — never below the minimum">−1 replica</button></form>

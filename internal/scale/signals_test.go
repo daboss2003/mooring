@@ -31,11 +31,11 @@ func TestCustomSignalAggregation(t *testing.T) {
 		spec MetricSpec
 		run  int
 	}{
-		"no ops interface": {&monitor.App{Project: "x"}, MetricSpec{Name: "q", Source: "ops"}, 4},
+		"no ops interface":  {&monitor.App{Project: "x"}, MetricSpec{Name: "q", Source: "ops"}, 4},
 		"degraded to BASIC": {&monitor.App{Ops: &ops.Result{Mode: ops.BASIC}}, MetricSpec{Name: "q", Source: "ops"}, 4},
 		"probe errored":     {&monitor.App{Ops: &ops.Result{Mode: ops.RICH, Err: "timeout"}}, MetricSpec{Name: "q", Source: "ops"}, 4},
 		"running is zero":   {app, MetricSpec{Name: "q", Source: "ops", Select: "jobs"}, 0},
-		"unknown source":   {app, MetricSpec{Name: "q", Source: "prometheus"}, 4},
+		"unknown source":    {app, MetricSpec{Name: "q", Source: "prometheus"}, 4},
 	} {
 		if s := customSignal(tc.app, tc.spec, tc.run); s.Present {
 			t.Errorf("%s: signal must be absent (Present:false), got %+v", name, s)

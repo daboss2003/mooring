@@ -24,7 +24,8 @@ const (
 type Metrics struct {
 	CPUMeanPct float64
 	MemMaxPct  float64
-	AllHealthy bool
+	AllHealthy bool     // every replica running and not unhealthy (gates scale-DOWN)
+	AllReady   bool     // every replica running, not unhealthy, AND not still starting (gates scale-UP)
 	Signals    []Signal // custom per-service signals, keyed by name
 }
 
@@ -206,6 +207,14 @@ func Decide(st State, m Metrics, p Policy, ceiling int, now int64) Decision {
 			// Sustained desire to grow, but the capacity guard blocks it: refuse and
 			// alert (never a silent hold). Keep the breach timer so it re-fires.
 			return Decision{Target: cur, Action: ActRefused, Reason: "scale-up refused: no host capacity", Next: ns}
+		}
+		// Wait for the current replicas to be READY before adding another. A newly-added replica is
+		// "starting" (or unhealthy while it warms up), and piling on more while it isn't yet serving
+		// only deepens CPU contention — the whole fleet can sit pinned and none become healthy. Holding
+		// here (breach timer kept) means "add one, let it come up and take load, then reconsider". A
+		// service with no healthcheck reports no starting/unhealthy state, so this never blocks it.
+		if !m.AllReady {
+			return hold(ns, "waiting for the current replicas to become ready")
 		}
 		ns.Replicas = cur + 1 // up-eager, one step per tick
 		ns.LastChange = now

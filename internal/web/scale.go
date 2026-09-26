@@ -49,9 +49,27 @@ func (s *Server) Scale(ctx context.Context, appProject, service string, replicas
 	return s.runner.RunHeld(ctx, job, nil)
 }
 
+// RemoveReplica removes specific replica container(s) of a service by id (docker rm -f), for the
+// auto-scaler's targeted per-replica stop. Called with the one-docker-child semaphore already held (the
+// scaler acquires it before calling, like Scale). A protected project is refused (authority never
+// widens what may run). The caller has already verified the ids belong to this app+service.
+func (s *Server) RemoveReplica(ctx context.Context, appProject string, ids []string) error {
+	if s.runner == nil {
+		return fmt.Errorf("write plane unavailable")
+	}
+	if s.cfg.IsProtectedProject(appProject) {
+		return fmt.Errorf("refusing to modify a protected project %q", appProject)
+	}
+	return s.runner.RemoveContainersHeld(ctx, ids, nil)
+}
+
 // SetReplicaNudger wires the scaler's manual ±replica entry point (set post-construction by
 // cmd_serve, like the circuit clearer, to avoid an import cycle with the watcher goroutine).
 func (s *Server) SetReplicaNudger(f func(app, service string, delta int)) { s.replicaNudger = f }
+
+// SetReplicaStopper wires the scaler's targeted per-replica stop (remove one specific copy). Set
+// post-construction like SetReplicaNudger.
+func (s *Server) SetReplicaStopper(f func(app, service, containerID string)) { s.replicaStopper = f }
 
 // handleReplicaNudge applies a manual one-step replica change (dir=up/down → +1/−1) to a scalable
 // service. Only a service with an ENABLED scaling policy can be nudged — the scaler manages only

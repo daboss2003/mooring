@@ -12,6 +12,7 @@ import (
 	"github.com/daboss2003/mooring/internal/git"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/monitor"
+	"github.com/daboss2003/mooring/internal/selfheal"
 )
 
 // RunCertRenewWatcher closes the cert-renewal gap (plan §7.5): the edge auto-renews
@@ -84,6 +85,30 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 	changed := changedServices(readDigestState(rd), newDigests)
 	if len(changed) == 0 {
 		return // no leaf changed
+	}
+
+	// Never recreate a service the operator has HELD (manually stopped): a cert renewal must not
+	// relaunch a service the operator deliberately took down (self-heal + the scaler already skip held
+	// services; the cert-renew recreate must too). Drop held services from the recreate set.
+	if s.selfHeal != nil {
+		if held, herr := s.selfHeal.ActiveHeld(); herr == nil && len(held) > 0 {
+			kept := changed[:0:0]
+			for _, svc := range changed {
+				if held[selfheal.Key{App: slug, Service: svc}] {
+					s.log.Info("cert-renew: skipping held service (operator-stopped)", "app", slug, "service", svc)
+					continue
+				}
+				kept = append(kept, svc)
+			}
+			changed = kept
+			if len(changed) == 0 {
+				// Everything changed is held — record the new digests so we don't recheck every tick.
+				if werr := s.writeDigestState(rd, newDigests); werr != nil {
+					s.log.Warn("cert-renew: could not record digests", "app", slug, "err", werr)
+				}
+				return
+			}
+		}
 	}
 
 	// A leaf renewed → recreate the affected services, exactly as a deploy would.

@@ -71,6 +71,22 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 		return
 	}
 
+	// Per-copy stop of a SCALED service: remove just the chosen replica instead of every copy. The
+	// auto-scaler applies it race-free and lowers desired so it isn't relaunched. Falls through to the
+	// normal whole-service stop when there's a single replica or the copy id is unknown.
+	if action == "stop" && s.replicaStopper != nil {
+		if copyID := r.URL.Query().Get("copy"); copyID != "" {
+			if n, valid := replicaRunningCount(app, service, copyID); valid && n > 1 {
+				s.replicaStopper(project, service, copyID)
+				_ = s.audit.Log(ctx, audit.Event{Actor: actor, IP: peer, Action: "lifecycle_stop_replica", Target: project + "/" + service, Outcome: audit.OK, Level: audit.Info})
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				fmt.Fprintf(w, "Stopping this copy of %s — the autoscaler removes it and keeps the other copies running.\n", service)
+				return
+			}
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering for live output
@@ -126,27 +142,46 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 	writeln("$ docker compose %s%s", strings.Join(args, " "), serviceSuffix(service))
 
 	job := dockerexec.Job{Project: project, Dir: app.WorkingDir, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: args, Service: service}
+
+	// Run the docker action on a DETACHED context, NOT the request context. Otherwise, if the operator
+	// navigates away (or a proxy/network blip ends the streamed response) mid-action, r.Context() is
+	// cancelled and the exec wrapper SIGKILLs the whole `docker compose` process group — leaving a stop
+	// half-done (containers still up) and skipping the hold, so self-heal + the scaler relaunch it. That
+	// is the "stop rarely works" bug. Detaching lets the action finish regardless of the client; output
+	// still streams to w best-effort while the client is connected and harmlessly no-ops after it leaves.
+	actionTimeout := 10 * time.Minute
+	if action == "redeploy" {
+		actionTimeout = 30 * time.Minute // a build can be slow
+	}
+	actionCtx, cancelAction := context.WithTimeout(context.WithoutCancel(ctx), actionTimeout)
+	defer cancelAction()
+
+	// A STOP records the hold BEFORE acting (durable intent): the service stays skipped by self-heal and
+	// the scaler even if the stop is interrupted or errors, so it can never be relaunched behind the
+	// operator's back. start/restart/redeploy CLEAR the hold, but only AFTER a successful action.
+	if action == "stop" {
+		s.applyHoldForAction(project, service, action, actor, app)
+	}
+
 	// Hold an expected_down lease so the self-healing supervisor doesn't read this
 	// intentional restart/redeploy as a crash loop (plan §8.5).
-	defer s.leaseExpectedDown(ctx, project)()
+	defer s.leaseExpectedDown(actionCtx, project)()
 	onl := func(line string) { writeln("%s", line) }
 	var runErr error
 	if len(args) > 0 && args[0] == "up" {
 		// A redeploy is an `up` — recover from a stranded name conflict (interrupted recreate).
-		declared := s.reapScope(ctx, project)
-		runErr = s.runUpWithConflictReap(ctx, project, declared,
+		declared := s.reapScope(actionCtx, project)
+		runErr = s.runUpWithConflictReap(actionCtx, project, declared,
 			func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
 			s.runner.RemoveContainers, onl)
 	} else {
-		runErr = s.runner.Run(ctx, job, onl) // restart/stop/start: no name-allocation to conflict
+		runErr = s.runner.Run(actionCtx, job, onl) // restart/stop/start: no name-allocation to conflict
 	}
 
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(ctx, depID, code, outcome)
-	if runErr == nil {
-		// A successful stop HOLDS the service(s) so the self-heal supervisor + auto-scaler leave
-		// them down (a manual stop stays stopped); start/restart/redeploy RELEASES the hold. Uses a
-		// detached context — the request ctx may already be cancelled now the stream has ended.
+	if runErr == nil && action != "stop" {
+		// start/restart/redeploy RELEASE the hold after a successful action (stop already set it above).
 		s.applyHoldForAction(project, service, action, actor, app)
 	}
 	level := audit.Info
@@ -194,6 +229,25 @@ func (s *Server) applyHoldForAction(project, service, action, actor string, app 
 		}
 		_ = s.selfHeal.ClearHeldApp(ctx, project) // app-level start/redeploy releases every hold
 	}
+}
+
+// replicaRunningCount returns how many replicas of a service are currently running, and whether
+// copyID is one of them — used to decide between a per-copy stop (scaled, >1 running) and the normal
+// whole-service stop.
+func replicaRunningCount(app *monitor.App, service, copyID string) (n int, validCopy bool) {
+	if app == nil {
+		return 0, false
+	}
+	for _, svc := range app.Services {
+		if svc.Service != service || !svc.Running() {
+			continue
+		}
+		n++
+		if svc.ContainerID == copyID {
+			validCopy = true
+		}
+	}
+	return n, validCopy
 }
 
 // distinctServiceNames returns the unique service names of an app's live containers (a scaled

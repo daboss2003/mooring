@@ -39,9 +39,9 @@ func TestPolicyValidation(t *testing.T) {
 	}
 }
 
-var hot = Metrics{CPUMeanPct: 90, MemMaxPct: 50, AllHealthy: true}
-var cold = Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true}
-var warm = Metrics{CPUMeanPct: 60, MemMaxPct: 50, AllHealthy: true} // in the dead band
+var hot = Metrics{CPUMeanPct: 90, MemMaxPct: 50, AllHealthy: true, AllReady: true}
+var cold = Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, AllReady: true}
+var warm = Metrics{CPUMeanPct: 60, MemMaxPct: 50, AllHealthy: true, AllReady: true} // in the dead band
 
 func TestScaleUpRequiresSustainedBreach(t *testing.T) {
 	p := testCtlPolicy()
@@ -95,6 +95,27 @@ func TestDownRequiresAllHealthy(t *testing.T) {
 	}
 }
 
+func TestScaleUpWaitsForReplicasReady(t *testing.T) {
+	p := testCtlPolicy()
+	// Under sustained load with the breach timer already satisfied and cooldown clear, but a replica
+	// is still starting (AllReady=false): the controller must HOLD, not pile on another replica.
+	notReady := hot
+	notReady.AllReady = false
+	st := State{Replicas: 2, BreachSince: 1, LastChange: 0}
+	d := Decide(st, notReady, p, 5, 5000)
+	if d.Action != ActNone {
+		t.Fatalf("scale-up must hold while a replica is not yet ready, got %s target=%d", d.Action, d.Target)
+	}
+	if d.Next.BreachSince == 0 {
+		t.Error("holding for readiness must keep the breach timer so it fires once ready")
+	}
+	// Once every replica is ready, the same sustained breach scales up one step.
+	d = Decide(st, hot, p, 5, 5000)
+	if d.Action != ActUp || d.Target != 3 {
+		t.Fatalf("with replicas ready, sustained breach should scale up to 3, got %s target=%d", d.Action, d.Target)
+	}
+}
+
 func TestScaleUpRefusedAtCapacity(t *testing.T) {
 	p := testCtlPolicy()
 	// Sustained breach + cooldown ok, but the capacity ceiling == current (2).
@@ -139,27 +160,27 @@ func TestCustomSignalScaling(t *testing.T) {
 	base := State{Replicas: 2, BreachSince: 940, LastChange: 0}    // breach already sustained, no cooldown
 
 	// Queue per-replica at 150 (> up 100) with cold CPU/mem → scale UP.
-	m := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Value: 150, Present: true}}}
+	m := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, AllReady: true, Signals: []Signal{{Name: "queue", Value: 150, Present: true}}}
 	if d := Decide(base, m, p, 5, 1000); d.Action != ActUp {
 		t.Fatalf("queue above up threshold should scale up, got %s (%s)", d.Action, d.Reason)
 	}
 
 	// Cold CPU/mem AND queue below down (30 < 40) → scale DOWN allowed.
 	down := State{Replicas: 3, LastChange: 0}
-	mLow := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Value: 30, Present: true}}}
+	mLow := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, AllReady: true, Signals: []Signal{{Name: "queue", Value: 30, Present: true}}}
 	if d := Decide(down, mLow, p, 5, 1000); d.Action != ActDown {
 		t.Errorf("cold + queue below down should scale down, got %s", d.Action)
 	}
 
 	// Queue in the dead band (60, between down 40 and up 100) → HOLD (no up, and down blocked).
-	mMid := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Value: 60, Present: true}}}
+	mMid := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, AllReady: true, Signals: []Signal{{Name: "queue", Value: 60, Present: true}}}
 	if d := Decide(down, mMid, p, 5, 1000); d.Action != ActNone {
 		t.Errorf("queue in the dead band should hold, got %s", d.Action)
 	}
 
 	// MISSING signal (probe down): must NOT scale up, and must BLOCK scale-down even though
 	// CPU/mem are cold — we can't confirm the queue drained, so we hold capacity.
-	mMissing := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: []Signal{{Name: "queue", Present: false}}}
+	mMissing := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, AllReady: true, Signals: []Signal{{Name: "queue", Present: false}}}
 	if d := Decide(down, mMissing, p, 5, 1000); d.Action != ActNone {
 		t.Errorf("a missing custom signal must block scale-down (hold), got %s", d.Action)
 	}
@@ -172,10 +193,12 @@ func TestCustomSignalValidation(t *testing.T) {
 		t.Fatal("a valid custom signal should pass")
 	}
 	for _, mut := range []func(p *Policy){
-		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "", Up: 10, Down: 1}} },          // no name
-		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 40, Down: 40}} },         // up not above down
-		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 10, Down: -1}} },         // negative
-		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 10, Down: 1}, {Name: "q", Up: 20, Down: 2}} }, // dup
+		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "", Up: 10, Down: 1}} },   // no name
+		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 40, Down: 40}} }, // up not above down
+		func(p *Policy) { p.Signals = []SignalPolicy{{Name: "q", Up: 10, Down: -1}} }, // negative
+		func(p *Policy) {
+			p.Signals = []SignalPolicy{{Name: "q", Up: 10, Down: 1}, {Name: "q", Up: 20, Down: 2}}
+		}, // dup
 	} {
 		p := testCtlPolicy()
 		mut(&p)
@@ -215,7 +238,7 @@ func TestOmittedSignalIsInert(t *testing.T) {
 	// …but the signal is OMITTED from m.Signals entirely (no managed edge to measure it). It must be
 	// INERT: cold CPU/mem must still be allowed to scale DOWN (regression — it used to pin/ratchet).
 	down := State{Replicas: 3, LastChange: 0}
-	m := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, Signals: nil}
+	m := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, AllReady: true, Signals: nil}
 	if d := Decide(down, m, p, 5, 1000); d.Action != ActDown {
 		t.Errorf("an omitted (unmeasurable) signal must be inert, allowing scale-down; got %s (%s)", d.Action, d.Reason)
 	}

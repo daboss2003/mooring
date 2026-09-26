@@ -107,6 +107,59 @@ func TestWatcherScalesUpUnderLoad(t *testing.T) {
 	}
 }
 
+// A per-replica STOP removes exactly the chosen container and lowers desired to match, so the
+// reconcile does not relaunch it — and it never issues a count-based compose --scale (which would
+// reshuffle which replica is removed).
+func TestWatcherStopReplicaRemovesTargetAndLowersDesired(t *testing.T) {
+	st := testStore(t)
+	enablePolicy(t, st, 256<<20)
+	var snap *monitor.Snapshot
+	var clock int64 = 1000
+	sc := &fakeScaler{}
+	var removed []string
+	w := New(Config{
+		Store:            st,
+		Snap:             func() *monitor.Snapshot { return snap },
+		Sem:              dockerexec.NewSemaphore(),
+		Scaler:           sc,
+		RemoveContainers: func(_ context.Context, _ string, ids []string) error { removed = append(removed, ids...); return nil },
+		Log:              slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WritePlaneOK:     true, HostCPUMilli: 8000,
+		Reserves: Reserves{MemReserveBytes: 512 << 20, MemFreeFloor: 256 << 20, PerReplicaMemFloor: 64 << 20, NearOOMFreeBytes: 128 << 20},
+		Now:      func() int64 { return clock },
+	})
+	mk := func(ids ...string) *monitor.Snapshot {
+		var svcs []monitor.ServiceStatus
+		for _, id := range ids {
+			svcs = append(svcs, monitor.ServiceStatus{Service: "web", ContainerID: id, State: "running", Health: "healthy", CPUPercent: 5, MemBytes: 40 << 20, MemLimit: 512 << 20})
+		}
+		return &monitor.Snapshot{DockerOK: true, HostOK: true, Host: hostmon.Sample{MemTotal: 8 * GiBw, MemUsed: 1 * GiBw}, Apps: []monitor.App{{Project: "shop", Services: svcs}}}
+	}
+	snap = mk("c1", "c2", "c3")
+	w.states[Key{App: "shop", Service: "web"}] = State{Replicas: 3}
+
+	w.StopReplica("shop", "web", "c2")
+	w.Tick(context.Background())
+	if len(removed) != 1 || removed[0] != "c2" {
+		t.Fatalf("StopReplica must remove exactly c2, got %v", removed)
+	}
+	if got := w.states[Key{App: "shop", Service: "web"}].Replicas; got != 2 {
+		t.Errorf("desired must drop to 2 after removing one replica, got %d", got)
+	}
+	if sc.count() != 0 {
+		t.Errorf("targeted removal must NOT trigger compose --scale, got calls=%v", sc.calls)
+	}
+
+	// A stop for an already-gone replica id is a safe no-op.
+	snap = mk("c1", "c3")
+	before := len(removed)
+	w.StopReplica("shop", "web", "c2")
+	w.Tick(context.Background())
+	if len(removed) != before {
+		t.Errorf("removing an already-gone replica must be a no-op, got %v", removed[before:])
+	}
+}
+
 // A brand-new service that a deploy launched with 1 replica but declares min:2 must be grown to
 // its floor on first sight, even with NO load and NO prior scaling state. Regression for the
 // first-sight seed clamping desired up to min (which made Decide hold at min and never launch the
@@ -203,7 +256,7 @@ func TestWatcherSkipsHeldService(t *testing.T) {
 	w := newWatcher(t, st, &snap, &clock, sc, nil)
 	w.cfg.Held = func() map[Key]bool { return map[Key]bool{{App: "shop", Service: "web"}: true} }
 	w.states[Key{App: "shop", Service: "web"}] = State{Replicas: 2} // desired 2, but held
-	snap = snapWeb(0, 0, 0, 512<<20, 8*GiBw, 1*GiBw)               // stopped: 0 running
+	snap = snapWeb(0, 0, 0, 512<<20, 8*GiBw, 1*GiBw)                // stopped: 0 running
 	for i := 0; i < 4; i++ {
 		clock = 1000 + int64(i)*100
 		w.Tick(context.Background())

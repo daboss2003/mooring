@@ -147,18 +147,22 @@ type Reserves struct {
 
 // Config configures the auto-scaling Watcher.
 type Config struct {
-	Store        *Store
-	Alerts       *alertstore.Store // nil → refusals are logged only
-	Snap         func() *monitor.Snapshot
-	Sem          *dockerexec.Semaphore
-	Scaler       Scaler
-	Edge         EdgeReconciler // optional
-	Reserves     Reserves
-	Log          *slog.Logger
-	Interval     time.Duration
-	WritePlaneOK bool
-	HostCPUMilli uint64                                        // total host CPU (milli); 0 disables the CPU budget
-	IsCandidate  func(app, service string) (ServiceSpec, bool) // C1–C6 from compose; nil → trust the policy opt-in
+	Store  *Store
+	Alerts *alertstore.Store // nil → refusals are logged only
+	Snap   func() *monitor.Snapshot
+	Sem    *dockerexec.Semaphore
+	Scaler Scaler
+	// RemoveContainers removes specific replica container(s) by id (docker rm -f), for the operator's
+	// targeted per-replica stop. Called with the one-docker-child semaphore already held (like Scaler).
+	// nil → the per-replica stop is a no-op.
+	RemoveContainers func(ctx context.Context, app string, ids []string) error
+	Edge             EdgeReconciler // optional
+	Reserves         Reserves
+	Log              *slog.Logger
+	Interval         time.Duration
+	WritePlaneOK     bool
+	HostCPUMilli     uint64                                        // total host CPU (milli); 0 disables the CPU budget
+	IsCandidate      func(app, service string) (ServiceSpec, bool) // C1–C6 from compose; nil → trust the policy opt-in
 	// EdgeStats returns the edge-measured p95 latency (ms) and request rate (req/s) for a service
 	// over the rolling window, plus whether ANY request was sampled in it. It backs source:edge
 	// metrics. nil = no managed edge on this host → source:edge metrics are OMITTED (inert), so they
@@ -192,9 +196,10 @@ type Watcher struct {
 	states  map[Key]State
 	refused map[Key]bool // services with an open scale_refused_no_capacity alert
 
-	mu           sync.Mutex  // guards pendingNudge only (drained at tick start; never held during tick I/O)
-	pendingNudge map[Key]int // operator manual ±replica requests, applied at the next tick
-	nudges       map[Key]int // this tick's drained nudges (tick goroutine only)
+	mu            sync.Mutex       // guards pendingNudge + pendingRemove (never held during tick I/O)
+	pendingNudge  map[Key]int      // operator manual ±replica requests, applied at the next tick
+	pendingRemove map[Key][]string // operator per-replica STOP requests (container ids), applied next tick
+	nudges        map[Key]int      // this tick's drained nudges (tick goroutine only)
 }
 
 // Nudge requests a manual one-step change (+1 / −1) to a service's desired replica count. It only
@@ -213,6 +218,25 @@ func (w *Watcher) Nudge(app, service string, delta int) {
 		w.pendingNudge = map[Key]int{}
 	}
 	w.pendingNudge[Key{App: app, Service: service}] += delta
+	w.mu.Unlock()
+}
+
+// StopReplica requests removal of ONE specific replica container of a service (the operator's per-copy
+// "stop"). It is recorded under the lock and applied by the next tick, which removes exactly that
+// container and lowers desired by one — so the controller does not relaunch it. Doing the removal and
+// the state change together in the tick goroutine is what makes it race-free (a plain web-side remove
+// would be undone by the reconcile that relaunches a service running below its desired count). A stale
+// or already-gone id is verified against the live replicas at apply time, so it is a safe no-op.
+func (w *Watcher) StopReplica(app, service, containerID string) {
+	if containerID == "" {
+		return
+	}
+	k := Key{App: app, Service: service}
+	w.mu.Lock()
+	if w.pendingRemove == nil {
+		w.pendingRemove = map[Key][]string{}
+	}
+	w.pendingRemove[k] = append(w.pendingRemove[k], containerID)
 	w.mu.Unlock()
 }
 
@@ -249,7 +273,8 @@ type replicaGroup struct {
 	running    int
 	cpuSum     float64
 	memMaxPct  float64
-	allHealthy bool
+	allHealthy bool // no replica down or unhealthy (gates scale-down)
+	allReady   bool // allHealthy AND no replica still "starting" (gates scale-up)
 }
 
 // Tick runs one control pass. Exported for tests.
@@ -334,10 +359,10 @@ func (w *Watcher) groupReplicas(snap *monitor.Snapshot) map[Key]replicaGroup {
 			k := Key{App: app.Project, Service: svc.Service}
 			g := out[k]
 			if g.running == 0 {
-				g.allHealthy = true // seed; cleared by any unhealthy/down replica
+				g.allHealthy, g.allReady = true, true // seed; cleared by any down/unhealthy/starting replica
 			}
 			if !svc.Running() {
-				g.allHealthy = false
+				g.allHealthy, g.allReady = false, false
 				out[k] = g
 				continue
 			}
@@ -349,7 +374,12 @@ func (w *Watcher) groupReplicas(snap *monitor.Snapshot) map[Key]replicaGroup {
 				}
 			}
 			if svc.Health == "unhealthy" {
-				g.allHealthy = false
+				g.allHealthy, g.allReady = false, false
+			}
+			// A replica still coming up ("starting") isn't serving yet — it blocks scale-UP (don't pile
+			// on) but NOT scale-down. A service without a healthcheck never reports this state.
+			if svc.Health == "starting" {
+				g.allReady = false
 			}
 			out[k] = g
 		}
@@ -408,6 +438,12 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		}
 	}
 
+	// Operator per-replica STOP: remove exactly the chosen container(s) and lower desired to match,
+	// before any load-based decision this tick (race-free — see removeReplicas).
+	if w.removeReplicas(ctx, snap, k, g, now) {
+		return
+	}
+
 	// Host-capacity guard on fresh data, reserving against OTHER apps' desired (the
 	// live running total minus this service's own current contribution).
 	otherMem := adjust(lb.mem, -st.Replicas, p.PerReplicaMem)
@@ -448,7 +484,7 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		return
 	}
 
-	metrics := Metrics{AllHealthy: g.allHealthy}
+	metrics := Metrics{AllHealthy: g.allHealthy, AllReady: g.allReady}
 	if g.running > 0 {
 		metrics.CPUMeanPct = g.cpuSum / float64(g.running)
 	}
@@ -493,6 +529,79 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		w.emitRefused(ctx, k, nearOOM, capReason)
 		w.save(ctx, k, d.Next, now)
 	}
+}
+
+// removeReplicas applies any pending per-replica STOP for k: it removes exactly the chosen container(s)
+// and lowers desired to match, so the controller won't relaunch them. It returns true when it CONSUMED
+// a pending request (the caller then skips normal autoscaling for this service this tick); false when
+// there was nothing pending or it couldn't act yet (write plane closed / semaphore busy — the request
+// stays pending and retries next tick). Race-free: it runs in the tick goroutine, changing state and
+// containers together, so the running<desired reconcile can never relaunch the removed replica.
+func (w *Watcher) removeReplicas(ctx context.Context, snap *monitor.Snapshot, k Key, g replicaGroup, now int64) bool {
+	w.mu.Lock()
+	ids := w.pendingRemove[k]
+	w.mu.Unlock()
+	if len(ids) == 0 {
+		return false
+	}
+	clear := func() { w.mu.Lock(); delete(w.pendingRemove, k); w.mu.Unlock() }
+
+	// Only remove ids that are CURRENTLY running replicas of this service (a stale id whose container
+	// was already removed/recreated is dropped — a safe no-op).
+	live := runningReplicaIDs(snap, k)
+	var valid []string
+	for _, id := range ids {
+		if live[id] {
+			valid = append(valid, id)
+		}
+	}
+	if len(valid) == 0 {
+		clear()
+		return true
+	}
+	if w.cfg.RemoveContainers == nil || !w.cfg.WritePlaneOK {
+		return false // can't act now; keep pending, don't freeze normal autoscaling
+	}
+	if !w.cfg.Sem.TryAcquire() {
+		return false // one docker child busy this tick — retry next tick
+	}
+	defer w.cfg.Sem.Release()
+
+	newDesired := g.running - len(valid)
+	if newDesired < 1 {
+		newDesired = 1
+	}
+	// Drain the edge pool to the new count first so the edge stops dialing the replicas about to go.
+	if w.cfg.Edge != nil {
+		_ = w.cfg.Edge.ReconcilePool(ctx, k.App, k.Service, newDesired)
+	}
+	if err := w.cfg.RemoveContainers(ctx, k.App, valid); err != nil {
+		w.cfg.Log.Warn("scale: per-replica stop failed", "app", k.App, "service", k.Service, "err", err)
+		clear() // drop rather than loop on a failing removal
+		return true
+	}
+	st := w.states[k]
+	st.Replicas = newDesired
+	st.LastChange = now
+	w.save(ctx, k, st, now)
+	w.cfg.Log.Info("stopped replica(s)", "app", k.App, "service", k.Service, "removed", len(valid), "desired", newDesired)
+	clear()
+	return true
+}
+
+// runningReplicaIDs is the set of running container ids for one service in the snapshot.
+func runningReplicaIDs(snap *monitor.Snapshot, k Key) map[string]bool {
+	out := map[string]bool{}
+	app := snap.AppByProject(k.App)
+	if app == nil {
+		return out
+	}
+	for _, svc := range app.Services {
+		if svc.Service == k.Service && svc.Running() && svc.ContainerID != "" {
+			out[svc.ContainerID] = true
+		}
+	}
+	return out
 }
 
 // scaleGated applies the §0 + semaphore gates, then scales + reconciles the pool.

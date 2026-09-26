@@ -770,10 +770,12 @@ func cmdServe(args []string) error {
 	for _, p := range cfg.ProtectedProjects {
 		protected[p] = true
 	}
-	var shAlerts *alertstore.Store
-	if cfg.Alerting.Enabled {
-		shAlerts = alertStore
-	}
+	// Infra alerts (self-heal circuit-open, scale-refused) are ALWAYS recorded: EnqueueInfra just writes
+	// a deduped outbox row, which the dashboard surfaces and the alert engine delivers when alerting is
+	// enabled with a channel. Gating this on cfg.Alerting.Enabled (and capturing it at boot) meant a
+	// service that gave up self-healing raised NO alert when alerting was off — and enabling alerting via
+	// reload didn't help until a full restart. imagescan already wires the store unconditionally; match it.
+	shAlerts := alertStore
 	watcher := selfheal.New(selfheal.Config{
 		Store:  selfHealStore,
 		Alerts: shAlerts,
@@ -814,16 +816,17 @@ func cmdServe(args []string) error {
 		edgeLive = edgeAgg.Live
 	}
 	scaler := scale.New(scale.Config{
-		Store:        scalingStore,
-		Alerts:       shAlerts,
-		Snap:         mon.Snapshot,
-		Sem:          dockerSem,
-		Scaler:       srv,
-		Edge:         edgePool,
-		Log:          log,
-		Interval:     cfg.Monitor.PollInterval.D(),
-		WritePlaneOK: writeAllowed,
-		HostCPUMilli: uint64(runtime.NumCPU() * 1000),
+		Store:            scalingStore,
+		Alerts:           shAlerts,
+		Snap:             mon.Snapshot,
+		Sem:              dockerSem,
+		Scaler:           srv,
+		RemoveContainers: func(ctx context.Context, app string, ids []string) error { return srv.RemoveReplica(ctx, app, ids) },
+		Edge:             edgePool,
+		Log:              log,
+		Interval:         cfg.Monitor.PollInterval.D(),
+		WritePlaneOK:     writeAllowed,
+		HostCPUMilli:     uint64(runtime.NumCPU() * 1000),
 		// Edge-measured latency/req-rate for source:edge metrics, wired ONLY when the managed edge is
 		// owned (edgeAgg != nil). When it isn't, both are nil → the scaler OMITS source:edge signals
 		// entirely (inert — never pins scaling), rather than reading them as phantom zero-load.
@@ -893,6 +896,7 @@ func cmdServe(args []string) error {
 		},
 	})
 	srv.SetReplicaNudger(func(app, service string, delta int) { scaler.Nudge(app, service, delta) })
+	srv.SetReplicaStopper(func(app, service, containerID string) { scaler.StopReplica(app, service, containerID) })
 	wg.Add(1)
 	go func() { defer wg.Done(); scaler.Run(ctx) }()
 
