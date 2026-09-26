@@ -45,8 +45,14 @@ const (
 	// webhookNonceTTL keeps a used nonce at least as long as any timestamp signed
 	// with it can remain valid.
 	webhookNonceTTL = webhookReplayWindow + webhookForwardSkew
-	// gitDeployTimeout caps a webhook-triggered background fetch+deploy.
-	gitDeployTimeout = 15 * time.Minute
+	// gitDeployTimeout caps a whole fetch → build → `docker compose up` for one deploy (both the
+	// interactive stream and the webhook/poller background path use it). On expiry the exec wrapper
+	// SIGKILLs the compose process group, surfacing as "docker compose up failed: signal: killed".
+	// Sized for a cold, from-scratch build on a CPU-constrained box: `npm ci` + a bundler build for
+	// several services, plus image export, can legitimately run past a quarter hour when the host CPU
+	// is contended (a build competing with the running app). Too tight a cap kills an otherwise-healthy
+	// deploy midway; 45m gives a slow box room while still bounding a genuinely stuck deploy.
+	gitDeployTimeout = 45 * time.Minute
 	// gitFetchTimeout caps a single network git fetch, independent of the larger
 	// deploy cap. A read-plane fetch must never hold the shared single-flight gate for
 	// a deploy-sized window — a slow/hostile repo endpoint (slow-loris, tarpit) would

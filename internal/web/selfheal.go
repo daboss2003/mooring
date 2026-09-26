@@ -13,9 +13,13 @@ import (
 )
 
 // expectedDownLease bounds how long a single write-plane action may suppress the
-// supervisor — a generous ceiling; the lease is released as soon as the action
+// supervisor — a fail-safe ceiling; the lease is released as soon as the action
 // returns. A crashed action's lease auto-expires after this and is cleared on boot.
-const expectedDownLease = 15 * time.Minute
+// It MUST be >= the longest action that holds it, or the lease lapses while the
+// action is still running and the supervisor acts on an app mid-flight. The longest
+// holder is a git deploy (its `docker compose up --build` runs inside the lease), so
+// this tracks gitDeployTimeout; a slow build must never let self-heal fight the deploy.
+const expectedDownLease = gitDeployTimeout
 
 // rungAction maps a supervisor rung to the same static argv the operator's lifecycle
 // uses. restart changes no config; recreate/redeploy re-apply the compose (so they
