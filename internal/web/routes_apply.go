@@ -453,6 +453,8 @@ func scalingPolicyRow(sc definition.Scaling) scale.PolicyRow {
 			UpCPUPct: upCPU, DownCPUPct: downCPU,
 			UpMemPct: upMem, DownMemPct: downMem,
 			BreachForSecs: breach, CooldownUpSecs: cdUp, CooldownDownSecs: cdDown,
+			// scale_on_cpu_mem defaults ON (nil ⇒ CPU/mem triggers active); only an explicit false disables them.
+			NoCPUMem: sc.ScaleOnCPUMem != nil && !*sc.ScaleOnCPUMem,
 		},
 		Enabled:       sc.Enabled,
 		PerReplicaMem: uint64(sc.PerReplicaMemMiB) << 20,

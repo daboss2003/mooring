@@ -95,24 +95,24 @@ func (s *Store) SavePolicy(ctx context.Context, k Key, pr PolicyRow) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO scaling_policy
-		(app, service, enabled, min_replicas, max_replicas, up_cpu_pct, up_mem_pct, down_cpu_pct, down_mem_pct, breach_for_secs, cooldown_up, cooldown_down, per_replica_mem, per_replica_cpu, signals_json)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		(app, service, enabled, min_replicas, max_replicas, up_cpu_pct, up_mem_pct, down_cpu_pct, down_mem_pct, breach_for_secs, cooldown_up, cooldown_down, per_replica_mem, per_replica_cpu, signals_json, cpu_mem_enabled)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(app,service) DO UPDATE SET
 			enabled=excluded.enabled, min_replicas=excluded.min_replicas, max_replicas=excluded.max_replicas,
 			up_cpu_pct=excluded.up_cpu_pct, up_mem_pct=excluded.up_mem_pct, down_cpu_pct=excluded.down_cpu_pct,
 			down_mem_pct=excluded.down_mem_pct, breach_for_secs=excluded.breach_for_secs,
 			cooldown_up=excluded.cooldown_up, cooldown_down=excluded.cooldown_down,
 			per_replica_mem=excluded.per_replica_mem, per_replica_cpu=excluded.per_replica_cpu,
-			signals_json=excluded.signals_json`,
+			signals_json=excluded.signals_json, cpu_mem_enabled=excluded.cpu_mem_enabled`,
 		k.App, k.Service, b2i(pr.Enabled), pr.Min, pr.Max, pr.UpCPUPct, pr.UpMemPct, pr.DownCPUPct, pr.DownMemPct,
-		pr.BreachForSecs, pr.CooldownUpSecs, pr.CooldownDownSecs, int64(pr.PerReplicaMem), int64(pr.PerReplicaCPU), sigJSON)
+		pr.BreachForSecs, pr.CooldownUpSecs, pr.CooldownDownSecs, int64(pr.PerReplicaMem), int64(pr.PerReplicaCPU), sigJSON, b2i(!pr.NoCPUMem))
 	return err
 }
 
 // EnabledPolicies returns every enabled policy keyed by (app,service).
 func (s *Store) EnabledPolicies() (map[Key]PolicyRow, error) {
 	rows, err := s.db.Query(`SELECT app, service, min_replicas, max_replicas, up_cpu_pct, up_mem_pct,
-		down_cpu_pct, down_mem_pct, breach_for_secs, cooldown_up, cooldown_down, per_replica_mem, per_replica_cpu, signals_json
+		down_cpu_pct, down_mem_pct, breach_for_secs, cooldown_up, cooldown_down, per_replica_mem, per_replica_cpu, signals_json, cpu_mem_enabled
 		FROM scaling_policy WHERE enabled=1`)
 	if err != nil {
 		return nil, err
@@ -124,11 +124,13 @@ func (s *Store) EnabledPolicies() (map[Key]PolicyRow, error) {
 		var pr PolicyRow
 		var mem, cpu int64
 		var sig string
+		var cpuMemEnabled int
 		if err := rows.Scan(&k.App, &k.Service, &pr.Min, &pr.Max, &pr.UpCPUPct, &pr.UpMemPct,
-			&pr.DownCPUPct, &pr.DownMemPct, &pr.BreachForSecs, &pr.CooldownUpSecs, &pr.CooldownDownSecs, &mem, &cpu, &sig); err != nil {
+			&pr.DownCPUPct, &pr.DownMemPct, &pr.BreachForSecs, &pr.CooldownUpSecs, &pr.CooldownDownSecs, &mem, &cpu, &sig, &cpuMemEnabled); err != nil {
 			return nil, err
 		}
 		pr.Enabled = true
+		pr.NoCPUMem = cpuMemEnabled == 0
 		pr.PerReplicaMem, pr.PerReplicaCPU = uint64(mem), uint64(cpu)
 		if err := pr.unmarshalSignals(sig); err != nil {
 			return nil, err
@@ -164,11 +166,12 @@ func (s *Store) PolicyFor(k Key) (PolicyRow, bool, error) {
 	var mem, cpu int64
 	var en int
 	var sig string
+	var cpuMemEnabled int
 	err := s.db.QueryRow(`SELECT enabled, min_replicas, max_replicas, up_cpu_pct, up_mem_pct, down_cpu_pct,
-		down_mem_pct, breach_for_secs, cooldown_up, cooldown_down, per_replica_mem, per_replica_cpu, signals_json
+		down_mem_pct, breach_for_secs, cooldown_up, cooldown_down, per_replica_mem, per_replica_cpu, signals_json, cpu_mem_enabled
 		FROM scaling_policy WHERE app=? AND service=?`, k.App, k.Service).
 		Scan(&en, &pr.Min, &pr.Max, &pr.UpCPUPct, &pr.UpMemPct, &pr.DownCPUPct, &pr.DownMemPct,
-			&pr.BreachForSecs, &pr.CooldownUpSecs, &pr.CooldownDownSecs, &mem, &cpu, &sig)
+			&pr.BreachForSecs, &pr.CooldownUpSecs, &pr.CooldownDownSecs, &mem, &cpu, &sig, &cpuMemEnabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		return PolicyRow{}, false, nil
 	}
@@ -176,6 +179,7 @@ func (s *Store) PolicyFor(k Key) (PolicyRow, bool, error) {
 		return PolicyRow{}, false, err
 	}
 	pr.Enabled = en == 1
+	pr.NoCPUMem = cpuMemEnabled == 0
 	pr.PerReplicaMem, pr.PerReplicaCPU = uint64(mem), uint64(cpu)
 	if err := pr.unmarshalSignals(sig); err != nil {
 		return PolicyRow{}, false, err

@@ -186,6 +186,47 @@ func TestCustomSignalScaling(t *testing.T) {
 	}
 }
 
+// Turning the built-in CPU/mem triggers OFF (NoCPUMem) must stop CPU/mem from moving the service:
+// a hot box no longer scales up, and a cold box no longer scales down — it holds at its desired
+// count. Custom signals still drive it, and min/max bounds still apply.
+func TestNoCPUMemToggle(t *testing.T) {
+	p := testCtlPolicy()
+	p.NoCPUMem = true
+	breached := State{Replicas: 2, BreachSince: 940, LastChange: 0} // any up-breach already sustained
+
+	// Hot CPU/mem but CPU/mem triggers off + no custom signals → HOLD (this is the feedback-loop fix:
+	// a CPU-bound service's own start-up CPU must not trigger more scale-ups).
+	if d := Decide(breached, hot, p, 5, 1000); d.Action != ActNone {
+		t.Fatalf("CPU/mem off: hot load must not scale up, got %s (%s)", d.Action, d.Reason)
+	}
+
+	// Cold CPU/mem, healthy, no custom signals → HOLD, not scale down (don't collapse to min just
+	// because it's idle; the operator asked to hold the count).
+	if d := Decide(State{Replicas: 3, LastChange: 0}, cold, p, 5, 1000); d.Action != ActNone {
+		t.Errorf("CPU/mem off + no signals: cold load must hold, not scale down, got %s", d.Action)
+	}
+
+	// A custom signal still works with CPU/mem off: above up → scale UP even though CPU/mem are cold.
+	p.Signals = []SignalPolicy{{Name: "queue", Up: 100, Down: 40}}
+	mUp := Metrics{CPUMeanPct: 10, MemMaxPct: 10, AllHealthy: true, AllReady: true, Signals: []Signal{{Name: "queue", Value: 150, Present: true}}}
+	if d := Decide(breached, mUp, p, 5, 1000); d.Action != ActUp {
+		t.Errorf("CPU/mem off: a custom signal above up must still scale up, got %s (%s)", d.Action, d.Reason)
+	}
+
+	// A custom signal below down (with CPU/mem off) → scale DOWN is permitted, driven by the signal alone.
+	mDown := Metrics{CPUMeanPct: 90, MemMaxPct: 90, AllHealthy: true, AllReady: true, Signals: []Signal{{Name: "queue", Value: 10, Present: true}}}
+	if d := Decide(State{Replicas: 3, LastChange: 0}, mDown, p, 5, 1000); d.Action != ActDown {
+		t.Errorf("CPU/mem off: a custom signal below down must scale down (hot CPU ignored), got %s", d.Action)
+	}
+
+	// Min floor still applies with CPU/mem off.
+	p.Signals = nil
+	p.Min = 3
+	if d := Decide(State{Replicas: 2, LastChange: 0}, cold, p, 5, 1000); d.Action != ActUp || d.Target != 3 {
+		t.Errorf("CPU/mem off must still honor the min floor: got %s target=%d", d.Action, d.Target)
+	}
+}
+
 func TestCustomSignalValidation(t *testing.T) {
 	p := testCtlPolicy()
 	p.Signals = []SignalPolicy{{Name: "queue", Up: 100, Down: 40}}

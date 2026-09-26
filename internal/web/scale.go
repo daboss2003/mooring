@@ -183,6 +183,9 @@ func (s *Server) handleScalingSave(w http.ResponseWriter, r *http.Request) {
 
 // scalingFromForm builds a definition scaling entry from the dashboard form.
 func scalingFromForm(service string, enabled bool, r *http.Request) definition.Scaling {
+	// The "scale on CPU/memory" checkbox (checked = on). A checkbox sends nothing when unchecked, so
+	// absence = off. Recorded explicitly (the dashboard owns the policy).
+	scaleOnCPUMem := r.PostFormValue("scale_on_cpu_mem") == "on"
 	return definition.Scaling{
 		Service:            service,
 		Enabled:            enabled,
@@ -197,6 +200,7 @@ func scalingFromForm(service string, enabled bool, r *http.Request) definition.S
 		BreachForSecs:      atoiDefault(r.PostFormValue("breach_for"), 60),
 		CooldownUpSecs:     atoiDefault(r.PostFormValue("cooldown_up"), 60),
 		CooldownDownSecs:   atoiDefault(r.PostFormValue("cooldown_down"), 300),
+		ScaleOnCPUMem:      &scaleOnCPUMem,
 	}
 }
 

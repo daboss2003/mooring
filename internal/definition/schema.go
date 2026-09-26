@@ -398,6 +398,11 @@ type Scaling struct {
 	BreachForSecs      int     `yaml:"breach_for_secs,omitempty"`    // sustain window before acting (default 60)
 	CooldownUpSecs     int     `yaml:"cooldown_up_secs,omitempty"`   // min seconds between scale-ups (default 60)
 	CooldownDownSecs   int     `yaml:"cooldown_down_secs,omitempty"` // min seconds between scale-downs (default 300; >= up)
+	// ScaleOnCPUMem toggles the built-in CPU/memory triggers. nil/absent or true = scale on CPU/mem as
+	// usual. false = DON'T scale on CPU/memory — the service then scales only on custom `metrics` (if
+	// any), or holds at a fixed count when there are none. Useful for a CPU-bound service whose own
+	// start-up CPU would otherwise trigger more scale-ups. Min/max + capacity limits still apply.
+	ScaleOnCPUMem *bool `yaml:"scale_on_cpu_mem,omitempty"`
 	// Metrics are OPTIONAL custom scaling signals in ADDITION to CPU/mem. Each reads a per-service
 	// number from a source and scales UP when the value is at/above `up`, permits DOWN below `down`
 	// (up>down is the dead band). Two sources: "ops" (queue depth from the app's own ops interface)
@@ -407,6 +412,10 @@ type Scaling struct {
 	// target-tracking through the same engine.
 	Metrics []ScalingMetric `yaml:"metrics,omitempty"`
 }
+
+// ScaleOnCPUMemEnabled reports whether the built-in CPU/memory triggers are on (the default when the
+// field is unset). Used by the dashboard form to render the checkbox.
+func (s Scaling) ScaleOnCPUMemEnabled() bool { return s.ScaleOnCPUMem == nil || *s.ScaleOnCPUMem }
 
 // ScalingMetric is one custom autoscaling signal (see Scaling.Metrics).
 type ScalingMetric struct {

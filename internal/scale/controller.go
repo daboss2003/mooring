@@ -62,6 +62,10 @@ type Policy struct {
 	CooldownUpSecs   int64
 	CooldownDownSecs int64
 	Signals          []SignalPolicy // custom signals (additive; CPU/mem unchanged)
+	// NoCPUMem turns OFF the built-in CPU/memory triggers for this service. The service then scales only
+	// on custom Signals (if any), or holds at its desired count when there are none. Min/max bounds and
+	// the host-capacity force-down still apply. Off (false) by default — CPU/mem drive scaling as usual.
+	NoCPUMem bool
 }
 
 // deadBand is the minimum gap required between an up and the matching down
@@ -166,8 +170,14 @@ func Decide(st State, m Metrics, p Policy, ceiling int, now int64) Decision {
 		return Decision{Target: cur, Action: ActRefused, Reason: "cannot reach min replicas: no host capacity", Next: st}
 	}
 
-	wantUp := m.CPUMeanPct >= p.UpCPUPct || m.MemMaxPct >= p.UpMemPct
-	wantDown := m.CPUMeanPct < p.DownCPUPct && m.MemMaxPct < p.DownMemPct && m.AllHealthy
+	// Built-in CPU/memory triggers — unless the operator turned them off for this service (e.g. a
+	// CPU-bound service whose own start-up CPU would trigger yet more scale-ups). With them off, only
+	// custom signals below can move it; with neither, it holds at its desired count.
+	wantUp := !p.NoCPUMem && (m.CPUMeanPct >= p.UpCPUPct || m.MemMaxPct >= p.UpMemPct)
+	wantDown := m.AllHealthy
+	if !p.NoCPUMem {
+		wantDown = wantDown && m.CPUMeanPct < p.DownCPUPct && m.MemMaxPct < p.DownMemPct
+	}
 
 	// Custom signals extend the SAME hysteresis engine. Three states per policy signal:
 	//   - NOT emitted this tick (absent from m.Signals) → the source can't measure it here at all
@@ -176,17 +186,24 @@ func Decide(st State, m Metrics, p Policy, ceiling int, now int64) Decision {
 	//   - emitted but Present:false (probe down / edge blind) → BLOCKS scale-down, so we never shed
 	//     capacity we currently can't measure. Never contributes to scale-up.
 	//   - emitted and Present → at/above up wants up (OR); at/above down blocks down (AND).
+	sawSignal := false
 	for _, sp := range p.Signals {
 		s, ok := signalByName(m.Signals, sp.Name)
 		if !ok {
 			continue // not emitted this tick → inert
 		}
+		sawSignal = true
 		if s.Present && s.Value >= sp.Up {
 			wantUp = true
 		}
 		if !s.Present || s.Value >= sp.Down {
 			wantDown = false
 		}
+	}
+	// CPU/mem OFF and NO custom signal measured this tick → there is no basis to move, so HOLD at the
+	// desired count (don't collapse a signal-less service to min just because it's healthy).
+	if p.NoCPUMem && !sawSignal {
+		wantDown = false
 	}
 
 	if wantUp {

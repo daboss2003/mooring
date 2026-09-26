@@ -126,6 +126,7 @@
         <label>Scale-down mem% <input type="number" name="down_mem" value="{{if $p}}{{pct1 $p.DownMemPct}}{{else}}40{{end}}" class="w-num"></label>
       </div>
       <label class="check"><input type="checkbox" name="attest"> I confirm this service is stateless and edge-fronted, with no fixed host port and no read-write volume.</label>
+      <label class="check"><input type="checkbox" name="scale_on_cpu_mem" {{if or (not $p) $p.ScaleOnCPUMemEnabled}}checked{{end}}> Scale on CPU &amp; memory (uncheck to scale only on custom signals, or to hold at a fixed count)</label>
       <label class="check"><input type="checkbox" name="enabled" {{if and $p $p.Enabled}}checked{{end}}> Enable auto-scaling for this service</label>
       <button type="submit">Save scaling policy</button>
     </form>

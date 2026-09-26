@@ -533,6 +533,7 @@ A deploy persists each policy (unset thresholds default to 80/40, with a positiv
 | `min` / `max` | int | `1`/`1` | Replica bounds. On a small box `effective_max` **collapses to 1** — scaling becomes a permanent safe no-op and a wanted scale-up fires `scale_refused_no_capacity` rather than queuing a docker child. |
 | `up_cpu_pct` / `down_cpu_pct` | float | — | Scale up above / down below this sustained CPU %. Hysteresis is up-eager / down-lazy with a dead band between them. |
 | `up_mem_pct` / `down_mem_pct` | float | — | Optional memory triggers, with the same hysteresis. The percentage is RSS ÷ the container's memory limit — so set the service's [`mem_limit`](#a-service) for a true per-service signal; without one, the kernel reports the limit as the host's total RAM and the trigger is box-relative. |
+| `scale_on_cpu_mem` | bool | `true` | Whether CPU and memory drive scaling. Set `false` to **turn the built-in CPU/memory triggers off**: the service then scales only on its custom `metrics` (if any), or holds at its current replica count if it has none. Use it for a service whose own start-up work is CPU-heavy, where warming replicas read as high load and trigger still more replicas. `min`/`max`, the host-capacity ceiling, and hand nudges still apply. |
 | `per_replica_mem_mib` | int | — | Per-replica memory reservation (MiB). Feeds the host-capacity guard; if a replica's real RSS exceeds it, Mooring clamps and alerts. |
 | `per_replica_cpu_milli` | int | — | Optional per-replica CPU reservation (millicores). |
 
