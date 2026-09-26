@@ -138,6 +138,14 @@ func (s *Server) verifyOperatorPassword(ctx context.Context, username, password 
 //     (git config / provision registry) are deleted LAST so a mid-teardown failure
 //     still leaves the app discoverable for an idempotent retry.
 func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) {
+	// Detach from the request context and give the teardown its own deadline. Otherwise, if the
+	// operator's browser disconnects mid-`down` (or the box is slow under load), the request context is
+	// cancelled, the exec wrapper SIGKILLs `docker compose down` partway (some containers removed, some
+	// not) AND the destructive record deletes below run on a cancelled context — leaving the app
+	// half-deleted. Detaching lets the whole teardown finish or fail cleanly as a unit.
+	ctx, cancelAll := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+	defer cancelAll()
+
 	// Hold the shared git/deploy slot for the WHOLE teardown (bounded blocking acquire,
 	// not best-effort): this both serializes us with any in-flight deploy/fetch AND
 	// stops a NEW deploy from bringing the app back up (or rewriting the object store)
