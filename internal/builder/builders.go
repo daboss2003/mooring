@@ -81,7 +81,9 @@ func (nodeBuilder) Dockerfile(s Spec, files map[string]bool) (string, error) {
 	lines = append(lines,
 		"FROM "+base+" AS run",
 		"WORKDIR /app",
-		"COPY --from=build /app /app",
+		// Own /app at COPY time (one layer) instead of a trailing `chown -R /app`, which would
+		// copy-up the whole runtime tree — node_modules included — into a duplicate layer.
+		"COPY "+runtimeChown(s.Nonroot)+"--from=build /app /app",
 	)
 	// Provision the manager in the runtime image too when the base image lacks it (pnpm),
 	// so a `pnpm start`-style CMD doesn't crash with "not found". Runs as root, before the
@@ -91,7 +93,9 @@ func (nodeBuilder) Dockerfile(s Spec, files map[string]bool) (string, error) {
 	if pm.runtime != "" {
 		lines = append(lines, "ENV npm_config_manage_package_manager_versions=false", "RUN "+pm.runtime)
 	}
-	lines = append(lines, nonrootIf(s.Nonroot, nonrootAlpine())...)
+	// nonrootUserAlpine (not nonrootAlpine): the COPY --chown above already set ownership, so no
+	// `chown -R /app` — that's the whole point of the change.
+	lines = append(lines, nonrootIf(s.Nonroot, nonrootUserAlpine())...)
 	lines = append(lines, cmd)
 	return join(lines...), nil
 }

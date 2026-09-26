@@ -168,8 +168,8 @@ type ServerConfig struct {
 
 	// BuildCacheKeepEnabled controls automatic reclamation of Docker/BuildKit build cache
 	// after a build-deploy. Mooring's generated multi-stage Dockerfiles emit a unique,
-	// single-use runtime layer per deploy (`COPY --from=build /app /app` + the non-root
-	// chown), so the cache grows without bound; Mooring runs `docker builder prune
+	// single-use runtime layer per deploy (`COPY --chown=<uid> --from=build /app /app`),
+	// so the cache grows without bound; Mooring runs `docker builder prune
 	// --keep-storage` to cap it — evicting the least-recently-used (stale) entries while
 	// keeping recent, reusable cache (e.g. the dependency-install layer) warm. ON by
 	// default (a *bool: unset = on); set false to disable — then Mooring never prunes.

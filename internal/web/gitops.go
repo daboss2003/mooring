@@ -1060,7 +1060,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	onLine("deployed " + shortSha(sha))
 
 	// Reclaim build cache so the generated multi-stage builds' single-use runtime layers
-	// (a unique `COPY --from=build /app /app` per deploy) don't accumulate on the host.
+	// (a unique `COPY --chown=<uid> --from=build /app /app` per deploy) don't accumulate on the host.
 	// Only when we actually built; best-effort (never fails the deploy); LRU-keeps recent
 	// cache warm. The app is already up, so this only extends the deploy log briefly.
 	if defHasBuild(def) && s.cfg.Server.BuildCacheGCOn() {

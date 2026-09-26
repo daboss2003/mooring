@@ -168,6 +168,36 @@ func TestNonrootPinnedUID(t *testing.T) {
 	}
 }
 
+// A non-root Node image owns its runtime /app via `COPY --chown` in one layer, NOT a trailing
+// `chown -R /app` — the latter copies-up the whole node_modules tree into a duplicate layer, which
+// doubled image size and made a large deploy's chown + export (and so the deploy) crawl.
+func TestNodeCopyChownNoRecursiveChown(t *testing.T) {
+	df, err := Generate(Spec{Language: "node", Version: "20", Start: []string{"node", "x"}, Nonroot: true}, map[string]bool{"package.json": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(df, "COPY --chown=10001:10001 --from=build /app /app") {
+		t.Errorf("non-root node runtime must own /app at copy time via COPY --chown, got:\n%s", df)
+	}
+	if strings.Contains(df, "chown -R") {
+		t.Errorf("the wasteful trailing `chown -R /app` must be gone for node:\n%s", df)
+	}
+	if !strings.Contains(df, "adduser -D -H -u 10001 -G app app") || !RunsAsNonroot(df) {
+		t.Errorf("the pinned non-root user + USER app must still be present:\n%s", df)
+	}
+	// Root image: no --chown flag, no non-root user.
+	root, err := Generate(Spec{Language: "node", Version: "20", Start: []string{"node", "x"}, Nonroot: false}, map[string]bool{"package.json": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(root, "COPY --from=build /app /app") || strings.Contains(root, "--chown") {
+		t.Errorf("a root node image must copy /app with no --chown, got:\n%s", root)
+	}
+	if RunsAsNonroot(root) {
+		t.Errorf("a root node image must not emit USER app:\n%s", root)
+	}
+}
+
 func TestRunsAsNonroot(t *testing.T) {
 	if !RunsAsNonroot("FROM alpine:3\nCOPY . .\nUSER app\n") {
 		t.Error("a Dockerfile with USER app must be non-root")

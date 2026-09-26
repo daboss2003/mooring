@@ -250,6 +250,31 @@ func nonrootDebian() []string {
 	}
 }
 
+// nonrootUserAlpine adds the pinned non-root user + USER directive WITHOUT a `chown -R /app`. It's for
+// a multi-stage builder whose runtime /app is populated solely by a `COPY --chown` (see runtimeChown),
+// so ownership is set at copy time in one layer. A trailing `chown -R /app` there is pure waste: it
+// copies-up every file into a SECOND layer (for Node, a duplicate of the whole node_modules tree),
+// which is what made a large image's chown + layer export — and so the deploy — crawl. Ordering: the
+// `COPY --chown` uses NUMERIC ids so it needs no prior user, and this user is added afterwards, before
+// USER app switches to it.
+func nonrootUserAlpine() []string {
+	return []string{
+		"RUN addgroup -g 10001 app && adduser -D -H -u 10001 -G app app",
+		"USER app",
+	}
+}
+
+// runtimeChown is the `COPY --chown=` flag (with a trailing space) that assigns copied files the pinned
+// non-root UID:GID in the SAME layer, for a non-root image; "" for a root image (files stay root-owned).
+// Numeric ids are used so the COPY needs no user to exist yet. Pair it with nonrootUserAlpine — never
+// with a separate `chown -R`, or the doubling this avoids comes right back.
+func runtimeChown(nonroot bool) string {
+	if !nonroot {
+		return ""
+	}
+	return fmt.Sprintf("--chown=%d:%d ", NonrootUID, NonrootUID)
+}
+
 // RunsAsNonroot reports whether a GENERATED Dockerfile ends up running as the pinned non-root user —
 // i.e. it emitted the `USER app` directive. It reads the actual generated output, so a build with no
 // non-root user (php/apache drops to www-data itself and never gets `USER app`, even when detected
