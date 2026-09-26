@@ -496,6 +496,22 @@ func (r *Runner) RemoveContainersHeld(ctx context.Context, ids []string, onLine 
 	return r.runArgv(ctx, "", append([]string{"rm", "-f"}, ids...), onLine)
 }
 
+// RestartContainersHeld restarts specific containers by id (`docker restart <id>...`) for a caller that
+// ALREADY HOLDS the one-docker-child semaphore (the self-heal supervisor, restarting only the
+// unhealthy/down replicas of a SCALED service instead of bouncing every copy via `compose restart`).
+// docker restart starts a stopped/exited container and cycles a running one, honoring its stop grace.
+// Same no-scoping contract as RemoveContainersHeld: the CALLER passes only ids it has verified belong
+// to the intended app+service.
+func (r *Runner) RestartContainersHeld(ctx context.Context, ids []string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return r.runArgv(ctx, "", append([]string{"restart"}, ids...), onLine)
+}
+
 // keepStorageFlag returns the correct "keep this much cache" flag for `docker builder
 // prune` on this host. Newer BuildKit renamed --keep-storage → --reserved-space (the old
 // name prints a deprecation warning and will be removed); older Docker only knows

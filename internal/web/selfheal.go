@@ -26,6 +26,25 @@ var rungAction = map[selfheal.Rung][]string{
 	selfheal.RungRedeploy: {"up", "-d", "--force-recreate"},
 }
 
+// unhealthyReplicaIDs returns the container ids of a service's down/unhealthy replicas and the total
+// replica count, so the supervisor can restart ONLY the sick copies of a scaled service (leaving the
+// healthy ones serving). A running "starting" replica is not counted as sick — it's still coming up.
+func unhealthyReplicaIDs(app monitor.App, service string) (bad []string, total int) {
+	for _, svc := range app.Services {
+		if svc.Service != service {
+			continue
+		}
+		total++
+		if svc.ContainerID == "" {
+			continue
+		}
+		if !svc.Running() || svc.Health == "unhealthy" {
+			bad = append(bad, svc.ContainerID)
+		}
+	}
+	return bad, total
+}
+
 // Remediate makes *Server the supervisor's Actioner: it runs the rung through the
 // SAME write path the operator uses (env render, §5.6 validation + config-file
 // materialization for recreate/redeploy), but via RunHeld — the supervisor's safety
@@ -41,6 +60,17 @@ func (s *Server) Remediate(ctx context.Context, app monitor.App, service string,
 	args, ok := rungAction[rung]
 	if !ok {
 		return fmt.Errorf("unknown rung %q", rung)
+	}
+
+	// RESTART rung on a SCALED service: restart ONLY the down/unhealthy replicas, leaving the healthy
+	// copies serving. `docker compose restart -- <service>` would bounce EVERY copy at once — a needless
+	// CPU spike and a full-service blip when only one replica is sick. (recreate/redeploy still act on
+	// the whole service; they re-apply compose/config.) The one-docker-child semaphore + the FSM's
+	// backoff/sustain/attempt-cap still bound how often this runs.
+	if rung == selfheal.RungRestart {
+		if bad, total := unhealthyReplicaIDs(app, service); total > 1 && len(bad) > 0 && len(bad) < total {
+			return s.runner.RestartContainersHeld(ctx, bad, func(l string) { s.log.Debug("selfheal restart", "out", l) })
+		}
 	}
 
 	env := s.composeEnv(&app)
