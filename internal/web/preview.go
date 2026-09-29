@@ -312,7 +312,7 @@ func (s *Server) handlePRWebhook(w http.ResponseWriter, r *http.Request) {
 				s.log.Error("preview webhook panic recovered", "base", base, "pr", ev.Number, "panic", rec)
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), gitDeployTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), s.deployTimeout())
 		defer cancel()
 		onLine := func(l string) { s.log.Info("preview", "base", base, "pr", ev.Number, "line", l) }
 		if open {
@@ -372,7 +372,8 @@ func (s *Server) createOrUpdatePreview(ctx context.Context, base string, number 
 	if err != nil {
 		return err
 	}
-	return s.deployRepoApp(ctx, cfg, sha, "preview", "webhook", false, onLine)
+	_, err = s.deployRepoApp(ctx, cfg, sha, "preview", "webhook", false, false, onLine) // previews are always paced
+	return err
 }
 
 // teardownPreview removes the pr-<n> preview app — but ONLY if it is actually a preview of THIS

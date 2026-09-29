@@ -20,8 +20,10 @@
           <td class="mono">{{if $v.Commit}}{{shortSha $v.Commit}}{{else}}—{{end}}</td>
           <td>{{$v.Note}}{{if and $firstPage (not $i)}} <span class="muted">(current)</span>{{end}}</td>
           <td class="row-actions">
-            {{if $v.Commit}}<button type="button" class="btn btn-sm btn-ghost lc-btn" data-lc-confirm="Roll back {{$proj}} to {{shortSha $v.Commit}}? This recreates its containers." data-lc-url="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/rollback">Roll back to this</button>{{end}}
-            {{if not (and $firstPage (not $i))}}<form method="post" action="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/delete" class="inline" data-confirm="Delete this deploy from history? It only trims the list — disk from old build images is reclaimed separately on the Server tab."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">delete</button></form>{{end}}
+            <div class="queue-actions">
+              {{if $v.Commit}}<span class="lc-group queue-actions"><button type="button" class="btn btn-sm btn-ghost lc-btn" data-lc-confirm="Roll back {{$proj}} to {{shortSha $v.Commit}}? This recreates its containers." data-lc-url="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/rollback">Roll back to this</button><label class="check muted"><input type="checkbox" class="lc-now"> all at once</label></span>{{end}}
+              {{if not (and $firstPage (not $i))}}<form method="post" action="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/delete" class="inline" data-confirm="Delete this deploy from history? It only trims the list — disk from old build images is reclaimed separately on the Server tab."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">delete</button></form>{{end}}
+            </div>
           </td>
         </tr>
         {{end}}
@@ -39,6 +41,8 @@
     <p class="muted">No deploys on this page.{{if .VersionsPrevURL}} <a href="{{.VersionsPrevURL}}">← Newer</a>{{else}} Deploy from the Overview and history shows up here.{{end}}</p>
   </section>
   {{end}}
+
+  <pre id="deploy-output" class="stream" hidden></pre>
   {{end}}
 </main>
 {{template "bottom" .}}

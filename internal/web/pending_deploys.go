@@ -137,7 +137,7 @@ func (s *Server) startPendingDeploy() bool {
 				s.log.Error("queued webhook deploy panic recovered", "project", d.project, "pr", d.pr, "panic", rec)
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), gitDeployTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), s.deployTimeout())
 		defer cancel()
 		if s.queuedRun != nil { // test seam
 			s.queuedRun(ctx, d)

@@ -265,6 +265,10 @@ func cronFailReason(lastLine string, ctxErr error, timeout time.Duration) string
 
 // beginForeground marks a multi-step write operation (a deploy, a certificate-renewal recreate, an app
 // delete) as running until the returned func is called. Scheduled tasks don't start while any is running.
+// ForegroundBusy reports whether a deploy, certificate renewal, app delete or paced operator action is
+// running. Background upkeep (backups, disk GC) yields the docker slot to it (cmd_serve).
+func (s *Server) ForegroundBusy() bool { return s.foreground.Load() > 0 }
+
 func (s *Server) beginForeground() func() {
 	s.foreground.Add(1)
 	return func() { s.foreground.Add(-1) }

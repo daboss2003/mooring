@@ -166,6 +166,9 @@ server:
     cpu_settle_pct: 50                # % of one core below which such a container has settled
     max_settle: 3m                    # longest one start holds others back
     max_wait: 10m                     # longest an action waits for CPU
+    deploy_wait: 2m                   # deploys/operator actions: total wait for CPU or other starts
+    service_settle: 15m               # deploys/operator actions: longest wait for one service to become healthy
+    rollout_budget: 45m               # deploys/operator actions: total pacing, then the rest start unpaced
 
 # --- App-data backups (off by default) ---  see docs/backup-and-recovery.md
 backups:

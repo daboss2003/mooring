@@ -26,11 +26,12 @@
   {{else}}
   <section class="panel">
     <h2>Lifecycle</h2>
-    <div class="queue-actions">
+    <div class="queue-actions lc-group">
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Start {{.App.Project}}?" data-lc-url="/apps/{{pathEscape .App.Project}}/start">Start</button>
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop {{.App.Project}}? All of its containers will be stopped." data-lc-url="/apps/{{pathEscape .App.Project}}/stop">Stop</button>
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart {{.App.Project}}?" data-lc-url="/apps/{{pathEscape .App.Project}}/restart">Restart</button>
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Redeploy {{.App.Project}}? This recreates its containers." data-lc-url="/apps/{{pathEscape .App.Project}}/redeploy">Redeploy</button>
+      <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
     </div>
   </section>
   {{end}}
@@ -61,7 +62,7 @@
     </table></div>
     {{end}}
 
-    <div class="queue-actions mt1">
+    <div class="queue-actions mt1 lc-group">
       <form method="post" action="/apps/{{pathEscape .Project}}/git/fetch" class="inline">
         <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
         <button type="submit" class="btn btn-sm">Check for updates</button>
@@ -69,8 +70,10 @@
       {{if and (not .WriteDisabledReason) (not $.Protected)}}
       {{if and (or (eq .UpdateState "update_available") (eq .UpdateState "history_rewritten")) .StagedCommit}}
       <button type="button" class="btn btn-sm btn-primary lc-btn" data-lc-confirm="Deploy commit {{.StagedCommit}} to {{.Project}}?" data-lc-url="/apps/{{pathEscape .Project}}/git/deploy?sha={{.StagedCommit}}">Deploy update</button>
+      <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
       {{else if .DeployedCommit}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Redeploy {{.Project}} at the current commit?" data-lc-url="/apps/{{pathEscape .Project}}/redeploy">Redeploy current</button>
+      <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
       {{end}}
       {{end}}
     </div>

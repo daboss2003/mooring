@@ -365,7 +365,9 @@ container that mounts that path, could then read live TLS keys. Instead, Mooring
 > **Renewal is autonomous.** A background watcher (hourly) re-syncs each app's
 > `cert_bindings` from the edge and, when a leaf has actually changed, recreates the affected
 > service so it loads the new cert — no manual redeploy. The recreate briefly bounces only that
-> service and is suppressed from self-healing. (The richer `cert_*` inventory/alerts described under
+> service and is suppressed from self-healing. When several services changed, they are recreated
+> one at a time, each waited for like a deploy's [paced starts](./gitops.md#paced-starts); a
+> deploy that starts meanwhile goes first, and the renewal is retried at the next hourly check. (The richer `cert_*` inventory/alerts described under
 > *Cert lifecycle visibility* below are still planned, not yet built.)
 
 #### `cert_bindings` — wiring a cert to a service declaratively

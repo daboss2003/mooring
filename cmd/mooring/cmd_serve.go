@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -178,6 +179,10 @@ func cmdServe(args []string) error {
 	// The global one-docker-child semaphore is SHARED by the write-plane runner and
 	// the setup sandbox (plan §4: one docker child across poller+deploy+sandbox).
 	dockerSem := dockerexec.NewSemaphore()
+	// Background upkeep (backups, disk GC) sees the docker slot as taken while a deploy or paced operator
+	// action runs, so it never grabs the slot between a rollout's steps. Set once the web server exists.
+	var foregroundBusy atomic.Pointer[func() bool]
+	upkeepSem := yieldingSem{sem: dockerSem, busy: &foregroundBusy}
 	runner := dockerexec.NewRunner(dockerSem, writeAllowed, writeReason)
 
 	// Mooring MANAGES its own read-only socket-proxy (plan §3) so the operator never
@@ -382,7 +387,7 @@ func cmdServe(args []string) error {
 				}
 				return hs.DiskUsed, hs.DiskTotal, true
 			},
-			runner, dockerSem, cfg.Server.DiskGCThresholdPct(), 15*time.Minute, cfg.Server.BuildCacheKeepSize(),
+			runner, upkeepSem, cfg.Server.DiskGCThresholdPct(), 15*time.Minute, cfg.Server.BuildCacheKeepSize(),
 			cfg.Server.BuildCacheGCOn(),
 			func(level, title, detail string) {
 				_ = alertStore.EnqueueInfra(context.Background(), alert.Outbox{
@@ -479,7 +484,7 @@ func cmdServe(args []string) error {
 				HelperImage: cfg.BackupHelperImage(), Key: key,
 				EnvFileDir: filepath.Join(cfg.DataDir, "backups", ".creds"), S3Prefix: s3prefix,
 			}
-			backupRunner := backupsched.New(runner, dockerSem, backupStore, appsFn, uploader, bsCfg, alertCb, log)
+			backupRunner := backupsched.New(runner, upkeepSem, backupStore, appsFn, uploader, bsCfg, alertCb, log)
 			wg.Add(1)
 			go func() { defer wg.Done(); backupRunner.Run(ctx) }()
 			log.Info("scheduled app-data backups enabled", "interval", cfg.BackupSchedule(), "retention", cfg.BackupRetention(), "off_box", uploader != nil)
@@ -728,6 +733,8 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	busy := srv.ForegroundBusy
+	foregroundBusy.Store(&busy)
 
 	// Persist the Activity event store on a cadence + at shutdown (the store dedups in bounded memory;
 	// the flush is a cheap atomic rewrite of the small deduped set). Joined before the deferred close.
@@ -823,7 +830,7 @@ func cmdServe(args []string) error {
 		Enabled: gs.Enabled, CPUBusyPct: gs.CPUBusyPct, SettleGrace: gs.SettleGrace, CPUSettlePct: gs.CPUSettlePct,
 		MaxSettle: gs.MaxSettle, MaxWait: gs.MaxWait, NumCPU: runtime.NumCPU(),
 	})
-	observeStarts := func(snap *monitor.Snapshot) { startGate.Observe(startObservation(snap, protected)) }
+	observeStarts := func(snap *monitor.Snapshot) { startGate.Observe(web.StartObservation(snap, protected)) }
 	srv.SetStartGate(startGate)
 	wg.Add(1)
 	go func() {
@@ -1311,18 +1318,18 @@ func toRetentionConfig(cfg *config.Config) retention.Config {
 	}
 }
 
-// startObservation converts a monitor snapshot into the start gate's view. Containers of protected
-// projects (Mooring's own edge, socket-proxy, ntfy) never hold app starts back.
-func startObservation(snap *monitor.Snapshot, protected map[string]bool) startgate.Observation {
-	o := startgate.Observation{At: snap.At, HostOK: snap.HostOK, HostCPUPct: snap.Host.CPUPercent}
-	for _, a := range snap.Apps {
-		for _, c := range a.Services {
-			o.Containers = append(o.Containers, startgate.Container{
-				ID: c.ContainerID, App: a.Project, Service: c.Service, Running: c.Running(), Health: c.Health,
-				StartedAt: c.StartedAt, RestartCount: c.RestartCount, CPUPercent: c.CPUPercent, CPUValid: c.CPUValid,
-				Inspected: c.Inspected, Protected: protected[a.Project],
-			})
-		}
-	}
-	return o
+// yieldingSem is the one-docker-child semaphore as background upkeep sees it: not available while a
+// deploy or paced operator action runs (busy), otherwise the real one.
+type yieldingSem struct {
+	sem  *dockerexec.Semaphore
+	busy *atomic.Pointer[func() bool]
 }
+
+func (y yieldingSem) TryAcquire() bool {
+	if f := y.busy.Load(); f != nil && (*f)() {
+		return false
+	}
+	return y.sem.TryAcquire()
+}
+
+func (y yieldingSem) Release() { y.sem.Release() }

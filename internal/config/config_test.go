@@ -511,4 +511,21 @@ func TestStartGateSettings(t *testing.T) {
 	mustReject(t, validYAML(t, "server:\n  start_gate:\n    max_settle: 2s\n"), "max_settle")
 	mustReject(t, validYAML(t, "server:\n  start_gate:\n    max_wait: 5h\n"), "max_wait")
 	mustReject(t, validYAML(t, "server:\n  start_gate:\n    settle_grace: 5m\n    max_settle: 1m\n"), "settle_grace")
+	if def.DeployWait != 2*time.Minute || def.ServiceSettle != 15*time.Minute || def.RolloutBudget != 45*time.Minute {
+		t.Errorf("rollout defaults: %+v", def)
+	}
+	ro, err := Parse([]byte(validYAML(t, "server:\n  start_gate:\n    deploy_wait: 30s\n    service_settle: 5m\n    rollout_budget: 20m\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ro.Server.StartGateSettings(); got.DeployWait != 30*time.Second || got.ServiceSettle != 5*time.Minute || got.RolloutBudget != 20*time.Minute {
+		t.Errorf("rollout settings: %+v", got)
+	}
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    deploy_wait: 45m\n"), "deploy_wait")
+	zero, err := Parse([]byte(validYAML(t, "server:\n  start_gate:\n    deploy_wait: 0s\n")))
+	if err != nil || zero.Server.StartGateSettings().DeployWait != 0 {
+		t.Errorf("deploy_wait: 0s means no waiting: %v %+v", err, zero.Server.StartGateSettings())
+	}
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    service_settle: 5s\n"), "service_settle")
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    rollout_budget: 5h\n"), "rollout_budget")
 }

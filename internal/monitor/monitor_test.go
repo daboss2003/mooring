@@ -220,7 +220,7 @@ func svcCtr(id, svc, state, status string) docker.Container {
 }
 
 // running is a running container of service "svc" with no health in its Status.
-func running(id string) docker.Container { return svcCtr(id, "svc", "running", "Up 1 hour") }
+func running(id string) docker.Container { return svcCtr(id, "svc", "running", "Up 3 days") }
 
 // inspectBody is an inspect response; health "" means no healthcheck.
 func inspectBody(state, health, startedAt string, restarts int) string {
@@ -267,7 +267,7 @@ func TestInspectOrder(t *testing.T) {
 				running("ok"),
 				svcCtr("down", "svc", "exited", "Exited (1) 2 minutes ago"),
 				running("boot"),
-				svcCtr("sick", "svc", "running", "Up 1 hour (unhealthy)"),
+				svcCtr("sick", "svc", "running", "Up 3 days (unhealthy)"),
 			},
 			known: map[string]inspectRecord{
 				"ok":   {seq: 4, health: "healthy"},
@@ -365,7 +365,7 @@ func TestPollInspectsUrgentFirstUnderBudget(t *testing.T) {
 				list: []docker.Container{
 					running("ok2"),
 					svcCtr("down", "svc", "exited", "Exited (137) 1 minute ago"),
-					svcCtr("boot", "svc", "running", "Up 5 seconds (health: starting)"),
+					svcCtr("boot", "svc", "running", "Up 3 days (health: starting)"),
 					running("ok1"),
 					running("db"),
 				},
@@ -410,7 +410,7 @@ func TestInspectCarryForward(t *testing.T) {
 	const t0 = "2026-09-29T10:00:00.5Z"
 	started, _ := time.Parse(time.RFC3339Nano, t0)
 	good := inspectBody("running", "healthy", t0, 2)
-	e := &scriptedEngine{list: []docker.Container{svcCtr("web1", "web", "running", "Up 1 hour (healthy)")}}
+	e := &scriptedEngine{list: []docker.Container{svcCtr("web1", "web", "running", "Up 3 days (healthy)")}}
 	m := newScriptedMonitor(t, e)
 
 	steps := []struct {
@@ -462,15 +462,17 @@ func TestCarryForwardVoidedByTheList(t *testing.T) {
 		now  docker.Container // the list entry on the poll whose inspect fails
 		want bool             // Inspected
 	}{
-		{"unchanged", svcCtr("web1", "web", "running", "Up 1 hour (healthy)"), true},
-		{"no health in the status", svcCtr("web1", "web", "running", "Up 1 hour"), true},
+		{"unchanged", svcCtr("web1", "web", "running", "Up 3 days (healthy)"), true},
+		{"no health in the status", svcCtr("web1", "web", "running", "Up 3 days"), true},
 		{"state changed", svcCtr("web1", "web", "exited", "Exited (137) 5 seconds ago"), false},
-		{"health changed", svcCtr("web1", "web", "running", "Up 1 hour (unhealthy)"), false},
+		{"health changed", svcCtr("web1", "web", "running", "Up 3 days (unhealthy)"), false},
+		// `docker restart` keeps the id and the running state; the uptime shows it is a new run.
+		{"restarted since", svcCtr("web1", "web", "running", "Up 5 seconds (healthy)"), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := &scriptedEngine{
-				list:    []docker.Container{svcCtr("web1", "web", "running", "Up 1 hour (healthy)")},
+				list:    []docker.Container{svcCtr("web1", "web", "running", "Up 3 days (healthy)")},
 				inspect: map[string]string{"web1": inspectBody("running", "healthy", "2026-09-29T10:00:00Z", 0)},
 			}
 			m := newScriptedMonitor(t, e)
@@ -509,7 +511,7 @@ func TestParseStartedAt(t *testing.T) {
 func TestCPUValid(t *testing.T) {
 	const run1, run2 = "2026-09-29T10:00:00Z", "2026-09-29T11:00:00Z"
 	e := &scriptedEngine{list: []docker.Container{
-		svcCtr("web1", "web", "running", "Up 1 hour"),
+		svcCtr("web1", "web", "running", "Up 3 days"),
 		svcCtr("old1", "old", "exited", "Exited (0) 1 hour ago"),
 	}}
 	m := newScriptedMonitor(t, e)
@@ -563,7 +565,7 @@ func TestPublishedOrderKeepsCopiesNewestFirst(t *testing.T) {
 	var webs []string
 	for i := 20; i > 0; i-- { // newest first
 		id := fmt.Sprintf("web%02d", i)
-		list = append(list, svcCtr(id, "web", "running", "Up 1 hour"))
+		list = append(list, svcCtr(id, "web", "running", "Up 3 days"))
 		webs = append(webs, id)
 	}
 	list = append(list, svcCtr("db1", "db", "exited", "Exited (1) 1 minute ago"))
@@ -577,6 +579,27 @@ func TestPublishedOrderKeepsCopiesNewestFirst(t *testing.T) {
 		}
 		if want := append([]string{"db1"}, webs...); !slices.Equal(got, want) {
 			t.Fatalf("poll %d: published order %v, want %v", poll, got, want)
+		}
+	}
+}
+
+func TestListUptimeMax(t *testing.T) {
+	for status, want := range map[string]time.Duration{
+		"Up Less than a second":          time.Second,
+		"Up 5 seconds":                   6 * time.Second,
+		"Up 1 second (health: starting)": 2 * time.Second,
+		"Up About a minute":              2 * time.Minute,
+		"Up 3 minutes (healthy)":         4 * time.Minute,
+		"Up About an hour":               2 * time.Hour,
+		"Up 5 hours":                     6 * time.Hour,
+	} {
+		if got, ok := listUptimeMax(status); !ok || got != want {
+			t.Errorf("listUptimeMax(%q) = %s, %v; want %s", status, got, ok, want)
+		}
+	}
+	for _, status := range []string{"Exited (0) 5 minutes ago", "Up 3 days", "Created", ""} {
+		if _, ok := listUptimeMax(status); ok {
+			t.Errorf("listUptimeMax(%q) must not be an uptime", status)
 		}
 	}
 }

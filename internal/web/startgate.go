@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/daboss2003/mooring/internal/definition"
+	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/scale"
 	"github.com/daboss2003/mooring/internal/selfheal"
 	"github.com/daboss2003/mooring/internal/startgate"
@@ -13,6 +14,34 @@ import (
 // lifecycle actions record their container starts with it so the autoscaler and self-heal wait for
 // those containers to settle; scheduled tasks consult it before starting.
 func (s *Server) SetStartGate(g *startgate.Gate) { s.startGate = g }
+
+// StartObservation converts a monitor snapshot into the start gate's view. Containers of protected
+// projects (Mooring's own edge, socket-proxy, ntfy) never hold app starts back.
+func StartObservation(snap *monitor.Snapshot, protected map[string]bool) startgate.Observation {
+	o := startgate.Observation{At: snap.At, HostOK: snap.HostOK, HostCPUPct: snap.Host.CPUPercent}
+	for _, a := range snap.Apps {
+		for _, c := range a.Services {
+			o.Containers = append(o.Containers, startgate.Container{
+				ID: c.ContainerID, App: a.Project, Service: c.Service, Running: c.Running(), Health: c.Health,
+				StartedAt: c.StartedAt, RestartCount: c.RestartCount, CPUPercent: c.CPUPercent, CPUValid: c.CPUValid,
+				Inspected: c.Inspected, Protected: protected[a.Project],
+			})
+		}
+	}
+	return o
+}
+
+// observeStarts folds snap into the start gate (idempotent per snapshot; skips an unusable one).
+func (s *Server) observeStarts(snap *monitor.Snapshot) {
+	if s.startGate == nil || snap == nil || !snap.DockerOK || snap.ListFailed {
+		return
+	}
+	protected := make(map[string]bool, len(s.cfg.ProtectedProjects))
+	for _, p := range s.cfg.ProtectedProjects {
+		protected[p] = true
+	}
+	s.startGate.Observe(StartObservation(snap, protected))
+}
 
 // recordStart tells the start gate that an action on project began at start and has just returned.
 // service "" covers every service of the app (a deploy or an app-level action). ok is whether the

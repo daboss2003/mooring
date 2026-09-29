@@ -179,6 +179,7 @@ type Server struct {
 	shInfoMu       sync.Mutex                             // guards shInfo
 	shInfo         map[string]shInfoEntry                 // app → per-service self-healing facts from its definition (startgate.go)
 	cronHeld       map[string]time.Time                   // app/task → when the start gate first held a due task back (cron loop only)
+	snapFn         func() *monitor.Snapshot               // test seam: replaces the monitor as snapshot()'s source
 	edgeReason     string                                 // why the edge isn't owned (banner)
 	l4Routes       *l4.RouteStore                         // managed L4 (TCP/UDP) routes (nil when L4 LB disabled)
 	l4Reconcile    func(context.Context) error            // push the L4 route set to the LB (nil when disabled)

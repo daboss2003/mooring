@@ -144,6 +144,9 @@ func (s *Server) renderLogin(w http.ResponseWriter, r *http.Request, errMsg stri
 }
 
 func (s *Server) snapshot() *monitor.Snapshot {
+	if s.snapFn != nil { // test seam
+		return s.snapFn()
+	}
 	if s.mon == nil {
 		return nil
 	}

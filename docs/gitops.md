@@ -39,10 +39,26 @@ Click **Deploy** to ship it. Mooring deploys **exactly the commit you reviewed**
 
 1. **Checks the Docker daemon.** The container view (the socket-proxy) must be current, and it and the `docker` CLI must reach the same Docker daemon — otherwise the deploy is refused (see [`mooring doctor`](./cli.md)).
 2. **Builds** every service that has a `build:` block, [scheduled services](./scheduled-tasks.md) included, and prints one line per image: its id, when it was created, and whether this deploy built it or it was unchanged (build cache). On a host with 2 CPUs or fewer the images are built one at a time; set [`server.build_concurrency`](./host-file.md) to `serial` or `parallel` to override.
-3. **Starts the app** with those images (`docker compose up`), and recreates services whose config files, secrets or certificates changed. The deploy doesn't wait for the [start gate](./scaling-and-self-healing.md#start-pacing); auto-scaling and self-healing wait for the containers it started to settle.
+3. **Starts the services one at a time**, dependencies (`depends_on`) first — see [paced starts](#paced-starts) below. A service that is running and whose configuration and image didn't change is left running. The containers of services removed from `mooring.yaml` are removed first.
 4. **Applies the edge routes and verifies them:** every route must be served and must dial only this app's running containers of its service — one `✓`/`✗` line per route (see [the edge](./edge-and-tls.md#upstream-addresses-and-unavailable-routes)).
 
-A build failure leaves the running containers untouched. A failure at step 3 or 4 leaves the containers already started by the deploy running — there is no automatic rollback; use [Deploy history](#deploy-history--rolling-back) to return to an earlier commit. Until a deploy succeeds, the repository shows the update as blocked and auto-deploy waits.
+A build failure leaves the running containers untouched. A failure at step 4 leaves the containers the deploy started running — there is no automatic rollback; use [Deploy history](#deploy-history--rolling-back) to return to an earlier commit. Until a deploy succeeds, the repository shows the update as blocked and auto-deploy waits.
+
+### Paced starts
+
+For each service it starts, a deploy:
+
+1. waits while the host CPU is busy or another app's container is still starting — at most `deploy_wait` (2 minutes) for the whole deploy, then it carries on. The service's own old containers never delay it;
+2. starts the service (`docker compose up -d --no-deps --no-build -- <service>`, with `--force-recreate` when its config files, secrets or certificates changed);
+3. waits until what it started is healthy: up to its healthcheck's own start-up window — `start_period + (interval + timeout) × (retries + 1) + 60s` — or, without a healthcheck, until its start-up CPU settles (at most about 3½ minutes); never longer than `service_settle` (15 minutes).
+
+The deploy log shows each step and a progress line every 15 seconds while it waits. A service that fails to start, exits, reports unhealthy, or is still starting when its time is up is listed as a problem, and the deploy **carries on with the other services**. It then ends with `[done — deployed with problems]`, raises a warning alert naming the services, and is recorded as deployed — so the next deploy, a fix for example, is never blocked. The routes of such a service are listed with `✗` in the edge check without failing the deploy. Only a deploy in which every service failed to start is a failed deploy. The next deploy without problems clears the alert.
+
+After 45 minutes of pacing (`rollout_budget`), any services still to start are started without waiting; their health isn't checked, so the deploy ends with problems. The limits are set in [`server.start_gate`](./scaling-and-self-healing.md#start-pacing).
+
+- **Stopped services start.** A deploy starts services you stopped by hand (held) with the new version and releases their holds.
+- **Auto-scaled services.** One that the deploy changes restarts as a single new copy; the auto-scaler then adds the other copies back one at a time. One the deploy doesn't change keeps all its copies.
+- **All at once.** Tick **all at once** next to Deploy or **Roll back to this** to start every service together in one `docker compose up`, without waiting — for when you need a fix out immediately. Webhook and auto-deploys are always paced.
 
 You'll find this on the app's page (a **Repository & updates** panel) and on the dedicated **Repository** page (with the full diff and history).
 
@@ -62,9 +78,11 @@ Every git deploy is recorded. On the Repository page, the **Deploy history** sub
 
 ## Starting and stopping services
 
-From an app's page you can **start, stop, restart, or redeploy** the whole app; from a service's own page you can do the same to a **single service** — so you can take one service down without touching the rest.
+From an app's page you can **start, stop, restart, or redeploy** the whole app; from a service's own page you can **start, stop or restart** that one service — so you can take one service down without touching the rest.
 
-A manual **Stop is a hold.** The stopped service — or, for an app-level stop, *every* service — stays down: Mooring's [self-healing](./scaling-and-self-healing.md) and auto-scaler both leave a held service alone instead of restarting it. So a service you deliberately stop stays stopped rather than bouncing back up. **Start**, **Restart**, or **Redeploy** releases the hold and brings it back. (A service that *crashes* on its own is different — self-healing does try to recover that.)
+A manual **Stop is a hold.** The stopped service — or, for an app-level stop, *every* service — stays down: Mooring's [self-healing](./scaling-and-self-healing.md) and auto-scaler both leave a held service alone instead of restarting it. So a service you deliberately stop stays stopped rather than bouncing back up. **Start**, **Restart**, **Redeploy**, or a git deploy releases the hold and brings it back. (A service that *crashes* on its own is different — self-healing does try to recover that.)
+
+**Start, Restart and Redeploy are paced** like a deploy's starts: one service at a time in dependency order, and for a service with several copies one copy at a time, each waited for until healthy. Start starts only the stopped copies; Restart restarts every copy; Redeploy recreates each service (`docker compose up -d --no-deps --force-recreate -- <service>`). Tick **all at once** to run the action in one `docker compose` call instead. Stop is never paced.
 
 ## Deleting an app
 

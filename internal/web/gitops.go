@@ -616,6 +616,7 @@ func (s *Server) handleGitDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sha := strings.TrimSpace(r.FormValue("sha"))
+	atOnce := r.URL.Query().Get("now") == "1" // "all at once": skip the paced one-service-at-a-time rollout
 
 	if !s.gitDeploy.TryAcquire() {
 		http.Error(w, "a deploy is already in progress — it continues in the background even if you leave this page; refresh the app to see the result", http.StatusConflict)
@@ -625,16 +626,20 @@ func (s *Server) handleGitDeploy(w http.ResponseWriter, r *http.Request) {
 	// Stream on a BACKGROUND context (not the request context) so navigating away can't
 	// cancel a build mid-flight; the single-flight gate (held until the goroutine finishes)
 	// blocks a duplicate restart. Progress is streamed best-effort.
-	s.streamDeploy(w, fmt.Sprintf("$ deploy %s @ %s", project, shortSha(sha)), func(bg context.Context, emit func(string)) {
-		if err := s.deployRepoApp(bg, cfg, sha, "manual", actor, false, emit); err != nil {
-			emit(fmt.Sprintf("\n[failed: %v]", err))
-			_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "git_deploy", Target: project + "@" + shortSha(sha), Outcome: audit.Error, Level: audit.Security, Detail: err.Error()})
-			return
-		}
-		emit("\n[done]")
-		_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "git_deploy", Target: project + "@" + shortSha(sha), Outcome: audit.OK, Level: audit.Security})
+	opening := fmt.Sprintf("$ deploy %s @ %s", project, shortSha(sha))
+	if atOnce {
+		opening += " (all at once)"
+	}
+	s.streamDeploy(w, opening, func(bg context.Context, emit func(string)) {
+		problems, err := s.deployRepoApp(bg, cfg, sha, "manual", actor, false, atOnce, emit)
+		outcome, detail := deployVerdict(emit, atOnce, problems, err)
+		_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "git_deploy", Target: project + "@" + shortSha(sha), Outcome: outcome, Level: audit.Security, Detail: detail})
 	})
 }
+
+// streamKeepalive is how long a deploy stream may stay silent before streamDeploy writes a progress line,
+// so a proxy or browser doesn't drop the response during a long quiet phase (an image export, a wait).
+var streamKeepalive = 20 * time.Second
 
 // streamDeploy runs a write-plane deploy/rollback in a background goroutine and streams its
 // output to the client best-effort. The CALLER must already hold the s.gitDeploy single-flight
@@ -651,7 +656,7 @@ func (s *Server) streamDeploy(w http.ResponseWriter, opening string, run func(bg
 	go func() {
 		defer s.gitDeploy.Release()
 		defer close(lines)
-		bg, cancel := context.WithTimeout(context.Background(), gitDeployTimeout)
+		bg, cancel := context.WithTimeout(context.Background(), s.deployTimeout())
 		defer cancel()
 		emit := func(line string) {
 			select {
@@ -667,13 +672,28 @@ func (s *Server) streamDeploy(w http.ResponseWriter, opening string, run func(bg
 
 	// Stream until the work finishes (lines closed) or the client disconnects (write error).
 	// On disconnect we just stop reading — the goroutine above keeps running in the background.
-	for line := range lines {
+	// Every write happens here, so the keepalive line never races a deploy line.
+	start := time.Now()
+	idle := time.NewTimer(streamKeepalive)
+	defer idle.Stop()
+	for {
+		var line string
+		select {
+		case l, ok := <-lines:
+			if !ok {
+				return
+			}
+			line = l
+		case <-idle.C:
+			line = fmt.Sprintf("… still working (%s)", time.Since(start).Round(time.Second))
+		}
 		if _, werr := fmt.Fprintln(w, line); werr != nil {
-			break
+			return
 		}
 		if flusher != nil {
 			flusher.Flush()
 		}
+		idle.Reset(streamKeepalive)
 	}
 }
 
@@ -717,19 +737,21 @@ func (s *Server) handleVersionRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	atOnce := r.URL.Query().Get("now") == "1" // "all at once": skip the paced one-service-at-a-time rollout
+
 	if !s.gitDeploy.TryAcquire() {
 		http.Error(w, "a deploy is already in progress — it continues in the background even if you leave this page; refresh the app to see the result", http.StatusConflict)
 		return
 	}
 
-	s.streamDeploy(w, fmt.Sprintf("$ rollback %s → %s", project, shortSha(commit)), func(bg context.Context, emit func(string)) {
-		if err := s.deployRepoApp(bg, cfg, commit, "rollback", actor, true, emit); err != nil {
-			emit(fmt.Sprintf("\n[failed: %v]", err))
-			_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "version_rollback", Target: project + "@" + shortSha(commit), Outcome: audit.Error, Level: audit.Security, Detail: err.Error()})
-			return
-		}
-		emit("\n[done]")
-		_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "version_rollback", Target: project + "@" + shortSha(commit), Outcome: audit.OK, Level: audit.Security})
+	opening := fmt.Sprintf("$ rollback %s → %s", project, shortSha(commit))
+	if atOnce {
+		opening += " (all at once)"
+	}
+	s.streamDeploy(w, opening, func(bg context.Context, emit func(string)) {
+		problems, err := s.deployRepoApp(bg, cfg, commit, "rollback", actor, true, atOnce, emit)
+		outcome, detail := deployVerdict(emit, atOnce, problems, err)
+		_ = s.audit.Log(bg, audit.Event{Actor: actor, IP: peer, Action: "version_rollback", Target: project + "@" + shortSha(commit), Outcome: outcome, Level: audit.Security, Detail: detail})
 	})
 }
 
@@ -781,23 +803,28 @@ func (s *Server) handleVersionDelete(w http.ResponseWriter, r *http.Request) {
 //  3. archive-extract the pinned tree into the Mooring-owned run dir (symlinks
 //     rejected, paths confined).
 //  4. materialize managed config files + the 0600 env-file (M5/M5b).
-//  5. `docker compose up -d` under the gate + one-docker-child semaphore (M4).
+//  5. build, then start the new version under the gate + one-docker-child semaphore (M4):
+//     one service at a time while the start gate is enabled (deploy_rollout.go), else — or
+//     with atOnce — one whole-project `docker compose up -d`.
 //  6. pin deployed_commit (ref + DB) so gc never prunes it (rollback stays valid).
-func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, source, actor string, rollback bool, onLine func(string)) error {
+//
+// It returns the services a paced rollout couldn't bring up cleanly; the deploy went ahead
+// regardless ("deployed with problems"). A non-nil error means the deploy failed.
+func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, source, actor string, rollback, atOnce bool, onLine func(string)) ([]rolloutProblem, error) {
 	bg := context.Background() // FSM/DB writes persist even if the client disconnects
 	defer s.beginForeground()()
 	slug := cfg.Project
 	rd := filepath.Clean(s.appRunDir(slug))
 	if !filepath.IsAbs(rd) || rd == "/" || isSensitiveDir(rd) {
-		return fmt.Errorf("app run directory %q is unsafe; refusing to deploy", rd)
+		return nil, fmt.Errorf("app run directory %q is unsafe; refusing to deploy", rd)
 	}
 	if !isFullSha40(sha) {
-		return errors.New("a full commit sha is required")
+		return nil, errors.New("a full commit sha is required")
 	}
 
 	repo, err := git.Open(s.gitObjectDir(slug))
 	if err != nil {
-		return fmt.Errorf("open object store: %w", err)
+		return nil, fmt.Errorf("open object store: %w", err)
 	}
 
 	// (1) sha-pin. A normal deploy promotes exactly the reviewed staged commit: the staged
@@ -809,11 +836,11 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		stagedNow := repo.RefSha(ctx, git.StagedRef)
 		if stagedNow != sha || cfg.StagedCommit != sha {
 			s.gitStore.SetState(bg, slug, "update_blocked")
-			return errors.New("the staged commit moved since it was reviewed; fetch and re-review before deploying")
+			return nil, errors.New("the staged commit moved since it was reviewed; fetch and re-review before deploying")
 		}
 	}
 	if _, err := repo.ResolveRef(ctx, sha); err != nil {
-		return fmt.Errorf("commit not found: %w", err)
+		return nil, fmt.Errorf("commit not found: %w", err)
 	}
 
 	// (2) Mooring OWNS the compose: read the repo's mooring.yaml at the pinned
@@ -826,7 +853,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	}
 	if derr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return derr
+		return nil, derr
 	}
 	if scaffolded {
 		onLine("no mooring file in the repo — using a generated default")
@@ -839,7 +866,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		baseNamespace, nerr := s.basePreviewNamespace(cfg.PreviewOf)
 		if nerr != nil {
 			s.gitStore.SetState(bg, slug, "update_blocked")
-			return nerr
+			return nil, nerr
 		}
 		applyPreviewPrefix(def, slug, baseNamespace)
 	}
@@ -850,19 +877,19 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	s.adviseSubdomainDNS(ctx, def, onLine)
 	if err := s.expandSubdomains(def); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 	composeBytes, gerr := definition.ComposeBytes(def)
 	if gerr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("generate compose: %w", gerr)
+		return nil, fmt.Errorf("generate compose: %w", gerr)
 	}
 	// Mint any `generate:` secrets that don't exist yet (idempotent — never
 	// overwrites a live value), BEFORE the env is read so freshly-minted values
 	// flow into validation and the deploy --env-file.
 	if err := s.ensureGeneratedSecrets(ctx, slug, def, onLine); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("generate secrets: %w", err)
+		return nil, fmt.Errorf("generate secrets: %w", err)
 	}
 	env := s.repoComposeEnv(ctx, repo, sha, cfg)
 	res := compose.ValidateBytes(composeBytes, env, rd, compose.Options{ProtectedPaths: s.protectedHostPaths()})
@@ -874,7 +901,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 				onLine("  - " + v.String())
 			}
 			s.gitStore.SetState(bg, slug, "update_blocked")
-			return fmt.Errorf("compose validation failed (%d finding(s))", len(res.Violations))
+			return nil, fmt.Errorf("compose validation failed (%d finding(s))", len(res.Violations))
 		}
 		onLine(fmt.Sprintf("WARNING (review mode): %d validator finding(s); proceeding.", len(res.Violations)))
 	}
@@ -885,13 +912,13 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// container view is down or stale, or while the read and write planes reach different daemons.
 	if err := s.preDeployPlaneCheck(ctx, onLine); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 
 	// (3) archive-extract the pinned tree (Mooring-owned run dir).
 	if err := os.MkdirAll(rd, 0o700); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 	// The run dir is REUSED across deploys, and `git archive | tar` only adds/overwrites —
 	// it never removes a file the new commit deleted. Left alone, a file dropped in this
@@ -910,7 +937,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	onLine("extracting " + shortSha(sha) + " → run dir")
 	if err := repo.ArchiveTo(ctx, sha, rd); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("checkout: %w", err)
+		return nil, fmt.Errorf("checkout: %w", err)
 	}
 
 	// (4) Mooring owns the compose: write the GENERATED compose into the run dir
@@ -921,63 +948,64 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// following it; ancestors checked) — never follow a planted symlink out of rd.
 	if err := atomicWrite(composeAbs, composeBytes, 0o644, rd); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("write generated compose: %w", err)
+		return nil, fmt.Errorf("write generated compose: %w", err)
 	}
 	nonrootSvcs, dfErr := s.writeGeneratedDockerfiles(ctx, repo, sha, rd, def, onLine)
 	if dfErr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("generate Dockerfile: %w", dfErr)
+		return nil, fmt.Errorf("generate Dockerfile: %w", dfErr)
 	}
 	// Pre-create bind-mount source dirs (Mooring-owned, confined) so Docker doesn't
 	// create a missing one as root.
 	if err := materializeBindDirs(rd, defBindSources(def)); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 	// Render managed config files + secret files into the run dir (the read-only bind
 	// mounts are already in the generated compose).
 	if err := s.materializeManaged(ctx, repo, sha, rd, slug, def); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 	// Register cert_bindings so the managed edge issues each hostname's cert, then
 	// sync the issued leaf into the run dir (blocks until issued). Replaces the
 	// docker.sock cert-reloader: no container holds the socket.
 	if err := s.registerCertBindings(ctx, slug, def, onLine); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 	// Wait for ACME to finish issuing each cert_binding (the edge was just told to),
 	// then copy the leaf in. This makes one deploy self-complete instead of failing
 	// closed and forcing a manual re-deploy.
 	if err := s.waitForCertBindings(ctx, def, onLine); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 	if err := s.syncCertBindings(rd, def); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return err
+		return nil, err
 	}
 	app := &monitor.App{Project: slug, WorkingDir: rd, ConfigFiles: []string{composeAbs}}
 	if err := s.materializeConfigFiles(app, env); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("config-file materialization: %w", err)
+		return nil, fmt.Errorf("config-file materialization: %w", err)
 	}
 	envFile, cleanup, ferr := s.renderEnvFile(app, env)
 	defer cleanup()
 	if ferr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return errors.New("could not render env file")
+		return nil, errors.New("could not render env file")
 	}
 
 	// Compose only diffs a service's CONFIG, not its bind-mounted file CONTENT — so a
 	// changed config_file / secret / cert (same mount path) wouldn't recreate the
 	// consumer. Digest each service's managed files now and compare to last deploy;
-	// the changed ones get force-recreated after the up (a cert renewal lands the same
-	// way). New services need no force — the up creates them.
+	// the changed ones get force-recreated (a cert renewal lands the same way). New
+	// services need no force — the up creates them.
 	newDigests := s.managedDigests(rd, def)
+	prevDigests := readDigestState(rd)
 	// Scheduled-only services are never force-recreated: naming one in `up … -- <svc>` would start it.
-	changed := withoutScheduled(def, changedServices(readDigestState(rd), newDigests))
+	changed := withoutScheduled(def, changedServices(prevDigests, newDigests))
 
 	depID := s.recordRepoDeployStart(bg, slug, source, actor, "git_deploy")
 	// Suppress the self-healing supervisor for this app from here to the end of the deploy (plan §8.5):
@@ -988,8 +1016,10 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// (5a) Build every build service explicitly, scheduled ones included. `up --build` builds only the
 	// services it starts and the scheduled compose profile keeps scheduled services out of `up`, so a
 	// scheduled task would otherwise keep its first image forever. A build failure stops the deploy
-	// before any running container is touched.
+	// before any running container is touched. The build has its own deadline (gitDeployTimeout); the
+	// start of the new version runs on the rest of ctx (deployTimeout adds the rollout budget).
 	if svcs := buildServiceNames(def); len(svcs) > 0 {
+		bctx, bcancel := context.WithTimeout(ctx, gitDeployTimeout)
 		buildStart := time.Now()
 		// On a small host (server.build_concurrency), build one service at a time: several images
 		// building at once starve the running apps of CPU.
@@ -1004,15 +1034,19 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		for _, g := range groups {
 			onLine("$ docker compose build " + strings.Join(g, " "))
 			bjob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: buildAction(g)}
-			if berr := s.runner.Run(ctx, bjob, onLine); berr != nil {
+			if berr := s.runner.Run(bctx, bjob, onLine); berr != nil {
+				bcancel()
 				code, outcome := classifyExit(berr)
 				s.recordDeployFinish(bg, depID, code, outcome)
 				s.gitStore.SetState(bg, slug, "update_blocked")
-				return fmt.Errorf("docker compose build failed: %w", berr)
+				return nil, fmt.Errorf("docker compose build failed: %w", berr)
 			}
 		}
-		s.reportBuiltImages(ctx, slug, svcs, buildStart, onLine)
+		s.reportBuiltImages(bctx, slug, svcs, buildStart, onLine)
+		bcancel()
 	}
+	// A long build can use up most of the expected_down lease; the start of the new version gets a full one.
+	s.renewExpectedDown(bg, slug)
 
 	// Heal data-volume ownership BEFORE `up`. A named volume left owned by a since-drifted build UID
 	// (or the one-time UID-pin transition) would otherwise leave the app silently unable to write its
@@ -1021,18 +1055,6 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// blocks the deploy. See internal/builder.NonrootUID.
 	reconciledVols := s.reconcileVolumeOwnership(ctx, slug, def, nonrootSvcs, onLine)
 
-	// (5b) docker compose up under the gate + one-docker-child semaphore. Build services were built in
-	// (5a), so the up never builds; pull-image services are never built on-box either.
-	action := []string{"up", "-d", "--remove-orphans", "--no-build"}
-	onLine("$ docker compose " + strings.Join(action, " "))
-	job := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: action}
-	upStart := time.Now()
-	runErr := s.runUpWithConflictReap(ctx, slug, declared,
-		func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
-		s.runner.RemoveContainers, onLine)
-	// The deploy never waits on the start gate (it may be the fix for the unhealthy service), but the
-	// autoscaler and self-heal wait for what it started to settle before starting more.
-	s.recordStart(slug, "", upStart, false)
 	// failed records the deploy's outcome for every failure after the build; a success is recorded only
 	// once the edge is verified below.
 	failed := func(err error) error {
@@ -1041,33 +1063,90 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return err
 	}
-	if runErr != nil {
-		// The `up` failed, so the OLD containers are still running. Roll any volume ownership we
-		// changed back to its prior UID, or that still-running old container (a different UID) would
-		// be left unable to write its own data until a deploy eventually succeeds. Detached context so
-		// it runs even if the request was cancelled.
-		s.rollbackVolumeOwnership(bg, reconciledVols, onLine)
-		s.streamOOMHint(ctx, slug, declared, onLine)
-		return failed(fmt.Errorf("docker compose up failed: %w", runErr))
-	}
-
-	// Force-recreate ONLY the services whose managed file content changed, so the new
-	// config/secret/cert takes effect (compose wouldn't otherwise restart them).
-	if len(changed) > 0 {
-		onLine("$ docker compose up -d --force-recreate " + strings.Join(changed, " ") + "  (changed config/secret/cert)")
-		recreate := append([]string{"up", "-d", "--no-build", "--force-recreate", "--"}, changed...)
-		rjob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: recreate}
-		recreateStart := time.Now()
-		rerr := s.runUpWithConflictReap(ctx, slug, declared,
-			func(c context.Context, ol func(string)) error { return s.runner.Run(c, rjob, ol) },
-			s.runner.RemoveContainers, onLine)
-		s.recordStart(slug, "", recreateStart, false)
-		if rerr != nil {
+	upJob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile}
+	digests := newDigests
+	var problems []rolloutProblem
+	paced := !atOnce && s.startGate != nil && s.cfg.Server.StartGateSettings().Enabled
+	if paced {
+		// Remove the containers of services no longer in the definition first, as the whole-project
+		// `up --remove-orphans` did: a renamed service may need the host port its old name still holds.
+		s.removeOrphanContainers(ctx, slug, declared, onLine)
+		// (5b) Start the new version one service at a time, dependencies first (deploy_rollout.go). Build
+		// services were built in (5a), so no `up` builds.
+		out, rerr := s.runDeployRollout(ctx, deployRollout{slug: slug, def: def, base: upJob, changed: changed}, onLine)
+		if out.allFailed() {
+			// Nothing started, so the OLD containers are still running: undo as for a failed whole-project up.
+			s.rollbackVolumeOwnership(bg, reconciledVols, onLine)
 			s.streamOOMHint(ctx, slug, declared, onLine)
-			return failed(fmt.Errorf("recreate of changed services failed: %w", rerr))
+			return nil, failed(fmt.Errorf("docker compose up failed: %s", deployProblemsText(out.problems)))
+		}
+		problems = out.problems
+		if len(problems) > 0 {
+			// Intentional: the deploy carries on past a service that failed to start or settle, so the rest of
+			// the new version still ships (it may be the fix). The problems are streamed last and alerted.
+			defer s.reportDeployProblems(slug, problems, onLine)
+		}
+		if rerr != nil {
+			return nil, failed(fmt.Errorf("the deploy stopped before every service was started: %w", rerr))
+		}
+		// A service that failed to start still runs its old container: give back the old owner of a
+		// volume only such services use (one a started service uses keeps the new owner).
+		if stuck := out.failedToStart(out.steps); len(stuck) > 0 && len(reconciledVols) > 0 {
+			s.rollbackVolumeOwnership(bg, volumesOnlyFor(def, slug, reconciledVols, stuck), onLine)
+		}
+		digests = keepDeployDigests(newDigests, prevDigests, out.failedToStart(changed))
+	} else {
+		if atOnce {
+			onLine("all at once: every service starts together, without waiting for each to become healthy")
+		}
+		// (5b) docker compose up under the gate + one-docker-child semaphore. Build services were built in
+		// (5a), so the up never builds; pull-image services are never built on-box either.
+		action := []string{"up", "-d", "--remove-orphans", "--no-build"}
+		onLine("$ docker compose " + strings.Join(action, " "))
+		job := upJob
+		job.Action = action
+		upStart := time.Now()
+		runErr := s.runUpWithConflictReap(ctx, slug, declared,
+			func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
+			s.runner.RemoveContainers, onLine)
+		// The deploy never waits on the start gate (it may be the fix for the unhealthy service), but the
+		// autoscaler and self-heal wait for what it started to settle before starting more.
+		s.recordStart(slug, "", upStart, false)
+		if runErr != nil {
+			// The `up` failed, so the OLD containers are still running. Roll any volume ownership we
+			// changed back to its prior UID, or that still-running old container (a different UID) would
+			// be left unable to write its own data until a deploy eventually succeeds. Detached context so
+			// it runs even if the request was cancelled.
+			s.rollbackVolumeOwnership(bg, reconciledVols, onLine)
+			s.streamOOMHint(ctx, slug, declared, onLine)
+			return nil, failed(fmt.Errorf("docker compose up failed: %w", runErr))
+		}
+
+		// Force-recreate ONLY the services whose managed file content changed, so the new
+		// config/secret/cert takes effect (compose wouldn't otherwise restart them).
+		if len(changed) > 0 {
+			onLine("$ docker compose up -d --force-recreate " + strings.Join(changed, " ") + "  (changed config/secret/cert)")
+			rjob := upJob
+			rjob.Action = append([]string{"up", "-d", "--no-build", "--force-recreate", "--"}, changed...)
+			recreateStart := time.Now()
+			rerr := s.runUpWithConflictReap(ctx, slug, declared,
+				func(c context.Context, ol func(string)) error { return s.runner.Run(c, rjob, ol) },
+				s.runner.RemoveContainers, onLine)
+			s.recordStart(slug, "", recreateStart, false)
+			if rerr != nil {
+				s.streamOOMHint(ctx, slug, declared, onLine)
+				return nil, failed(fmt.Errorf("recreate of changed services failed: %w", rerr))
+			}
+		}
+		// The whole-project `up` started every service, held ones included: release their holds, as a
+		// paced deploy does, so self-heal and the autoscaler look after them again.
+		for svc := range declared {
+			if !isScheduledService(def, svc) {
+				s.releaseDeployHold(slug, svc)
+			}
 		}
 	}
-	if err := s.writeDigestState(rd, newDigests); err != nil {
+	if err := s.writeDigestState(rd, digests); err != nil {
 		onLine("warning: could not record managed-file digests: " + err.Error())
 	}
 
@@ -1082,7 +1161,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		note = "rollback to " + shortSha(sha)
 	}
 	if err := s.applyDefinition(ctx, slug, def, note, sha); err != nil {
-		return failed(fmt.Errorf("apply definition: %w", err))
+		return nil, failed(fmt.Errorf("apply definition: %w", err))
 	}
 
 	// (6) pin the deployed commit (ref keeps gc from pruning it; DB drives the FSM). The new containers
@@ -1118,11 +1197,24 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		})
 		return ids, err
 	}
-	if verr := s.verifyEdgeTargets(ctx, slug, s.cfg.Edge.ApplyProbeWindow.D(), psIDs, onLine); verr != nil {
-		return failed(verr)
+	// A service already reported as a problem (it didn't start or settle) leaves its routes unserved: they
+	// are listed with ✗ but don't fail the deploy — it carries on past the problem, as the rollout did.
+	excused := map[string]bool{}
+	for _, p := range problems {
+		excused[p.Service] = true
 	}
-	s.recordDeployFinish(bg, depID, 0, "ok")
+	if verr := s.verifyEdgeTargetsExcept(ctx, slug, s.cfg.Edge.ApplyProbeWindow.D(), psIDs, onLine, excused); verr != nil {
+		return nil, failed(verr)
+	}
+	outcome := "ok"
+	if len(problems) > 0 {
+		outcome = "problems"
+	}
+	s.recordDeployFinish(bg, depID, 0, outcome)
 	onLine("deployed " + shortSha(sha))
+	if len(problems) == 0 {
+		s.resolveDeployProblems(slug) // any clean deploy clears an open "deployed with problems" alert
+	}
 
 	// Reclaim build cache so the generated multi-stage builds' single-use runtime layers
 	// (a unique `COPY --chown=<uid> --from=build /app /app` per deploy) don't accumulate on the host.
@@ -1137,7 +1229,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		}
 		pcancel()
 	}
-	return nil
+	return problems, nil
 }
 
 // pruneDeletedTrackedFiles removes from the run dir the git-tracked files present in
@@ -1282,7 +1374,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	s.auditWebhook(r, project, audit.OK, "accepted")
 	go func() {
 		defer s.gitDeploy.Release()
-		ctx, cancel := context.WithTimeout(context.Background(), gitDeployTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), s.deployTimeout())
 		defer cancel()
 		s.fetchAndMaybeDeploy(ctx, project, "webhook")
 	}()
@@ -1319,10 +1411,15 @@ func (s *Server) fetchAndMaybeDeploy(ctx context.Context, project, actor string)
 	if ok, _ := s.runner.WriteAllowed(); !ok {
 		return
 	}
-	if err := s.deployRepoApp(ctx, fresh, staged, actor, actor, false, func(line string) {
+	// An automatic deploy is always paced (never "all at once").
+	problems, err := s.deployRepoApp(ctx, fresh, staged, actor, actor, false, false, func(line string) {
 		s.log.Info("git auto-deploy", "project", project, "via", actor, "line", line)
-	}); err != nil {
+	})
+	switch {
+	case err != nil:
 		s.log.Warn("git auto-deploy failed", "project", project, "via", actor)
+	case len(problems) > 0:
+		s.log.Warn("git auto-deploy finished with problems", "project", project, "via", actor, "problems", deployProblemsText(problems))
 	}
 }
 

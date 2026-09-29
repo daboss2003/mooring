@@ -81,6 +81,56 @@ func imageInspectArgv(slug string, svcs []string) []string {
 
 var imageIDRe = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
+// serviceImageRef is the image a service's containers run: compose's <slug>-<service> for a build service,
+// else the definition's image.
+func serviceImageRef(slug, name string, svc definition.Service) string {
+	if svc.Build != nil {
+		return imageRef(slug, name)
+	}
+	return svc.Image
+}
+
+// imageIDArgv is the static docker argv that prints one image's id: `docker image inspect --format
+// {{.Id}} -- <ref>`. The ref comes from a validated slug and service name, or the definition's image.
+func imageIDArgv(ref string) []string {
+	return []string{"image", "inspect", "--format", "{{.Id}}", "--", ref}
+}
+
+// parseImageID returns the image id printed by imageIDArgv, or "" unless the output is exactly one id.
+func parseImageID(out string) string {
+	if f := strings.Fields(out); len(f) == 1 && imageIDRe.MatchString(f[0]) {
+		return f[0]
+	}
+	return ""
+}
+
+// serviceImageIDs returns the local image id each service's containers would run now (serviceImageRef,
+// inspected once per distinct ref). A service whose image can't be inspected has no entry.
+func (s *Server) serviceImageIDs(ctx context.Context, slug string, def *definition.Definition, services []string) map[string]string {
+	ids := map[string]string{}
+	byRef := map[string]string{}
+	for _, name := range services {
+		ref := serviceImageRef(slug, name, def.Spec.Compose.Services[name])
+		if ref == "" {
+			continue
+		}
+		id, done := byRef[ref]
+		if !done {
+			var out bytes.Buffer
+			ictx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			if err := s.runner.RunStream(ictx, imageIDArgv(ref), &out, nil); err == nil {
+				id = parseImageID(out.String())
+			}
+			cancel()
+			byRef[ref] = id
+		}
+		if id != "" {
+			ids[name] = id
+		}
+	}
+	return ids
+}
+
 type imageInfo struct {
 	ID      string
 	Created time.Time

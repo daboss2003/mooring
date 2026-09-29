@@ -29,12 +29,13 @@
         {{if .StatusText}}<tr><td>Status</td><td class="muted">{{.StatusText}}</td></tr>{{end}}
       </tbody>
     </table></div>
-    <div class="queue-actions mt1">
+    <div class="queue-actions mt1 lc-group">
       <button type="button" class="btn btn-sm lc-btn" data-log-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs{{if .ContainerID}}?copy={{pathEscape .ContainerID}}{{end}}">View logs</button>
       <a class="btn btn-sm" href="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs/history" title="Search this service's retained logs">Log history</a>
       {{if and (not $.WriteDisabledReason) (not $.Protected)}}
       {{if .Held}}
       <button type="button" class="btn btn-sm btn-primary lc-btn" data-lc-confirm="Start the {{.Service}} service and resume auto-restart?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/start">Start</button>
+      <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
       {{else}}
       {{if gt (len .Copies) 1}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart just this copy ({{.ContainerName}})? The other copies keep serving." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart?copy={{pathEscape .ContainerID}}">Restart this copy</button>
@@ -42,6 +43,7 @@
       {{end}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart the {{.Service}} service{{if gt (len .Copies) 1}} (all copies){{end}}?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart">Restart{{if gt (len .Copies) 1}} service{{end}}</button>
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop the {{.Service}} service{{if gt (len .Copies) 1}} (all copies){{end}}? It stays stopped (auto-restart paused) until you start it — the rest of the app keeps running." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/stop">Stop{{if gt (len .Copies) 1}} service{{end}}</button>
+      <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
       {{if and .Policy .Policy.Enabled}}
       <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/up" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Add one replica now — auto-scaling still manages it (sheds it under sustained no load, keeps it under load)">+1 replica</button></form>
       <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/down" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Remove one replica now — never below the minimum">−1 replica</button></form>

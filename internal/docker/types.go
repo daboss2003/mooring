@@ -36,6 +36,9 @@ type Container struct {
 	Status          string                  `json:"Status"` // human string, e.g. "Up 3 hours (healthy)"
 	Labels          map[string]string       `json:"Labels"`
 	NetworkSettings containerNetworkSummary `json:"NetworkSettings"`
+
+	// ImageID is the image the container runs (sha256:…).
+	ImageID string `json:"ImageID"`
 }
 
 // containerNetworkSummary is the slice of /containers/json's NetworkSettings we
@@ -68,6 +71,10 @@ func (c Container) IPs() []string {
 
 // Project returns the compose project label (the app key), or "" if unlabeled.
 func (c Container) Project() string { return c.Labels[LabelProject] }
+
+// ConfigHash returns compose's hash of the service definition the container was created from; a
+// container whose hash differs from `docker compose config --hash` for its service is out of date.
+func (c Container) ConfigHash() string { return c.Labels["com.docker.compose.config-hash"] }
 
 // OneOff reports whether this is a transient `compose run` one-shot container (cron task or
 // backup/restore sidecar) rather than a supervised long-running service.

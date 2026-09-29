@@ -76,6 +76,13 @@ type AdmitOpts struct {
 	// IgnoreCPU skips the CPU check (the action already waited MaxWait for CPU, or it restores a
 	// service with no running copy at all).
 	IgnoreCPU bool
+	// IgnoreApp: starts recorded for this app, and its containers still starting, don't hold the start
+	// back. A rollout paces its own app itself (it waits for each service before the next) and only
+	// waits here for other apps' starts and the CPU.
+	IgnoreApp string
+	// IgnoreStarts: no other start holds this one back (only the CPU check remains) — the action already
+	// waited MaxWait for them.
+	IgnoreStarts bool
 }
 
 // Decision kinds.
@@ -332,6 +339,9 @@ func (g *Gate) Admit(now time.Time, o AdmitOpts) Decision {
 		return Decision{OK: true}
 	}
 	for _, e := range g.ledger {
+		if o.IgnoreStarts || (o.IgnoreApp != "" && e.app == o.IgnoreApp) {
+			continue
+		}
 		if now.Before(g.expiry(e)) {
 			who := e.app
 			if e.service != "" {
@@ -346,7 +356,7 @@ func (g *Gate) Admit(now time.Time, o AdmitOpts) Decision {
 		excluded[id] = true
 	}
 	for _, c := range g.cur {
-		if !excluded[c.ID] && g.holdsLocked(c, now) {
+		if !o.IgnoreStarts && !excluded[c.ID] && (o.IgnoreApp == "" || c.App != o.IgnoreApp) && g.holdsLocked(c, now) {
 			return Decision{Kind: Settling, Blocker: c.App + "/" + c.Service,
 				Reason: fmt.Sprintf("%s/%s is still starting", c.App, c.Service)}
 		}
@@ -388,10 +398,15 @@ type Wait struct {
 	settleSince time.Time // first settle deferral
 }
 
-// Admit asks g, skipping the CPU check once this action has waited MaxWait for CPU.
+// Admit asks g, skipping the CPU check once this action has waited MaxWait for CPU, and other starts
+// once it has waited MaxWait for them (a long rollout of another app must not keep it waiting).
 func (w *Wait) Admit(g *Gate, now time.Time, o AdmitOpts) Decision {
-	if !w.cpuSince.IsZero() && now.Sub(w.cpuSince) >= g.Config().MaxWait {
+	maxWait := g.Config().MaxWait
+	if !w.cpuSince.IsZero() && now.Sub(w.cpuSince) >= maxWait {
 		o.IgnoreCPU = true
+	}
+	if !w.settleSince.IsZero() && now.Sub(w.settleSince) >= maxWait {
+		o.IgnoreStarts = true
 	}
 	d := g.Admit(now, o)
 	switch d.Kind {

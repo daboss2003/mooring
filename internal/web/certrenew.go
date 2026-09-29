@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"errors"
+	"maps"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,7 +28,8 @@ import (
 // Safe + idempotent by construction:
 //   - acts ONLY when the synced leaf digest changed (changedServices); an unchanged
 //     leaf is a no-op (re-sync writes identical bytes → same digest → nothing recreated)
-//   - takes the single-flight deploy lock (gitDeploy) so it never races a deploy
+//   - takes the single-flight deploy lock (gitDeploy) so it never races a deploy — with paced
+//     starts only around each service's docker call, stopping when a git operation holds it
 //   - holds an expected-down lease per app so self-heal ignores the brief recreate
 //   - reuses syncCertBindings + managedDigests/changedServices + renderEnvFile + the
 //     deploy's `up --force-recreate` job, so a renewal recreate == a deploy recreate
@@ -81,8 +84,9 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 		s.log.Debug("cert-renew: sync skipped", "app", slug, "err", err)
 		return
 	}
+	oldDigests := readDigestState(rd)
 	newDigests := s.managedDigests(rd, def)
-	allChanged := changedServices(readDigestState(rd), newDigests)
+	allChanged := changedServices(oldDigests, newDigests)
 	if len(allChanged) == 0 {
 		return // no leaf changed
 	}
@@ -123,6 +127,10 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 	}
 
 	// A leaf renewed → recreate the affected services, exactly as a deploy would.
+	if s.pacedStartsEnabled() {
+		s.renewCertsPaced(ctx, cfg, def, rd, changed, oldDigests, newDigests)
+		return
+	}
 	if !s.gitDeploy.TryAcquire() {
 		return // a deploy/another renewal holds the lock; retry next tick
 	}
@@ -161,6 +169,120 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 	_ = s.audit.Log(ctx, audit.Event{
 		Actor: "system", Action: "cert_renew", Target: slug, Outcome: audit.OK,
 		Level: audit.Security, Detail: "recreated: " + strings.Join(changed, ","),
+	})
+}
+
+// renewCertsPaced is the renewal's recreate when starts are paced: the changed services one at a time,
+// dependencies first, each waited for (recreateRenewed). The whole renewal counts as a foreground
+// operation, so scheduled tasks don't take the docker slot in its settle gaps.
+func (s *Server) renewCertsPaced(ctx context.Context, cfg gitstore.Config, def *definition.Definition, rd string, changed []string, oldDigests, newDigests map[string]string) {
+	slug := cfg.Project
+	defer s.beginForeground()()
+	repo, err := git.Open(s.gitObjectDir(slug))
+	if err != nil {
+		s.log.Warn("cert-renew: open repo failed", "app", slug, "err", err)
+		return
+	}
+	env := s.repoComposeEnv(ctx, repo, cfg.DeployedCommit, cfg)
+	app := &monitor.App{Project: slug, WorkingDir: rd, ConfigFiles: []string{filepath.Join(rd, "docker-compose.yml")}}
+	envFile, cleanup, ferr := s.renderEnvFile(app, env)
+	defer cleanup()
+	if ferr != nil {
+		s.log.Warn("cert-renew: render env failed", "app", slug, "err", ferr)
+		return
+	}
+	base := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile}
+	s.recreateRenewed(ctx, slug, rd, def, base, changed, oldDigests, newDigests)
+}
+
+// recreateRenewed force-recreates changed one service at a time (runRollout) and records the
+// managed-file digests. The git-deploy single-flight is taken only around each docker call, never
+// across a settle wait, so a renewal doesn't turn deploys and webhooks away while it waits; when a git
+// operation holds it, the renewal stops without recording anything and the next tick picks up what is
+// left. A service whose recreate didn't start keeps its old digest, so the next tick retries only it.
+func (s *Server) recreateRenewed(ctx context.Context, slug, rd string, def *definition.Definition, base dockerexec.Job, changed []string, oldDigests, newDigests map[string]string) {
+	rctx, cancel := context.WithTimeout(ctx, s.deployTimeout())
+	defer cancel()
+	// Suppress the supervisor for this app while we intentionally recreate it.
+	defer s.leaseExpectedDown(rctx, slug)()
+	gs := s.cfg.Server.StartGateSettings()
+	var steps []rolloutStep
+	for _, svc := range rolloutOrder(changed, lifecycleDeps(def)) {
+		st := lifecycleStep(def, svc, gs)
+		st.Job, st.Reap = base, true
+		st.Job.Action, st.Job.Service = []string{"up", "-d", "--no-deps", "--no-build", "--force-recreate"}, svc
+		steps = append(steps, st)
+	}
+	started := map[string]bool{}
+	problems, err := s.runRollout(rctx, steps, rolloutOpts{
+		App:     slug,
+		OnLine:  func(l string) { s.log.Debug("cert-renew", "app", slug, "out", l) },
+		Renew:   s.expectedDownRenewer(slug),
+		Started: func(svc string) { started[svc] = true },
+		Lock: func() bool {
+			if !s.gitDeploy.TryAcquire() {
+				return false
+			}
+			// Intentional: a git deploy that finished since this renewal began has re-synced the leaves,
+			// recorded new digests and recreated what changed. Recreating the rest with this renewal's
+			// env file (rendered for the commit deployed before it) could undo that deploy, so stop as
+			// if it were still running.
+			if !maps.Equal(readDigestState(rd), oldDigests) {
+				s.gitDeploy.Release()
+				return false
+			}
+			return true
+		},
+		Unlock: s.gitDeploy.Release,
+	})
+	recreated := make([]string, 0, len(started))
+	for _, svc := range changed {
+		if started[svc] {
+			recreated = append(recreated, svc)
+		}
+	}
+	// record is the digest state after this renewal: the new digest for each service it recreated, the old
+	// one for the rest (retried next tick).
+	record := maps.Clone(newDigests)
+	for _, svc := range changed {
+		if !started[svc] {
+			record[svc] = oldDigests[svc]
+		}
+	}
+	if err != nil {
+		// Stopped part-way: another app's git operation holds the lock, or the renewal was interrupted. Keep
+		// what was recreated, so the next tick doesn't recreate it again — unless a deploy of this app ran
+		// meanwhile (the digest file moved on), whose own record then stands.
+		if len(recreated) > 0 && maps.Equal(readDigestState(rd), oldDigests) {
+			if werr := s.writeDigestState(rd, record); werr != nil {
+				s.log.Warn("cert-renew: could not record digests", "app", slug, "err", werr)
+			}
+		}
+		if errors.Is(err, errRolloutLocked) {
+			s.log.Info("cert-renew: a git operation is running; the rest of the renewal waits for the next tick", "app", slug, "recreated", recreated)
+		} else {
+			s.log.Warn("cert-renew: renewal interrupted", "app", slug, "recreated", recreated, "err", err)
+		}
+		return
+	}
+	if len(recreated) == 0 {
+		s.log.Warn("cert-renew: recreate failed", "app", slug, "services", changed, "problems", lifecycleProblemSummary(problems))
+		return
+	}
+	if werr := s.writeDigestState(rd, record); werr != nil {
+		s.log.Warn("cert-renew: could not record digests", "app", slug, "err", werr)
+	}
+	s.reconcileEdgeAfter(rctx) // the recreated containers have new addresses
+	detail := "recreated: " + strings.Join(recreated, ",")
+	if len(problems) > 0 {
+		detail += "; problems: " + lifecycleProblemSummary(problems)
+		s.log.Warn("cert-renew: renewed leaf synced; some services had problems", "app", slug, "recreated", recreated, "problems", lifecycleProblemSummary(problems))
+	} else {
+		s.log.Info("cert-renew: renewed leaf synced + services recreated", "app", slug, "services", recreated)
+	}
+	_ = s.audit.Log(ctx, audit.Event{
+		Actor: "system", Action: "cert_renew", Target: slug, Outcome: audit.OK,
+		Level: audit.Security, Detail: detail,
 	})
 }
 

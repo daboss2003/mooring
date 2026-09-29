@@ -179,6 +179,19 @@ func (s *Server) leaseExpectedDown(ctx context.Context, project string) func() {
 	}
 }
 
+// renewExpectedDown extends project's expected_down lease to expectedDownLease from now, if anything
+// holds it — a rollout calls it after every step, so a long rollout can't outlive the lease row.
+func (s *Server) renewExpectedDown(ctx context.Context, project string) {
+	if s.selfHeal == nil {
+		return
+	}
+	s.leaseMu.Lock()
+	defer s.leaseMu.Unlock()
+	if s.leaseHolders[project] > 0 {
+		_ = s.selfHeal.AcquireExpectedDown(ctx, project, time.Now().Add(expectedDownLease).Unix())
+	}
+}
+
 // SetCircuitClearer wires the supervisor's clear-circuit entry point (set by
 // cmd_serve after both the server and the watcher exist — avoids an import cycle).
 func (s *Server) SetCircuitClearer(c func(project, service string)) { s.circuitClearer = c }

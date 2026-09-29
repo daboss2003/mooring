@@ -77,9 +77,9 @@ A service that sets [`self_healing.on_unhealthy: notify`](./definition-file.md#s
 Starting several services at once on a small host makes them compete for CPU, and none of them becomes healthy. The **start gate** makes Mooring's own automatic starts — auto-scaling, self-healing, and [scheduled tasks](./scheduled-tasks.md) — wait while:
 
 - another container started recently is still starting: until its healthcheck passes, or, for a container without a healthcheck, for at least `settle_grace` and until its CPU drops below `cpu_settle_pct` of one core. One start holds others back for at most `max_settle`. A container that keeps crashing (its restart count rising) holds nothing back;
-- the host CPU (averaged over the last three monitor samples) is at or above `cpu_busy_pct`. An action that has waited `max_wait` for CPU starts anyway, and restoring a service with no running copy never waits for CPU. When self-healing restarts a service, that service's own containers are left out of both checks. A scheduled task held back for `max_wait` for either reason starts anyway.
+- the host CPU (averaged over the last three monitor samples) is at or above `cpu_busy_pct`. An action that has waited `max_wait` for CPU — or for other starts — starts anyway, and restoring a service with no running copy never waits for CPU. When self-healing restarts a service, that service's own containers are left out of both checks. A scheduled task held back for `max_wait` for either reason starts anyway.
 
-Deploys, rollbacks, lifecycle actions (start, restart, redeploy) and certificate renewals are **never held back** — a deploy is often the fix for the unhealthy service. The containers they start are recorded, so the automatic starters wait for them to settle.
+Deploys, rollbacks, lifecycle actions (start, restart, redeploy) and certificate renewals start services one at a time too, but they are **paced, never held back** — a deploy is often the fix for the unhealthy service. Their waits for CPU or other apps' starts total at most `deploy_wait` per deploy or action; each service waits at most its health deadline (capped at `service_settle`); after `rollout_budget` the remaining services start without waiting; and a service that doesn't become healthy is reported while the rest carry on (see [paced starts](./gitops.md#paced-starts)). The containers they start are recorded, so the automatic starters wait for them to settle.
 
 Configure it in `/etc/mooring/config.yaml` (restart Mooring to apply):
 
@@ -92,6 +92,9 @@ server:
     cpu_settle_pct: 50   # % of one core below which it has settled (1–1000)
     max_settle: 3m       # longest one start holds others back (10s–30m)
     max_wait: 10m        # longest an action waits for CPU (1m–2h)
+    deploy_wait: 2m      # deploys and operator actions: total wait for CPU or other starts (0s–30m)
+    service_settle: 15m  # deploys and operator actions: longest wait for one service to become healthy (30s–1h)
+    rollout_budget: 45m  # deploys and operator actions: total pacing; the rest then start unpaced (1m–3h)
 ```
 
 A service whose start-up is slow should declare a [`healthcheck`](./definition-file.md#healthcheck) with a `start_period`; Mooring then waits for the healthcheck instead of guessing from CPU.

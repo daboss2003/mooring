@@ -23,6 +23,13 @@ import (
 // service's running container ids via the write plane.
 func (s *Server) verifyEdgeTargets(ctx context.Context, slug string, window time.Duration,
 	writeIDs func(ctx context.Context, svc string) ([]string, error), onLine func(string)) error {
+	return s.verifyEdgeTargetsExcept(ctx, slug, window, writeIDs, onLine, nil)
+}
+
+// verifyEdgeTargetsExcept is verifyEdgeTargets for a paced deploy: the routes of the services in
+// excused (the deploy's reported problems) are still checked and listed, but can't fail the deploy.
+func (s *Server) verifyEdgeTargetsExcept(ctx context.Context, slug string, window time.Duration,
+	writeIDs func(ctx context.Context, svc string) ([]string, error), onLine func(string), excused map[string]bool) error {
 	if s.edgeRecon == nil || s.edgeRoutes == nil {
 		return nil // the edge isn't Mooring's on this host: nothing to verify
 	}
@@ -37,6 +44,7 @@ func (s *Server) verifyEdgeTargets(ctx context.Context, slug string, window time
 			failures = []string{"edge config not applied: " + rerr.Error()}
 		} else {
 			lines, failures = s.checkEdgeTargets(ctx, slug, writeIDs)
+			failures = s.dropExcusedRoutes(slug, failures, excused)
 		}
 		if len(failures) == 0 || time.Now().After(deadline) || ctx.Err() != nil {
 			for _, l := range lines {
@@ -52,6 +60,31 @@ func (s *Server) verifyEdgeTargets(ctx context.Context, slug string, window time
 		case <-time.After(3 * time.Second):
 		}
 	}
+}
+
+// dropExcusedRoutes removes from failures ("<host>: <why>") the routes whose service is in excused.
+func (s *Server) dropExcusedRoutes(slug string, failures []string, excused map[string]bool) []string {
+	if len(excused) == 0 || len(failures) == 0 {
+		return failures
+	}
+	stored, err := s.edgeRoutes.List()
+	if err != nil {
+		return failures
+	}
+	hosts := map[string]bool{}
+	for _, rt := range stored {
+		if svc, _, ok := parseUpstream(rt.Upstream); ok && rt.AppID == slug && excused[svc] {
+			hosts[rt.Hostname+rt.PathPrefix] = true
+		}
+	}
+	kept := failures[:0]
+	for _, f := range failures {
+		host, _, _ := strings.Cut(f, ": ")
+		if !hosts[host] {
+			kept = append(kept, f)
+		}
+	}
+	return kept
 }
 
 // statusKey matches an edge.RouteStatus to its stored route (hostnames are unique per path prefix).

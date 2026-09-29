@@ -113,6 +113,10 @@ func NewRunner(sem *Semaphore, writeAllowed bool, writeReason string) *Runner {
 	return &Runner{sem: sem, writeAllowed: writeAllowed, writeReason: writeReason, binary: "docker"}
 }
 
+// Semaphore returns the one-docker-child semaphore the runner guards, for a caller that holds it
+// across several *Held calls.
+func (r *Runner) Semaphore() *Semaphore { return r.sem }
+
 // WriteAllowed reports whether the write plane is armed, and why not if not.
 func (r *Runner) WriteAllowed() (bool, string) { return r.writeAllowed, r.writeReason }
 
@@ -510,6 +514,19 @@ func (r *Runner) RestartContainersHeld(ctx context.Context, ids []string, onLine
 		return nil
 	}
 	return r.runArgv(ctx, "", append([]string{"restart"}, ids...), onLine)
+}
+
+// StartContainersHeld starts specific containers by id (`docker start <id>...`) for a caller that
+// ALREADY HOLDS the one-docker-child semaphore (a paced rollout starting one copy at a time).
+// Same no-scoping contract as RestartContainersHeld: the caller verifies the ids.
+func (r *Runner) StartContainersHeld(ctx context.Context, ids []string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	return r.runArgv(ctx, "", append([]string{"start"}, ids...), onLine)
 }
 
 // RestartContainers restarts specific containers by id under the §0 gate + the one-docker-child

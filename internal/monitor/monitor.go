@@ -7,6 +7,7 @@ package monitor
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"strings"
@@ -52,6 +53,10 @@ type ServiceStatus struct {
 	// with CPUPercent 0, on a container's first sample, when it is not running, when
 	// its stats failed or were skipped this poll, and across a restart.
 	CPUValid bool
+	// ImageID is the image the container runs (sha256:…) and ConfigHash compose's hash of the
+	// service definition it was created from — both from the container list.
+	ImageID    string
+	ConfigHash string
 }
 
 // Running reports whether the service container is running.
@@ -151,6 +156,8 @@ type Monitor struct {
 	// inspected holds each listed container's last successful inspect, carried
 	// forward over polls where its inspect fails or is skipped (see inspect).
 	inspected map[string]inspectRecord
+	// kick asks Run for a poll now (Kick).
+	kick chan struct{}
 }
 
 // cpuCounters holds a container's raw CPU usage counters from one stats sample and
@@ -194,6 +201,19 @@ func New(db *store.DB, cli *docker.Client, host *hostmon.Sampler, interval, rete
 		interval: interval, retention: retention, log: log,
 		prober:     prober,
 		pruneEvery: 30, // prune roughly every 30 ticks
+		kick:       make(chan struct{}, 1),
+	}
+}
+
+// Kick asks for a poll now instead of at the next tick (a rollout wants to see what it just
+// started). Kicks while one is pending coalesce; it never blocks.
+func (m *Monitor) Kick() {
+	if m == nil || m.kick == nil {
+		return
+	}
+	select {
+	case m.kick <- struct{}{}:
+	default:
 	}
 }
 
@@ -211,6 +231,9 @@ func (m *Monitor) Run(ctx context.Context) {
 			return
 		case <-t.C:
 			m.snap.Store(m.pollOnce(ctx))
+		case <-m.kick:
+			m.snap.Store(m.pollOnce(ctx))
+			t.Reset(m.interval)
 		}
 	}
 }
@@ -356,6 +379,8 @@ func (m *Monitor) collect(ctx context.Context, c docker.Container, next map[stri
 		State:       c.State,
 		StatusText:  c.Status,
 		Health:      "none",
+		ImageID:     c.ImageID,
+		ConfigHash:  c.ConfigHash(),
 	}
 	if rec, ok := m.inspect(ctx, c); ok {
 		svc.RestartCount = rec.restartCount
@@ -421,7 +446,47 @@ func (m *Monitor) inspect(ctx context.Context, c docker.Container) (inspectRecor
 	if h := listHealth(c.Status); h != "" && h != rec.health {
 		return inspectRecord{}, false
 	}
+	// A container restarted since the record (`docker restart` keeps its id and its "running" state)
+	// lists a shorter uptime than the record's StartedAt implies: the record is from its previous run.
+	if up, ok := listUptimeMax(c.Status); ok && !rec.startedAt.IsZero() && time.Since(rec.startedAt) > up+5*time.Second {
+		return inspectRecord{}, false
+	}
 	return rec, true
+}
+
+// listUptimeMax reads the uptime in a running container's list Status ("Up 5 seconds", "Up About a
+// minute (healthy)", …, as docker's units.HumanDuration writes it) and returns an upper bound for it.
+// ok is false when the text isn't an uptime, or is too coarse (days and longer) to be useful.
+func listUptimeMax(status string) (time.Duration, bool) {
+	rest, ok := strings.CutPrefix(status, "Up ")
+	if !ok {
+		return 0, false
+	}
+	if i := strings.Index(rest, " ("); i >= 0 {
+		rest = rest[:i]
+	}
+	switch rest {
+	case "Less than a second":
+		return time.Second, true
+	case "About a minute":
+		return 2 * time.Minute, true
+	case "About an hour":
+		return 2 * time.Hour, true
+	}
+	var n int
+	var unit string
+	if _, err := fmt.Sscanf(rest, "%d %s", &n, &unit); err != nil || n < 0 {
+		return 0, false
+	}
+	switch strings.TrimSuffix(unit, "s") {
+	case "second":
+		return time.Duration(n+1) * time.Second, true
+	case "minute":
+		return time.Duration(n+1) * time.Minute, true
+	case "hour":
+		return time.Duration(n+1) * time.Hour, true
+	}
+	return 0, false
 }
 
 // inspectOrder returns the indexes of cs in the order to inspect them this poll. The

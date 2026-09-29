@@ -294,6 +294,30 @@ func eligibleReconcileVolumes(def *definition.Definition, nonrootSvcs map[string
 // called when the deploy's `up` fails, so a chowned volume plus a still-running OLD container never
 // leaves that container unable to write its own data. Best-effort + detached (a cancelled deploy
 // still rolls back).
+// volumesOnlyFor returns the reconciled volumes whose every user (a service of def mounting it) is in svcs.
+func volumesOnlyFor(def *definition.Definition, slug string, vols []reconciledVol, svcs []string) []reconciledVol {
+	in := make(map[string]bool, len(svcs))
+	for _, s := range svcs {
+		in[s] = true
+	}
+	var out []reconciledVol
+	for _, v := range vols {
+		only, used := true, false
+		for name, svc := range def.Spec.Compose.Services {
+			for _, m := range svc.Volumes {
+				if m.Name != "" && slug+"_"+m.Name == v.name {
+					used = true
+					only = only && in[name]
+				}
+			}
+		}
+		if used && only {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 func (s *Server) rollbackVolumeOwnership(ctx context.Context, changed []reconciledVol, onLine func(string)) {
 	if s.runner == nil {
 		return

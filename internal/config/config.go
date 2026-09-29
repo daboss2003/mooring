@@ -198,6 +198,11 @@ type StartGateConfig struct {
 	CPUSettlePct int      `yaml:"cpu_settle_pct"` // % of one core below which it has settled; default 50
 	MaxSettle    Duration `yaml:"max_settle"`     // longest one start holds others back; default 3m
 	MaxWait      Duration `yaml:"max_wait"`       // longest one action waits for CPU; default 10m
+
+	// Rollouts (deploys, rollbacks, app and service start/restart/redeploy, certificate renewals).
+	DeployWait    *Duration `yaml:"deploy_wait"`    // total wait for CPU or other starts per rollout; default 2m; 0s = none
+	ServiceSettle Duration  `yaml:"service_settle"` // longest wait for one service to become healthy; default 15m
+	RolloutBudget Duration  `yaml:"rollout_budget"` // total pacing per rollout, then the rest start unpaced; default 45m
 }
 
 // StartGateSettings are the start gate's settings with defaults applied.
@@ -205,6 +210,8 @@ type StartGateSettings struct {
 	Enabled                         bool
 	CPUBusyPct, CPUSettlePct        float64
 	SettleGrace, MaxSettle, MaxWait time.Duration
+
+	DeployWait, ServiceSettle, RolloutBudget time.Duration
 }
 
 // StartGateSettings resolves server.start_gate.
@@ -213,6 +220,7 @@ func (s ServerConfig) StartGateSettings() StartGateSettings {
 	out := StartGateSettings{
 		Enabled: g.Enabled == nil || *g.Enabled, CPUBusyPct: 85, CPUSettlePct: 50,
 		SettleGrace: 30 * time.Second, MaxSettle: 3 * time.Minute, MaxWait: 10 * time.Minute,
+		DeployWait: 2 * time.Minute, ServiceSettle: 15 * time.Minute, RolloutBudget: 45 * time.Minute,
 	}
 	if g.CPUBusyPct > 0 {
 		out.CPUBusyPct = float64(g.CPUBusyPct)
@@ -228,6 +236,15 @@ func (s ServerConfig) StartGateSettings() StartGateSettings {
 	}
 	if g.MaxWait > 0 {
 		out.MaxWait = g.MaxWait.D()
+	}
+	if g.DeployWait != nil {
+		out.DeployWait = g.DeployWait.D()
+	}
+	if g.ServiceSettle > 0 {
+		out.ServiceSettle = g.ServiceSettle.D()
+	}
+	if g.RolloutBudget > 0 {
+		out.RolloutBudget = g.RolloutBudget.D()
 	}
 	return out
 }
@@ -248,6 +265,12 @@ func (g StartGateConfig) validate() error {
 		return fmt.Errorf("server.start_gate.max_settle %s must be between 10s and 30m", g.MaxSettle.D())
 	case g.MaxWait != 0 && (g.MaxWait.D() < time.Minute || g.MaxWait.D() > 2*time.Hour):
 		return fmt.Errorf("server.start_gate.max_wait %s must be between 1m and 2h", g.MaxWait.D())
+	case g.DeployWait != nil && (*g.DeployWait < 0 || g.DeployWait.D() > 30*time.Minute):
+		return fmt.Errorf("server.start_gate.deploy_wait %s must be between 0s and 30m", g.DeployWait.D())
+	case g.ServiceSettle != 0 && (g.ServiceSettle.D() < 30*time.Second || g.ServiceSettle.D() > time.Hour):
+		return fmt.Errorf("server.start_gate.service_settle %s must be between 30s and 1h", g.ServiceSettle.D())
+	case g.RolloutBudget != 0 && (g.RolloutBudget.D() < time.Minute || g.RolloutBudget.D() > 3*time.Hour):
+		return fmt.Errorf("server.start_gate.rollout_budget %s must be between 1m and 3h", g.RolloutBudget.D())
 	}
 	return nil
 }

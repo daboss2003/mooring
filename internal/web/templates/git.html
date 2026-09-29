@@ -74,9 +74,15 @@
     {{else if eq .UpdateState "history_rewritten"}}
     <div class="error" role="alert">History was rewritten on the remote (the deployed commit is not in the
       fetched history). Review carefully; deploy is allowed but treated as a fresh promote.</div>
-    <button type="button" class="btn btn-primary lc-btn" data-lc-confirm="Deploy {{.StagedCommit}} to {{.Project}}? History was rewritten." data-lc-url="/apps/{{pathEscape .Project}}/git/deploy?sha={{.StagedCommit}}">Deploy {{.StagedCommit}}</button>
+    <div class="lc-group queue-actions">
+      <button type="button" class="btn btn-primary lc-btn" data-lc-confirm="Deploy {{.StagedCommit}} to {{.Project}}? History was rewritten." data-lc-url="/apps/{{pathEscape .Project}}/git/deploy?sha={{.StagedCommit}}">Deploy {{.StagedCommit}}</button>
+      <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
+    </div>
     {{else}}
-    <button type="button" class="btn btn-primary lc-btn" data-lc-confirm="Deploy commit {{.StagedCommit}} to {{.Project}}? This recreates its containers." data-lc-url="/apps/{{pathEscape .Project}}/git/deploy?sha={{.StagedCommit}}">Deploy {{.StagedCommit}}</button>
+    <div class="lc-group queue-actions">
+      <button type="button" class="btn btn-primary lc-btn" data-lc-confirm="Deploy commit {{.StagedCommit}} to {{.Project}}? This recreates its containers." data-lc-url="/apps/{{pathEscape .Project}}/git/deploy?sha={{.StagedCommit}}">Deploy {{.StagedCommit}}</button>
+      <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
+    </div>
     {{end}}
   </section>
   {{end}}

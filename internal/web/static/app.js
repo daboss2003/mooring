@@ -275,6 +275,14 @@
     var lcURL = btn.getAttribute("data-lc-url");
     if (!lcURL) return;
     var confirmMsg = btn.getAttribute("data-lc-confirm");
+    // An "all at once" checkbox (input.lc-now) in the button's .lc-group skips pacing: the services
+    // start together instead of one at a time.
+    var group = btn.closest(".lc-group");
+    var now = group ? group.querySelector("input.lc-now") : null;
+    if (now && now.checked && !/\/stop(\?|$)/.test(lcURL)) { // a stop is never paced
+      lcURL += (lcURL.indexOf("?") >= 0 ? "&" : "?") + "now=1";
+      if (confirmMsg) confirmMsg += "\n\nAll at once: every service starts together, without waiting for each to become healthy.";
+    }
     if (confirmMsg && !window.confirm(confirmMsg)) return;
     var out = document.getElementById("deploy-output");
     if (out) { showStream(out); startStream(out); pushStreamLine(out, "$ " + lcURL); } // filterable build/deploy log

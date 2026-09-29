@@ -315,3 +315,40 @@ func TestLedgerAppWideEntry(t *testing.T) {
 		t.Fatalf("everything the deploy started has settled: %+v", d)
 	}
 }
+
+func TestIgnoreAppSkipsTheRolloutsOwnStarts(t *testing.T) {
+	g := testGate()
+	g.Record("app", "api", t0, t0.Add(time.Second), true)
+	g.Observe(obs(t0.Add(10*time.Second), 10, running("new", "api", "starting", t0.Add(500*time.Millisecond), 90)))
+	if d := g.Admit(t0.Add(10*time.Second), AdmitOpts{}); d.OK {
+		t.Fatal("without IgnoreApp the app's own start holds")
+	}
+	if d := g.Admit(t0.Add(10*time.Second), AdmitOpts{IgnoreApp: "app"}); !d.OK {
+		t.Fatalf("a rollout of app isn't held by app's own starts: %+v", d)
+	}
+	other := running("o1", "db", "starting", t0.Add(5*time.Second), 90)
+	other.App = "other"
+	g.Observe(obs(t0.Add(20*time.Second), 10, running("new", "api", "starting", t0.Add(500*time.Millisecond), 90), other))
+	if d := g.Admit(t0.Add(20*time.Second), AdmitOpts{IgnoreApp: "app"}); d.OK || d.Blocker != "other/db" {
+		t.Fatalf("another app's start still holds: %+v", d)
+	}
+}
+
+func TestWaitStopsWaitingForOtherStartsAfterMaxWait(t *testing.T) {
+	g := testGate()
+	var w Wait
+	// Another app's rollout keeps starting services, so there is always a start in progress.
+	check := func(at time.Duration) Decision {
+		g.Record("other", "", t0.Add(at-time.Second), t0.Add(at), false)
+		return w.Admit(g, t0.Add(at), AdmitOpts{})
+	}
+	if d := check(time.Second); d.OK {
+		t.Fatal("another start in progress holds the action first")
+	}
+	if d := check(9 * time.Minute); d.OK {
+		t.Fatal("still inside max_wait")
+	}
+	if d := check(11 * time.Minute); !d.OK {
+		t.Fatalf("after max_wait other starts no longer hold it: %+v", d)
+	}
+}
