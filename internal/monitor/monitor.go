@@ -9,6 +9,7 @@ import (
 	"context"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +35,23 @@ type ServiceStatus struct {
 	OOMKilled    bool // the container's last stop was an OOM kill
 	HasRWVolume  bool // a shared read-write bind/named volume (auto-scaling C3 disqualifier)
 	StatusText   string
+	// StartedAt is when the container's current run started (its last run, if it is
+	// not running): inspect State.StartedAt. Zero when unknown, unparseable, or
+	// Docker's zero time (never started). A restart keeps the container id, so a new
+	// StartedAt only arrives with a fresh inspect.
+	StartedAt time.Time
+	// Inspected reports that Health, RestartCount, ExitCode, OOMKilled, StartedAt and
+	// HasRWVolume come from a successful inspect: this poll's or, when this poll's
+	// failed or the budget ran out, the last one carried forward if it is at most
+	// inspectCarryPolls (2) polls old and this poll's list entry still agrees with it
+	// (same State, no other health in the Status text). False means they are defaults
+	// and must not be trusted.
+	Inspected bool
+	// CPUValid reports that CPUPercent is a real delta between two stats samples of
+	// the same run; after a missed sample the delta spans the longer window. False,
+	// with CPUPercent 0, on a container's first sample, when it is not running, when
+	// its stats failed or were skipped this poll, and across a restart.
+	CPUValid bool
 }
 
 // Running reports whether the service container is running.
@@ -89,6 +107,14 @@ type Snapshot struct {
 	Host      hostmon.Sample
 	HostOK    bool
 	HostErr   string
+
+	// ListFailed: the container list couldn't be read, so Apps is empty although containers may be
+	// running. Anything that acts on the absence of containers (self-heal pruning its state, the
+	// autoscaler, the start gate) must skip such a snapshot. Deploys are not refused for it.
+	ListFailed bool
+	// Truncated: the host has more containers than one poll covers (maxContainersPerPoll), so a
+	// container missing from Apps may still exist. Never read absence as "gone" from such a snapshot.
+	Truncated bool
 }
 
 // AppByProject returns the app with the given project, or nil.
@@ -116,13 +142,50 @@ type Monitor struct {
 	pruneEvery         int
 	tickCount          int
 	prober             *ops.Prober // may be nil (ops disabled → BASIC only)
-	// prevCPU carries last tick's raw CPU counters per container for %-delta
-	// calc. Accessed only from the single Run/pollOnce goroutine.
+	// prevCPU carries each listed container's last raw CPU counters for %-delta
+	// calc. Accessed only from the single Run/pollOnce goroutine, as are seq and
+	// inspected.
 	prevCPU map[string]cpuCounters
+	// seq numbers the polls (failed ones too), so an inspect's age is counted in polls.
+	seq int64
+	// inspected holds each listed container's last successful inspect, carried
+	// forward over polls where its inspect fails or is skipped (see inspect).
+	inspected map[string]inspectRecord
 }
 
-// cpuCounters holds a container's raw CPU usage counters for one tick.
-type cpuCounters struct{ total, system uint64 }
+// cpuCounters holds a container's raw CPU usage counters from one stats sample and
+// the run they belong to (its StartedAt; zero when unknown).
+type cpuCounters struct {
+	total, system uint64
+	startedAt     time.Time
+}
+
+// continuedBy reports whether cur can be diffed against c as one stretch of the same
+// run: both counters moved forward (a restart resets the container's cgroup
+// counters, and a system counter that did not move means no time passed) and, when
+// both are known, the StartedAt is unchanged.
+func (c cpuCounters) continuedBy(cur cpuCounters) bool {
+	if cur.total < c.total || cur.system <= c.system {
+		return false
+	}
+	return c.startedAt.IsZero() || cur.startedAt.IsZero() || c.startedAt.Equal(cur.startedAt)
+}
+
+// inspectCarryPolls is how many polls old a container's last successful inspect may
+// be and still stand in for this poll's, when this poll's failed or the budget ran out.
+const inspectCarryPolls = 2
+
+// inspectRecord is the inspect-derived part of a ServiceStatus, taken on poll seq.
+type inspectRecord struct {
+	seq          int64
+	state        string // State.Status when taken; a different list State voids the carry-forward
+	health       string
+	restartCount int
+	exitCode     int
+	oomKilled    bool
+	startedAt    time.Time
+	hasRWVolume  bool
+}
 
 // New builds a Monitor. prober may be nil (ops probing disabled).
 func New(db *store.DB, cli *docker.Client, host *hostmon.Sampler, interval, retention time.Duration, log *slog.Logger, prober *ops.Prober) *Monitor {
@@ -159,7 +222,9 @@ const maxContainersPerPoll = 500
 
 // pollBudget caps the wall-clock time of a single poll so a slow-but-not-dead
 // proxy can't stall the poller proportional to container count (review #1). The
-// per-request http.Client timeouts are secondary guards under this.
+// per-request http.Client timeouts are secondary guards under this. When the
+// budget runs out part-way, the containers not yet reached are the least urgent
+// (inspectOrder) and carry their last inspect forward (inspect).
 func (m *Monitor) pollBudget() time.Duration {
 	if b := 2 * m.interval; b > 30*time.Second {
 		return b
@@ -168,6 +233,7 @@ func (m *Monitor) pollBudget() time.Duration {
 }
 
 func (m *Monitor) pollOnce(parent context.Context) *Snapshot {
+	m.seq++
 	now := time.Now()
 	snap := &Snapshot{At: now}
 
@@ -185,11 +251,13 @@ func (m *Monitor) pollOnce(parent context.Context) *Snapshot {
 
 	containers, err := m.cli.ListContainers(ctx, true)
 	if err != nil {
+		snap.ListFailed = true
 		snap.DockerErr = "cannot list containers"
 		m.sampleHost(snap)
 		return snap
 	}
 	if len(containers) > maxContainersPerPoll {
+		snap.Truncated = true
 		sort.Slice(containers, func(i, j int) bool { return containers[i].ID < containers[j].ID })
 		if !m.containerCapWarned {
 			m.containerCapWarned = true
@@ -199,58 +267,51 @@ func (m *Monitor) pollOnce(parent context.Context) *Snapshot {
 		containers = containers[:maxContainersPerPoll]
 	}
 
-	prev := m.prevCPU
-	if prev == nil {
-		prev = map[string]cpuCounters{}
-	}
-	next := make(map[string]cpuCounters)
-
-	byProject := map[string][]ServiceStatus{}
-	projMeta := map[string]docker.Container{} // first container per project (for labels)
+	// The supervised compose services' containers, in list order (newest first).
+	cs := make([]docker.Container, 0, len(containers))
+	listed := make(map[string]bool, len(containers))
 	for _, c := range containers {
-		project := c.Project()
-		if project == "" {
+		if c.Project() == "" {
 			continue // not a compose-managed app
 		}
 		if c.OneOff() {
 			continue // transient `compose run` one-shot (cron task / backup sidecar), not a service
 		}
+		cs = append(cs, c)
+		listed[c.ID] = true
+	}
+
+	// Collect in inspect-priority order: if the budget runs out part-way, the calls
+	// that fail are the least urgent ones, and those carry their last inspect forward.
+	if m.inspected == nil {
+		m.inspected = map[string]inspectRecord{}
+	}
+	statuses := make([]ServiceStatus, len(cs))
+	next := make(map[string]cpuCounters, len(cs))
+	for _, i := range inspectOrder(cs, m.inspected, m.seq) {
+		statuses[i] = m.collect(ctx, cs[i], next)
+	}
+	m.prevCPU = next
+	for id := range m.inspected {
+		if !listed[id] {
+			delete(m.inspected, id) // gone from the list
+		}
+	}
+
+	byProject := map[string][]ServiceStatus{}
+	projMeta := map[string]docker.Container{} // first container per project (for labels)
+	for i, c := range cs {
+		project := c.Project()
 		if _, ok := projMeta[project]; !ok {
 			projMeta[project] = c
 		}
-		svc := ServiceStatus{
-			Service:     c.Service(),
-			ContainerID: c.ID,
-			Name:        c.Name(),
-			Image:       c.Image,
-			State:       c.State,
-			StatusText:  c.Status,
-			Health:      "none",
-		}
-		if ci, err := m.cli.InspectContainer(ctx, c.ID); err == nil {
-			svc.RestartCount = ci.RestartCount
-			svc.Health = ci.HealthStatus()
-			svc.ExitCode = ci.State.ExitCode
-			svc.OOMKilled = ci.State.OOMKilled
-			svc.HasRWVolume = ci.HasSharedRWVolume()
-		}
-		if c.State == "running" {
-			if st, err := m.cli.StatsOneShot(ctx, c.ID); err == nil {
-				total, system := st.RawCPU()
-				if p, ok := prev[c.ID]; ok {
-					svc.CPUPercent = st.CPUPercentBetween(p.total, p.system)
-				}
-				next[c.ID] = cpuCounters{total: total, system: system}
-				svc.MemBytes = st.MemUsed()
-				svc.MemLimit = st.MemLimit()
-			}
-		}
-		byProject[project] = append(byProject[project], svc)
+		byProject[project] = append(byProject[project], statuses[i])
 	}
-	m.prevCPU = next
 
 	for project, svcs := range byProject {
-		sort.Slice(svcs, func(i, j int) bool { return svcs[i].Service < svcs[j].Service })
+		// Stable over the list order, so the copies of a scaled service stay newest
+		// first (the service page shows the first copy as the newest).
+		sort.SliceStable(svcs, func(i, j int) bool { return svcs[i].Service < svcs[j].Service })
 		meta := projMeta[project]
 		snap.Apps = append(snap.Apps, App{
 			Project: project, DisplayName: project, Services: svcs,
@@ -281,6 +342,170 @@ func (m *Monitor) pollOnce(parent context.Context) *Snapshot {
 	m.sampleHost(snap)
 	m.persist(parent, snap)
 	return snap
+}
+
+// collect builds one container's ServiceStatus from its list entry, its inspect
+// (fresh or carried forward) and, when it is running, a one-shot stats sample. It
+// stores the container's CPU baseline for the next poll in next.
+func (m *Monitor) collect(ctx context.Context, c docker.Container, next map[string]cpuCounters) ServiceStatus {
+	svc := ServiceStatus{
+		Service:     c.Service(),
+		ContainerID: c.ID,
+		Name:        c.Name(),
+		Image:       c.Image,
+		State:       c.State,
+		StatusText:  c.Status,
+		Health:      "none",
+	}
+	if rec, ok := m.inspect(ctx, c); ok {
+		svc.RestartCount = rec.restartCount
+		svc.Health = rec.health
+		svc.ExitCode = rec.exitCode
+		svc.OOMKilled = rec.oomKilled
+		svc.HasRWVolume = rec.hasRWVolume
+		svc.StartedAt = rec.startedAt
+		svc.Inspected = true
+	}
+	prev, havePrev := m.prevCPU[c.ID]
+	if c.State == "running" && ctx.Err() == nil {
+		if st, err := m.cli.StatsOneShot(ctx, c.ID); err == nil {
+			cur := cpuCounters{startedAt: svc.StartedAt}
+			cur.total, cur.system = st.RawCPU()
+			if havePrev && prev.continuedBy(cur) {
+				svc.CPUPercent = st.CPUPercentBetween(prev.total, prev.system)
+				svc.CPUValid = true
+			}
+			next[c.ID] = cur
+			svc.MemBytes = st.MemUsed()
+			svc.MemLimit = st.MemLimit()
+			return svc
+		}
+	}
+	if havePrev {
+		// No sample this poll: keep the baseline, so the next sample is still a real
+		// delta (over a longer window) rather than another first sample.
+		next[c.ID] = prev
+	}
+	return svc
+}
+
+// inspect returns c's inspect-derived fields. A successful inspect is recorded and
+// returned. When it fails, or the poll budget has already run out, the last
+// successful one stands in if it is at most inspectCarryPolls polls old and the list
+// shows nothing it describes has changed since: the same State, and no other health
+// in the Status text. ok=false leaves the caller's defaults.
+func (m *Monitor) inspect(ctx context.Context, c docker.Container) (inspectRecord, bool) {
+	if ctx.Err() == nil {
+		if ci, err := m.cli.InspectContainer(ctx, c.ID); err == nil {
+			rec := inspectRecord{
+				seq:          m.seq,
+				state:        ci.State.Status,
+				health:       ci.HealthStatus(),
+				restartCount: ci.RestartCount,
+				exitCode:     ci.State.ExitCode,
+				oomKilled:    ci.State.OOMKilled,
+				startedAt:    parseStartedAt(ci.State.StartedAt),
+				hasRWVolume:  ci.HasSharedRWVolume(),
+			}
+			if rec.state == "" {
+				rec.state = c.State // an inspect without State.Status: take the list's
+			}
+			m.inspected[c.ID] = rec
+			return rec, true
+		}
+	}
+	rec, ok := m.inspected[c.ID]
+	if !ok || m.seq-rec.seq > inspectCarryPolls || rec.state != c.State {
+		return inspectRecord{}, false
+	}
+	if h := listHealth(c.Status); h != "" && h != rec.health {
+		return inspectRecord{}, false
+	}
+	return rec, true
+}
+
+// inspectOrder returns the indexes of cs in the order to inspect them this poll. The
+// budget can run out before every container is inspected (each call is slow on a
+// CPU-starved host), and Docker lists newest first, so a fixed order would leave the
+// same oldest containers (often the database) uninspected poll after poll. Most
+// urgent first:
+//
+//  0. not running: self-heal acts on its ExitCode/OOMKilled;
+//  1. last known health unhealthy or starting (the inspect record, or the list's
+//     fresher Status text);
+//  2. never inspected (new containers);
+//  3. the rest.
+//
+// Within a class the least recently inspected go first, and ties follow container id
+// order rotated by the poll sequence, so no container is starved across polls.
+func inspectOrder(cs []docker.Container, known map[string]inspectRecord, seq int64) []int {
+	n := len(cs)
+	byID := make([]int, n)
+	for i := range byID {
+		byID[i] = i
+	}
+	sort.Slice(byID, func(a, b int) bool { return cs[byID[a]].ID < cs[byID[b]].ID })
+	order := make([]int, 0, n) // id order, rotated by the poll: the tie-break
+	if n > 0 {
+		k := int(seq % int64(n))
+		order = append(append(order, byID[k:]...), byID[:k]...)
+	}
+	class := make([]int, n)
+	last := make([]int64, n) // poll of the last successful inspect; 0 = never
+	for i, c := range cs {
+		rec, ok := known[c.ID]
+		class[i], last[i] = inspectClass(c, rec, ok), rec.seq
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		i, j := order[a], order[b]
+		if class[i] != class[j] {
+			return class[i] < class[j]
+		}
+		return last[i] < last[j]
+	})
+	return order
+}
+
+// inspectClass ranks how urgently c needs a fresh inspect (see inspectOrder).
+func inspectClass(c docker.Container, rec inspectRecord, known bool) int {
+	lh := listHealth(c.Status)
+	switch {
+	case c.State != "running":
+		return 0
+	case rec.health == "unhealthy" || rec.health == "starting" || lh == "unhealthy" || lh == "starting":
+		return 1
+	case !known:
+		return 2
+	}
+	return 3
+}
+
+// listHealth returns the healthcheck status Docker puts at the end of a list entry's
+// Status text ("Up 2 minutes (healthy)", "Up 3 seconds (health: starting)", "Up 1
+// hour (unhealthy)"), or "" when there is none. It is only a hint for ordering
+// inspects and for spotting a carried-forward inspect the list has overtaken; it
+// never stands in for an inspect.
+func listHealth(status string) string {
+	switch {
+	case strings.HasSuffix(status, "(healthy)"):
+		return "healthy"
+	case strings.HasSuffix(status, "(unhealthy)"):
+		return "unhealthy"
+	case strings.HasSuffix(status, "(health: starting)"):
+		return "starting"
+	}
+	return ""
+}
+
+// parseStartedAt parses an inspect State.StartedAt (RFC 3339). An empty or
+// unparseable value, and Docker's "0001-01-01T00:00:00Z" for a container that has
+// never started, yield the zero time.
+func parseStartedAt(s string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil || t.IsZero() {
+		return time.Time{}
+	}
+	return t
 }
 
 func (m *Monitor) sampleHost(snap *Snapshot) {

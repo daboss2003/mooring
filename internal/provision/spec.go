@@ -57,16 +57,16 @@ type EnvVar struct {
 // Service is one generated service. Only safe fields exist here by construction. A
 // service is `Image` (pull) XOR `Build` (Mooring generates the Dockerfile).
 type Service struct {
-	Name        string   `json:"name"`
-	Image       string   `json:"image"`
-	Build       *Build   `json:"build,omitempty"`
-	Ports       []Port   `json:"ports"`
-	Volumes     []Volume `json:"volumes"`
-	Env         []EnvVar `json:"env"`         // per-service env: literal XOR secret ref
-	Command     []string `json:"command"`     // exec form (no shell)
-	Healthcheck []string `json:"healthcheck"` // exec form, e.g. ["curl","-f","http://localhost/health"]
-	Restart     string   `json:"restart"`
-	DependsOn   []string `json:"depends_on"` // sibling service names
+	Name        string       `json:"name"`
+	Image       string       `json:"image"`
+	Build       *Build       `json:"build,omitempty"`
+	Ports       []Port       `json:"ports"`
+	Volumes     []Volume     `json:"volumes"`
+	Env         []EnvVar     `json:"env"`                   // per-service env: literal XOR secret ref
+	Command     []string     `json:"command"`               // exec form (no shell)
+	Healthcheck *Healthcheck `json:"healthcheck,omitempty"` // nil = no healthcheck
+	Restart     string       `json:"restart"`
+	DependsOn   []string     `json:"depends_on"` // sibling service names
 	// MemLimit/MemReservation are compose byte-size strings ("768m", "1g"); empty omits the
 	// key. A limit bounds each replica (per-container OOM protection) and makes the scaler's
 	// mem trigger per-service. Validated in the definition layer; allow-listed in compose.
@@ -82,6 +82,18 @@ type Service struct {
 	// gives it a compose profile so `up` never starts it; Mooring runs it on its interval via
 	// `compose run --rm`. Not a security-relevant field (no compose privilege), just placement.
 	Scheduled bool `json:"scheduled,omitempty"`
+}
+
+// Healthcheck mirrors the definition type for the compose `healthcheck`. Test is exec form,
+// e.g. ["curl","-f","http://localhost/health"], rendered as ["CMD", ...]. The timing fields are
+// compose duration strings / a retry count, validated in the definition layer; an empty one
+// omits its compose key, so a test-only healthcheck renders exactly as before they existed.
+type Healthcheck struct {
+	Test        []string `json:"test"`
+	Interval    string   `json:"interval,omitempty"`
+	Timeout     string   `json:"timeout,omitempty"`
+	Retries     int      `json:"retries,omitempty"`
+	StartPeriod string   `json:"start_period,omitempty"`
 }
 
 // Ulimits / NofileLimit mirror the definition types for compose `ulimits.nofile`.
@@ -211,8 +223,14 @@ func (svc Service) validate(siblings map[string]bool) error {
 	if err := validateExec(svc.Command); err != nil {
 		return fmt.Errorf("command: %w", err)
 	}
-	if err := validateExec(svc.Healthcheck); err != nil {
-		return fmt.Errorf("healthcheck: %w", err)
+	if hc := svc.Healthcheck; hc != nil {
+		if err := validateExec(hc.Test); err != nil {
+			return fmt.Errorf("healthcheck: %w", err)
+		}
+		// The generator emits nothing without a test, so timing without one would be dropped silently.
+		if len(hc.Test) == 0 && (hc.Interval != "" || hc.Timeout != "" || hc.Retries != 0 || hc.StartPeriod != "") {
+			return fmt.Errorf("healthcheck: timing is set without a test command")
+		}
 	}
 	for _, d := range svc.DependsOn {
 		if !siblings[d] {

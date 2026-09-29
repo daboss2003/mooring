@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/daboss2003/mooring/internal/alertstore"
 	"github.com/daboss2003/mooring/internal/dockerexec"
@@ -17,15 +18,19 @@ import (
 )
 
 type fakeScaler struct {
-	mu    sync.Mutex
-	calls []int // target replica counts requested
+	mu        sync.Mutex
+	calls     []int       // target replica counts requested
+	deadlines []time.Time // each call's context deadline (zero when it had none)
+	err       error       // returned by every call
 }
 
-func (f *fakeScaler) Scale(_ context.Context, _, _ string, replicas int) error {
+func (f *fakeScaler) Scale(ctx context.Context, _, _ string, replicas int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, replicas)
-	return nil
+	dl, _ := ctx.Deadline()
+	f.deadlines = append(f.deadlines, dl)
+	return f.err
 }
 func (f *fakeScaler) count() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.calls) }
 func (f *fakeScaler) last() int {
@@ -54,7 +59,7 @@ const GiBw = 1 << 30
 func snapWeb(replicas int, cpu float64, memUsed, memLimit uint64, hostTotal, hostUsed uint64) *monitor.Snapshot {
 	var svcs []monitor.ServiceStatus
 	for i := 0; i < replicas; i++ {
-		svcs = append(svcs, monitor.ServiceStatus{Service: "web", State: "running", Health: "healthy", CPUPercent: cpu, MemBytes: memUsed, MemLimit: memLimit})
+		svcs = append(svcs, monitor.ServiceStatus{Service: "web", State: "running", Health: "healthy", CPUPercent: cpu, MemBytes: memUsed, MemLimit: memLimit, Inspected: true})
 	}
 	return &monitor.Snapshot{
 		DockerOK: true, HostOK: true,

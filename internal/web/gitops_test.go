@@ -744,7 +744,8 @@ func TestWebhookHTTPAuthAndReplay(t *testing.T) {
 	}
 	defer e.srv.gitDeploy.Release()
 
-	// Valid signed call → 202 (busy: another git op is "in progress").
+	// Valid signed call → 202, QUEUED (another git op is "in progress"): it runs once the gate frees
+	// instead of being dropped.
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	nonce := "abc-123"
 	mac := hmac.New(sha256.New, secret)
@@ -753,6 +754,9 @@ func TestWebhookHTTPAuthAndReplay(t *testing.T) {
 	hdr := map[string]string{"X-Mooring-Timestamp": ts, "X-Mooring-Nonce": nonce, "X-Mooring-Signature": sig}
 	if resp := e.req(t, "POST", "/webhook/"+token, ciPeer, hdr, nil, nil); resp.StatusCode != http.StatusAccepted {
 		t.Errorf("valid webhook: status %d, want 202", resp.StatusCode)
+	}
+	if got := e.srv.deployQueue.keys(); len(got) != 1 || got[0] != appQueueKey(slug) {
+		t.Errorf("a webhook that finds the gate busy must be queued, queue = %v", got)
 	}
 
 	// Replay the exact same signed call → 409 (nonce already used).
@@ -796,5 +800,39 @@ func TestIsFullSha40(t *testing.T) {
 		if isFullSha40(bad) {
 			t.Errorf("invalid sha %q accepted", bad)
 		}
+	}
+}
+
+// A depends_on cycle is rejected when a new definition is deployed (stored canonicals with one still
+// load; compose itself refuses a cycle at `up`).
+func TestDeployRejectsDependencyCycle(t *testing.T) {
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	e.srv.runner = dockerexec.NewRunner(dockerexec.NewSemaphore(), false, "disabled for test")
+	slug := "shop"
+	cyclic := `apiVersion: mooring/v1
+kind: App
+metadata: {slug: app}
+spec:
+  compose:
+    source: generated
+    services:
+      api:
+        image: nginx:1.27
+        depends_on: [worker]
+      worker:
+        image: nginx:1.27
+        depends_on: [api]
+`
+	sha := gitObjStoreFixture(t, e.srv.gitObjectDir(slug), cyclic)
+	if err := e.srv.gitStore.Save(context.Background(), gitstore.SaveInput{
+		Project: slug, RepoURL: "https://nonexistent.invalid/o/r.git", Ref: "refs/heads/main", BuildPolicy: "never",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.srv.gitStore.SetFetchResult(context.Background(), slug, sha, 1, "update_available")
+	cfg, _, _ := e.srv.gitStore.Get(slug)
+	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
+	if err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("want a depends_on cycle rejection, got %v", err)
 	}
 }

@@ -55,6 +55,7 @@ import (
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/setupstore"
 	"github.com/daboss2003/mooring/internal/socketproxy"
+	"github.com/daboss2003/mooring/internal/startgate"
 	"github.com/daboss2003/mooring/internal/store"
 	"github.com/daboss2003/mooring/internal/updatecheck"
 	"github.com/daboss2003/mooring/internal/web"
@@ -132,6 +133,8 @@ func cmdServe(args []string) error {
 	// and probe the App Ops Interface (M3). The poller is joined before the
 	// deferred db.Close() so no DB write can race the close (review #8).
 	dockerCli := docker.New(cfg.Docker.ProxyAddr)
+	// The monitor's own Sampler: every Sample() starts a new CPU window, so no other caller may
+	// share it (the boot gate and disk-GC create their own).
 	hostSampler := hostmon.New(cfg.DataDir)
 	opsStore := ops.NewConfigStore(db, cipher)
 	// The ops prober dials a service-name base_url (http://api:3000), but the control
@@ -163,7 +166,7 @@ func cmdServe(args []string) error {
 	// Write plane (M4): the §0 resource gate (RAM + swap) + the global one-docker-child
 	// semaphore + static-argv exec wrapper.
 	var memTotal, swapTotal uint64
-	if hs, herr := hostSampler.Sample(); herr == nil {
+	if hs, herr := hostmon.New(cfg.DataDir).Sample(); herr == nil {
 		memTotal, swapTotal = hs.MemTotal, hs.SwapTotal
 	}
 	writeAllowed, writeReason := dockerexec.WritePlaneGate(memTotal, swapTotal, cfg.Docker.WritePlaneFloorBytes())
@@ -370,9 +373,10 @@ func cmdServe(args []string) error {
 	// which rebuilds, or app data). Rides the one-docker-child slot via TryAcquire, so it never
 	// delays a deploy/self-heal.
 	if cfg.Server.DiskGCOn() {
+		gcSampler := hostmon.New(cfg.DataDir)
 		gc := diskgc.New(
 			func() (uint64, uint64, bool) {
-				hs, herr := hostSampler.Sample()
+				hs, herr := gcSampler.Sample()
 				if herr != nil {
 					return 0, 0, false
 				}
@@ -810,6 +814,34 @@ func cmdServe(args []string) error {
 	// service that gave up self-healing raised NO alert when alerting was off — and enabling alerting via
 	// reload didn't help until a full restart. imagescan already wires the store unconditionally; match it.
 	shAlerts := alertStore
+
+	// The host-wide start gate (server.start_gate): the scaler, self-heal and scheduled tasks start a
+	// container only when no other recent start is still settling and the host has CPU headroom; deploys
+	// and lifecycle actions are never held back but record what they start. Fed every monitor snapshot.
+	gs := cfg.Server.StartGateSettings()
+	startGate := startgate.New(startgate.Config{
+		Enabled: gs.Enabled, CPUBusyPct: gs.CPUBusyPct, SettleGrace: gs.SettleGrace, CPUSettlePct: gs.CPUSettlePct,
+		MaxSettle: gs.MaxSettle, MaxWait: gs.MaxWait, NumCPU: runtime.NumCPU(),
+	})
+	observeStarts := func(snap *monitor.Snapshot) { startGate.Observe(startObservation(snap, protected)) }
+	srv.SetStartGate(startGate)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(cfg.Monitor.PollInterval.D())
+		defer t.Stop()
+		for {
+			if snap := mon.Snapshot(); snap != nil && snap.DockerOK && !snap.ListFailed {
+				observeStarts(snap)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
+
 	watcher := selfheal.New(selfheal.Config{
 		Store:  selfHealStore,
 		Alerts: shAlerts,
@@ -831,6 +863,10 @@ func cmdServe(args []string) error {
 		WritePlaneOK: writeAllowed,
 		Paused:       srv.DaemonMismatch, // read/write planes on different Docker daemons → hold all remediation
 		Protected:    protected,
+		Gate:         startGate,
+		Observe:      observeStarts,
+		// depends_on / on_unhealthy / healthcheck interval from each app's verified definition.
+		Services: srv.SelfHealServices,
 	})
 	srv.SetCircuitClearer(func(p, svc string) { watcher.ClearCircuit(selfheal.Key{App: p, Service: svc}) })
 	wg.Add(1)
@@ -892,6 +928,35 @@ func cmdServe(args []string) error {
 				}
 			}
 			return out
+		},
+		// Services self-heal is working on (or waiting on a dependency for, or reporting unhealthy):
+		// the scaler adds no copy to them meanwhile.
+		SelfHealBusy: func() map[scale.Key]bool {
+			out := map[scale.Key]bool{}
+			if all, err := selfHealStore.LoadAll(); err == nil {
+				for k, f := range all {
+					switch f.Phase {
+					case selfheal.Remediating, selfheal.WaitingOnDependency, selfheal.Unhealthy:
+						out[scale.Key{App: k.App, Service: k.Service}] = true
+					}
+				}
+			}
+			return out
+		},
+		Gate:    startGate,
+		Observe: observeStarts,
+		StopGrace: func(app, service string) time.Duration {
+			if info, ok := srv.SelfHealServices(app); ok {
+				return info[service].StopGrace
+			}
+			return 0
+		},
+		// A service with a policy but no containers is restored only when the deployed definition still
+		// declares it as a long-running (not scheduled) autoscaled service.
+		Restorable: func(app, service string) bool {
+			info, ok := srv.SelfHealServices(app)
+			si, declared := info[service]
+			return ok && declared && !si.Scheduled && si.Scaled
 		},
 		// Apps with an active expected_down lease have an operator lifecycle/deploy action in flight;
 		// the scaler defers to the write plane (and this closes the stop→hold-write gap).
@@ -963,6 +1028,11 @@ func cmdServe(args []string) error {
 	// the operator deploys with a click). Joined before db.Close.
 	wg.Add(1)
 	go func() { defer wg.Done(); srv.RunGitPoller(ctx, cfg.Git.PollIntervalD()) }()
+
+	// Webhook queue: a verified webhook that arrived while another git operation held the gate runs
+	// here as soon as the gate frees (one entry per app / preview PR).
+	wg.Add(1)
+	go func() { defer wg.Done(); srv.RunPendingDeploys(ctx) }()
 
 	// Scheduled-task (cron) loop: runs each app's scheduled_tasks on their intervals as
 	// one-shot `compose run --rm` containers. No-op for apps with no scheduled_tasks.
@@ -1239,4 +1309,20 @@ func toRetentionConfig(cfg *config.Config) retention.Config {
 		EventsMaxRows:   cfg.Retention.EventsMaxRows,
 		ArchiveMaxBytes: int64(cfg.Retention.ArchiveMaxMB) << 20,
 	}
+}
+
+// startObservation converts a monitor snapshot into the start gate's view. Containers of protected
+// projects (Mooring's own edge, socket-proxy, ntfy) never hold app starts back.
+func startObservation(snap *monitor.Snapshot, protected map[string]bool) startgate.Observation {
+	o := startgate.Observation{At: snap.At, HostOK: snap.HostOK, HostCPUPct: snap.Host.CPUPercent}
+	for _, a := range snap.Apps {
+		for _, c := range a.Services {
+			o.Containers = append(o.Containers, startgate.Container{
+				ID: c.ContainerID, App: a.Project, Service: c.Service, Running: c.Running(), Health: c.Health,
+				StartedAt: c.StartedAt, RestartCount: c.RestartCount, CPUPercent: c.CPUPercent, CPUValid: c.CPUValid,
+				Inspected: c.Inspected, Protected: protected[a.Project],
+			})
+		}
+	}
+	return o
 }

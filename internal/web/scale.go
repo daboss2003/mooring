@@ -15,10 +15,12 @@ import (
 )
 
 // Scale makes *Server the auto-scaler's Scaler: it changes a service's replica count
-// with a static-argv `docker compose up -d --no-deps --no-recreate --scale <svc>=<n>`
+// with a static-argv `docker compose up -d --no-deps --no-recreate --no-build --scale <svc>=<n> -- <svc>`
 // through the gated write path (env render + §5.6 validation), via RunHeld — the
 // scaler's safety gate already holds the one-docker-child semaphore. A protected
-// project is refused (authority never widens what may run).
+// project is refused (authority never widens what may run). The service positional scopes the
+// call to that one service: without it compose converges every service of the project (resetting
+// other scaled services to one copy and starting stopped or held ones).
 func (s *Server) Scale(ctx context.Context, appProject, service string, replicas int) error {
 	if s.runner == nil {
 		return fmt.Errorf("write plane unavailable")
@@ -42,11 +44,16 @@ func (s *Server) Scale(ctx context.Context, appProject, service string, replicas
 	if res := s.validateAppCompose(app, env); !res.OK() && s.cfg.ComposeValidation.Mode != "review" {
 		return fmt.Errorf("§5.6 compose validation failed (%d findings)", len(res.Violations))
 	}
-	job := dockerexec.Job{
-		Project: appProject, Dir: app.WorkingDir, ConfigFiles: app.ConfigFiles, EnvFile: envFile,
-		Action: []string{"up", "-d", "--no-deps", "--no-recreate", "--scale", service + "=" + strconv.Itoa(replicas)},
+	return s.runner.RunHeld(ctx, scaleJob(app, envFile, service, replicas), nil)
+}
+
+// scaleJob is the compose call that sets service's copy count to replicas.
+func scaleJob(app *monitor.App, envFile, service string, replicas int) dockerexec.Job {
+	return dockerexec.Job{
+		Project: app.Project, Dir: app.WorkingDir, ConfigFiles: app.ConfigFiles, EnvFile: envFile,
+		Action:  []string{"up", "-d", "--no-deps", "--no-recreate", "--no-build", "--scale", service + "=" + strconv.Itoa(replicas)},
+		Service: service,
 	}
-	return s.runner.RunHeld(ctx, job, nil)
 }
 
 // RemoveReplica removes specific replica container(s) of a service by id (docker rm -f), for the

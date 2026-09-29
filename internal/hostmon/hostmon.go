@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // ErrUnsupported is returned by Sample on non-Linux platforms.
@@ -26,26 +27,33 @@ type Sample struct {
 }
 
 // Sampler holds the previous CPU counters so it can compute instantaneous CPU%
-// from the delta between successive Sample calls.
+// from the delta between successive Sample calls. It is safe for concurrent use,
+// but the CPU window belongs to the Sampler, not the caller: every Sample call
+// starts a new window for all of its callers. A caller that relies on its own
+// window (the monitor) must not share its Sampler; other callers create their own
+// with New.
 type Sampler struct {
-	diskPath  string
+	diskPath string
+	readCPU  func() (busy, total uint64, err error) // readCPUTimes; a fake in tests
+
+	mu        sync.Mutex // guards the CPU baseline below
 	prevBusy  uint64
 	prevTotal uint64
 	havePrev  bool
 }
 
-// New returns a Sampler that measures disk usage at diskPath.
-func New(diskPath string) *Sampler { return &Sampler{diskPath: diskPath} }
+// New returns a Sampler that measures disk usage at diskPath. Samplers share no
+// state, so each one has its own CPU window.
+func New(diskPath string) *Sampler { return &Sampler{diskPath: diskPath, readCPU: readCPUTimes} }
 
-// Sample reads current host metrics. CPU% is 0 on the first call (no prior
-// counters to diff against).
+// Sample reads current host metrics. CPU% covers the time since this Sampler's
+// previous Sample call, and is 0 on the first call (no prior counters to diff
+// against).
 func (s *Sampler) Sample() (Sample, error) {
-	busy, total, err := readCPUTimes()
+	cpu, err := s.sampleCPU()
 	if err != nil {
 		return Sample{}, err
 	}
-	cpu := cpuPercent(s.havePrev, s.prevBusy, s.prevTotal, busy, total)
-	s.prevBusy, s.prevTotal, s.havePrev = busy, total, true
 
 	memTotal, memUsed, err := readMem()
 	if err != nil {
@@ -61,6 +69,25 @@ func (s *Sampler) Sample() (Sample, error) {
 		MemTotal: memTotal, MemUsed: memUsed, SwapTotal: readSwapTotal(),
 		DiskTotal: diskTotal, DiskUsed: diskUsed,
 	}, nil
+}
+
+// sampleCPU reads the CPU counters and advances the baseline under one lock, so
+// concurrent callers get consecutive windows. Locking only the update would let a
+// caller diff its read against a newer baseline another caller had just stored.
+func (s *Sampler) sampleCPU() (float64, error) {
+	read := s.readCPU
+	if read == nil {
+		read = readCPUTimes
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	busy, total, err := read()
+	if err != nil {
+		return 0, err
+	}
+	cpu := cpuPercent(s.havePrev, s.prevBusy, s.prevTotal, busy, total)
+	s.prevBusy, s.prevTotal, s.havePrev = busy, total, true
+	return cpu, nil
 }
 
 // cpuPercent computes CPU% from busy/total jiffy counters versus the previous

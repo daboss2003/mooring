@@ -48,6 +48,7 @@ import (
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/session"
 	"github.com/daboss2003/mooring/internal/setupstore"
+	"github.com/daboss2003/mooring/internal/startgate"
 	"github.com/daboss2003/mooring/internal/store"
 	"github.com/daboss2003/mooring/internal/updatecheck"
 )
@@ -170,6 +171,14 @@ type Server struct {
 	daemonAlerted  bool                                   // a mismatch alert is open (re-adopted from the outbox at boot)
 	daemonSeeded   bool                                   // daemonAlerted has been seeded from the outbox
 	foreground     atomic.Int32                           // multi-step write operations running now (beginForeground)
+	deployQueue    *deployQueue                           // webhooks that arrived while the git gate was busy (pending_deploys.go)
+	leaseMu        sync.Mutex                             // guards leaseHolders
+	leaseHolders   map[string]int                         // app → holders of its expected_down lease (selfheal.go)
+	queuedRun      queuedDeployFn                         // test seam: replaces the real queued-deploy run
+	startGate      *startgate.Gate                        // host-wide container start pacing (nil = none; set post-construction)
+	shInfoMu       sync.Mutex                             // guards shInfo
+	shInfo         map[string]shInfoEntry                 // app → per-service self-healing facts from its definition (startgate.go)
+	cronHeld       map[string]time.Time                   // app/task → when the start gate first held a due task back (cron loop only)
 	edgeReason     string                                 // why the edge isn't owned (banner)
 	l4Routes       *l4.RouteStore                         // managed L4 (TCP/UDP) routes (nil when L4 LB disabled)
 	l4Reconcile    func(context.Context) error            // push the L4 route set to the LB (nil when disabled)
@@ -262,6 +271,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		webhookFlash:  newTokenFlash(2 * time.Minute),
 		discoFlash:    newDiscoveryFlash(5 * time.Minute),
 		gitDeploy:     dockerexec.NewSemaphore(),
+		deployQueue:   newDeployQueue(),
 		logStreams:    make(chan struct{}, maxConcurrentLogStreams),
 	}
 	s.sweepDiscoveryScratch() // clear any orphaned multi-file-connect scratch dirs from a prior run

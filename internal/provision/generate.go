@@ -54,8 +54,15 @@ type composeBuild struct {
 	Dockerfile string `yaml:"dockerfile,omitempty"`
 }
 
+// composeHealth is the generated `healthcheck:`. The timing keys are omitted when unset, so a
+// test-only healthcheck renders byte-identically to before they existed (no recreate on
+// upgrade). start_interval is not expressible: it needs Docker Engine API 1.44+.
 type composeHealth struct {
-	Test []string `yaml:"test"`
+	Test        []string `yaml:"test"`
+	Interval    string   `yaml:"interval,omitempty"`
+	Timeout     string   `yaml:"timeout,omitempty"`
+	Retries     int      `yaml:"retries,omitempty"`
+	StartPeriod string   `yaml:"start_period,omitempty"`
 }
 
 // scheduledProfile is the compose profile Mooring puts on scheduled-only (cron) services so
@@ -141,8 +148,11 @@ func Generate(spec Spec) ([]byte, error) {
 		if len(svc.Command) > 0 {
 			cs.Command = svc.Command
 		}
-		if len(svc.Healthcheck) > 0 {
-			cs.Healthcheck = &composeHealth{Test: append([]string{"CMD"}, svc.Healthcheck...)}
+		if hc := svc.Healthcheck; hc != nil && len(hc.Test) > 0 {
+			cs.Healthcheck = &composeHealth{
+				Test:     append([]string{"CMD"}, hc.Test...),
+				Interval: hc.Interval, Timeout: hc.Timeout, Retries: hc.Retries, StartPeriod: hc.StartPeriod,
+			}
 		}
 		cf.Services[svc.Name] = cs
 	}

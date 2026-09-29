@@ -47,7 +47,7 @@ func TestAggregatorWindowSlides(t *testing.T) {
 
 	a.Record(k, 200) // old
 	cur = base.Add(6 * time.Second)
-	a.Record(k, 400) // recent
+	a.Record(k, 400)                 // recent
 	cur = base.Add(12 * time.Second) // old sample (t=0) now outside the 10s window; recent (t=6) still in
 	p95, rate, present := a.Stats(k)
 	if !present || p95 != 400 {

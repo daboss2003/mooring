@@ -23,6 +23,8 @@ Everything reaches the runtime through **one validator** — the same one whethe
 - [How parsing works (and what is rejected)](#how-parsing-works-and-what-is-rejected)
 - [The `spec` sections](#the-spec-sections)
   - [`compose`](#speccompose)
+    - [`healthcheck`](#healthcheck)
+    - [`self_healing` (per service)](#self_healing-per-service)
   - [`setup`](#specsetup-an-advanced-setup-script)
   - [`secrets`](#specsecrets)
   - [`config_files`](#config_files-per-service)
@@ -158,7 +160,10 @@ compose:
 | `config_files` | app config files Mooring renders and bind-mounts read-only — see [`config_files`](#specconfig_files). |
 | `cert_bindings` | a managed cert synced into the service — see [`cert_bindings`](#speccert_bindings). |
 | `volumes` | `{ name, target }` (a managed named volume) or `{ source, target, read_only }` (a bind under the app's directory; the directory is created for you). |
-| `depends_on` / `healthcheck` / `command` / `restart` | sibling services / exec-array / exec-array / enum. |
+| `depends_on` | sibling service names this service starts after. A cycle (`api` → `worker` → `api`) is rejected when the definition is deployed. Self-healing doesn't restart a service while one it depends on is failing — see [dependencies](./scaling-and-self-healing.md#dependencies). |
+| `healthcheck` | an exec array, or a mapping that also sets the check timing — see [`healthcheck`](#healthcheck). |
+| `self_healing` | `{ on_unhealthy: restart \| notify }` — what a failing healthcheck triggers; see [`self_healing` (per service)](#self_healing-per-service). |
+| `command` / `restart` | exec array / enum (`no`, `always`, `on-failure`, `unless-stopped`). |
 | `mem_limit` / `mem_reservation` | optional cgroup memory cap / soft reservation per replica, as a size string (`768m`, `1g`). A limit hard-bounds each replica (per-container OOM protection) **and** makes the auto-scaler's `up_mem_pct`/`down_mem_pct` measure against *this* budget instead of the host's total RAM — i.e. a true per-service signal. Omit both to leave the container unbounded (the default). Size comfortably above measured RSS so the kernel doesn't OOM-kill it. |
 | `stop_grace_period` | optional duration (`60s`, `1m30s`) the container gets between `SIGTERM` and `SIGKILL` on stop (scale-down / redeploy), widening docker's 10s default so the app can drain long in-flight requests. Pairs with the app's graceful-shutdown hooks. Omit for the default. |
 | `ulimits` | optional per-container open-file limit — only `nofile: { soft, hard }` is supported. Raise it for a service holding many concurrent sockets, whose `max_connections` would otherwise be clamped by docker's default `nofile` of 1024 (e.g. an MQTT broker). `1 ≤ soft ≤ hard`; `hard` can't exceed the host kernel's `fs.nr_open` (commonly `1048576`) — higher needs a host `sysctl` (Mooring forbids in-container `sysctls`). Omit for the docker default. |
@@ -166,6 +171,66 @@ compose:
 The dangerous keys (`privileged`, `cap_add`, host namespaces, host binds, host-publish) **cannot be
 expressed** — no input can generate them, and the generated compose is re-checked by the validator
 anyway.
+
+#### `healthcheck`
+
+A healthcheck is the argv of a command run inside the container. Mooring runs it as `CMD` (no
+shell), so write the command and its arguments only, without a leading `CMD` or `CMD-SHELL`. The
+array form sets the command alone:
+
+```yaml
+healthcheck: [wget, -qO-, http://localhost:3000/health]
+```
+
+The mapping form also sets the check timing:
+
+```yaml
+healthcheck:
+  test: [wget, -qO-, http://localhost:3000/health]
+  interval: 10s
+  timeout: 5s
+  retries: 3
+  start_period: 60s
+```
+
+| Field | Type | Allowed | Default |
+|---|---|---|---|
+| `test` | exec array | required, non-empty | — |
+| `interval` | duration | `1s`–`10m` | `30s` |
+| `timeout` | duration | `1s`–`5m` | `30s` |
+| `retries` | int | `1`–`20` | `3` |
+| `start_period` | duration | `0s`–`30m` | `0s` |
+
+- `interval` is the time between checks, `timeout` is how long one check may run, and `retries` is
+  the number of consecutive failed checks that marks the container `unhealthy`.
+- `start_period` is start-up time for a slow-starting service. Checks that fail during it don't count
+  toward `retries`, and the container's health shows `starting` meanwhile. Once a check has passed,
+  every failure counts, even inside the start period.
+- Durations use the Go/compose syntax: `10s`, `90s`, `1m30s`.
+- An unset field uses the image's own `HEALTHCHECK` value when the image defines one, otherwise the
+  Docker default in the table.
+- `start_interval`, `disable`, and the shell string form (`test: "curl -f … || exit 1"`) are not
+  supported. An unknown key is rejected.
+
+#### `self_healing` (per service)
+
+`services.<name>.self_healing.on_unhealthy` sets what a failing healthcheck triggers:
+
+```yaml
+api:
+  image: ghcr.io/acme/api:1.4
+  healthcheck: [wget, -qO-, http://localhost:3000/health]
+  self_healing:
+    on_unhealthy: notify     # restart (default) | notify
+```
+
+| Value | Behaviour |
+|---|---|
+| `restart` (default) | The self-healing supervisor remediates an unhealthy service the same way as a crashed one (restart, then recreate). |
+| `notify` | A failing healthcheck raises a warning alert and never restarts the service; its self-healing state shows `UNHEALTHY`. The service is still restarted if its container exits. |
+
+`on_unhealthy` applies only to a service with a `healthcheck`: without one, a container never
+reports `unhealthy`. The app-wide remediation tunables are in [`spec.self_healing`](#specself_healing).
 
 #### `build:` — Mooring generates the Dockerfile
 
@@ -614,7 +679,7 @@ Notes:
 - **`timeout`** caps a single run. It defaults to **30 minutes**; set it higher for a long batch job (e.g. `timeout: 4h`) or lower to fail fast. A task holds the single docker slot for its whole run, so a very long timeout can make a stuck task block deploys until it hits the cap — that's why it's ceilinged at 24h. When a run hits the timeout it's killed and recorded as timed-out.
 - A scheduled service **can't also be an auto-scaling target** (a one-shot doesn't scale) — that's rejected at validation.
 - **Rebuilt on every deploy.** When the scheduled service has a `build:` block, every deploy rebuilds its image with the app's other build services, so the next run uses the deployed code. The deploy log shows one line per image (built by this deploy, or unchanged).
-- A task doesn't start while a deploy, certificate renewal or app delete is running on the server, or while its own app is mid-deploy or mid lifecycle action; it stays due and starts at the next minute's check after. A task already running when a deploy starts keeps the single docker slot until it finishes, and the deploy waits for it. A failed task raises an alert; the last run is remembered across restarts (a restart doesn't re-fire everything).
+- A task doesn't start while a deploy, certificate renewal or app delete is running on the server, or while its own app is mid-deploy or mid lifecycle action; it stays due and starts at the next minute's check after. The [start gate](./scaling-and-self-healing.md#start-pacing) can also hold a due task back — while other containers are still starting or the host CPU is busy — for at most `max_wait`. A task already running when a deploy starts keeps the single docker slot until it finishes, and the deploy waits for it. A failed task raises an alert; the last run is remembered across restarts (a restart doesn't re-fire everything).
 - **See what ran:** the dashboard's **[Scheduled tasks](./scheduled-tasks.md)** tab shows what's running right now (with live CPU/memory and the owning app), plus the recent run history with results and captured logs (kept 7 days).
 
 ### `spec.self_healing`
@@ -642,6 +707,8 @@ self_healing:
 | `redeploy_enabled` | bool | Opt in to the rung-3 redeploy (still gated on host headroom). |
 
 > Self-healing has no separate dashboard editor — `mooring.yaml` is the source of truth. The supervisor reads the policy each tick, so a redeploy re-tunes it without a restart. See [Self-healing](./scaling-and-self-healing.md).
+
+To alert on a failing healthcheck instead of restarting the service, set `on_unhealthy: notify` on that service — see [`self_healing` (per service)](#self_healing-per-service).
 
 ### `spec.ops_interface` / `services.<name>.ops_interface`
 
@@ -817,7 +884,7 @@ the broker's cert.
 apiVersion: mooring/v1            # exact-match; an unknown version is rejected, never best-effort parsed
 kind: App
 metadata:
-  slug: credlock                   # immutable after first deploy
+  slug: acme                       # immutable after first deploy
 
 spec:
   compose:
@@ -979,9 +1046,14 @@ spec:
 | `…services.<name>.config_files[].bindings.<KEY>` | literal \| `{secret\|env\|app\|cert: ARG}` | no | — |
 | `…services.<name>.cert_bindings[]` | `{hostname, mount}` | no | — |
 | `…services.<name>.volumes[]` | `{name\|source, target, read_only}` | no | — |
-| `…services.<name>.command` / `.healthcheck` | exec array | no | — |
+| `…services.<name>.command` | exec array | no | — |
+| `…services.<name>.healthcheck` | exec array \| `{test, interval, timeout, retries, start_period}` | no | — |
+| `…services.<name>.healthcheck.interval` / `.timeout` | duration (`1s`–`10m` / `1s`–`5m`) | no | `30s` / `30s` |
+| `…services.<name>.healthcheck.retries` | int (`1`–`20`) | no | `3` |
+| `…services.<name>.healthcheck.start_period` | duration (`0s`–`30m`) | no | `0s` |
+| `…services.<name>.self_healing.on_unhealthy` | `restart` \| `notify` | no | `restart` |
 | `…services.<name>.restart` | enum (`no`/`always`/`on-failure`/`unless-stopped`) | no | docker default |
-| `…services.<name>.depends_on[]` | list of sibling service names | no | — |
+| `…services.<name>.depends_on[]` | list of sibling service names (no cycles) | no | — |
 | `…services.<name>.mem_limit` / `.mem_reservation` | size string (`768m`, `1g`) | no | unbounded |
 | `…services.<name>.stop_grace_period` | duration string (`60s`, `1m30s`) | no | docker 10s |
 | `…services.<name>.ulimits.nofile` | `{ soft, hard }` ints (`1 ≤ soft ≤ hard`) | no | docker default (1024) |

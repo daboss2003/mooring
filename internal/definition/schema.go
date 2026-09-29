@@ -142,7 +142,10 @@ type Service struct {
 	ConfigFiles  []ConfigFile        `yaml:"config_files,omitempty"`
 	CertBindings []CertBinding       `yaml:"cert_bindings,omitempty"`
 	Command      []string            `yaml:"command,omitempty"`
-	Healthcheck  []string            `yaml:"healthcheck,omitempty"`
+	Healthcheck  *Healthcheck        `yaml:"healthcheck,omitempty"` // exec array, or a mapping with timing knobs
+	// SelfHealing is this service's own self-healing setting (what a failing healthcheck
+	// triggers); the app-level spec.self_healing tunes the remediation ladder itself.
+	SelfHealing  *ServiceSelfHealing `yaml:"self_healing,omitempty"`
 	Restart      string              `yaml:"restart,omitempty"`
 	DependsOn    []string            `yaml:"depends_on,omitempty"`
 	OpsInterface *OpsInterface       `yaml:"ops_interface,omitempty"` // per-service ops endpoint (§4); probed for RICH health/queues/metrics
@@ -173,6 +176,187 @@ type Ulimits struct {
 type NofileLimit struct {
 	Soft int `yaml:"soft"`
 	Hard int `yaml:"hard"`
+}
+
+// Healthcheck is a service's container healthcheck. Test is an exec argv, rendered as
+// ["CMD", ...] (there is no shell form). It is written as that bare exec array, or as a
+// mapping that adds Docker's timing knobs:
+//
+//	healthcheck: [wget, -qO-, http://localhost:3000/health]
+//	healthcheck: { test: [wget, -qO-, http://localhost:3000/health], interval: 10s, retries: 3 }
+//
+// The canonical form is the bare array whenever only Test is set, so a definition stored
+// before the mapping form existed re-marshals byte-identically. An unset timing field is left
+// to Docker: the image's own HEALTHCHECK value if it declares one, else Docker's default (the
+// accessors return the default). start_interval is deliberately absent: it needs Docker Engine
+// API 1.44+ and older compose clients reject it.
+type Healthcheck struct {
+	Test        []string `yaml:"test"`
+	Interval    string   `yaml:"interval,omitempty"`     // time between checks, 1s–10m
+	Timeout     string   `yaml:"timeout,omitempty"`      // limit for one check, 1s–5m
+	Retries     int      `yaml:"retries,omitempty"`      // consecutive failures before unhealthy, 1–20
+	StartPeriod string   `yaml:"start_period,omitempty"` // start-up grace whose failures don't count, 0–30m
+}
+
+// Docker's healthcheck defaults for an unset timing field (start_period defaults to 0).
+const (
+	healthDefaultInterval = 30 * time.Second
+	healthDefaultTimeout  = 30 * time.Second
+	healthDefaultRetries  = 3
+)
+
+// healthcheckExample is the exec-array shape quoted in healthcheck decode errors.
+const healthcheckExample = "[wget, -qO-, http://localhost:3000/health]"
+
+// IsZero reports an empty healthcheck (e.g. `healthcheck: []`), which means no healthcheck —
+// yaml omitempty drops it from the canonical, exactly as it dropped an empty exec array.
+func (h Healthcheck) IsZero() bool {
+	return len(h.Test) == 0 && h.Interval == "" && h.Timeout == "" && h.Retries == 0 && h.StartPeriod == ""
+}
+
+// MarshalYAML renders the bare exec array when only Test is set (the pre-mapping canonical
+// form), else the mapping — so Canonical round-trips back through UnmarshalYAML.
+func (h Healthcheck) MarshalYAML() (any, error) {
+	if h.Interval == "" && h.Timeout == "" && h.Retries == 0 && h.StartPeriod == "" {
+		return h.Test, nil
+	}
+	type plain Healthcheck // no methods: the encoder renders the tagged fields
+	return plain(h), nil
+}
+
+// UnmarshalYAML accepts the bare exec array or a mapping of `test` plus the timing fields. A
+// custom unmarshaler doesn't inherit the decoder's KnownFields, so unknown or repeated keys,
+// wrongly-shaped values, and a missing or empty test are rejected here. Value bounds are
+// checked by validateHealthcheck.
+func (h *Healthcheck) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.SequenceNode:
+		return n.Decode(&h.Test)
+	case yaml.MappingNode:
+	default:
+		return fmt.Errorf("line %d: healthcheck must be an exec array like %s or a mapping with test (the shell string form is not supported)", n.Line, healthcheckExample)
+	}
+	seen := map[string]bool{}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		k, v := n.Content[i], n.Content[i+1]
+		if seen[k.Value] {
+			return fmt.Errorf("line %d: healthcheck key %q is repeated", k.Line, k.Value)
+		}
+		seen[k.Value] = true
+		if k.Value != "test" && v.ShortTag() == "!!null" {
+			continue // an explicit null leaves the field unset
+		}
+		switch k.Value {
+		case "test":
+			if v.Kind != yaml.SequenceNode {
+				return fmt.Errorf("line %d: healthcheck.test must be an exec array like %s (the shell string form is not supported)", v.Line, healthcheckExample)
+			}
+			if err := v.Decode(&h.Test); err != nil {
+				return err
+			}
+			// Compose's own `test:` starts with CMD / CMD-SHELL / NONE. Mooring prepends CMD
+			// itself, so a copied compose test would run a binary named "CMD" and never pass.
+			// (The bare-array form keeps its original rules: stored canonicals must re-parse.)
+			if len(h.Test) > 0 && (h.Test[0] == "CMD" || h.Test[0] == "CMD-SHELL" || h.Test[0] == "NONE") {
+				return fmt.Errorf("line %d: healthcheck.test is the command's argv: drop the leading %q (Mooring adds CMD; the shell form is not supported)", v.Line, h.Test[0])
+			}
+		case "interval", "timeout", "start_period":
+			if v.Kind != yaml.ScalarNode {
+				return fmt.Errorf("line %d: healthcheck.%s must be a duration like 10s", v.Line, k.Value)
+			}
+			switch k.Value {
+			case "interval":
+				h.Interval = v.Value
+			case "timeout":
+				h.Timeout = v.Value
+			default:
+				h.StartPeriod = v.Value
+			}
+		case "retries":
+			if v.ShortTag() != "!!int" {
+				return fmt.Errorf("line %d: healthcheck.retries must be a whole number", v.Line)
+			}
+			if err := v.Decode(&h.Retries); err != nil {
+				return err
+			}
+			if h.Retries == 0 { // 0 would read as unset; validateHealthcheck bounds the rest
+				return fmt.Errorf("line %d: healthcheck.retries must be between 1 and 20 (omit it for Docker's default of 3)", v.Line)
+			}
+		default:
+			return fmt.Errorf("line %d: unknown healthcheck key %q (allowed: test, interval, timeout, retries, start_period)", k.Line, k.Value)
+		}
+	}
+	if len(h.Test) == 0 {
+		return fmt.Errorf("line %d: healthcheck needs a non-empty test, e.g. test: %s", n.Line, healthcheckExample)
+	}
+	return nil
+}
+
+// IntervalD returns the time between checks: the declared interval, else Docker's 30s default.
+// Nil-safe.
+func (h *Healthcheck) IntervalD() time.Duration {
+	if h == nil {
+		return healthDefaultInterval
+	}
+	return durationOr(h.Interval, healthDefaultInterval)
+}
+
+// TimeoutD returns the limit for one check: the declared timeout, else Docker's 30s default.
+// Nil-safe.
+func (h *Healthcheck) TimeoutD() time.Duration {
+	if h == nil {
+		return healthDefaultTimeout
+	}
+	return durationOr(h.Timeout, healthDefaultTimeout)
+}
+
+// RetriesN returns the consecutive failures that mark the container unhealthy: the declared
+// retries, else Docker's default of 3. Nil-safe.
+func (h *Healthcheck) RetriesN() int {
+	if h == nil || h.Retries < 1 {
+		return healthDefaultRetries
+	}
+	return h.Retries
+}
+
+// StartPeriodD returns the start-up grace during which failed checks don't count: the
+// declared start_period, else Docker's default of 0. Nil-safe.
+func (h *Healthcheck) StartPeriodD() time.Duration {
+	if h == nil {
+		return 0
+	}
+	return durationOr(h.StartPeriod, 0)
+}
+
+// durationOr parses an optional positive duration, falling back to def when it is unset or
+// unusable (validation has already rejected a bad value in a parsed definition).
+func durationOr(v string, def time.Duration) time.Duration {
+	if d, err := time.ParseDuration(v); err == nil && d > 0 {
+		return d
+	}
+	return def
+}
+
+// On-unhealthy actions for services.<name>.self_healing.on_unhealthy.
+const (
+	OnUnhealthyRestart = "restart" // default: the self-healing supervisor remediates a failing healthcheck
+	OnUnhealthyNotify  = "notify"  // alert only; a failing healthcheck never restarts the service
+)
+
+// ServiceSelfHealing is the per-service self-healing block (services.<name>.self_healing).
+// OnUnhealthy chooses what a failing healthcheck triggers: "restart" (the default) or
+// "notify" (an alert, and no restart for the failing healthcheck — a container that exits is
+// still restarted). Read it through Service.OnUnhealthy, which fills the default.
+type ServiceSelfHealing struct {
+	OnUnhealthy string `yaml:"on_unhealthy,omitempty"`
+}
+
+// OnUnhealthy returns the service's on_unhealthy action: the declared value, else "restart".
+func (s Service) OnUnhealthy() string {
+	if s.SelfHealing == nil || s.SelfHealing.OnUnhealthy == "" {
+		return OnUnhealthyRestart
+	}
+	return s.SelfHealing.OnUnhealthy
 }
 
 // EnvValue is a per-service env var: a literal value XOR a `{secret: NAME}` reference.
@@ -920,8 +1104,15 @@ func (s *Spec) validateServices() error {
 		if err := validateExec("command", name, svc.Command); err != nil {
 			return err
 		}
-		if err := validateExec("healthcheck", name, svc.Healthcheck); err != nil {
+		if err := validateHealthcheck(name, svc.Healthcheck); err != nil {
 			return err
+		}
+		if sh := svc.SelfHealing; sh != nil {
+			switch sh.OnUnhealthy {
+			case "", OnUnhealthyRestart, OnUnhealthyNotify:
+			default:
+				return fmt.Errorf("service %q self_healing.on_unhealthy %q must be restart or notify", name, sh.OnUnhealthy)
+			}
 		}
 		for _, d := range svc.DependsOn {
 			if d == name {
@@ -930,6 +1121,84 @@ func (s *Spec) validateServices() error {
 			if !names[d] {
 				return fmt.Errorf("service %q depends_on unknown service %q", name, d)
 			}
+		}
+	}
+	return nil
+}
+
+// validateHealthcheck checks a service healthcheck: the test follows the same exec rules as
+// `command`, it is required once any timing field is set, and each timing field is within its
+// bounds. Nil or empty (`healthcheck: []`) is no healthcheck.
+func validateHealthcheck(svc string, h *Healthcheck) error {
+	if h == nil || h.IsZero() {
+		return nil
+	}
+	if len(h.Test) == 0 {
+		return fmt.Errorf("service %q healthcheck needs a test command", svc)
+	}
+	if err := validateExec("healthcheck", svc, h.Test); err != nil {
+		return err
+	}
+	for _, f := range []struct {
+		key, v string
+		lo, hi time.Duration
+	}{
+		{"interval", h.Interval, time.Second, 10 * time.Minute},
+		{"timeout", h.Timeout, time.Second, 5 * time.Minute},
+		{"start_period", h.StartPeriod, 0, 30 * time.Minute},
+	} {
+		if err := validDurationRange(fmt.Sprintf("service %q healthcheck.%s", svc, f.key), f.v, f.lo, f.hi); err != nil {
+			return err
+		}
+	}
+	if h.Retries < 0 || h.Retries > 20 { // 0 = unset (Docker's default)
+		return fmt.Errorf("service %q healthcheck.retries %d must be between 1 and 20", svc, h.Retries)
+	}
+	return nil
+}
+
+// DependencyCycle returns one depends_on cycle as the service path that closes it (e.g.
+// [api worker api]), or nil when there is none. It is a visited-set DFS over the services in
+// sorted order, following each depends_on list in declared order, so the reported cycle is
+// deterministic; a dependency on an undeclared service is skipped (validateServices rejects
+// it). It is NOT part of Parse: a stored canonical is re-parsed on every read, so a new
+// parse-time rule would make an existing cyclic canonical unreadable. ValidateForSubmit runs it
+// when a new definition is accepted.
+func (s *Spec) DependencyCycle() []string {
+	const (
+		unseen = iota
+		visiting
+		done
+	)
+	state := map[string]int{}
+	pos := map[string]int{} // a visiting service's index in path
+	var path, cycle []string
+	var visit func(n string) bool
+	visit = func(n string) bool {
+		state[n] = visiting
+		pos[n] = len(path)
+		path = append(path, n)
+		for _, dep := range s.Compose.Services[n].DependsOn {
+			if _, ok := s.Compose.Services[dep]; !ok {
+				continue
+			}
+			switch state[dep] {
+			case visiting: // dep is on the current path: it closes a cycle
+				cycle = append(append([]string{}, path[pos[dep]:]...), dep)
+				return true
+			case unseen:
+				if visit(dep) {
+					return true
+				}
+			}
+		}
+		path = path[:len(path)-1]
+		state[n] = done
+		return false
+	}
+	for _, name := range s.serviceNames() {
+		if state[name] == unseen && visit(name) {
+			return cycle
 		}
 	}
 	return nil

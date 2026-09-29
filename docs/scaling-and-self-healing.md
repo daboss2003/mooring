@@ -14,7 +14,18 @@ Auto-scaling adjusts how many copies (**replicas**) of a service run, based on l
 
 **Edge-fronted means HTTP *or* L4.** Normally "edge-fronted" is an HTTP service behind an `edge.route`. A **non-HTTP** stream service (DNS, MQTT) can also scale if you front it with an [`edge.l4_route`](./definition-file.md#specedgel4_routes-tcpudp-load-balancing): the L4 load balancer owns the public port and the replicas stay internal, so it no longer "publishes a fixed host port." This needs **nginx installed on the host** and `edge.l4_enabled` (it's opt-in and not bundled — see the definition-file reference). Without it, such services run as a single instance.
 
-**It only adds capacity when there's room.** Before starting another replica, Mooring checks there's provably enough memory and CPU, keeping headroom for itself and the edge. On a server that's near its limit it **collapses to a single replica** and won't scale up. It moves **one step at a time** with separate scale-up and scale-down thresholds (and a hold window), so it doesn't flap up and down.
+**It only adds capacity when there's room.** Before starting another replica, Mooring checks there's provably enough memory and CPU, keeping headroom for itself and the edge. On a server that's near its limit it **collapses to a single replica** and won't scale up. Separate scale-up and scale-down thresholds (and a hold window) keep it from flapping up and down.
+
+**It adds one copy at a time.** Every scale-up starts a single new copy, and the next copy is started only when:
+
+- every copy of the service is running and healthy — or, for a service without a healthcheck, past its start-up (see [start pacing](#start-pacing));
+- no copy is stopped (a crashed copy is restarted by self-healing, not by the scaler);
+- self-healing isn't working on the service;
+- the [start gate](#start-pacing) admits the start.
+
+Raising `min` or nudging by more than one raises the desired count at once; the copies are then started one by one. Removing copies is never delayed. A scale-up driven by load also holds while earlier copies are still being added, and doesn't happen while the host CPU is busy (another copy on a saturated host adds contention, not capacity).
+
+If every container of an auto-scaled service is gone (removed outside Mooring, say) while the rest of its app still runs, the service is started again one copy at a time — but only when the app's deployed `mooring.yaml` still declares it as a long-running service. A scale call that fails is retried after 1 minute, then after 2, 4 and 8, and then every 10 minutes until one succeeds.
 
 **You're alerted if it can't scale up.** If it declines to scale because the server is constrained, it can alert you — that's your cue the box needs more resources.
 
@@ -32,14 +43,59 @@ You configure min/max replicas, per-replica memory and CPU, and the up/down thre
 
 ## Self-healing
 
-The self-healing supervisor watches your services and **recovers ones that crash or get stuck** — restarting a failed container, and escalating if a restart isn't enough. It only ever *reduces* pressure or holds steady; it never adds load.
+The self-healing supervisor watches your services and **recovers ones that crash or get stuck** — restarting a failed container, and escalating if a restart isn't enough. It restarts one container at a time, paced by the [start gate](#start-pacing).
 
 **How it escalates.** For a crashed or unhealthy service it climbs a short ladder — **restart**, then **recreate** (which also re-renders the service's config files and re-syncs its certificates, healing config drift), and, only if you opt in on a box with enough RAM, **redeploy**. Each rung is tried at most once per window, with back-off between attempts. Two cases short-circuit the ladder because retrying wouldn't help: a service being **OOM-killed repeatedly** (it needs more memory, not another restart), and a restart that would need memory the host can't spare (Mooring **pages you instead of acting**). It also covers the **deploy path** — if an interrupted recreate strands a container holding a service's name, Mooring reclaims that app's own stuck container and retries once (see [self-healing a stuck container](./gitops.md#how-updates-work)).
 
-When it **can't** recover a service after trying, it stops retrying (to avoid a crash-loop hammering the box), **flags the service on the Incidents screen**, and alerts you. That's the "self-healing gave up" state — you investigate, fix the underlying problem, and click **clear & retry** to let Mooring try again.
+**Services with several copies.** A scaled service is judged as a whole: it is failing when any copy is down or failing its healthcheck.
+
+- **Restart** restarts one sick copy (`docker restart <copy>`); the other copies keep serving.
+- Every other sick copy is then restarted the same way, one per action, before the service moves up the ladder. Only the first of these restarts uses up an attempt — so after a reboot that left several copies stopped, they come back one at a time.
+- **Recreate**, for an auto-scaled service with at least one copy that isn't sick, removes the sick copies and the auto-scaler starts fresh ones, one at a time. Otherwise the service is recreated (`docker compose up --force-recreate --no-deps` for that service).
+- The attempt count isn't reset while the service keeps running with several copies, until the attempt window (30 minutes by default) ends. A copy that keeps failing — even minutes after each restart — ends in the "gave up" state below instead of being restarted forever.
+
+When it **can't** recover a service after trying, it stops retrying (to avoid a crash-loop hammering the box), **flags the service on the Incidents screen**, and alerts you. That's the "self-healing gave up" state — you investigate, fix the underlying problem, and click **clear & retry** to let Mooring try again. The state holds while the service waits on a dependency or on its certificate.
 
 **Stopping a service on purpose won't fight you.** When you **Stop** a service (or a whole app), Mooring records a *hold*: the supervisor and the auto-scaler both leave it down and won't restart it. A held service stays stopped until you **Start**, **Restart**, or **Redeploy** it — so planned downtime is just Stop, with no window to set or expire. (See [Starting and stopping services](./gitops.md#starting-and-stopping-services).)
 
 Self-healing is conservative for the same reason auto-scaling is: a recovery action that needs to recreate a container runs only when there's room, so healing one app can't knock over the server.
+
+### Dependencies
+
+When a service is failing while a service it depends on (`depends_on`) is failing or still recovering, it is not restarted: restarting it can't fix the dependency and only adds load. The service shows **waiting on a dependency** (`WAITING_ON_DEPENDENCY`), and the dependency is remediated first.
+
+A dependency counts as recovering until it has been running and healthy for 60 seconds, or two of the dependent's healthcheck intervals if that is longer. Dependencies are followed through `depends_on` chains. The graph comes only from the app's deployed `mooring.yaml`.
+
+The wait is capped at **10 minutes**. After that Mooring sends a warning alert and the service goes through its normal restart/recreate ladder.
+
+### Reporting instead of restarting
+
+A service that sets [`self_healing.on_unhealthy: notify`](./definition-file.md#self_healing-per-service) is never restarted for a failing healthcheck. After the failure persists it shows **failing its healthcheck** (`UNHEALTHY`) and Mooring sends one warning alert, resolved when the healthcheck passes again. A copy that exits is still restarted.
+
+## Start pacing
+
+Starting several services at once on a small host makes them compete for CPU, and none of them becomes healthy. The **start gate** makes Mooring's own automatic starts — auto-scaling, self-healing, and [scheduled tasks](./scheduled-tasks.md) — wait while:
+
+- another container started recently is still starting: until its healthcheck passes, or, for a container without a healthcheck, for at least `settle_grace` and until its CPU drops below `cpu_settle_pct` of one core. One start holds others back for at most `max_settle`. A container that keeps crashing (its restart count rising) holds nothing back;
+- the host CPU (averaged over the last three monitor samples) is at or above `cpu_busy_pct`. An action that has waited `max_wait` for CPU starts anyway, and restoring a service with no running copy never waits for CPU. When self-healing restarts a service, that service's own containers are left out of both checks. A scheduled task held back for `max_wait` for either reason starts anyway.
+
+Deploys, rollbacks, lifecycle actions (start, restart, redeploy) and certificate renewals are **never held back** — a deploy is often the fix for the unhealthy service. The containers they start are recorded, so the automatic starters wait for them to settle.
+
+Configure it in `/etc/mooring/config.yaml` (restart Mooring to apply):
+
+```yaml
+server:
+  start_gate:
+    enabled: true        # false turns pacing off
+    cpu_busy_pct: 85     # host CPU % at which starts wait (10–100)
+    settle_grace: 30s    # minimum start-up time of a container without a healthcheck (0s–10m)
+    cpu_settle_pct: 50   # % of one core below which it has settled (1–1000)
+    max_settle: 3m       # longest one start holds others back (10s–30m)
+    max_wait: 10m        # longest an action waits for CPU (1m–2h)
+```
+
+A service whose start-up is slow should declare a [`healthcheck`](./definition-file.md#healthcheck) with a `start_period`; Mooring then waits for the healthcheck instead of guessing from CPU.
+
+## Tuning self-healing
 
 Every service is supervised with a conservative built-in default; you don't turn it on per service. To tune the ladder for an app — the anti-flap window, attempt cap, back-off, and the opt-in rung-3 redeploy — declare [`spec.self_healing`](./definition-file.md#specself_healing) in its `mooring.yaml` and deploy (omitted fields keep the default). The only dashboard self-healing **action** is **clear & retry** on the Incidents screen, which resets a service whose circuit has opened.

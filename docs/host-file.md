@@ -158,6 +158,14 @@ server:
   disk_gc_threshold: 75               # % disk usage that triggers it (50–95)
   build_cache_keep_enabled: true      # trim BuildKit cache after each build-deploy
   build_cache_keep: "5GB"             # how much recent cache to keep
+  build_concurrency: auto             # auto (one image at a time on ≤2 CPUs) | serial | parallel
+  start_gate:                         # pacing of automatic container starts — see docs/scaling-and-self-healing.md#start-pacing
+    enabled: true
+    cpu_busy_pct: 85                  # host CPU % at which automatic starts wait (10–100)
+    settle_grace: 30s                 # minimum start-up time of a container without a healthcheck
+    cpu_settle_pct: 50                # % of one core below which such a container has settled
+    max_settle: 3m                    # longest one start holds others back
+    max_wait: 10m                     # longest an action waits for CPU
 
 # --- App-data backups (off by default) ---  see docs/backup-and-recovery.md
 backups:

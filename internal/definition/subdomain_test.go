@@ -15,16 +15,16 @@ func TestValidateHostOrSubdomain(t *testing.T) {
 		}
 	}
 	bad := []struct{ host, sub string }{
-		{"", ""},                  // neither
+		{"", ""},                     // neither
 		{"mqtt.example.com", "mqtt"}, // both
-		{"", "*"},                 // wildcard label
-		{"", "-bad"},              // leading hyphen
-		{"", "bad-"},              // trailing hyphen
-		{"", "Up"},                // uppercase
-		{"", "a.b"},               // a dot (not a single label)
-		{"", "under_score"},       // underscore
-		{"*.example.com", ""},     // wildcard hostname
-		{"nodot", ""},             // not an FQDN
+		{"", "*"},                    // wildcard label
+		{"", "-bad"},                 // leading hyphen
+		{"", "bad-"},                 // trailing hyphen
+		{"", "Up"},                   // uppercase
+		{"", "a.b"},                  // a dot (not a single label)
+		{"", "under_score"},          // underscore
+		{"*.example.com", ""},        // wildcard hostname
+		{"nodot", ""},                // not an FQDN
 	}
 	for _, c := range bad {
 		if err := validateHostOrSubdomain("x", c.host, c.sub); err == nil {

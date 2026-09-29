@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"time"
 
 	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/compose"
@@ -122,9 +123,11 @@ func (s *Server) handleProvisionDeploy(w http.ResponseWriter, r *http.Request) {
 	defer s.leaseExpectedDown(r.Context(), slug)()
 	onl := func(line string) { writeln("%s", line) }
 	declared := s.reapScope(r.Context(), slug)
+	upStart := time.Now()
 	runErr := s.runUpWithConflictReap(r.Context(), slug, declared,
 		func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
 		s.runner.RemoveContainers, onl)
+	s.recordStart(slug, "", upStart, false) // never held back, but automatic starters wait for it
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(context.Background(), depID, code, outcome)
 	if runErr != nil {

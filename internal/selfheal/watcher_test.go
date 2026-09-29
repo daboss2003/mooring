@@ -17,15 +17,24 @@ import (
 
 // fakeActioner records remediation calls instead of running docker.
 type fakeActioner struct {
-	mu    sync.Mutex
-	calls []string // "service:rung"
-	fail  bool
+	mu        sync.Mutex
+	calls     []string // "service:rung"
+	targets   []Target
+	deadlines []time.Time // each call's context deadline (zero if none)
+	fail      bool
+	after     func(service string, rung Rung, t Target) // simulates the action's effect (optional)
 }
 
-func (f *fakeActioner) Remediate(_ context.Context, app monitor.App, service string, rung Rung) error {
+func (f *fakeActioner) Remediate(ctx context.Context, app monitor.App, service string, rung Rung, t Target) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, service+":"+string(rung))
+	f.targets = append(f.targets, t)
+	dl, _ := ctx.Deadline()
+	f.deadlines = append(f.deadlines, dl)
+	if f.after != nil {
+		f.after(service, rung, t)
+	}
 	if f.fail {
 		return io.EOF
 	}

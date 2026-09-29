@@ -27,7 +27,14 @@ type Metrics struct {
 	AllHealthy bool     // every replica running and not unhealthy (gates scale-DOWN)
 	AllReady   bool     // every replica running, not unhealthy, AND not still starting (gates scale-UP)
 	Signals    []Signal // custom per-service signals, keyed by name
+	// Behind: fewer copies are running than desired (the watcher is still adding them one at a
+	// time, or a copy is down). Load holds instead of raising desired further meanwhile.
+	Behind bool
 }
+
+// reasonLoad is the reason of a load-driven scale-up (the only up-move that never overrides a busy
+// host CPU: another copy on a saturated host adds contention, not capacity).
+const reasonLoad = "sustained load"
 
 // Signal is one custom metric input for a tick, already aggregated by the watcher to the
 // per-replica value the thresholds compare against (so a service-TOTAL like queue depth is
@@ -230,13 +237,16 @@ func Decide(st State, m Metrics, p Policy, ceiling int, now int64) Decision {
 		// only deepens CPU contention — the whole fleet can sit pinned and none become healthy. Holding
 		// here (breach timer kept) means "add one, let it come up and take load, then reconsider". A
 		// service with no healthcheck reports no starting/unhealthy state, so this never blocks it.
+		if m.Behind {
+			return hold(ns, "still adding the previous copies")
+		}
 		if !m.AllReady {
 			return hold(ns, "waiting for the current replicas to become ready")
 		}
 		ns.Replicas = cur + 1 // up-eager, one step per tick
 		ns.LastChange = now
 		ns.BreachSince = 0
-		return Decision{Target: ns.Replicas, Action: ActUp, Reason: "sustained load", Next: ns}
+		return Decision{Target: ns.Replicas, Action: ActUp, Reason: reasonLoad, Next: ns}
 	}
 
 	// Not breaching up → reset the breach timer.

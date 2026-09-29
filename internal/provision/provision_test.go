@@ -81,6 +81,82 @@ func TestGenerateStopGracePeriod(t *testing.T) {
 	}
 }
 
+// testOnlyHealthCompose is Generate's output for a test-only healthcheck as produced BEFORE the
+// timing fields existed (captured from that build). It must stay byte-identical so an existing
+// app's compose is unchanged and an upgrade recreates nothing.
+const testOnlyHealthCompose = `name: shop
+services:
+    web:
+        image: nginx:1.27
+        restart: unless-stopped
+        ports:
+            - 127.0.0.1:8080:8080
+        volumes:
+            - data:/var/lib/data
+            - ./conf:/etc/app:ro
+        environment:
+            - LOG_LEVEL=info
+            - DB_PASSWORD=${DB_PASSWORD}
+        command:
+            - nginx
+            - -g
+            - daemon off;
+        healthcheck:
+            test:
+                - CMD
+                - curl
+                - -f
+                - http://localhost:8080/health
+volumes:
+    data: null
+`
+
+func TestGenerateHealthcheckTestOnlyByteIdentical(t *testing.T) {
+	spec := sampleSpec()
+	spec.Services[0].Healthcheck = &Healthcheck{Test: []string{"curl", "-f", "http://localhost:8080/health"}}
+	spec.Services[0].Command = []string{"nginx", "-g", "daemon off;"}
+	out, err := Generate(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(out) != testOnlyHealthCompose {
+		t.Fatalf("test-only healthcheck compose changed:\n--- got\n%s\n--- want\n%s", out, testOnlyHealthCompose)
+	}
+}
+
+// The timing fields render under the healthcheck only when set, in compose's key order.
+func TestGenerateHealthcheckTiming(t *testing.T) {
+	spec := sampleSpec()
+	spec.Services[0].Healthcheck = &Healthcheck{Test: []string{"curl", "-f", "http://localhost:8080/health"},
+		Interval: "10s", Timeout: "5s", Retries: 3, StartPeriod: "1m"}
+	out, err := Generate(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "        healthcheck:\n            test:\n                - CMD\n                - curl\n                - -f\n                - http://localhost:8080/health\n" +
+		"            interval: 10s\n            timeout: 5s\n            retries: 3\n            start_period: 1m\n"
+	if !strings.Contains(string(out), want) {
+		t.Errorf("generated compose missing the timed healthcheck:\n%s", out)
+	}
+	if res := compose.ValidateBytes(out, compose.Env{}, "/srv/apps/shop", compose.Options{}); !res.OK() {
+		t.Fatalf("timed healthcheck compose failed §5.6: %s", res.Error())
+	}
+	// Only the fields that are set are emitted.
+	spec.Services[0].Healthcheck = &Healthcheck{Test: []string{"curl"}, Retries: 5}
+	out, _ = Generate(spec)
+	if !strings.Contains(string(out), "retries: 5") || strings.Contains(string(out), "interval") ||
+		strings.Contains(string(out), "timeout") || strings.Contains(string(out), "start_period") {
+		t.Errorf("unset timing fields must be omitted:\n%s", out)
+	}
+	// No healthcheck (nil or empty test) emits no key.
+	for _, hc := range []*Healthcheck{nil, {}} {
+		spec.Services[0].Healthcheck = hc
+		if bare, _ := Generate(spec); strings.Contains(string(bare), "healthcheck") {
+			t.Errorf("%+v must not emit a healthcheck:\n%s", hc, bare)
+		}
+	}
+}
+
 // The generated compose is safe by construction AND passes the §5.6 chokepoint.
 func TestGenerateProducesSafeComposeThatPassesValidator(t *testing.T) {
 	out, err := Generate(sampleSpec())
@@ -191,6 +267,11 @@ func TestValidateRejectsBadInput(t *testing.T) {
 		"unknown depends_on":   func(s *Spec) { s.Services[0].DependsOn = []string{"ghost"} },
 		"bad restart":          func(s *Spec) { s.Services[0].Restart = "sometimes" },
 		"newline in command":   func(s *Spec) { s.Services[0].Command = []string{"sh\n-c"} },
+		"newline in health":    func(s *Spec) { s.Services[0].Healthcheck = &Healthcheck{Test: []string{"curl\n-f"}} },
+		"empty health arg":     func(s *Spec) { s.Services[0].Healthcheck = &Healthcheck{Test: []string{"curl", ""}} },
+		"health timing no test": func(s *Spec) {
+			s.Services[0].Healthcheck = &Healthcheck{Interval: "10s"}
+		},
 		"colon in bind source": func(s *Spec) { s.Services[0].Volumes = []Volume{{Source: "a:b", Target: "/x"}} },
 		"colon in target":      func(s *Spec) { s.Services[0].Volumes = []Volume{{Name: "v", Target: "/x:y"}} },
 	}

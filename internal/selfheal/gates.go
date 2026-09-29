@@ -1,10 +1,12 @@
 package selfheal
 
-// The four ordered tiny-box safety gates (plan §8.5) applied before EVERY action.
+// The ordered tiny-box safety gates (plan §8.5) applied before EVERY action.
 // All must pass or the action defers (re-checked next tick) — EXCEPT the headroom
 // gate, which converts a restart into a page ("don't restart, page instead"), and
 // the edge gate, which removes a target entirely. These are what guarantee the
 // supervisor can only reduce pressure or hold steady, never manufacture an OOM.
+// The last gate is the host-wide start gate: a restart waits while another container
+// is still starting or the host has no CPU headroom.
 
 // GateOutcome is the result of evaluating the gates for a proposed action.
 type GateOutcome string
@@ -29,6 +31,8 @@ type GateInput struct {
 	// NON-BLOCKING TryAcquire supplied by the watcher; nil means "treat as busy".
 	// When it returns true the caller now HOLDS the semaphore and must Release it.
 	AcquireSemaphore func() bool
+	// ReleaseSemaphore gives the slot back when a later gate defers after acquiring it.
+	ReleaseSemaphore func()
 
 	// Gate 3 — memory-headroom floor. A restart momentarily runs old+new, so below
 	// the floor we must not restart. HeadroomBytes is current free memory (host),
@@ -38,6 +42,10 @@ type GateInput struct {
 
 	// Gate 4 — edge protection. The edge slice and control plane are never targets.
 	IsEdgeOrControlPlane bool
+
+	// Gate 5 — the host-wide start gate, asked while holding the slot so no other starter can
+	// start a container in between. nil = the action starts nothing (or pacing is off).
+	Admit func() (bool, string)
 }
 
 // Gates evaluates the four gates IN ORDER for a proposed remediation. On
@@ -69,6 +77,16 @@ func Gates(in GateInput) (GateOutcome, string) {
 	// docker children (queuing IS the OOM vector) — if busy, defer to next tick.
 	if in.AcquireSemaphore == nil || !in.AcquireSemaphore() {
 		return GateDefer, "docker-child semaphore busy"
+	}
+
+	// Gate 5 — start pacing. Deferring here consumes no attempt.
+	if in.Admit != nil {
+		if ok, why := in.Admit(); !ok {
+			if in.ReleaseSemaphore != nil {
+				in.ReleaseSemaphore()
+			}
+			return GateDefer, "start gate: " + why
+		}
 	}
 	return GateProceed, "all gates passed"
 }

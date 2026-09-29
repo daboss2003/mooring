@@ -351,10 +351,10 @@ func TestListPaginates(t *testing.T) {
 func TestNewValidatesConfig(t *testing.T) {
 	bad := []Config{
 		{Region: "us-east-1", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s"}, // no endpoint
-		{Endpoint: "e", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s"},        // no region
-		{Endpoint: "e", Region: "r", AccessKeyID: "a", SecretAccessKey: "s"},        // no bucket
-		{Endpoint: "e", Region: "r", Bucket: "b", SecretAccessKey: "s"},             // no access key
-		{Endpoint: "e", Region: "r", Bucket: "b", AccessKeyID: "a"},                 // no secret
+		{Endpoint: "e", Bucket: "b", AccessKeyID: "a", SecretAccessKey: "s"},       // no region
+		{Endpoint: "e", Region: "r", AccessKeyID: "a", SecretAccessKey: "s"},       // no bucket
+		{Endpoint: "e", Region: "r", Bucket: "b", SecretAccessKey: "s"},            // no access key
+		{Endpoint: "e", Region: "r", Bucket: "b", AccessKeyID: "a"},                // no secret
 	}
 	for i, cfg := range bad {
 		if _, err := New(cfg, nil); err == nil {

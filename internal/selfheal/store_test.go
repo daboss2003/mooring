@@ -3,6 +3,7 @@ package selfheal
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/daboss2003/mooring/internal/store"
@@ -22,7 +23,8 @@ func TestFSMRoundTrip(t *testing.T) {
 	s := testStore(t)
 	ctx := context.Background()
 	k := Key{App: "shop", Service: "web"}
-	f := FSM{Phase: CircuitOpen, Attempts: 3, LastRung: RungRecreate, BackoffUntil: 999, OOMStrikes: 2, Open: true, WindowStart: 5}
+	f := FSM{Phase: CircuitOpen, Attempts: 3, LastRung: RungRecreate, BackoffUntil: 999, OOMStrikes: 2, Open: true, WindowStart: 5,
+		ReplicasAtAction: 3, Restarted: []string{"aaa", "bbb"}, DepWaitSince: 77, DepPaged: true}
 	if err := s.Save(ctx, k, f, 10); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +36,9 @@ func TestFSMRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("FSM not persisted")
 	}
-	if got.Phase != CircuitOpen || got.LastRung != RungRecreate || !got.Open || got.OOMStrikes != 2 {
+	if got.Phase != CircuitOpen || got.LastRung != RungRecreate || !got.Open || got.OOMStrikes != 2 ||
+		got.ReplicasAtAction != 3 || strings.Join(got.Restarted, ",") != "aaa,bbb" ||
+		got.DepWaitSince != 77 || !got.DepPaged {
 		t.Errorf("round-trip mismatch: %+v", got)
 	}
 	// ClearCircuit resets to a clean HEALTHY.

@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/builder"
@@ -42,6 +43,29 @@ func validDuration(field, v string) error {
 	return nil
 }
 
+// validDurationRange checks an optional duration bounded to [lo, hi]. Empty, malformed, and
+// negative values get validDuration's verdict; an explicit zero ("0s") is judged by the bounds,
+// so it passes only when lo is 0.
+func validDurationRange(field, v string, lo, hi time.Duration) error {
+	d, err := time.ParseDuration(v)
+	if v == "" || err != nil || d < 0 {
+		return validDuration(field, v)
+	}
+	if d < lo || d > hi {
+		return fmt.Errorf("%s %q must be between %s and %s", field, v, boundString(lo), boundString(hi))
+	}
+	return nil
+}
+
+// boundString renders a bound for an error message ("10m", not time.Duration's "10m0s").
+func boundString(d time.Duration) string {
+	s := d.String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	return s
+}
+
 // reconcile.go is the shared validation core (plan §7.7): a definition is fanned out
 // into the EXISTING typed sub-structs and run through the SAME chokepoints the
 // dashboard uses — §5.6 (compose) and §6.2 (edge) — so the CLI/dashboard/repo are
@@ -58,7 +82,7 @@ func toProvisionSpec(d *Definition) provision.Spec {
 		svc := d.Spec.Compose.Services[name]
 		s := provision.Service{
 			Name:    name,
-			Command: svc.Command, Healthcheck: svc.Healthcheck, Restart: svc.Restart, DependsOn: svc.DependsOn,
+			Command: svc.Command, Healthcheck: toProvisionHealthcheck(svc.Healthcheck), Restart: svc.Restart, DependsOn: svc.DependsOn,
 			MemLimit: svc.MemLimit, MemReservation: svc.MemReservation, StopGracePeriod: svc.StopGracePeriod,
 			Ulimits:   toProvisionUlimits(svc.Ulimits),
 			Scheduled: scheduled[name],
@@ -115,10 +139,6 @@ func ComposeBytes(d *Definition) ([]byte, error) {
 	return provision.Generate(ps)
 }
 
-// Validate runs the full reconcile validation: §5.6 over the (generated or inline)
-// compose, then §6.2 over the edge routes (upstreams are service selectors, never
-// literal dial targets). Returns the first violation. env is for inline ${VAR}
-// resolution; runDir is the app run dir bind mounts must stay under.
 // toProvisionUlimits maps a definition ulimits block to the provision spec (nil-safe).
 func toProvisionUlimits(u *Ulimits) *provision.Ulimits {
 	if u == nil || u.Nofile == nil {
@@ -127,7 +147,35 @@ func toProvisionUlimits(u *Ulimits) *provision.Ulimits {
 	return &provision.Ulimits{Nofile: &provision.NofileLimit{Soft: u.Nofile.Soft, Hard: u.Nofile.Hard}}
 }
 
+// toProvisionHealthcheck maps a definition healthcheck to the provision spec (nil-safe; an
+// empty healthcheck is none, as an empty exec array always was).
+func toProvisionHealthcheck(h *Healthcheck) *provision.Healthcheck {
+	if h == nil || h.IsZero() {
+		return nil
+	}
+	return &provision.Healthcheck{Test: h.Test, Interval: h.Interval, Timeout: h.Timeout, Retries: h.Retries, StartPeriod: h.StartPeriod}
+}
+
+// ValidateForSubmit runs the checks that apply only when a NEW definition is accepted (a git
+// deploy's mooring file, a dashboard edit, a preview, `mooring validate`), never when a stored
+// canonical is re-read. Parse stays the gate on every read, so a rule added there would make an
+// already-stored canonical that breaks it unreadable; a rule added here only stops new input.
+// d must already have passed Parse.
+func ValidateForSubmit(d *Definition) error {
+	if cycle := d.Spec.DependencyCycle(); cycle != nil {
+		return fmt.Errorf("depends_on has a cycle: %s", strings.Join(cycle, " → "))
+	}
+	return nil
+}
+
+// Validate runs the full reconcile validation: the submit-time checks, §5.6 over the
+// generated compose, then §6.2 over the edge routes (upstreams are service selectors, never
+// literal dial targets). Returns the first violation. env is for ${VAR} resolution; runDir is
+// the app run dir bind mounts must stay under.
 func Validate(d *Definition, runDir string, env compose.Env, protectedPaths []string) error {
+	if err := ValidateForSubmit(d); err != nil {
+		return err
+	}
 	raw, err := ComposeBytes(d)
 	if err != nil {
 		return fmt.Errorf("compose: %w", err)

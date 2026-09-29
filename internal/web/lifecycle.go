@@ -122,11 +122,13 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 				defer aCancel()
 				defer s.leaseExpectedDown(aCtx, project)() // suppress self-heal during the intentional cycle
 				var e error
+				copyStart := time.Now()
 				if action == "restart" {
 					e = s.runner.RestartContainers(aCtx, []string{copyID}, onl)
 				} else {
 					e = s.runner.StartContainers(aCtx, []string{copyID}, onl)
 				}
+				s.recordStart(project, service, copyStart, e == nil)
 				outcome := audit.OK
 				if e != nil {
 					outcome = audit.Error
@@ -222,6 +224,7 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 	defer s.leaseExpectedDown(actionCtx, project)()
 	onl := func(line string) { writeln("%s", line) }
 	var runErr error
+	actionStart := time.Now()
 	if len(args) > 0 && args[0] == "up" {
 		// A redeploy is an `up` — recover from a stranded name conflict (interrupted recreate).
 		declared := s.reapScope(actionCtx, project)
@@ -232,6 +235,10 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 		runErr = s.runner.Run(actionCtx, job, onl) // restart/stop/start: no name-allocation to conflict
 	}
 
+	if action != "stop" {
+		// The operator's action is never held back, but automatic starters wait for what it started.
+		s.recordStart(project, service, actionStart, false)
+	}
 	code, outcome := classifyExit(runErr)
 	s.recordDeployFinish(ctx, depID, code, outcome)
 	if runErr == nil && action != "stop" {

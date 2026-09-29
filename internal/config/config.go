@@ -177,6 +177,92 @@ type ServerConfig struct {
 	// BuildCacheKeep is how much of the most-recently-used build cache to KEEP when pruning
 	// (default "5GB"). A size like "2GB"/"512MB". Smaller = less disk, colder rebuilds.
 	BuildCacheKeep string `yaml:"build_cache_keep"`
+
+	// BuildConcurrency controls how a deploy builds an app's build services: "auto" (default) builds
+	// them one at a time on a host with 2 CPUs or fewer and together otherwise; "serial" always one at
+	// a time; "parallel" always together. Building several images at once on a small box starves the
+	// running apps of CPU.
+	BuildConcurrency string `yaml:"build_concurrency"`
+
+	// StartGate paces the container starts the scaler and self-heal make: one at a time, each waiting
+	// until the previous start is healthy (or, without a healthcheck, past its start-up CPU burst) and
+	// the host has CPU headroom.
+	StartGate StartGateConfig `yaml:"start_gate"`
+}
+
+// StartGateConfig tunes the start gate (server.start_gate). Unset values take the defaults.
+type StartGateConfig struct {
+	Enabled      *bool    `yaml:"enabled"`        // default true
+	CPUBusyPct   int      `yaml:"cpu_busy_pct"`   // host CPU % that defers starts; default 85
+	SettleGrace  Duration `yaml:"settle_grace"`   // minimum start-up time without a healthcheck; default 30s
+	CPUSettlePct int      `yaml:"cpu_settle_pct"` // % of one core below which it has settled; default 50
+	MaxSettle    Duration `yaml:"max_settle"`     // longest one start holds others back; default 3m
+	MaxWait      Duration `yaml:"max_wait"`       // longest one action waits for CPU; default 10m
+}
+
+// StartGateSettings are the start gate's settings with defaults applied.
+type StartGateSettings struct {
+	Enabled                         bool
+	CPUBusyPct, CPUSettlePct        float64
+	SettleGrace, MaxSettle, MaxWait time.Duration
+}
+
+// StartGateSettings resolves server.start_gate.
+func (s ServerConfig) StartGateSettings() StartGateSettings {
+	g := s.StartGate
+	out := StartGateSettings{
+		Enabled: g.Enabled == nil || *g.Enabled, CPUBusyPct: 85, CPUSettlePct: 50,
+		SettleGrace: 30 * time.Second, MaxSettle: 3 * time.Minute, MaxWait: 10 * time.Minute,
+	}
+	if g.CPUBusyPct > 0 {
+		out.CPUBusyPct = float64(g.CPUBusyPct)
+	}
+	if g.CPUSettlePct > 0 {
+		out.CPUSettlePct = float64(g.CPUSettlePct)
+	}
+	if g.SettleGrace > 0 {
+		out.SettleGrace = g.SettleGrace.D()
+	}
+	if g.MaxSettle > 0 {
+		out.MaxSettle = g.MaxSettle.D()
+	}
+	if g.MaxWait > 0 {
+		out.MaxWait = g.MaxWait.D()
+	}
+	return out
+}
+
+// validate rejects out-of-range server.start_gate values (unset = default).
+func (g StartGateConfig) validate() error {
+	if s := (ServerConfig{StartGate: g}).StartGateSettings(); s.SettleGrace > s.MaxSettle {
+		return fmt.Errorf("server.start_gate.settle_grace %s must not exceed max_settle %s", s.SettleGrace, s.MaxSettle)
+	}
+	switch {
+	case g.CPUBusyPct != 0 && (g.CPUBusyPct < 10 || g.CPUBusyPct > 100):
+		return fmt.Errorf("server.start_gate.cpu_busy_pct %d must be between 10 and 100", g.CPUBusyPct)
+	case g.CPUSettlePct != 0 && (g.CPUSettlePct < 1 || g.CPUSettlePct > 1000):
+		return fmt.Errorf("server.start_gate.cpu_settle_pct %d must be between 1 and 1000", g.CPUSettlePct)
+	case g.SettleGrace < 0 || g.SettleGrace.D() > 10*time.Minute:
+		return fmt.Errorf("server.start_gate.settle_grace %s must be between 0s and 10m", g.SettleGrace.D())
+	case g.MaxSettle != 0 && (g.MaxSettle.D() < 10*time.Second || g.MaxSettle.D() > 30*time.Minute):
+		return fmt.Errorf("server.start_gate.max_settle %s must be between 10s and 30m", g.MaxSettle.D())
+	case g.MaxWait != 0 && (g.MaxWait.D() < time.Minute || g.MaxWait.D() > 2*time.Hour):
+		return fmt.Errorf("server.start_gate.max_wait %s must be between 1m and 2h", g.MaxWait.D())
+	}
+	return nil
+}
+
+// BuildsOneAtATime reports whether a deploy should build its services one at a time on a host with
+// ncpu CPUs (see BuildConcurrency).
+func (s ServerConfig) BuildsOneAtATime(ncpu int) bool {
+	switch strings.TrimSpace(s.BuildConcurrency) {
+	case "serial":
+		return true
+	case "parallel":
+		return false
+	default: // "auto" or unset
+		return ncpu <= 2
+	}
 }
 
 // VersionCheckOn reports whether the self-update check is enabled (default on).
@@ -337,7 +423,12 @@ func (c *Config) validateServer() error {
 	if c.Server.DebCacheDir != "" && !filepath.IsAbs(c.Server.DebCacheDir) {
 		return fmt.Errorf("server.deb_cache_dir %q must be absolute", c.Server.DebCacheDir)
 	}
-	return nil
+	switch strings.TrimSpace(c.Server.BuildConcurrency) {
+	case "", "auto", "serial", "parallel":
+	default:
+		return fmt.Errorf("server.build_concurrency %q must be auto, serial or parallel", c.Server.BuildConcurrency)
+	}
+	return c.Server.StartGate.validate()
 }
 
 // IsProtectedProject reports whether a compose project is in the protected set.

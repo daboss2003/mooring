@@ -289,10 +289,18 @@ func (s *Server) handlePRWebhook(w http.ResponseWriter, r *http.Request) {
 	// would self-deadlock (45s timeout, nothing deleted).
 	open := prIsOpen(ev.Action)
 	if open && !s.gitDeploy.TryAcquire() {
-		s.auditWebhook(r, base, audit.OK, "busy; another git op in progress")
+		// Another git operation holds the gate: queue the preview deploy (one entry per PR) so it runs
+		// once the gate frees, instead of dropping the push.
+		s.deployQueue.add(pendingDeploy{key: prQueueKey(base, ev.Number), project: base, pr: ev.Number, queued: time.Now()})
+		s.auditWebhook(r, base, audit.OK, "pr #"+fmt.Sprint(ev.Number)+" queued; another git op in progress")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte("busy\n"))
+		_, _ = w.Write([]byte("queued\n"))
 		return
+	}
+	if !open {
+		// A closed PR cancels a still-queued deploy of it, or that deploy would recreate the preview
+		// right after this teardown.
+		s.deployQueue.remove(prQueueKey(base, ev.Number))
 	}
 	s.auditWebhook(r, base, audit.OK, "pr #"+fmt.Sprint(ev.Number)+" "+ev.Action)
 	go func() {

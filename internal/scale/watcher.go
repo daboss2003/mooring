@@ -12,7 +12,12 @@ import (
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/monitor"
 	"github.com/daboss2003/mooring/internal/ops"
+	"github.com/daboss2003/mooring/internal/startgate"
 )
+
+// scaleCallTimeout bounds one docker call the scaler makes (a scale step or a copy removal). A scale
+// step also gets the service's stop grace (callTimeout).
+const scaleCallTimeout = 5 * time.Minute
 
 // customSignal reads one custom metric spec into a per-replica controller Signal. Phase 1 sources
 // only "ops" (queue depth from the app's ops probe).
@@ -197,7 +202,37 @@ type Config struct {
 	// plane, and this also closes the brief window during an operator STOP before its hold row lands
 	// (self-heal holds the lease until after the hold is written). Read once per tick.
 	BusyApps func() map[string]bool
-	Now      func() int64
+	// SelfHealBusy returns services self-heal is working on (remediating, waiting on a dependency, or
+	// reporting unhealthy): no copy is added to them meanwhile. Read once per tick. nil → none.
+	SelfHealBusy func() map[Key]bool
+	// Gate paces container starts host-wide: an up-move waits until it admits the start and is
+	// recorded with it. nil = no host-wide pacing (the per-service checks still apply).
+	Gate *startgate.Gate
+	// Observe folds a snapshot into Gate at the start of each tick (nil = the caller feeds Gate).
+	Observe func(*monitor.Snapshot)
+	Now     func() int64
+
+	// StopGrace returns a service's stop_grace_period (0 = Docker's default), so a scale call that
+	// stops copies gets time for them to stop. nil → 0.
+	StopGrace func(app, service string) time.Duration
+	// Restorable reports whether a service with a policy but no containers may be restored: the app's
+	// deployed definition declares it a long-running, autoscaled service. A stale policy (the service
+	// was dropped, or now runs only on a schedule — naming it would start it as a long-running
+	// container) must never be restored. nil → never restore.
+	Restorable func(app, service string) bool
+}
+
+// Failed scale calls back off per service, doubling from scaleFailBackoff up to scaleFailBackoffMax,
+// so a call that keeps failing neither runs every tick nor keeps holding the start gate.
+const (
+	scaleFailBackoff    = time.Minute
+	scaleFailBackoffMax = 10 * time.Minute
+)
+
+// scaleFailure is a service's run of failed scale calls.
+type scaleFailure struct {
+	n     int   // consecutive failures
+	until int64 // unix sec; no scale call for the service before this
 }
 
 // Watcher is the auto-scaling controller loop (plan §8A).
@@ -205,6 +240,13 @@ type Watcher struct {
 	cfg     Config
 	states  map[Key]State
 	refused map[Key]bool // services with an open scale_refused_no_capacity alert
+	lastAt  time.Time    // the last snapshot acted on (each is acted on once)
+
+	// Copy additions (tick goroutine only).
+	shBusy map[Key]bool            // this tick's SelfHealBusy
+	waits  map[Key]*startgate.Wait // start-gate deferral of each service's pending copy addition
+	upWant map[Key]bool            // services that wanted to add a copy this tick
+	failed map[Key]scaleFailure    // services backing off after failed scale calls
 
 	mu            sync.Mutex       // guards pendingNudge + pendingRemove (never held during tick I/O)
 	pendingNudge  map[Key]int      // operator manual ±replica requests, applied at the next tick
@@ -258,7 +300,8 @@ func New(cfg Config) *Watcher {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	return &Watcher{cfg: cfg, states: map[Key]State{}, refused: map[Key]bool{}}
+	return &Watcher{cfg: cfg, states: map[Key]State{}, refused: map[Key]bool{}, waits: map[Key]*startgate.Wait{},
+		failed: map[Key]scaleFailure{}}
 }
 
 // Run recovers state and ticks until ctx is cancelled.
@@ -278,20 +321,34 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 }
 
-// replicaGroup aggregates the running replicas of one service in the snapshot.
+// replicaGroup aggregates the copies of one service in the snapshot.
 type replicaGroup struct {
 	running    int
 	cpuSum     float64
 	memMaxPct  float64
 	allHealthy bool // no replica down or unhealthy (gates scale-down)
-	allReady   bool // allHealthy AND no replica still "starting" (gates scale-up)
+	allReady   bool // allHealthy AND no replica still starting up (gates scale-up)
+	stopped    int  // copies not running (exited, created, restarting)
+	starting   int  // running copies still starting up, or crash-looping
+	unknown    int  // copies the monitor couldn't inspect this poll
 }
 
 // Tick runs one control pass. Exported for tests.
 func (w *Watcher) Tick(ctx context.Context) {
 	snap := w.cfg.Snap()
-	if snap == nil || !snap.DockerOK {
+	// A failed container list shows no containers although they may be running: acting on it would
+	// start copies that already exist.
+	if snap == nil || !snap.DockerOK || snap.ListFailed {
 		return
+	}
+	if !snap.At.IsZero() {
+		if snap.At.Equal(w.lastAt) {
+			return // no new observation: a step taken on this one isn't visible in it yet
+		}
+		w.lastAt = snap.At
+	}
+	if w.cfg.Observe != nil {
+		w.cfg.Observe(snap)
 	}
 	now := w.cfg.Now()
 	policies, err := w.cfg.Store.EnabledPolicies()
@@ -300,6 +357,17 @@ func (w *Watcher) Tick(ctx context.Context) {
 	}
 
 	groups := w.groupReplicas(snap)
+	for k := range policies {
+		if _, ok := groups[k]; !ok && w.restorable(snap, k) {
+			// No container at all: no copy is down, unhealthy or starting, so nothing holds back
+			// restoring the service (one copy at a time, like any addition).
+			groups[k] = replicaGroup{allHealthy: true, allReady: true}
+		}
+	}
+	w.shBusy = nil
+	if w.cfg.SelfHealBusy != nil {
+		w.shBusy = w.cfg.SelfHealBusy()
+	}
 
 	// Cross-app budget: memory/cpu reserved by ALL enabled services' DESIRED replicas
 	// (red-team: reserve against desired, not observed). This is a LIVE running total
@@ -342,12 +410,26 @@ func (w *Watcher) Tick(ctx context.Context) {
 		lb.cpu += uint64(d) * p.PerReplicaCPU
 	}
 
+	w.upWant = map[Key]bool{}
 	for k, p := range policies {
 		if skip(k) {
 			continue // never reconcile/scale a service that is held, given-up-on, or mid-lifecycle
 		}
 		w.stepService(ctx, snap, k, p, groups[k], lb, now)
 	}
+	for k := range w.waits {
+		if !w.upWant[k] {
+			delete(w.waits, k) // no copy pending any more: a later addition gets a fresh CPU budget
+		}
+	}
+}
+
+// restorable reports whether k, which has a policy but no container in snap, may be restored: the
+// snapshot lists every container, k's app still has containers (the scale call needs the app's
+// working directory and compose files, which come from them), and the deployed definition declares k
+// a long-running autoscaled service (Config.Restorable).
+func (w *Watcher) restorable(snap *monitor.Snapshot, k Key) bool {
+	return !snap.Truncated && snap.AppByProject(k.App) != nil && w.cfg.Restorable != nil && w.cfg.Restorable(k.App, k.Service)
 }
 
 // liveBudget is the running cross-app reservation, mutated as services scale within
@@ -364,14 +446,22 @@ func adjust(v uint64, delta int, per uint64) uint64 {
 
 func (w *Watcher) groupReplicas(snap *monitor.Snapshot) map[Key]replicaGroup {
 	out := map[Key]replicaGroup{}
+	at := snap.At
+	if at.IsZero() {
+		at = time.Now()
+	}
 	for _, app := range snap.Apps {
 		for _, svc := range app.Services {
 			k := Key{App: app.Project, Service: svc.Service}
-			g := out[k]
-			if g.running == 0 {
-				g.allHealthy, g.allReady = true, true // seed; cleared by any down/unhealthy/starting replica
+			g, seen := out[k]
+			if !seen {
+				g.allHealthy, g.allReady = true, true // cleared by any down/unhealthy/starting copy
+			}
+			if !svc.Inspected {
+				g.unknown++
 			}
 			if !svc.Running() {
+				g.stopped++
 				g.allHealthy, g.allReady = false, false
 				out[k] = g
 				continue
@@ -383,12 +473,15 @@ func (w *Watcher) groupReplicas(snap *monitor.Snapshot) map[Key]replicaGroup {
 					g.memMaxPct = pct
 				}
 			}
-			if svc.Health == "unhealthy" {
+			switch {
+			case svc.Health == "unhealthy":
 				g.allHealthy, g.allReady = false, false
-			}
-			// A replica still coming up ("starting") isn't serving yet — it blocks scale-UP (don't pile
-			// on) but NOT scale-down. A service without a healthcheck never reports this state.
-			if svc.Health == "starting" {
+			case svc.Health == "starting",
+				w.cfg.Gate != nil && svc.Health != "healthy" && w.cfg.Gate.Unsettled(svc.ContainerID, at):
+				// Still coming up — its healthcheck hasn't passed, or (no healthcheck) it's inside the
+				// start-up grace or still burning start-up CPU, or it is crash-looping. It isn't serving
+				// yet: it blocks adding copies (don't pile on) but NOT scale-down.
+				g.starting++
 				g.allReady = false
 			}
 			out[k] = g
@@ -441,7 +534,7 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 			st.BreachSince = 0 // clear stale hysteresis so a later re-gain starts fresh
 			if st.Replicas > p.Min {
 				// Through the same gates as every other scale (write plane, pause, the one docker slot).
-				w.scaleGated(ctx, k, Decision{Target: p.Min, Action: ActDown, Reason: "lost candidacy: " + reason, Next: st}, now)
+				w.scaleGated(ctx, k, g, Decision{Target: p.Min, Action: ActDown, Reason: "lost candidacy: " + reason, Next: st}, now)
 			} else {
 				w.save(ctx, k, st, now)
 			}
@@ -487,15 +580,31 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		next := st
 		next.Replicas = target
 		next.LastChange = now
-		if g.running != target {
-			w.scaleGated(ctx, k, Decision{Target: target, Next: next, Reason: "manual scale"}, now)
-		} else {
+		switch {
+		case g.running == target:
 			w.save(ctx, k, next, now)
+		case target > g.running:
+			// Adding copies: record the new desired count at once; the copies are added one at a
+			// time as each settles (below and by the reconcile on later ticks).
+			if w.scaleGated(ctx, k, g, Decision{Target: target, Next: next, Reason: "manual scale"}, now) != scaleApplied {
+				w.save(ctx, k, next, now)
+			}
+		default:
+			switch w.scaleGated(ctx, k, g, Decision{Target: target, Next: next, Reason: "manual scale"}, now) {
+			case scaleDeferred:
+				w.Nudge(k.App, k.Service, delta) // couldn't act this tick (writes paused, docker busy): retry
+			case scaleFailed:
+				// Intentional: dropped, not re-queued. Retrying a failing call kept this branch returning
+				// early on every tick, which froze the service's autoscaling.
+				w.cfg.Log.Warn("scale: manual scale-down dropped after its scale call failed", "app", k.App, "service", k.Service, "target", target)
+			}
 		}
 		return
 	}
 
-	metrics := Metrics{AllHealthy: g.allHealthy, AllReady: g.allReady}
+	// Intentional: not g.allHealthy alone. AllHealthy gates scale-down on load, and with no copy running
+	// there is no load to measure: the zero CPU/memory must not shed desired while the copies are restored.
+	metrics := Metrics{AllHealthy: g.allHealthy && g.running > 0, AllReady: g.allReady, Behind: g.running < st.Replicas}
 	if g.running > 0 {
 		metrics.CPUMeanPct = g.cpuSum / float64(g.running)
 	}
@@ -529,13 +638,13 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		// running" symptom). If we are steady but short of desired and capacity allows, re-assert
 		// desired. (A future manual "hold" on a service must also gate this, so a deliberately
 		// stopped replica is not relaunched.)
-		if g.running < d.Next.Replicas && d.Next.Replicas <= ceiling {
-			w.scaleGated(ctx, k, Decision{Target: d.Next.Replicas, Next: d.Next, Reason: "reconcile running→desired"}, now)
+		if g.running < d.Next.Replicas && d.Next.Replicas <= ceiling &&
+			w.scaleGated(ctx, k, g, Decision{Target: d.Next.Replicas, Next: d.Next, Reason: "reconcile running→desired"}, now) == scaleApplied {
 			return
 		}
 		w.save(ctx, k, d.Next, now)
 	case ActUp, ActDown:
-		w.scaleGated(ctx, k, d, now)
+		w.scaleGated(ctx, k, g, d, now)
 	case ActRefused:
 		w.emitRefused(ctx, k, nearOOM, capReason)
 		w.save(ctx, k, d.Next, now)
@@ -577,6 +686,9 @@ func (w *Watcher) removeReplicas(ctx context.Context, snap *monitor.Snapshot, k 
 		return false // one docker child busy this tick — retry next tick
 	}
 	defer w.cfg.Sem.Release()
+	// Intentional: no stop grace added (unlike a scale call): docker rm -f kills at once.
+	ctx, cancel := context.WithTimeout(ctx, scaleCallTimeout)
+	defer cancel()
 
 	newDesired := g.running - len(valid)
 	if newDesired < 1 {
@@ -628,27 +740,135 @@ func (w *Watcher) writesAllowed() bool {
 	return w.cfg.WritePlaneOK && (w.cfg.Paused == nil || !w.cfg.Paused())
 }
 
-// scaleGated applies the §0 + semaphore gates, then scales + reconciles the pool.
-func (w *Watcher) scaleGated(ctx context.Context, k Key, d Decision, now int64) {
+// scaleOutcome is what scaleGated did with a decision.
+type scaleOutcome int
+
+const (
+	scaleDeferred scaleOutcome = iota // not tried: writes closed or paused, docker busy, or a copy addition blocked or not admitted
+	scaleApplied                      // scaled; or, a down-move with nothing to remove, desired lowered
+	scaleFailed                       // the scale call ran and failed
+)
+
+// scaleGated applies the §0 + semaphore gates, then scales + reconciles the pool, and reports the
+// outcome. Removing copies is never held back. Adding copies goes ONE copy at a time (compose
+// target running+1, while desired is persisted at d.Target so later ticks keep stepping) and only
+// once the service is ready for it: every copy running and inspected, none unhealthy or still
+// starting, self-heal not working on it, and the host-wide start gate admits the start.
+func (w *Watcher) scaleGated(ctx context.Context, k Key, g replicaGroup, d Decision, now int64) scaleOutcome {
 	if !w.writesAllowed() {
-		return // §0 write-plane gate closed, or writes paused — try next tick
+		return scaleDeferred // §0 write-plane gate closed, or writes paused — try next tick
+	}
+	if f := w.failed[k]; now < f.until {
+		return scaleDeferred // backing off after a failed scale call
+	}
+	target := d.Target
+	up := target > g.running
+	if up && d.Action == ActDown {
+		// Lowering desired while fewer copies run than even the new count: there is nothing to
+		// remove, and the reconcile adds the missing copies one at a time.
+		next := d.Next
+		next.Replicas = d.Target
+		w.save(ctx, k, next, now)
+		return scaleApplied
+	}
+	if up {
+		if w.upWant != nil {
+			w.upWant[k] = true
+		}
+		if why := w.upBlocked(k, g); why != "" {
+			w.cfg.Log.Debug("scale: adding a copy deferred", "app", k.App, "service", k.Service, "reason", why)
+			return scaleDeferred
+		}
+		target = g.running + 1
 	}
 	if !w.cfg.Sem.TryAcquire() {
-		return // never queue a docker child — skip this tick (plan §8A)
+		return scaleDeferred // never queue a docker child — skip this tick (plan §8A)
 	}
 	defer w.cfg.Sem.Release()
-	w.act(ctx, k, d.Target, d.Next, now, d.Reason)
+	if up && w.cfg.Gate != nil {
+		// Asked while holding the slot, so no other starter can start a container in between. A
+		// service with no running copy is restored without waiting for CPU; restoring the operator's
+		// count (min, a nudge, a copy that went missing) waits for CPU at most max_wait; a load-driven
+		// step never overrides a busy host (another copy there adds contention, not capacity).
+		wait := w.waits[k]
+		if wait == nil {
+			wait = &startgate.Wait{}
+			w.waits[k] = wait
+		}
+		opts := startgate.AdmitOpts{IgnoreCPU: g.running == 0}
+		var dec startgate.Decision
+		if d.Reason == reasonLoad {
+			dec = w.cfg.Gate.Admit(time.Now(), opts)
+		} else {
+			dec = wait.Admit(w.cfg.Gate, time.Now(), opts)
+		}
+		if !dec.OK {
+			w.cfg.Log.Debug("scale: adding a copy deferred", "app", k.App, "service", k.Service, "reason", dec.Reason)
+			return scaleDeferred
+		}
+	}
+	next := d.Next
+	next.Replicas = d.Target
+	started := time.Now()
+	ok := w.act(ctx, k, target, next, now, d.Reason)
+	if up {
+		delete(w.waits, k)
+		if w.cfg.Gate != nil {
+			w.cfg.Gate.Record(k.App, k.Service, started, time.Now(), ok) // even on failure: it may have started one
+		}
+	}
+	if !ok {
+		w.noteFailure(k, now)
+		return scaleFailed
+	}
+	delete(w.failed, k)
+	return scaleApplied
 }
 
-// act performs the scale + edge-pool reconcile and persists the new desired state.
-// On a scale-DOWN the edge pool is reconciled FIRST so the edge stops sending new
-// connections to the replica about to be removed (best-effort drain).
-func (w *Watcher) act(ctx context.Context, k Key, target int, next State, now int64, reason string) {
-	next.Replicas = target
-	down := target < currentDesired(w.states[k])
+// noteFailure starts or extends k's back-off after a failed scale call.
+func (w *Watcher) noteFailure(k Key, now int64) {
+	f := w.failed[k]
+	f.n++
+	d := scaleFailBackoff
+	for i := 1; i < f.n && d < scaleFailBackoffMax; i++ {
+		d *= 2
+	}
+	if d > scaleFailBackoffMax {
+		d = scaleFailBackoffMax
+	}
+	f.until = now + int64(d.Seconds())
+	w.failed[k] = f
+}
+
+// upBlocked reports why a copy can't be added to k now ("" when it can).
+func (w *Watcher) upBlocked(k Key, g replicaGroup) string {
+	switch {
+	case g.running == 0 && g.stopped == 0 && !g.allHealthy:
+		return "no container of the service, and it isn't one to restore"
+	case g.stopped > 0:
+		return "a copy is not running (self-heal restarts it first)"
+	case g.unknown > 0:
+		return "a copy's state is unknown this poll"
+	case !g.allHealthy:
+		return "a copy is unhealthy"
+	case g.starting > 0:
+		return "a copy is still starting"
+	case w.shBusy[k]:
+		return "self-heal is working on this service"
+	}
+	return ""
+}
+
+// act runs one scale call to target copies, reconciles the edge pool, and persists next (whose
+// Replicas is the desired count, which may be above target while copies are added one at a time).
+// It reports whether the scale call succeeded.
+func (w *Watcher) act(ctx context.Context, k Key, target int, next State, now int64, reason string) bool {
+	ctx, cancel := context.WithTimeout(ctx, w.callTimeout(k))
+	defer cancel()
+	down := next.Replicas < currentDesired(w.states[k])
 	if err := w.cfg.Scaler.Scale(ctx, k.App, k.Service, target); err != nil {
 		w.cfg.Log.Warn("scale: action failed", "app", k.App, "service", k.Service, "target", target, "err", err)
-		return // don't persist a desired we couldn't apply
+		return false // don't persist a desired we couldn't apply
 	}
 	// Re-discover right after the change in either direction: a scale-up adds the new copy (the edge
 	// admits it once it is ready), and a scale-down drops the removed copies' addresses at once rather
@@ -660,8 +880,21 @@ func (w *Watcher) act(ctx context.Context, k Key, target int, next State, now in
 	if !down {
 		w.resolveRefused(ctx, k) // a successful scale-up clears any open refusal
 	}
-	w.cfg.Log.Info("scaled", "app", k.App, "service", k.Service, "replicas", target, "reason", reason)
+	w.cfg.Log.Info("scaled", "app", k.App, "service", k.Service, "replicas", target, "desired", next.Replicas, "reason", reason)
 	w.save(ctx, k, next, now)
+	return true
+}
+
+// callTimeout bounds one scale call on k: scaleCallTimeout plus the service's stop grace, which a
+// scale-down waits out for the copies it stops.
+func (w *Watcher) callTimeout(k Key) time.Duration {
+	d := scaleCallTimeout
+	if w.cfg.StopGrace != nil {
+		if grace := w.cfg.StopGrace(k.App, k.Service); grace > 0 {
+			d += grace
+		}
+	}
+	return d
 }
 
 func currentDesired(st State) int {

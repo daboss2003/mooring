@@ -146,7 +146,10 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 	defer s.leaseExpectedDown(ctx, slug)()
 	recreate := append([]string{"up", "-d", "--no-build", "--force-recreate", "--"}, changed...)
 	job := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: recreate}
-	if rerr := s.runner.Run(ctx, job, func(l string) { s.log.Debug("cert-renew", "out", l) }); rerr != nil {
+	recreateStart := time.Now()
+	rerr := s.runner.Run(ctx, job, func(l string) { s.log.Debug("cert-renew", "out", l) })
+	s.recordStart(slug, "", recreateStart, false)
+	if rerr != nil {
 		s.log.Warn("cert-renew: recreate failed", "app", slug, "services", changed, "err", rerr)
 		return
 	}

@@ -196,6 +196,8 @@
             <button type="submit" class="link">clear</button>
           </form>
           {{end}}
+        {{else if eq $phase "WAITING_ON_DEPENDENCY"}}<span class="badge badge-warn" title="Failing because a service it depends on is failing or still recovering; not restarted meanwhile (at most 10 minutes).">waiting on dependency</span>
+        {{else if eq $phase "UNHEALTHY"}}<span class="badge badge-warn" title="Failing its healthcheck. on_unhealthy: notify, so it is reported, not restarted.">unhealthy (notify)</span>
         {{else if $phase}}<span class="muted" title="self-healing supervisor state">{{$phase}}</span>
         {{else}}<span class="muted">—</span>{{end}}
       </td>

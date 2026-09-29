@@ -1,6 +1,10 @@
 package hostmon
 
-import "testing"
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+)
 
 func TestParseProcStatus(t *testing.T) {
 	data := "Name:\tnginx\nState:\tS (sleeping)\nPid:\t42\nPPid:\t1\nVmRSS:\t   12345 kB\n"
@@ -102,5 +106,69 @@ func TestSamplerCPUDelta(t *testing.T) {
 	s := New("/")
 	if s == nil {
 		t.Fatal("New returned nil")
+	}
+}
+
+// steppingCPU is a fake counter source that advances busy by 5 and total by 10
+// jiffies on every read: consecutive reads are exactly 50% apart.
+func steppingCPU() func() (uint64, uint64, error) {
+	var reads atomic.Uint64
+	return func() (uint64, uint64, error) {
+		n := reads.Add(1)
+		return n * 5, n * 10, nil
+	}
+}
+
+func TestSamplerConcurrentUse(t *testing.T) {
+	// Run with -race. The read and the baseline update happen under one lock, so
+	// every call's window is exactly one step of the fake counters (50%): never a
+	// read diffed against a newer baseline stored by another goroutine.
+	s := New("/")
+	s.readCPU = steppingCPU()
+	if cpu, err := s.sampleCPU(); err != nil || cpu != 0 {
+		t.Fatalf("first sample = %v, %v; want 0, nil", cpu, err)
+	}
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if i%4 == 0 {
+					// The public entry point; past the CPU read it needs /proc (Linux).
+					if smp, err := s.Sample(); err == nil && smp.CPUPercent != 50 {
+						t.Errorf("Sample CPU = %v, want 50", smp.CPUPercent)
+					}
+					continue
+				}
+				if cpu, err := s.sampleCPU(); err != nil || cpu != 50 {
+					t.Errorf("sampleCPU = %v, %v; want 50, nil", cpu, err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestSamplersAreIndependent(t *testing.T) {
+	// Two Samplers read one host: each keeps its own window, so sampling one never
+	// shifts the other's (a shared Sampler reports 0% for a's second call here).
+	reads := [][2]uint64{{0, 0}, {100, 100}, {100, 200}} // busy, total per read
+	next := 0
+	read := func() (uint64, uint64, error) {
+		r := reads[next]
+		next++
+		return r[0], r[1], nil
+	}
+	a, b := New("/"), New("/")
+	a.readCPU, b.readCPU = read, read
+	if cpu, _ := a.sampleCPU(); cpu != 0 {
+		t.Errorf("a first = %v, want 0", cpu)
+	}
+	if cpu, _ := b.sampleCPU(); cpu != 0 {
+		t.Errorf("b first = %v, want 0 (its own first sample, not a delta on a's)", cpu)
+	}
+	if cpu, _ := a.sampleCPU(); cpu != 50 {
+		t.Errorf("a second = %v, want 50 over a's own window", cpu)
 	}
 }

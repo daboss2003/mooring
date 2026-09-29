@@ -465,3 +465,50 @@ func TestAdminHostnameResolved(t *testing.T) {
 		t.Errorf("default edge_listen: got %q", c4.AdminEdgeListen())
 	}
 }
+
+// build_concurrency: auto builds one at a time on ≤2 CPUs; serial/parallel force it; anything else is
+// rejected.
+func TestBuildConcurrency(t *testing.T) {
+	cfg, err := Parse([]byte(validYAML(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Server.BuildsOneAtATime(1) || !cfg.Server.BuildsOneAtATime(2) || cfg.Server.BuildsOneAtATime(4) {
+		t.Error("auto (unset) must build one at a time on ≤2 CPUs only")
+	}
+	serial, err := Parse([]byte(validYAML(t, "server:\n  build_concurrency: serial\n")))
+	if err != nil || !serial.Server.BuildsOneAtATime(16) {
+		t.Errorf("serial must always build one at a time: %v", err)
+	}
+	parallel, err := Parse([]byte(validYAML(t, "server:\n  build_concurrency: parallel\n")))
+	if err != nil || parallel.Server.BuildsOneAtATime(1) {
+		t.Errorf("parallel must never serialize: %v", err)
+	}
+	mustReject(t, validYAML(t, "server:\n  build_concurrency: fast\n"), "build_concurrency")
+}
+
+func TestStartGateSettings(t *testing.T) {
+	cfg, err := Parse([]byte(validYAML(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	def := cfg.Server.StartGateSettings()
+	if !def.Enabled || def.CPUBusyPct != 85 || def.CPUSettlePct != 50 || def.SettleGrace != 30*time.Second ||
+		def.MaxSettle != 3*time.Minute || def.MaxWait != 10*time.Minute {
+		t.Errorf("defaults: %+v", def)
+	}
+	set, err := Parse([]byte(validYAML(t, "server:\n  start_gate:\n    enabled: false\n    cpu_busy_pct: 70\n    settle_grace: 45s\n    max_settle: 5m\n    max_wait: 20m\n    cpu_settle_pct: 150\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := set.Server.StartGateSettings()
+	if got.Enabled || got.CPUBusyPct != 70 || got.CPUSettlePct != 150 || got.SettleGrace != 45*time.Second ||
+		got.MaxSettle != 5*time.Minute || got.MaxWait != 20*time.Minute {
+		t.Errorf("set: %+v", got)
+	}
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    cpu_busy_pct: 5\n"), "cpu_busy_pct")
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    cpu_settle_pct: 5000\n"), "cpu_settle_pct")
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    max_settle: 2s\n"), "max_settle")
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    max_wait: 5h\n"), "max_wait")
+	mustReject(t, validYAML(t, "server:\n  start_gate:\n    settle_grace: 5m\n    max_settle: 1m\n"), "settle_grace")
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 
 	"github.com/daboss2003/mooring/internal/store"
 )
@@ -22,7 +23,8 @@ type Key struct{ App, Service string }
 // LoadAll returns every persisted FSM, keyed by (app,service).
 func (s *Store) LoadAll() (map[Key]FSM, error) {
 	rows, err := s.db.Query(`SELECT app, service, phase, unhealthy_streak, healthy_streak, attempts,
-		last_rung, backoff_until, window_start, oom_strikes, degraded_since, open FROM supervisor_state`)
+		last_rung, backoff_until, window_start, oom_strikes, degraded_since, open,
+		replicas_at_action, restarted, dep_wait_since, dep_paged FROM supervisor_state`)
 	if err != nil {
 		return nil, err
 	}
@@ -31,14 +33,19 @@ func (s *Store) LoadAll() (map[Key]FSM, error) {
 	for rows.Next() {
 		var k Key
 		var f FSM
-		var lastRung string
-		var open int
+		var lastRung, restarted string
+		var open, depPaged int
 		if err := rows.Scan(&k.App, &k.Service, &f.Phase, &f.UnhealthyStreak, &f.HealthyStreak,
-			&f.Attempts, &lastRung, &f.BackoffUntil, &f.WindowStart, &f.OOMStrikes, &f.DegradedSince, &open); err != nil {
+			&f.Attempts, &lastRung, &f.BackoffUntil, &f.WindowStart, &f.OOMStrikes, &f.DegradedSince, &open,
+			&f.ReplicasAtAction, &restarted, &f.DepWaitSince, &depPaged); err != nil {
 			return nil, err
 		}
 		f.LastRung = Rung(lastRung)
 		f.Open = open == 1
+		f.DepPaged = depPaged == 1
+		if restarted != "" {
+			f.Restarted = strings.Split(restarted, ",")
+		}
 		out[k] = f
 	}
 	return out, rows.Err()
@@ -47,15 +54,19 @@ func (s *Store) LoadAll() (map[Key]FSM, error) {
 // Save upserts one FSM.
 func (s *Store) Save(ctx context.Context, k Key, f FSM, now int64) error {
 	_, err := s.db.ExecContext(ctx, `INSERT INTO supervisor_state
-		(app, service, phase, unhealthy_streak, healthy_streak, attempts, last_rung, backoff_until, window_start, oom_strikes, degraded_since, open, updated_at)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+		(app, service, phase, unhealthy_streak, healthy_streak, attempts, last_rung, backoff_until, window_start, oom_strikes, degraded_since, open,
+		 replicas_at_action, restarted, dep_wait_since, dep_paged, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(app, service) DO UPDATE SET
 			phase=excluded.phase, unhealthy_streak=excluded.unhealthy_streak, healthy_streak=excluded.healthy_streak,
 			attempts=excluded.attempts, last_rung=excluded.last_rung, backoff_until=excluded.backoff_until,
 			window_start=excluded.window_start, oom_strikes=excluded.oom_strikes, degraded_since=excluded.degraded_since,
-			open=excluded.open, updated_at=excluded.updated_at`,
+			open=excluded.open, replicas_at_action=excluded.replicas_at_action,
+			restarted=excluded.restarted, dep_wait_since=excluded.dep_wait_since, dep_paged=excluded.dep_paged,
+			updated_at=excluded.updated_at`,
 		k.App, k.Service, string(f.Phase), f.UnhealthyStreak, f.HealthyStreak, f.Attempts, string(f.LastRung),
-		f.BackoffUntil, f.WindowStart, f.OOMStrikes, f.DegradedSince, b2i(f.Open), now)
+		f.BackoffUntil, f.WindowStart, f.OOMStrikes, f.DegradedSince, b2i(f.Open),
+		f.ReplicasAtAction, strings.Join(f.Restarted, ","), f.DepWaitSince, b2i(f.DepPaged), now)
 	return err
 }
 

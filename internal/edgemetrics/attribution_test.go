@@ -19,7 +19,7 @@ func TestHostIndexLookup(t *testing.T) {
 		wantApp, wantSvc string
 		wantOK           bool
 	}{
-		{"api.example.com", "/anything", "shop", "api", true},   // host match is case-insensitive
+		{"api.example.com", "/anything", "shop", "api", true},     // host match is case-insensitive
 		{"app.example.com", "/api/v2/x", "shop", "backend", true}, // longest prefix wins over "/"
 		{"app.example.com", "/apiary", "shop", "web", true},       // segment boundary: /apiary is NOT under /api
 		{"app.example.com", "/home", "shop", "web", true},         // falls to the "/" (root) route

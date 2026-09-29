@@ -16,7 +16,7 @@ Any task currently executing appears at the top, with:
 
 Tasks run **one at a time** (they share the single docker slot with deploys), so this is usually empty or a single row — but when a nightly job is grinding, you can see it working and how much it's using.
 
-A task doesn't start while a deploy, certificate renewal or app delete is running on the server; it stays due and starts at the next minute's check after.
+A task doesn't start while a deploy, certificate renewal or app delete is running on the server; it stays due and starts at the next minute's check after. The [start gate](./scaling-and-self-healing.md#start-pacing) can also hold a due task back while other containers are still starting or the host CPU is busy, for at most its `max_wait` (10 minutes by default).
 
 ## Which code a run uses
 

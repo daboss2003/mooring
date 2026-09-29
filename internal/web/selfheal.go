@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/monitor"
+	"github.com/daboss2003/mooring/internal/scale"
 	"github.com/daboss2003/mooring/internal/selfheal"
 )
 
@@ -21,32 +23,35 @@ import (
 // this tracks gitDeployTimeout; a slow build must never let self-heal fight the deploy.
 const expectedDownLease = gitDeployTimeout
 
-// rungAction maps a supervisor rung to the same static argv the operator's lifecycle
-// uses. restart changes no config; recreate/redeploy re-apply the compose (so they
-// run the §5.6 validator + config-file materialization, healing drift).
+// rungAction maps a supervisor rung to the static argv for a whole-service action. restart
+// changes no config; recreate/redeploy re-apply the compose (so they run the §5.6 validator +
+// config-file materialization, healing drift) for this service only (--no-deps: never start a
+// dependency the operator stopped) and never build (a missing image is a deploy's job, not
+// self-heal's).
 var rungAction = map[selfheal.Rung][]string{
 	selfheal.RungRestart:  {"restart"},
-	selfheal.RungRecreate: {"up", "-d", "--force-recreate"},
-	selfheal.RungRedeploy: {"up", "-d", "--force-recreate"},
+	selfheal.RungRecreate: {"up", "-d", "--no-deps", "--no-build", "--force-recreate"},
+	selfheal.RungRedeploy: {"up", "-d", "--no-deps", "--no-build", "--force-recreate"},
 }
 
-// unhealthyReplicaIDs returns the container ids of a service's down/unhealthy replicas and the total
-// replica count, so the supervisor can restart ONLY the sick copies of a scaled service (leaving the
-// healthy ones serving). A running "starting" replica is not counted as sick — it's still coming up.
-func unhealthyReplicaIDs(app monitor.App, service string) (bad []string, total int) {
+// serviceHasCopy reports whether id is one of service's containers in app (from the snapshot).
+func serviceHasCopy(app monitor.App, service, id string) bool {
 	for _, svc := range app.Services {
-		if svc.Service != service {
-			continue
-		}
-		total++
-		if svc.ContainerID == "" {
-			continue
-		}
-		if !svc.Running() || svc.Health == "unhealthy" {
-			bad = append(bad, svc.ContainerID)
+		if svc.Service == service && svc.ContainerID == id && id != "" {
+			return true
 		}
 	}
-	return bad, total
+	return false
+}
+
+// scalerManages reports whether the autoscaler keeps service's copy count (an enabled policy), so
+// a removed copy is replaced.
+func (s *Server) scalerManages(project, service string) bool {
+	if s.scaling == nil {
+		return false
+	}
+	pr, ok, err := s.scaling.PolicyFor(scale.Key{App: project, Service: service})
+	return err == nil && ok && pr.Enabled
 }
 
 // Remediate makes *Server the supervisor's Actioner: it runs the rung through the
@@ -54,7 +59,11 @@ func unhealthyReplicaIDs(app monitor.App, service string) (bad []string, total i
 // materialization for recreate/redeploy), but via RunHeld — the supervisor's safety
 // gate already holds the one-docker-child semaphore, so re-acquiring would deadlock.
 // Authority never widens what may run: a protected project is refused here too.
-func (s *Server) Remediate(ctx context.Context, app monitor.App, service string, rung selfheal.Rung) (err error) {
+//
+// With t.CopyID, the restart rung restarts only that copy (`docker restart <id>`). With t.Remove,
+// the sick copies are removed (the autoscaler starts fresh ones, paced by the start gate) while the
+// service's other copies keep serving. Copy ids must be containers of this app's service.
+func (s *Server) Remediate(ctx context.Context, app monitor.App, service string, rung selfheal.Rung, t selfheal.Target) (err error) {
 	defer func() {
 		if err == nil {
 			s.reconcileEdgeAfter(ctx) // a restarted/recreated container may have a new address
@@ -70,16 +79,33 @@ func (s *Server) Remediate(ctx context.Context, app monitor.App, service string,
 	if !ok {
 		return fmt.Errorf("unknown rung %q", rung)
 	}
-
-	// RESTART rung on a SCALED service: restart ONLY the down/unhealthy replicas, leaving the healthy
-	// copies serving. `docker compose restart -- <service>` would bounce EVERY copy at once — a needless
-	// CPU spike and a full-service blip when only one replica is sick. (recreate/redeploy still act on
-	// the whole service; they re-apply compose/config.) The one-docker-child semaphore + the FSM's
-	// backoff/sustain/attempt-cap still bound how often this runs.
-	if rung == selfheal.RungRestart {
-		if bad, total := unhealthyReplicaIDs(app, service); total > 1 && len(bad) > 0 && len(bad) < total {
-			return s.runner.RestartContainersHeld(ctx, bad, func(l string) { s.log.Debug("selfheal restart", "out", l) })
+	for _, id := range append([]string{t.CopyID}, t.Remove...) {
+		if id != "" && (!hexIDRe.MatchString(id) || !serviceHasCopy(app, service, id)) {
+			return fmt.Errorf("container %s is not a copy of %s/%s", shortContainerID(id), app.Project, service)
 		}
+	}
+	logLine := func(l string) { s.log.Debug("selfheal", "service", service, "out", l) }
+	switch {
+	case t.CopyID != "" && (len(t.Remove) > 0 || rung != selfheal.RungRestart):
+		return fmt.Errorf("a single-copy target is only valid for a restart")
+	case len(t.Remove) > 0:
+		// Intentional: never fall back to recreating the service here — that would start containers the
+		// supervisor didn't pace. It decides between removal and a recreate itself.
+		if !s.scalerManages(app.Project, service) {
+			return fmt.Errorf("%s/%s: %w", app.Project, service, selfheal.ErrNoReplacement)
+		}
+		if s.edgeRecon != nil {
+			_ = s.edgeRecon.DrainContainers(ctx, t.Remove) // stop dialing them before they go
+		}
+		if err := s.runner.RemoveContainersHeld(ctx, t.Remove, logLine); err != nil {
+			if s.edgeRecon != nil {
+				_ = s.edgeRecon.UndrainContainers(ctx, t.Remove)
+			}
+			return err
+		}
+		return nil
+	case t.CopyID != "":
+		return s.runner.RestartContainersHeld(ctx, []string{t.CopyID}, logLine)
 	}
 
 	env := s.composeEnv(&app)
@@ -118,15 +144,38 @@ func (s *Server) Remediate(ctx context.Context, app monitor.App, service string,
 // intentional restart/redeploy/provision/git-deploy as a crash loop. The release
 // uses a background context so a cancelled request still clears the lease; the
 // bounded `until` + boot-time clear cover a crash. A no-op when self-heal is absent.
+//
+// The lease is ONE row per app, so overlapping holders (a per-copy restart while a deploy runs, a cert
+// renewal during a lifecycle action) are reference-counted here: every holder re-writes the row (so its
+// expiry covers the latest holder too), and only the LAST holder's release deletes it. Without the count,
+// the first holder to finish would delete the row under the others and self-heal would act mid-deploy.
 func (s *Server) leaseExpectedDown(ctx context.Context, project string) func() {
 	if s.selfHeal == nil {
 		return func() {}
 	}
+	// Intentional: the row writes happen under leaseMu, so a last holder's delete can never land after
+	// a new holder's upsert (which would drop the new holder's lease).
+	s.leaseMu.Lock()
+	if s.leaseHolders == nil {
+		s.leaseHolders = map[string]int{}
+	}
+	s.leaseHolders[project]++
 	_ = s.selfHeal.AcquireExpectedDown(ctx, project, time.Now().Add(expectedDownLease).Unix())
+	s.leaseMu.Unlock()
+	var once sync.Once
 	return func() {
-		rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = s.selfHeal.ReleaseExpectedDown(rctx, project)
+		once.Do(func() {
+			s.leaseMu.Lock()
+			defer s.leaseMu.Unlock()
+			s.leaseHolders[project]--
+			if s.leaseHolders[project] > 0 {
+				return // another holder still needs the app suspended
+			}
+			delete(s.leaseHolders, project)
+			rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = s.selfHeal.ReleaseExpectedDown(rctx, project)
+		})
 	}
 }
 

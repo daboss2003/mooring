@@ -13,8 +13,9 @@ package selfheal
 
 // Phase is the supervisor state for one (app,service). The happy path is
 // HEALTHY → SUSPECT → DEGRADED → REMEDIATING → (RECOVERED → HEALTHY) and the giving-
-// up path is → CIRCUIT_OPEN. WAITING_ON_EDGE / EXPECTED_DOWN are suspensions where
-// the supervisor deliberately does NOT act.
+// up path is → CIRCUIT_OPEN. WAITING_ON_EDGE / WAITING_ON_DEPENDENCY / EXPECTED_DOWN / HELD
+// are suspensions where the supervisor deliberately does NOT act; UNHEALTHY is a service that
+// declares on_unhealthy: notify failing its healthcheck (reported, never restarted).
 type Phase string
 
 const (
@@ -27,7 +28,19 @@ const (
 	WaitingOnEdge Phase = "WAITING_ON_EDGE"
 	ExpectedDown  Phase = "EXPECTED_DOWN"
 	Held          Phase = "HELD" // operator hold: deliberately stopped / auto-restart paused
+	// WaitingOnDependency: failing while a service it depends on is failing or recovering — restarting
+	// it would not help and only adds load. Bounded by DependencyWaitSecs.
+	WaitingOnDependency Phase = "WAITING_ON_DEPENDENCY"
+	// Unhealthy: running copies fail their healthcheck on a service with on_unhealthy: notify.
+	Unhealthy Phase = "UNHEALTHY"
 )
+
+// DependencyWaitSecs bounds WAITING_ON_DEPENDENCY: after this long the wait is paged and the service
+// goes back to its normal remediation ladder.
+const DependencyWaitSecs int64 = 600
+
+// maxRestarted bounds FSM.Restarted, and so the free restarts per window.
+const maxRestarted = 16
 
 // Rung is one step of the remediation ladder, in escalating order.
 type Rung string
@@ -52,8 +65,10 @@ const (
 	ActResolve   Act = "resolve"   // recovered: clear any open infra alert
 )
 
-// Observation is the per-tick view of one service, derived from the latest snapshot
-// (no extra I/O). ExpectedDown / WaitingOnEdge are computed by the watcher.
+// Observation is the per-tick view of one service — all of its copies — derived from the latest
+// snapshot (no extra I/O). ExpectedDown / WaitingOnEdge / WaitingOnDependency are computed by the
+// watcher. For a service with several copies, Running is false when any copy is down and Health is
+// "unhealthy" when any running copy fails its healthcheck (and counts as sick).
 type Observation struct {
 	Running       bool
 	Health        string // none|healthy|unhealthy|starting
@@ -63,6 +78,30 @@ type Observation struct {
 	WaitingOnEdge bool // a service still waiting on its edge-issued cert
 	ExpectedDown  bool // a VALID write-plane lease is held for this app
 	Held          bool // the operator has deliberately stopped/paused this service (never restart)
+
+	// Replicas is how many copies the service has; Sick of them are down or failing their
+	// healthcheck, with container ids SickIDs (sorted). Zero Replicas means a single-copy
+	// observation built without counts.
+	Replicas int
+	Sick     int
+	SickIDs  []string
+	// Reported counts running copies failing their healthcheck on a service that declares
+	// on_unhealthy: notify. They are reported, never restarted, and are not Sick.
+	Reported int
+	// WaitingOnDependency: the service is failing while Dependency, a service it depends on, is
+	// failing or still recovering.
+	WaitingOnDependency bool
+	Dependency          string
+	// Scaled: an enabled autoscaling policy keeps the copy count, so a removed copy is replaced.
+	Scaled bool
+}
+
+// replicas is the number of copies (at least 1).
+func (o Observation) replicas() int {
+	if o.Replicas < 1 {
+		return 1
+	}
+	return o.Replicas
 }
 
 // oomKilled reports an OOM kill, counting exit-137 / at-limit kills too (plan §8.5),
@@ -96,6 +135,11 @@ type FSM struct {
 	OOMStrikes      int   // consecutive OOM-classified failures
 	DegradedSince   int64 // unix sec; first failing tick of the current episode
 	Open            bool  // an infra alert is currently open for this service
+
+	ReplicasAtAction int      // copies when the last action ran
+	Restarted        []string // copies restarted in the current window (oldest first, bounded)
+	DepWaitSince     int64    // unix sec; start of the current WAITING_ON_DEPENDENCY stretch
+	DepPaged         bool     // that stretch outlived DependencyWaitSecs and was paged
 }
 
 // Policy holds the tunables (plan §8.5 / Tier-1 selfheal.* config).
@@ -126,6 +170,15 @@ type Decision struct {
 	Rung   Rung   // the rung to run when Act==ActRemediate
 	Kind   string // the can't-fix taxonomy kind when Act==ActPage
 	Reason string // human-readable, for the event/audit
+
+	// Target is the one copy a restart acts on ("" = the whole service).
+	Target string
+	// Remove: the recreate rung removes these sick copies instead of recreating the service — another
+	// copy isn't sick, and the service's autoscaling policy starts fresh ones.
+	Remove []string
+	// FreeRestart: a restart of a sick copy not yet restarted this window, which consumes no attempt
+	// and doesn't climb the ladder.
+	FreeRestart bool
 }
 
 // nextRung returns the lowest ladder rung above lastRung that is currently
@@ -176,6 +229,7 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 	if o.Held {
 		f.Phase = Held
 		f.UnhealthyStreak, f.HealthyStreak, f.DegradedSince = 0, 0, 0
+		f.DepWaitSince, f.DepPaged = 0, false
 		return Decision{Next: f, Act: ActNone, Reason: "operator hold (auto-restart paused)"}
 	}
 	if o.ExpectedDown {
@@ -183,7 +237,21 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 		// failure accounting so a deploy doesn't look like a crash loop.
 		f.Phase = ExpectedDown
 		f.UnhealthyStreak, f.HealthyStreak, f.DegradedSince = 0, 0, 0
+		f.DepWaitSince, f.DepPaged = 0, false
 		return Decision{Next: f, Act: ActNone, Reason: "expected_down lease held"}
+	}
+
+	failing := o.failing()
+	// A latched circuit stays open through the edge and dependency waits below: only recovery, an
+	// operator hold or clear, or a write-plane action (a deploy) releases it.
+	if prev.Phase == CircuitOpen && failing {
+		f.HealthyStreak = 0
+		if f.DegradedSince == 0 {
+			f.DegradedSince = now
+		}
+		f.UnhealthyStreak++
+		rollWindow(&f, p, now)
+		return Decision{Next: f, Act: ActNone, Reason: "circuit open"}
 	}
 	if o.WaitingOnEdge && !o.healthyNow() {
 		// Waiting on an edge-issued cert: the startup deadline is suspended; never
@@ -192,14 +260,64 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 		f.UnhealthyStreak, f.HealthyStreak = 0, 0
 		return Decision{Next: f, Act: ActNone, Reason: "waiting on edge-issued cert"}
 	}
+	switch {
+	case !failing:
+		// Intentional: a non-failing tick keeps the dependency-wait clock — a crash-looping dependent
+		// is sometimes seen running. Only healthy stabilization (below) ends the wait.
+	case !o.WaitingOnDependency:
+		f.DepWaitSince, f.DepPaged = 0, false // failing for its own reasons
+	case !f.DepPaged:
+		// Failing because a dependency is: restarting this service can't fix it and only adds load.
+		// Wait for the dependency — bounded, then page and fall back to the normal ladder.
+		if f.DepWaitSince == 0 {
+			f.DepWaitSince = now
+		}
+		f.UnhealthyStreak, f.HealthyStreak = 0, 0
+		if now-f.DepWaitSince < DependencyWaitSecs {
+			f.Phase = WaitingOnDependency
+			return Decision{Next: f, Act: ActNone, Reason: "waiting on dependency " + o.Dependency}
+		}
+		f.DepPaged = true
+		f.Phase = Suspect
+		f.Open = true
+		return Decision{Next: f, Act: ActPage, Kind: "dependency_wait",
+			Reason: "waited on dependency " + o.Dependency + " too long; remediating it again"}
+	}
+
+	// on_unhealthy: notify — copies failing their healthcheck are reported (once the failure has
+	// lasted SustainTicks), never restarted.
+	if !failing && o.Reported > 0 {
+		f.HealthyStreak = 0
+		if prev.Phase == CircuitOpen {
+			return Decision{Next: f, Act: ActNone, Reason: "circuit open"} // a failing healthcheck isn't recovery
+		}
+		f.DepWaitSince, f.DepPaged = 0, false // running (only reported): not waiting on a dependency
+		if prev.Phase != Unhealthy {
+			f.UnhealthyStreak = 0 // failing ticks before it came back up don't count toward the report
+		}
+		f.UnhealthyStreak++
+		f.Phase = Unhealthy
+		if f.UnhealthyStreak >= p.SustainTicks && !f.Open {
+			f.Open = true
+			return Decision{Next: f, Act: ActPage, Kind: "unhealthy_reported", Reason: "failing its healthcheck (on_unhealthy: notify)"}
+		}
+		return Decision{Next: f, Act: ActNone, Reason: "unhealthy (on_unhealthy: notify)"}
+	}
 
 	// Healthy path.
 	if o.healthyNow() {
 		f.UnhealthyStreak = 0
 		f.DegradedSince = 0
-		if prev.Phase == Healthy || prev.Phase == ExpectedDown || prev.Phase == WaitingOnEdge || prev.Phase == Held {
+		switch prev.Phase {
+		case Healthy, ExpectedDown, WaitingOnEdge, Held:
 			f.Phase = Healthy
 			f.HealthyStreak = 0
+			f.DepWaitSince, f.DepPaged = 0, false
+			if f.Open {
+				// Healthy again through a suspension (a deploy, a hold) while an alert is open: resolve it.
+				f.Open = false
+				return Decision{Next: f, Act: ActResolve, Reason: "recovered"}
+			}
 			return Decision{Next: f, Act: ActNone}
 		}
 		// Was failing/remediating/open: require a stabilization streak before we
@@ -207,7 +325,15 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 		f.HealthyStreak++
 		if f.HealthyStreak >= p.StabilizeTicks {
 			wasOpen := f.Open
-			f = FSM{Phase: Healthy} // full reset: attempts/window/backoff cleared
+			if f.ReplicasAtAction > 1 && f.WindowStart != 0 && now-f.WindowStart <= p.WindowSeconds {
+				// A service with several copies keeps its ladder until the window rolls: a copy that was
+				// restarted or replaced and fails again escalates instead of starting over, so a
+				// flapping copy ends in the circuit rather than a restart loop.
+				f.Phase, f.HealthyStreak, f.Open, f.OOMStrikes = Healthy, 0, false, 0
+				f.DepWaitSince, f.DepPaged = 0, false
+			} else {
+				f = FSM{Phase: Healthy} // full reset: attempts/window/backoff cleared
+			}
 			if wasOpen {
 				return Decision{Next: f, Act: ActResolve, Reason: "recovered and stabilized"}
 			}
@@ -222,14 +348,13 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 	if f.DegradedSince == 0 {
 		f.DegradedSince = now
 	}
+	if prev.Phase == Unhealthy {
+		f.UnhealthyStreak = 0 // the reported ticks don't count toward acting on a copy that went down
+	}
 	f.UnhealthyStreak++
 
 	// Roll the attempt window: a quiet window resets the attempt budget.
-	if f.WindowStart == 0 || now-f.WindowStart > p.WindowSeconds {
-		f.WindowStart = now
-		f.Attempts = 0
-		f.LastRung = RungNone
-	}
+	rollWindow(&f, p, now)
 
 	// Already given up this window — keep paging-state latched, do nothing.
 	if f.Phase == CircuitOpen {
@@ -260,6 +385,19 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 		return Decision{Next: f, Act: ActNone, Reason: "backoff"}
 	}
 
+	// The restart rung restarts one sick copy per action: while it is the last rung, a sick copy not
+	// restarted yet this window is restarted next. Intentional: this consumes no attempt and doesn't
+	// climb the ladder, whether or not the last restart helped — every copy that came down (a reboot,
+	// an outage) gets its restart before the service escalates, and none is left stopped. A copy
+	// restarted once already escalates; maxRestarted bounds the free restarts per window.
+	if f.LastRung == RungRestart && len(f.Restarted) < maxRestarted {
+		if id := firstNotIn(o.SickIDs, f.Restarted); id != "" {
+			f.Phase = Remediating
+			return Decision{Next: f, Act: ActRemediate, Rung: RungRestart, Target: id, FreeRestart: true,
+				Reason: "remediating: restart the next sick copy"}
+		}
+	}
+
 	// Out of attempts this window → open the circuit and page.
 	if f.Attempts >= p.AttemptCap {
 		f.Phase = CircuitOpen
@@ -277,10 +415,50 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 
 	// Propose the rung. The attempt is NOT consumed here: the watcher applies the
 	// four safety gates, and only if the action actually EXECUTES does it call
-	// CommitRemediation (attempt consumed, backoff armed). A gate-deferred action
-	// persists this Next as-is, so a deferral never burns an attempt.
+	// Commit (attempt consumed, backoff armed). A gate-deferred action persists this
+	// Next as-is, so a deferral never burns an attempt.
 	f.Phase = Remediating
-	return Decision{Next: f, Act: ActRemediate, Rung: rung, Reason: "remediating: " + string(rung)}
+	d := Decision{Next: f, Act: ActRemediate, Rung: rung, Reason: "remediating: " + string(rung)}
+	switch {
+	case rung == RungRestart:
+		// One sick copy per action — preferring one not restarted yet this window.
+		if d.Target = firstNotIn(o.SickIDs, f.Restarted); d.Target == "" && len(o.SickIDs) > 0 {
+			d.Target = o.SickIDs[0]
+		}
+	case rung == RungRecreate && o.Scaled && o.Replicas > 1 && o.Sick > 0 && o.Sick < o.Replicas && len(o.SickIDs) == o.Sick:
+		// Another copy isn't sick: remove every sick copy rather than recreating the healthy ones too;
+		// the autoscaling policy starts fresh copies. Without a policy nothing would replace them.
+		d.Remove = append([]string(nil), o.SickIDs...)
+	}
+	return d
+}
+
+// rollWindow starts a new attempt window once the current one is over (a quiet window resets the
+// attempt budget and the restarted-copy record).
+func rollWindow(f *FSM, p Policy, now int64) {
+	if f.WindowStart == 0 || now-f.WindowStart > p.WindowSeconds {
+		f.WindowStart = now
+		f.Attempts = 0
+		f.LastRung = RungNone
+		f.Restarted = nil
+	}
+}
+
+// firstNotIn returns the first id in ids that isn't in skip ("" if none).
+func firstNotIn(ids, skip []string) string {
+	for _, id := range ids {
+		found := false
+		for _, s := range skip {
+			if s == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return id
+		}
+	}
+	return ""
 }
 
 // CommitRemediation advances the FSM after a rung has actually been executed: it
@@ -290,6 +468,30 @@ func CommitRemediation(f FSM, rung Rung, p Policy, now int64) FSM {
 	f.Attempts++
 	f.LastRung = rung
 	f.BackoffUntil = backoff(now, f.Attempts, p)
+	return f
+}
+
+// Commit records an executed remediation d taken on observation o. A free restart consumes no
+// attempt and leaves the ladder where it is (it still arms the backoff); every action records the
+// sick and total copies it found and the copy it restarted.
+func Commit(d Decision, o Observation, p Policy, now int64) FSM {
+	f := d.Next
+	if d.FreeRestart {
+		n := f.Attempts
+		if n < 1 {
+			n = 1
+		}
+		f.BackoffUntil = backoff(now, n, p)
+	} else {
+		f = CommitRemediation(f, d.Rung, p, now)
+	}
+	f.ReplicasAtAction = o.replicas()
+	if d.Rung == RungRestart && d.Target != "" {
+		f.Restarted = append(append([]string(nil), f.Restarted...), d.Target)
+		if len(f.Restarted) > maxRestarted {
+			f.Restarted = f.Restarted[len(f.Restarted)-maxRestarted:]
+		}
+	}
 	return f
 }
 

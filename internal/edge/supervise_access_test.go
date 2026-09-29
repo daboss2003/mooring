@@ -40,7 +40,7 @@ func TestDrainAccessOverlongLineDoesNotStop(t *testing.T) {
 		AccessLine: func(line []byte) { got = append(got, string(line)) },
 	}
 	huge := strings.Repeat("Z", drainAccessBuf+50_000) // exceeds the per-line buffer
-	input := "before\n" + huge + "\n" + "after\n"       // an over-long line BETWEEN two good ones
+	input := "before\n" + huge + "\n" + "after\n"      // an over-long line BETWEEN two good ones
 	s.drainAccess(strings.NewReader(input))
 
 	if len(got) != 2 || got[0] != "before" || got[1] != "after" {

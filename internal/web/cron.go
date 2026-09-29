@@ -13,6 +13,7 @@ import (
 	"github.com/daboss2003/mooring/internal/definition"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/monitor"
+	"github.com/daboss2003/mooring/internal/startgate"
 )
 
 // cronBaseInterval is how often the scheduler wakes to check which tasks are due.
@@ -102,6 +103,7 @@ func (s *Server) cronTick(ctx context.Context) {
 	if s.selfHeal != nil {
 		leased, _ = s.selfHeal.ActiveExpectedDown(now)
 	}
+	due := map[string]bool{} // tasks due this tick
 	for _, a := range apps {
 		if ctx.Err() != nil {
 			return
@@ -122,25 +124,55 @@ func (s *Server) cronTick(ctx context.Context) {
 			if now-last.LastRun < int64(every.Seconds()) {
 				continue // not due yet
 			}
-			s.runScheduledTask(ctx, a.Project, task, now)
+			key := a.Project + "/" + task.Name
+			due[key] = true
+			if !s.cronMayStart(key) {
+				continue // other containers are still starting, or the host CPU is busy: stays due
+			}
+			if s.runScheduledTask(ctx, a.Project, task, now) {
+				delete(s.cronHeld, key) // it ran: a later hold starts a fresh clock
+			}
 		}
 	}
+	for key := range s.cronHeld {
+		if !due[key] {
+			delete(s.cronHeld, key) // not due any more (or no longer declared)
+		}
+	}
+}
+
+// cronMayStart reports whether the due task key may start its container now: the start gate admits
+// it, or the gate has held it back for max_wait already (it then runs anyway). The hold clock is
+// cleared once the task actually runs (cronTick). Called only from the cron loop.
+func (s *Server) cronMayStart(key string) bool {
+	if s.startGate == nil || s.startGate.Admit(time.Now(), startgate.AdmitOpts{}).OK {
+		return true
+	}
+	if s.cronHeld == nil {
+		s.cronHeld = map[string]time.Time{}
+	}
+	first, held := s.cronHeld[key]
+	if !held {
+		s.cronHeld[key] = time.Now()
+		return false
+	}
+	return time.Since(first) >= s.startGate.Config().MaxWait
 }
 
 // runScheduledTask runs one due task under a briefly-held docker slot (TryAcquire; skip if a
 // deploy holds it). It reuses the deploy machinery — the app's run dir, its generated compose,
 // and a freshly-rendered 0600 env-file — so the one-shot container gets the app's env, secrets,
 // and network. Records the outcome and alerts on failure.
-func (s *Server) runScheduledTask(ctx context.Context, slug string, task definition.ScheduledTask, now int64) {
+func (s *Server) runScheduledTask(ctx context.Context, slug string, task definition.ScheduledTask, now int64) bool {
 	if !s.dockerSem.TryAcquire() {
-		return // a deploy/self-heal holds the slot — retry next tick
+		return false // a deploy/self-heal holds the slot — retry next tick
 	}
 	defer s.dockerSem.Release()
 
 	rd := s.appRunDir(slug)
 	composeAbs := filepath.Join(rd, "docker-compose.yml")
 	if _, err := os.Stat(composeAbs); err != nil {
-		return // app not deployed yet — nothing to run
+		return true // app not deployed yet — nothing to run
 	}
 	app := &monitor.App{Project: slug, WorkingDir: rd, ConfigFiles: []string{composeAbs}}
 	env := s.composeEnv(app)
@@ -148,7 +180,7 @@ func (s *Server) runScheduledTask(ctx context.Context, slug string, task definit
 	defer cleanup()
 	if ferr != nil {
 		s.log.Warn("scheduled task: env render failed", "app", slug, "task", task.Name)
-		return
+		return true
 	}
 	job := dockerexec.Job{
 		Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile,
@@ -200,6 +232,7 @@ func (s *Server) runScheduledTask(ctx context.Context, slug string, task definit
 	// Record WHY in the audit Detail too (the same concise reason recorded on the run). Previously
 	// always blank, which made a failed task's incident row unable to show a reason.
 	_ = s.audit.Log(bg, audit.Event{Actor: "scheduler", Action: "scheduled_task", Target: slug + "/" + task.Name, Outcome: outcome, Level: audit.Security, Detail: detail})
+	return true
 }
 
 // cronFailReason builds a concise, single-line reason for a failed scheduled task: the task's last
