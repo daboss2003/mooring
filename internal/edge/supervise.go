@@ -69,6 +69,11 @@ type Supervisor struct {
 	// stdout on os.Stdout as before. Caddy's own logs + errors always stay on STDERR (→ journald),
 	// so nothing here affects error visibility.
 	AccessLine func(line []byte)
+	// OnLaunch, when set, runs (in its own goroutine) each time a Caddy child has been started. A
+	// (re)launched child boots on InitialCfg — the route-less base — so the owner must push the full
+	// config again (see Reconciler.ReloadAfterRestart); otherwise every app host answers 404 until the
+	// render next changes.
+	OnLaunch func()
 }
 
 // Run supervises the child with capped backoff until ctx is cancelled. NOTE: the
@@ -147,7 +152,13 @@ func (s *Supervisor) launch(ctx context.Context) error {
 		close(drained)
 	}
 
-	err := cmd.Run()
+	err := cmd.Start()
+	if err == nil {
+		if s.OnLaunch != nil {
+			go s.OnLaunch()
+		}
+		err = cmd.Wait()
+	}
 	if pw != nil {
 		pw.Close() // close our write end so the drain goroutine sees EOF and exits
 		<-drained  // and finish draining before we loop/backoff (bounded: pipe EOF)

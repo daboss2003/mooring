@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,11 +15,14 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/config"
+	"github.com/daboss2003/mooring/internal/docker"
 )
 
 // cmd_doctor.go is the host-prerequisites helper. Mooring's RUNTIME service is
@@ -101,7 +105,7 @@ func cmdSetup(args []string) error {
 	}
 
 	// setup runs at onboarding (before config/service start), so skip the runtime-state
-	// checks (run dir / egress / socket-proxy) — they need a running service.
+	// checks (run dir / egress / socket-proxy / daemon match) — they need a running service.
 	rep := preflight(*l4, nil, false)
 	rep.print(os.Stdout)
 
@@ -225,7 +229,7 @@ func printGuidance(rep report, l4 bool) {
 }
 
 func (r report) print(w io.Writer) {
-	icon := map[string]string{"ok": "✓", "warn": "!", "fail": "✗"}
+	icon := map[string]string{"ok": "✓", "warn": "!", "fail": "✗", "skip": "-"}
 	for _, x := range r.results {
 		fmt.Fprintf(w, "  %s %-16s %s\n", icon[x.state], x.name, x.detail)
 		if x.state != "ok" && x.fix != "" {
@@ -236,7 +240,8 @@ func (r report) print(w io.Writer) {
 
 // preflight runs the checks. cfg may be nil (config not loaded → defaults used).
 // runtimeChecks adds the checks that need a configured + running service (run dir,
-// egress, socket-proxy); setup skips them since it runs before the service starts.
+// egress, socket-proxy, daemon match); setup skips them since it runs before the
+// service starts.
 func preflight(l4 bool, cfg *config.Config, runtimeChecks bool) report {
 	managed := cfg == nil || cfg.Edge.Mode == config.EdgeManaged // default mode is managed
 	var r report
@@ -245,6 +250,8 @@ func preflight(l4 bool, cfg *config.Config, runtimeChecks bool) report {
 		r.add(checkDistroService("caddy", ":80/:443 (edge)"))
 	}
 	r.add(checkBinary("docker", "container read/write plane", "install Docker + the compose plugin"))
+	r.add(checkDockerDaemons())
+	r.add(checkDockerInstalls())
 	r.add(checkDockerLogRotation())
 	r.add(checkDNS())
 	r.add(checkCapsActive(managed || l4))
@@ -266,6 +273,7 @@ func preflight(l4 bool, cfg *config.Config, runtimeChecks bool) report {
 		}
 		r.add(checkDeployEnv())
 		r.add(checkSocketProxy(cfg))
+		r.add(checkDaemonMatch(cfg))
 	}
 	return r
 }
@@ -528,6 +536,342 @@ func checkSocketProxy(cfg *config.Config) result {
 		return result{"socket-proxy", "warn", fmt.Sprintf("%s returned HTTP %d", addr, resp.StatusCode), "check the socket-proxy container"}
 	}
 	return result{"socket-proxy", "ok", "managed socket-proxy answering on " + addr, ""}
+}
+
+// --- one Docker daemon behind both planes ---
+//
+// Two Docker installs on one host (e.g. apt docker.io + the docker snap) each run a
+// daemon. The socket-proxy container (read plane) keeps the socket of the daemon it was
+// started against, while the docker CLI (write plane) follows /var/run/docker.sock to
+// whichever daemon owns it now. The planes then split silently: deploys land on one
+// daemon, the dashboard and edge watch the other, and every other check stays green.
+// These checks name the extra install; they never remove one (which install holds the
+// apps' images and volumes is the operator's call).
+
+// dockerDedupeFix is the fix for more than one Docker daemon/installation.
+const dockerDedupeFix = "keep the install the mooring service uses (sudo docker info -f '{{.DockerRootDir}}' shows its data dir; /var/snap/docker/... is the snap) and remove the other: sudo snap remove docker, or sudo apt remove docker.io (docker-ce if installed from Docker's repo); then sudo systemctl restart docker mooring"
+
+// dockerdProc is one running dockerd found in /proc.
+type dockerdProc struct {
+	pid    int
+	exe    string // /proc/<pid>/exe target; "" when unreadable (another user's exe link needs root)
+	unit   string // systemd unit from /proc/<pid>/cgroup: docker.service, snap.docker.dockerd.service, …
+	uid    int    // real UID from /proc/<pid>/status; -1 when unknown
+	nested bool   // in a child PID namespace (NSpid lists >1 pid): a daemon inside a container
+}
+
+// label renders the process for the report: "pid 812 /usr/bin/dockerd (docker.service)".
+func (p dockerdProc) label() string {
+	s := "pid " + strconv.Itoa(p.pid)
+	if p.exe != "" {
+		s += " " + p.exe
+	}
+	if p.unit != "" {
+		s += " (" + p.unit + ")"
+	}
+	return s
+}
+
+// checkDockerDaemons counts the Docker daemons running on the host. Linux only: it
+// scans /proc (CGO-free).
+func checkDockerDaemons() result {
+	if runtime.GOOS != "linux" {
+		return result{"docker daemons", "skip", "not checked (the dockerd scan reads Linux /proc)", ""}
+	}
+	procs, err := scanDockerdProcs("/proc")
+	if err != nil {
+		return result{"docker daemons", "warn", "could not scan /proc for dockerd (" + err.Error() + ")", ""}
+	}
+	return evalDockerDaemons(procs)
+}
+
+// scanDockerdProcs lists the dockerd processes under procRoot (/proc on the host, a
+// fixture tree in tests), sorted by pid. Per-pid errors are tolerated: a pid that exits
+// mid-scan is skipped, and a dockerd whose exe, cgroup or status can't be read is still
+// listed with that field unknown.
+func scanDockerdProcs(procRoot string) ([]dockerdProc, error) {
+	entries, err := os.ReadDir(procRoot)
+	if err != nil {
+		return nil, err
+	}
+	var out []dockerdProc
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || !e.IsDir() {
+			continue // not a pid dir
+		}
+		dir := filepath.Join(procRoot, e.Name())
+		comm, err := os.ReadFile(filepath.Join(dir, "comm"))
+		if err != nil || strings.TrimSpace(string(comm)) != "dockerd" {
+			continue // exited mid-scan, or another program
+		}
+		p := dockerdProc{pid: pid, uid: -1}
+		p.exe, _ = os.Readlink(filepath.Join(dir, "exe")) // EACCES unless root: leave "" and still count it
+		if b, err := os.ReadFile(filepath.Join(dir, "cgroup")); err == nil {
+			p.unit = cgroupUnit(string(b))
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, "status")); err == nil {
+			p.uid, p.nested = parseStatusIDs(string(b))
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].pid < out[j].pid })
+	return out, nil
+}
+
+// cgroupUnit returns the systemd unit in /proc/<pid>/cgroup contents: the last *.service
+// or *.scope element of the cgroup path, from the v2 "0::" line or the v1 name=systemd
+// line (both carry the systemd path). "" when there is none.
+func cgroupUnit(data string) string {
+	for _, line := range strings.Split(data, "\n") {
+		f := strings.SplitN(line, ":", 3)
+		if len(f) != 3 {
+			continue
+		}
+		if v2 := f[0] == "0" && f[1] == ""; !v2 && f[1] != "name=systemd" {
+			continue
+		}
+		parts := strings.Split(f[2], "/")
+		for i := len(parts) - 1; i >= 0; i-- {
+			if strings.HasSuffix(parts[i], ".service") || strings.HasSuffix(parts[i], ".scope") {
+				return parts[i]
+			}
+		}
+	}
+	return ""
+}
+
+// parseStatusIDs reads the real UID and whether the process is in a child PID namespace
+// (NSpid lists more than one pid) from /proc/<pid>/status contents. uid is -1 when the
+// Uid line is missing; a kernel without NSpid reports nested=false.
+func parseStatusIDs(data string) (uid int, nested bool) {
+	uid = -1
+	for _, line := range strings.Split(data, "\n") {
+		key, val, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(val)
+		switch key {
+		case "Uid":
+			if len(f) > 0 {
+				if n, err := strconv.Atoi(f[0]); err == nil {
+					uid = n
+				}
+			}
+		case "NSpid":
+			nested = len(f) > 1
+		}
+	}
+	return uid, nested
+}
+
+// evalDockerDaemons maps the dockerds found to a result: none → warn, one → ok, more →
+// fail. Only host daemons count: one inside a container (child PID namespace) or a
+// rootless one (non-root UID) doesn't serve /var/run/docker.sock, so it can't split the
+// planes. An unknown UID counts. Pure — unit-tested.
+func evalDockerDaemons(procs []dockerdProc) result {
+	var host []string
+	other := 0
+	for _, p := range procs {
+		if p.nested || p.uid > 0 {
+			other++
+			continue
+		}
+		host = append(host, p.label())
+	}
+	note := ""
+	if other > 0 {
+		note = fmt.Sprintf(" (ignoring %d dockerd inside a container or rootless)", other)
+	}
+	switch len(host) {
+	case 0:
+		return result{"docker daemons", "warn", "no Docker daemon (dockerd) is running" + note,
+			"sudo systemctl start docker   (if it is running, re-run as root: /proc can hide other users' processes)"}
+	case 1:
+		return result{"docker daemons", "ok", "one Docker daemon: " + host[0] + note, ""}
+	default:
+		return result{"docker daemons", "fail",
+			fmt.Sprintf("%d Docker daemons are running: %s — Mooring must talk to exactly one; with more, the socket-proxy (read plane) and the docker CLI (write plane) can reach different daemons%s",
+				len(host), strings.Join(host, "; "), note),
+			dockerDedupeFix}
+	}
+}
+
+// dockerCLIPaths are where packages (/usr/bin), manual or static installs
+// (/usr/local/bin) and the snap (/snap/bin) put the docker CLI.
+var dockerCLIPaths = []string{"/usr/bin/docker", "/usr/local/bin/docker", "/snap/bin/docker"}
+
+// dockerCLI is one docker CLI found at a standard path.
+type dockerCLI struct {
+	path string // where it was found, e.g. /usr/bin/docker
+	real string // symlinks resolved; paths that share it are one install
+}
+
+// checkDockerInstalls looks for more than one Docker installation on disk. Unlike the
+// dockerd scan, it also sees a second install whose daemon is stopped right now.
+func checkDockerInstalls() result {
+	clis, snap := findDockerInstalls("/")
+	return evalDockerInstalls(clis, snap)
+}
+
+// findDockerInstalls stats the standard docker CLI paths and the snap's mount dir
+// (/snap/docker) under root ("/" on the host, a fixture tree in tests). A missing path
+// or a dangling symlink is not an install.
+func findDockerInstalls(root string) (clis []dockerCLI, snap bool) {
+	for _, p := range dockerCLIPaths {
+		full := filepath.Join(root, p)
+		if fi, err := os.Stat(full); err != nil || fi.IsDir() {
+			continue
+		}
+		real, err := filepath.EvalSymlinks(full)
+		if err != nil {
+			real = full
+		}
+		clis = append(clis, dockerCLI{path: p, real: real})
+	}
+	fi, err := os.Stat(filepath.Join(root, "snap", "docker"))
+	return clis, err == nil && fi.IsDir()
+}
+
+// isSnapCLI reports whether a docker CLI leads into the docker snap: /snap/bin/docker
+// itself, or a link to it (which resolves to snapd's launcher, /usr/bin/snap) or into
+// the snap's mount (/snap/docker/...).
+func isSnapCLI(c dockerCLI) bool {
+	return strings.HasPrefix(c.path, "/snap/") || strings.HasPrefix(c.real, "/snap/") || filepath.Base(c.real) == "snap"
+}
+
+// evalDockerInstalls fails on more than one Docker installation: two distinct docker
+// CLIs (deduped by real path), or the docker snap next to an apt or /usr/local CLI.
+// Every path into the snap is the one snap install; without a CLI link the snap still
+// counts through snapInstalled (/snap/docker). Pure — unit-tested.
+func evalDockerInstalls(clis []dockerCLI, snapInstalled bool) result {
+	var found []string
+	seen := map[string]bool{}
+	snapLabel := ""
+	for _, c := range clis {
+		if isSnapCLI(c) {
+			if snapLabel == "" {
+				snapLabel = c.path + " (snap)"
+			}
+			continue
+		}
+		if !seen[c.real] { // a symlink to a CLI already counted is the same install
+			seen[c.real] = true
+			found = append(found, c.path)
+		}
+	}
+	if snapLabel == "" && snapInstalled {
+		snapLabel = "the docker snap (/snap/docker)"
+	}
+	if snapLabel != "" {
+		found = append(found, snapLabel)
+	}
+	switch len(found) {
+	case 0:
+		return result{"docker installs", "ok", "no docker CLI in /usr/bin, /usr/local/bin or /snap/bin", ""}
+	case 1:
+		return result{"docker installs", "ok", "one Docker installation: " + found[0], ""}
+	default:
+		return result{"docker installs", "fail",
+			fmt.Sprintf("%d Docker installations: %s — Mooring must talk to exactly one Docker daemon", len(found), strings.Join(found, ", ")),
+			dockerDedupeFix}
+	}
+}
+
+// checkDaemonMatch confirms the socket-proxy (read plane) and the docker CLI (write
+// plane) reach the same Docker daemon, by daemon ID. The read side is GET /info on the
+// proxy address the socket-proxy check probes, through the read plane's own client.
+func checkDaemonMatch(cfg *config.Config) result {
+	addr := doctorProxyAddr(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	read, rerr := docker.New(addr).Info(ctx)
+	cancel()
+	if rerr != nil {
+		if cfg != nil && cfg.Docker.ExternalProxy {
+			// An operator-run proxy need not allow INFO (Mooring's read plane doesn't use it).
+			return result{"daemon match", "skip", "external proxy on " + addr + " did not answer /info (" + rerr.Error() + ") — not compared", ""}
+		}
+		rerr = fmt.Errorf("socket-proxy on %s: %w", addr, rerr)
+	}
+	writeID, werr := dockerCLIDaemonID()
+	return evalDaemonMatch(read, rerr, writeID, werr)
+}
+
+// dockerCLIDaemonID returns the ID of the daemon the docker CLI reaches — the daemon the
+// write plane's docker / docker compose children act on. Static argv, no shell (SEC-1).
+func dockerCLIDaemonID() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "info", "--format", "{{.ID}}")
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.Output()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "", errors.New("docker info did not answer within 10s")
+	}
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			if msg := firstLine(ee.Stderr); msg != "" {
+				return "", errors.New("docker info: " + msg)
+			}
+		}
+		return "", fmt.Errorf("docker info: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// firstLine returns the first non-empty line of b, trimmed.
+func firstLine(b []byte) string {
+	for _, l := range strings.Split(string(b), "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			return l
+		}
+	}
+	return ""
+}
+
+// evalDaemonMatch compares the daemon behind the socket-proxy (read) with the one the
+// docker CLI reports (write): same ID → ok, different → fail. If either side can't be
+// read it warns with the reason and skips the comparison. Pure — unit-tested.
+func evalDaemonMatch(read docker.Info, readErr error, writeID string, writeErr error) result {
+	var why []string
+	switch {
+	case readErr != nil:
+		why = append(why, "read plane: "+readErr.Error())
+	case read.ID == "":
+		why = append(why, "read plane: the socket-proxy's /info has no daemon ID")
+	}
+	switch {
+	case writeErr != nil:
+		why = append(why, "write plane: "+writeErr.Error())
+	case writeID == "":
+		why = append(why, "write plane: docker info printed no daemon ID")
+	}
+	if len(why) > 0 {
+		return result{"daemon match", "warn", "could not compare the read- and write-plane daemons — " + strings.Join(why, "; "),
+			"re-run as root while the mooring service and its socket-proxy are running"}
+	}
+	if read.ID != writeID {
+		return result{"daemon match", "fail",
+			"the socket-proxy (read plane) and the docker CLI (write plane) talk to different Docker daemons: " + daemonLabel(read) + " vs " + writeID,
+			"two Docker installs, or a stale socket-proxy container bound to another daemon's socket: remove the extra install (see docker daemons / docker installs), then sudo docker rm -f mooring-socket-proxy; sudo systemctl restart mooring (recreates the proxy on the remaining daemon)"}
+	}
+	return result{"daemon match", "ok", "the socket-proxy and the docker CLI reach the same Docker daemon (" + read.ID + ")", ""}
+}
+
+// daemonLabel renders a daemon as "ID (name, data root)", leaving out empty fields.
+func daemonLabel(i docker.Info) string {
+	var extra []string
+	for _, s := range []string{i.Name, i.DockerRootDir} {
+		if s != "" {
+			extra = append(extra, s)
+		}
+	}
+	if len(extra) == 0 {
+		return i.ID
+	}
+	return i.ID + " (" + strings.Join(extra, ", ") + ")"
 }
 
 // ownedByMooring reports whether fi is owned by the mooring user. If the user can't

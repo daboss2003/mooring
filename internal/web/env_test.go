@@ -142,6 +142,36 @@ func TestRenderEnvFileUniqueAnd0600(t *testing.T) {
 	}
 }
 
+// Compose reads its own control variables (COMPOSE_PROFILES, COMPOSE_PROJECT_NAME, …) from the
+// --env-file, so an app env key must never reach it: COMPOSE_PROFILES=mooring-scheduled would start the
+// scheduled services on every `up`. Ordinary keys still render.
+func TestRenderEnvFileDropsComposeControlVars(t *testing.T) {
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	e.srv.cfg.DataDir = t.TempDir()
+	if _, err := e.srv.envStore.Save(context.Background(), "shop", []envstore.Entry{{Key: "K", Value: secret.New("v"), Secret: false}}, "op"); err != nil {
+		t.Fatal(err)
+	}
+	app := &monitor.App{Project: "shop", WorkingDir: "/srv/shop"}
+	env := compose.Env{"K": "v", "COMPOSE_PROFILES": "mooring-scheduled", "COMPOSE_PROJECT_NAME": "other", "COMPOSER_HOME": "/c",
+		"DOCKER_DEFAULT_PLATFORM": "linux/amd64", "COMPOSE_TOKEN": "app-secret"}
+	p, c, err := e.srv.renderEnvFile(app, env)
+	if err != nil || p == "" {
+		t.Fatalf("render: %v %q", err, p)
+	}
+	defer c()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	if strings.Contains(got, "COMPOSE_PROFILES") || strings.Contains(got, "COMPOSE_PROJECT_NAME") || strings.Contains(got, "DOCKER_DEFAULT_PLATFORM") {
+		t.Errorf("compose control variables must be dropped:\n%s", got)
+	}
+	if !strings.Contains(got, "K=v\n") || !strings.Contains(got, "COMPOSER_HOME=/c\n") || !strings.Contains(got, "COMPOSE_TOKEN=app-secret\n") {
+		t.Errorf("ordinary keys (incl. an app's own COMPOSE_TOKEN) must still render:\n%s", got)
+	}
+}
+
 // Importing a .env file from disk parses, classifies, and stores its entries — the
 // path behind the file picker (whose accept= filter was dropped so dotenv files are
 // selectable). Literals end up visible on the env page.

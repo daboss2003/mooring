@@ -498,11 +498,25 @@ func (s *Server) renderEnvFile(app *monitor.App, env compose.Env) (string, func(
 	}
 	sort.Strings(keys)
 	var b strings.Builder
+	var dropped []string
 	for _, k := range keys {
 		// Sanitize against env-file injection on the .env-merge path (review
 		// #5/#10): the store validates on save, but .env values from disk do not
 		// go through it. Skip any unsafe key/value rather than emit a broken line.
 		if !envKeyRe.MatchString(k) {
+			continue
+		}
+		// This file is compose's --env-file (interpolation only — container env comes from the
+		// generated `environment:` entries). Compose also reads its own control variables from it, so
+		// an app env key like COMPOSE_PROFILES=mooring-scheduled would start scheduled services on every
+		// `up`, COMPOSE_PROJECT_NAME / COMPOSE_FILE / COMPOSE_COMPATIBILITY would change what a compose
+		// command acts on, and DOCKER_DEFAULT_PLATFORM would force a foreign build platform. Mooring owns
+		// all of that: those keys are never passed through. Other COMPOSE_-prefixed names (an app's own
+		// COMPOSE_TOKEN, say) are ordinary variables and still render. (dockerexec's minimalEnv also pins
+		// the dangerous ones in the process environment, which covers the repo's own .env when no
+		// --env-file is passed.)
+		if composeControlKeys[k] {
+			dropped = append(dropped, k)
 			continue
 		}
 		v := strings.TrimRight(env[k], "\r")
@@ -523,10 +537,25 @@ func (s *Server) renderEnvFile(app *monitor.App, env compose.Env) (string, func(
 		cleanup()
 		return "", noop, err
 	}
+	if len(dropped) > 0 && s.log != nil {
+		// Key names only — never values.
+		s.log.Warn("env file: ignored compose control variables (Mooring sets these itself)", "app", app.Project, "keys", strings.Join(dropped, ","))
+	}
 	return path, cleanup, nil
 }
 
 // envKeyRe mirrors envstore.keyRe for the .env-merge sanitization path.
+// composeControlKeys are Docker Compose's own settings (its documented pre-defined environment
+// variables) plus the build-platform override. Compose reads them from an env file; Mooring sets them.
+var composeControlKeys = map[string]bool{
+	"COMPOSE_PROJECT_NAME": true, "COMPOSE_FILE": true, "COMPOSE_PROFILES": true, "COMPOSE_PATH_SEPARATOR": true,
+	"COMPOSE_COMPATIBILITY": true, "COMPOSE_IGNORE_ORPHANS": true, "COMPOSE_REMOVE_ORPHANS": true,
+	"COMPOSE_CONVERT_WINDOWS_PATHS": true, "COMPOSE_PARALLEL_LIMIT": true, "COMPOSE_ENV_FILES": true,
+	"COMPOSE_DISABLE_ENV_FILE": true, "COMPOSE_BAKE": true, "COMPOSE_MENU": true, "COMPOSE_EXPERIMENTAL": true,
+	"COMPOSE_ANSI": true, "COMPOSE_STATUS_STDOUT": true, "COMPOSE_PROGRESS": true, "COMPOSE_HTTP_TIMEOUT": true,
+	"COMPOSE_TLS_VERSION": true, "DOCKER_DEFAULT_PLATFORM": true,
+}
+
 var envKeyRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // pathUnder reports whether p is within dir (p == dir or a descendant).

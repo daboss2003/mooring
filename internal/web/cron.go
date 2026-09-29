@@ -83,14 +83,31 @@ func (s *Server) cronTick(ctx context.Context) {
 	if ok, _ := s.runner.WriteAllowed(); !ok {
 		return
 	}
+	// A deploy (or cert renewal / app delete) is running somewhere on the host. It runs several docker
+	// steps back to back and releases the one docker slot between them; a task taking the slot in a gap
+	// would hold it for its whole run (up to its timeout) and stall the deploy. Tasks stay due and run
+	// on the next tick after it finishes. (Read-only git fetches don't count.)
+	if s.foreground.Load() > 0 {
+		return
+	}
 	apps, err := s.gitStore.List()
 	if err != nil {
 		return
 	}
 	now := time.Now().Unix()
+	// An app that is mid-deploy (or mid lifecycle action) holds an expected_down lease. Its tasks wait
+	// until that finishes — they stay due and run on the next tick after — so a task never pairs a new
+	// compose/command with an old image, or the reverse.
+	var leased map[string]bool
+	if s.selfHeal != nil {
+		leased, _ = s.selfHeal.ActiveExpectedDown(now)
+	}
 	for _, a := range apps {
 		if ctx.Err() != nil {
 			return
+		}
+		if leased[a.Project] {
+			continue
 		}
 		def, err := s.defStore.Current(a.Project)
 		if err != nil || def == nil || len(def.Spec.ScheduledTasks) == 0 {
@@ -211,4 +228,11 @@ func cronFailReason(lastLine string, ctxErr error, timeout time.Duration) string
 		r = r[:300] + "…"
 	}
 	return r
+}
+
+// beginForeground marks a multi-step write operation (a deploy, a certificate-renewal recreate, an app
+// delete) as running until the returned func is called. Scheduled tasks don't start while any is running.
+func (s *Server) beginForeground() func() {
+	s.foreground.Add(1)
+	return func() { s.foreground.Add(-1) }
 }

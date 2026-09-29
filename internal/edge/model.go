@@ -1,5 +1,7 @@
 package edge
 
+import "encoding/json"
+
 // The typed subset of the Caddy v2 admin-API config Mooring emits. The config is
 // ALWAYS marshalled from these structs (never string concat / loose maps for the
 // security-relevant parts) so what Caddy runs is exactly Mooring's typed render
@@ -101,7 +103,26 @@ type caddyHandler struct {
 	// headers handler
 	Response *caddyHeaderOps `json:"response,omitempty"`
 	// static_response
-	StatusCode int `json:"status_code,omitempty"`
+	StatusCode int    `json:"status_code,omitempty"`
+	Body       string `json:"body,omitempty"`
+	// StaticHeaders are static_response's response headers. Caddy spells them "headers" too, but as a
+	// plain field→values map, not reverse_proxy's {request,response} ops — MarshalJSON emits them under
+	// "headers" for a static_response handler only.
+	StaticHeaders map[string][]string `json:"-"`
+}
+
+// MarshalJSON renders a static_response handler's StaticHeaders under Caddy's "headers" key (a
+// different JSON shape from reverse_proxy's header ops, which share the key). Every other handler
+// marshals as the plain struct.
+func (h caddyHandler) MarshalJSON() ([]byte, error) {
+	type plain caddyHandler
+	if h.Handler == "static_response" && len(h.StaticHeaders) > 0 {
+		return json.Marshal(struct {
+			plain
+			Headers map[string][]string `json:"headers"`
+		}{plain(h), h.StaticHeaders})
+	}
+	return json.Marshal(plain(h))
 }
 
 // caddyLoadBalancing selects across a replica pool (least_conn for M14 edge pools).

@@ -225,8 +225,9 @@ func TestDeployBuildServiceGeneratesDockerfile(t *testing.T) {
 	})
 	cfg := configureRepo(t, e, slug, sha)
 	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
-	if err == nil || !strings.Contains(err.Error(), "up failed") {
-		t.Fatalf("expected up to fail (write disabled) after generation, got %v", err)
+	// A build service is built explicitly before `up`, so a write-disabled runner fails at the build.
+	if err == nil || !strings.Contains(err.Error(), "build failed") {
+		t.Fatalf("expected the build to fail (write disabled) after generation, got %v", err)
 	}
 	df, rerr := os.ReadFile(filepath.Join(e.srv.appRunDir(slug), ".mooring", "Dockerfile.api"))
 	if rerr != nil || !strings.Contains(string(df), "golang:") {
@@ -374,8 +375,9 @@ func TestDeployScaffoldsWhenNoMooringYAML(t *testing.T) {
 	})
 	cfg := configureRepo(t, e, slug, sha)
 	err := e.srv.deployRepoApp(context.Background(), cfg, sha, "manual", "operator", false, func(string) {})
-	if err == nil || !strings.Contains(err.Error(), "up failed") {
-		t.Fatalf("expected scaffold→generate→up-fail, got %v", err)
+	// The scaffolded app has a build service, which is built before `up`: a write-disabled runner fails there.
+	if err == nil || !strings.Contains(err.Error(), "build failed") {
+		t.Fatalf("expected scaffold→generate→build-fail, got %v", err)
 	}
 	df, rerr := os.ReadFile(filepath.Join(e.srv.appRunDir(slug), ".mooring", "Dockerfile.app"))
 	if rerr != nil || !strings.Contains(string(df), "golang:") {

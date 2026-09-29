@@ -70,6 +70,12 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 		http.Error(w, "app not found", http.StatusNotFound)
 		return
 	}
+	// A scheduled-only service runs only as a one-shot `compose run` on its schedule. Naming it in a
+	// start/restart/redeploy would enable its compose profile and start it as a long-running container.
+	if action != "stop" && isScheduledService(s.currentDef(project), service) {
+		http.Error(w, "scheduled services run only on their schedule; they can't be started, restarted or redeployed", http.StatusConflict)
+		return
+	}
 
 	// Per-copy stop of a SCALED service: remove just the chosen replica instead of every copy. The
 	// auto-scaler applies it race-free and lowers desired so it isn't relaunched. Falls through to the
@@ -126,6 +132,7 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 					outcome = audit.Error
 					fmt.Fprintf(w, "\n[failed: %v]\n", e)
 				} else {
+					s.reconcileEdgeAfter(aCtx)
 					fmt.Fprintln(w, "\n[done]")
 				}
 				_ = s.audit.Log(ctx, audit.Event{Actor: actor, IP: peer, Action: "lifecycle_" + action + "_copy", Target: project + "/" + service, Outcome: outcome, Level: audit.Info})
@@ -230,6 +237,11 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 	if runErr == nil && action != "stop" {
 		// start/restart/redeploy RELEASE the hold after a successful action (stop already set it above).
 		s.applyHoldForAction(project, service, action, actor, app)
+	}
+	if runErr == nil {
+		// New/stopped containers: re-point the edge now (a stopped service answers 503 at once instead
+		// of the edge dialing a dead address until the next refresh).
+		s.reconcileEdgeAfter(actionCtx)
 	}
 	level := audit.Info
 	auditOutcome := audit.OK

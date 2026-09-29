@@ -82,9 +82,20 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 		return
 	}
 	newDigests := s.managedDigests(rd, def)
-	changed := changedServices(readDigestState(rd), newDigests)
-	if len(changed) == 0 {
+	allChanged := changedServices(readDigestState(rd), newDigests)
+	if len(allChanged) == 0 {
 		return // no leaf changed
+	}
+	// A scheduled-only service is never recreated here: naming it in `up … -- <svc>` would start it as a
+	// long-running container. It picks the renewed leaf up on its next scheduled run.
+	changed := withoutScheduled(def, allChanged)
+	if len(changed) == 0 {
+		// Only scheduled services use the renewed leaf — record the digests so it isn't rediscovered
+		// on every tick.
+		if werr := s.writeDigestState(rd, newDigests); werr != nil {
+			s.log.Warn("cert-renew: could not record digests", "app", slug, "err", werr)
+		}
+		return
 	}
 
 	// Never recreate a service the operator has HELD (manually stopped): a cert renewal must not
@@ -116,6 +127,7 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 		return // a deploy/another renewal holds the lock; retry next tick
 	}
 	defer s.gitDeploy.Release()
+	defer s.beginForeground()()
 
 	repo, err := git.Open(s.gitObjectDir(slug))
 	if err != nil {
@@ -141,6 +153,7 @@ func (s *Server) refreshCertsForApp(ctx context.Context, cfg gitstore.Config, de
 	if werr := s.writeDigestState(rd, newDigests); werr != nil {
 		s.log.Warn("cert-renew: could not record digests", "app", slug, "err", werr)
 	}
+	s.reconcileEdgeAfter(ctx) // the recreated containers have new addresses
 	s.log.Info("cert-renew: renewed leaf synced + services recreated", "app", slug, "services", changed)
 	_ = s.audit.Log(ctx, audit.Event{
 		Actor: "system", Action: "cert_renew", Target: slug, Outcome: audit.OK,

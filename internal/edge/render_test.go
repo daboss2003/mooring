@@ -103,13 +103,16 @@ func TestRenderSingleCABackwardCompatible(t *testing.T) {
 // 404, and admin stays on the unix socket with enforce_origin.
 func TestRenderHappyPath(t *testing.T) {
 	out, err := Render(baseCfg(), []Route{
-		{Hostname: "app.example.com", Upstream: "shop-web:8080", UpstreamScheme: "http", HSTS: true, SecurityHeaders: true, Enabled: true},
+		{Hostname: "app.example.com", Upstream: "shop-web:8080", Pool: []string{"172.18.0.5:8080"}, UpstreamScheme: "http", HSTS: true, SecurityHeaders: true, Enabled: true},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := string(out)
-	for _, want := range []string{"app.example.com", "shop-web:8080", "acme", "https://acme.example/directory", "enforce_origin", "static_response"} {
+	if strings.Contains(s, "shop-web:8080") {
+		t.Errorf("the service-name selector must never be dialed:\n%s", s)
+	}
+	for _, want := range []string{"app.example.com", "172.18.0.5:8080", "reverse_proxy", "acme", "https://acme.example/directory", "enforce_origin", "static_response"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("rendered config missing %q:\n%s", want, s)
 		}
@@ -159,13 +162,13 @@ func TestRenderRejectsWildcardHost(t *testing.T) {
 // every pool member is validated (a control-plane member is refused).
 func TestRenderScaledPool(t *testing.T) {
 	out, err := Render(baseCfg(), []Route{
-		{Hostname: "app.example.com", Pool: []string{"app-web-1:8080", "app-web-2:8080", "app-web-3:8080"}, UpstreamScheme: "http", Enabled: true},
+		{Hostname: "app.example.com", Upstream: "web:8080", Pool: []string{"172.18.0.4:8080", "172.18.0.5:8080", "172.18.0.6:8080"}, UpstreamScheme: "http", Enabled: true},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s := string(out)
-	for _, want := range []string{"app-web-1:8080", "app-web-2:8080", "app-web-3:8080", "least_conn", "passive", "max_fails"} {
+	for _, want := range []string{"172.18.0.4:8080", "172.18.0.5:8080", "172.18.0.6:8080", "least_conn", "passive", "max_fails"} {
 		if !strings.Contains(s, want) {
 			t.Errorf("scaled pool render missing %q:\n%s", want, s)
 		}
@@ -230,9 +233,54 @@ func TestRenderEmptyIsSafeFloor(t *testing.T) {
 
 // XFF is overwritten to the real peer on every proxied route.
 func TestRenderXFFOverwrite(t *testing.T) {
-	out, _ := Render(baseCfg(), []Route{{Hostname: "app.example.com", Upstream: "web:80", UpstreamScheme: "http", Enabled: true}}, nil)
+	out, _ := Render(baseCfg(), []Route{{Hostname: "app.example.com", Upstream: "web:80", Pool: []string{"172.18.0.5:80"}, UpstreamScheme: "http", Enabled: true}}, nil)
 	if !strings.Contains(string(out), "X-Forwarded-For") || !strings.Contains(string(out), "{http.request.remote.host}") {
 		t.Errorf("reverse_proxy must overwrite XFF to the real peer:\n%s", out)
+	}
+}
+
+// A route with no container to dial (no pool, a service-name upstream, or marked Unroutable) answers a
+// fixed 503 with Retry-After — never a name dial — and keeps its host matcher and ACME subject so the
+// certificate keeps renewing.
+func TestRenderUnroutableServes503AndKeepsCert(t *testing.T) {
+	for _, rt := range []Route{
+		{Hostname: "app.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true},
+		{Hostname: "app.example.com", Upstream: "web:8080", Pool: []string{"172.18.0.5:8080"}, Unroutable: true, UpstreamScheme: "http", Enabled: true},
+	} {
+		out, err := Render(baseCfg(), []Route{rt}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := strings.Join(strings.Fields(string(out)), "")
+		if strings.Contains(s, `"dial":`) || strings.Contains(s, "reverse_proxy") {
+			t.Errorf("an unroutable route must not proxy:\n%s", out)
+		}
+		for _, want := range []string{`"status_code":503`, `"Retry-After":["5"]`, `"body":"503ServiceUnavailable\n"`, `"automate":["app.example.com"]`} {
+			if !strings.Contains(s, want) {
+				t.Errorf("missing %s in:\n%s", want, out)
+			}
+		}
+	}
+}
+
+// The selector is validated even though it is never dialed: an unsafe upstream is a render ERROR
+// (SBD-4), not a quiet 503.
+func TestRenderRejectsUnsafeSelectorWithoutPool(t *testing.T) {
+	for _, up := range []string{"host:2375", "localhost:8080", "127.0.0.1:9000"} {
+		if _, err := Render(baseCfg(), []Route{{Hostname: "app.example.com", Upstream: up, UpstreamScheme: "http", Enabled: true}}, nil); err == nil {
+			t.Errorf("upstream %q must be rejected", up)
+		}
+	}
+}
+
+// A pool holds container IP addresses only; a name in a pool is a render error, so no caller can
+// smuggle a name dial past the "never dial a name" rule.
+func TestRenderRejectsNamePoolMember(t *testing.T) {
+	for _, pool := range [][]string{{"web-2:8080"}, {"172.18.0.5:8080", "db:5432"}, {"172.18.0.5"}} {
+		_, err := Render(baseCfg(), []Route{{Hostname: "app.example.com", Upstream: "web:8080", Pool: pool, UpstreamScheme: "http", Enabled: true}}, nil)
+		if err == nil {
+			t.Errorf("pool %v must be rejected", pool)
+		}
 	}
 }
 

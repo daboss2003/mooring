@@ -20,6 +20,11 @@ type Info struct {
 	NCPU              int    `json:"NCPU"`
 	MemTotal          int64  `json:"MemTotal"`
 	ServerVersion     string `json:"ServerVersion"`
+	// ID identifies the daemon (a UUID on current engines, a key fingerprint on old
+	// ones). Two daemons on one host differ here even though Name is the same.
+	ID            string `json:"ID"`
+	Name          string `json:"Name"`          // the daemon host's hostname
+	DockerRootDir string `json:"DockerRootDir"` // e.g. /var/lib/docker; the snap's is under /var/snap/docker
 }
 
 // Container is the subset of a GET /containers/json entry we use.

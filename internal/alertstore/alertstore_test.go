@@ -157,3 +157,30 @@ func TestAckAndSilence(t *testing.T) {
 		t.Error("silence not recorded")
 	}
 }
+
+// A key whose latest infra row is "firing" is still open; one that was resolved later is not; other
+// kinds and rule-based rows are ignored.
+func TestOpenInfraAlerts(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	for _, o := range []alert.Outbox{
+		{Target: "shop", Kind: "edge_unroutable", Level: alert.LevelWarning, Transition: "firing", DedupeKey: "edge:a.example.com"},
+		{Target: "shop", Kind: "edge_unroutable", Level: alert.LevelWarning, Transition: "firing", DedupeKey: "edge:b.example.com"},
+		{Target: "shop", Kind: "edge_unroutable", Level: alert.LevelWarning, Transition: "resolved", DedupeKey: "edge:b.example.com"},
+		{Target: "", Kind: "docker_daemon_mismatch", Level: alert.LevelCritical, Transition: "firing", DedupeKey: "docker:daemon-mismatch"},
+	} {
+		if err := s.EnqueueInfra(ctx, o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.OpenInfraAlerts(ctx, "edge_unroutable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["edge:a.example.com"] != "shop" {
+		t.Fatalf("want only edge:a open, got %v", got)
+	}
+	if d, _ := s.OpenInfraAlerts(ctx, "docker_daemon_mismatch"); len(d) != 1 {
+		t.Fatalf("want the daemon alert open, got %v", d)
+	}
+}

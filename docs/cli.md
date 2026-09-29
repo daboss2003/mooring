@@ -83,8 +83,13 @@ mooring serving bind=127.0.0.1:9000 edge_mode=managed db=/var/lib/mooring/moorin
 
 - **Purpose:** check and install the host **prerequisites** the managed planes need. The running service is deliberately unprivileged (it can't install packages, edit host DNS, or grant capabilities — a compromised dashboard mustn't either), so these are run by *you* over SSH, as root, once. Linux-only.
 - **Usage:**
-  - `mooring doctor [--l4]` — **read-only.** Reports each prerequisite (Caddy, Docker, DNS, the state dirs + run dir, that `CAP_NET_BIND_SERVICE` is active, egress reachability, socket-proxy liveness, Docker log rotation; `--l4` adds nginx + the stream module + a `systemd-resolved :53` conflict) and prints the exact fix for anything off. Changes nothing.
+  - `mooring doctor [--l4]` — **read-only.** Reports each prerequisite (Caddy, Docker and the Docker installation checks below, DNS, the state dirs + run dir, that `CAP_NET_BIND_SERVICE` is active, egress reachability, socket-proxy liveness, Docker log rotation; `--l4` adds nginx + the stream module + a `systemd-resolved :53` conflict) and prints the exact fix for anything off. Changes nothing.
   - `mooring setup [--l4] [--restart] [--yes]` — prints a **fix plan** (a dry run); `--yes` applies it (needs root, uses apt). `--l4` includes the L4 prerequisites; `--restart` restarts the mooring service at the end.
+- **Docker installation checks:** the socket-proxy (read plane) and the `docker` CLI (write plane) must reach the same Docker daemon. `doctor` runs all three checks; `setup` runs `docker daemons` and `docker installs`.
+  - `docker daemons` — lists the running `dockerd` processes (pid, binary, systemd unit). A daemon inside a container or a rootless daemon is not counted. More than one fails; none running is a warning.
+  - `docker installs` — looks for the `docker` CLI in `/usr/bin`, `/usr/local/bin` and `/snap/bin` (symlinks to the same binary count once) and for the Docker snap (`/snap/docker`). Two installations fail, including the snap next to an apt or `/usr/local` install.
+  - `daemon match` — compares the daemon ID from the socket-proxy's `GET /info` with `docker info --format '{{.ID}}'`. Different IDs fail: deploys go to one daemon while the dashboard and edge read another. A warning means one side could not be read; run `doctor` as root with the service running. With `docker.external_proxy: true`, a proxy that does not answer `/info` skips the check.
+  - Neither command removes a Docker installation. A failure prints the removal commands for the snap and apt installs.
 - **What `setup --yes` does:** adds the Caddy apt repo (key fetched over HTTPS) + installs `caddy`; with `--l4` installs `nginx` + `libnginx-mod-stream`; disables the **distro** caddy/nginx units (Mooring supervises its own children); and **caps Docker's container logs** — it merges `log-opts.max-size` into `/etc/docker/daemon.json` (preserving your other keys, backing up the original) and restarts Docker. (The bind capability + runtime/state dirs are already provided by the unit + postinstall — no drop-in step.)
 - **What it will NOT do automatically:** rewrite host DNS / free `:53` (it prints the steps — too easy to lock yourself out). The Docker restart **bounces running containers**, so it's a labelled step in the dry-run plan you review first — run `setup` *before* deploying apps and it disrupts nothing.
 
@@ -93,6 +98,8 @@ $ sudo mooring doctor --l4
   ✗ caddy            MISSING — managed HTTPS edge (:80/:443 + ACME)
       → sudo mooring setup --yes
   ✓ docker           found at /usr/bin/docker — container read/write plane
+  ✓ docker daemons   one Docker daemon: pid 812 /usr/bin/dockerd (docker.service)
+  ✓ docker installs  one Docker installation: /usr/bin/docker
   ! docker logs      json-file driver has no size cap — container logs can fill the disk
       → sudo mooring setup --yes (caps it), or set log-opts.max-size by hand (snippet below)
   ✓ dns              host name resolution works

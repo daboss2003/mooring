@@ -3,34 +3,29 @@ package web
 import (
 	"context"
 	"log/slog"
-	"net"
-	"sort"
-	"strconv"
 
 	"github.com/daboss2003/mooring/internal/docker"
 	"github.com/daboss2003/mooring/internal/l4"
+	"github.com/daboss2003/mooring/internal/monitor"
 )
 
-// DiscoverL4Pools resolves each L4 route to the live container endpoints (ip:port) of
-// its backing service's replicas, so the host nginx dials bridge IPs directly and never
-// has to resolve a compose service name (which it can't — and one unresolvable upstream
-// makes `nginx -t` reject the WHOLE config). Counterpart of DiscoverEdgePools, keyed by
-// l4.PoolKey(route). Fail-safe: a nil docker client / discovery error / a service with no
-// running replica yields no pool for that route — the renderer then SKIPS it (rather than
-// emitting an unresolvable name that takes every listener down). An L4 upstream is a raw
-// TCP/UDP service:port, so there is no https case to skip.
+// DiscoverL4Pools resolves each L4 route to the running container endpoints (ip:port) of its backing
+// service, so the host nginx dials bridge IPs directly and never has to resolve a compose service name
+// (which it can't — and one unresolvable upstream makes `nginx -t` reject the WHOLE config). Counterpart
+// of DiscoverEdgePools, keyed by l4.PoolKey(route); a route with no running replica gets no pool and the
+// renderer skips it. ok=false means discovery itself failed (socket-proxy down, list error) — the caller
+// keeps each route's last-known pool for a while instead of unbinding every listener. Replicas that
+// aren't ready yet are left out whenever a ready one exists (see servingReplicas); health comes from
+// the latest monitor snapshot and may be nil.
 //
-// It is a free function (not a *Server method like DiscoverEdgePools) because the L4
-// reconcile closure is built BEFORE the *Server — web.New needs that closure — so it has
-// only the docker client to work with, not a *Server.
-func DiscoverL4Pools(ctx context.Context, dc *docker.Client, log *slog.Logger, routes []l4.Route) map[string][]string {
-	if len(routes) == 0 {
-		return nil
+// It is a free function (not a *Server method like DiscoverEdgePools) because the L4 reconcile closure
+// is built BEFORE the *Server — web.New needs that closure — so it has only the docker client.
+func DiscoverL4Pools(ctx context.Context, dc *docker.Client, log *slog.Logger, routes []l4.Route, snap *monitor.Snapshot) (map[string][]string, bool) {
+	reps, ok := discoverReplicas(ctx, dc, log)
+	if !ok {
+		return nil, false
 	}
-	ipsByService := ReplicaIPsByService(ctx, dc, log)
-	if len(ipsByService) == 0 {
-		return nil
-	}
+	health := containerHealth(snap)
 	out := map[string][]string{}
 	for _, rt := range routes {
 		if rt.AppID == "" {
@@ -40,24 +35,9 @@ func DiscoverL4Pools(ctx context.Context, dc *docker.Client, log *slog.Logger, r
 		if _, done := out[key]; done {
 			continue
 		}
-		ips := ipsByService[svcKey(rt.AppID, rt.Service)]
-		if len(ips) == 0 {
-			continue
+		if eps := endpoints(servingReplicas(reps[svcKey(rt.AppID, rt.Service)], nil, health), rt.Port); len(eps) > 0 {
+			out[key] = eps
 		}
-		eps := make([]string, 0, len(ips))
-		seen := map[string]bool{}
-		for _, ip := range ips {
-			ep := net.JoinHostPort(ip, strconv.Itoa(rt.Port))
-			if !seen[ep] {
-				seen[ep] = true
-				eps = append(eps, ep)
-			}
-		}
-		sort.Strings(eps) // deterministic → stable replica set re-renders byte-identical
-		out[key] = eps
 	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return out, true
 }

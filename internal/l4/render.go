@@ -23,8 +23,8 @@ import (
 // Route is one managed L4 listener: a public port the LB owns, forwarded to a
 // service's internal replica pool. Service/Port are SELECTORS (never a literal dial
 // target the operator types); Pool, when populated by the reconciler, lists the live
-// replica host:port endpoints. With an empty Pool the upstream is the Service:Port
-// name, resolved on the compose network (Docker DNS) — the v1 fallback.
+// replica host:port endpoints. A route with an empty Pool is skipped (its listener isn't
+// bound): the host nginx can't resolve a compose service name, so it is never dialed.
 type Route struct {
 	AppID    string   // owning project — discovery scopes Service to it (two apps may share a service name)
 	Listen   int      // host port the L4 LB binds

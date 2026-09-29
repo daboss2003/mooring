@@ -613,7 +613,8 @@ Notes:
 - The task's **command is the service's `command:`** (a fresh container runs it), so give the scheduled service the exact command you want to run.
 - **`timeout`** caps a single run. It defaults to **30 minutes**; set it higher for a long batch job (e.g. `timeout: 4h`) or lower to fail fast. A task holds the single docker slot for its whole run, so a very long timeout can make a stuck task block deploys until it hits the cap — that's why it's ceilinged at 24h. When a run hits the timeout it's killed and recorded as timed-out.
 - A scheduled service **can't also be an auto-scaling target** (a one-shot doesn't scale) — that's rejected at validation.
-- Runs ride the same one-docker-child slot as deploys and **skip** (retry next interval) when a deploy is in progress, so a task never delays a deploy. A failed task raises an alert; the last run is remembered across restarts (a restart doesn't re-fire everything).
+- **Rebuilt on every deploy.** When the scheduled service has a `build:` block, every deploy rebuilds its image with the app's other build services, so the next run uses the deployed code. The deploy log shows one line per image (built by this deploy, or unchanged).
+- A task doesn't start while a deploy, certificate renewal or app delete is running on the server, or while its own app is mid-deploy or mid lifecycle action; it stays due and starts at the next minute's check after. A task already running when a deploy starts keeps the single docker slot until it finishes, and the deploy waits for it. A failed task raises an alert; the last run is remembered across restarts (a restart doesn't re-fire everything).
 - **See what ran:** the dashboard's **[Scheduled tasks](./scheduled-tasks.md)** tab shows what's running right now (with live CPU/memory and the owning app), plus the recent run history with results and captured logs (kept 7 days).
 
 ### `spec.self_healing`

@@ -54,7 +54,12 @@ func unhealthyReplicaIDs(app monitor.App, service string) (bad []string, total i
 // materialization for recreate/redeploy), but via RunHeld — the supervisor's safety
 // gate already holds the one-docker-child semaphore, so re-acquiring would deadlock.
 // Authority never widens what may run: a protected project is refused here too.
-func (s *Server) Remediate(ctx context.Context, app monitor.App, service string, rung selfheal.Rung) error {
+func (s *Server) Remediate(ctx context.Context, app monitor.App, service string, rung selfheal.Rung) (err error) {
+	defer func() {
+		if err == nil {
+			s.reconcileEdgeAfter(ctx) // a restarted/recreated container may have a new address
+		}
+	}()
 	if s.runner == nil {
 		return fmt.Errorf("write plane unavailable")
 	}

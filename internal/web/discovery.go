@@ -22,38 +22,91 @@ import (
 // collision-free separator.
 func svcKey(project, service string) string { return project + "\x00" + service }
 
-// ReplicaIPsByService lists running containers ONCE and groups one routable bridge IP
-// per replica, keyed by svcKey(project, service). A nil client or a list error yields
-// nil (callers fail safe). IPs() is per-container sorted, so a multi-homed replica's
-// chosen IP is stable.
-func ReplicaIPsByService(ctx context.Context, dc *docker.Client, log *slog.Logger) map[string][]string {
+// replica is one running container of a compose service, as the read plane lists it.
+type replica struct {
+	ID string // full container id
+	IP string // the bridge address the host dials
+}
+
+// discoverReplicas lists running containers ONCE and groups each routable replica (id + one bridge IP)
+// by svcKey(project, service). ok=false means the listing itself failed (nil client, socket-proxy down, a
+// list error) — as opposed to listing fine and finding nothing — so callers can tell "no container" from
+// "no information". One-off `compose run` containers are skipped: they are never a service's serving
+// replica. A multi-homed replica uses its `<project>_default` address when it has one, else its first
+// routable address in network-name order (stable across renders).
+func discoverReplicas(ctx context.Context, dc *docker.Client, log *slog.Logger) (map[string][]replica, bool) {
 	if dc == nil {
-		return nil
+		return nil, false
 	}
 	cs, err := dc.ListContainers(ctx, false) // running only
 	if err != nil {
 		if log != nil {
-			log.Debug("container discovery failed; callers fall back", "err", err)
+			log.Debug("container discovery failed", "err", err)
 		}
-		return nil
+		return nil, false
 	}
-	out := map[string][]string{}
+	out := map[string][]replica{}
 	for _, c := range cs {
 		if !strings.EqualFold(c.State, "running") {
 			continue
 		}
 		proj, svc := c.Project(), c.Service()
-		if proj == "" || svc == "" {
+		if proj == "" || svc == "" || strings.EqualFold(c.Labels["com.docker.compose.oneoff"], "true") {
 			continue
 		}
-		for _, ip := range c.IPs() {
-			if routableUpstreamIP(ip) {
-				out[svcKey(proj, svc)] = append(out[svcKey(proj, svc)], ip)
-				break
-			}
+		if ip := replicaIP(c, proj); ip != "" {
+			out[svcKey(proj, svc)] = append(out[svcKey(proj, svc)], replica{ID: c.ID, IP: ip})
+		}
+	}
+	return out, true
+}
+
+// replicaIP picks the address the host dials for one container: its compose project's default network
+// when it is attached to it, else its first routable address.
+func replicaIP(c docker.Container, project string) string {
+	if n, ok := c.NetworkSettings.Networks[project+"_default"]; ok {
+		if ip := strings.TrimSpace(n.IPAddress); routableUpstreamIP(ip) {
+			return ip
+		}
+	}
+	for _, ip := range c.IPs() {
+		if routableUpstreamIP(ip) {
+			return ip
+		}
+	}
+	return ""
+}
+
+// ReplicaIPsByService lists running containers ONCE and groups one routable bridge IP
+// per replica, keyed by svcKey(project, service). A nil client or a list error yields
+// nil (callers fail safe).
+func ReplicaIPsByService(ctx context.Context, dc *docker.Client, log *slog.Logger) map[string][]string {
+	reps, ok := discoverReplicas(ctx, dc, log)
+	if !ok {
+		return nil
+	}
+	out := make(map[string][]string, len(reps))
+	for k, rs := range reps {
+		for _, r := range rs {
+			out[k] = append(out[k], r.IP)
 		}
 	}
 	return out
+}
+
+// sameContainer reports whether two container ids refer to the same container, allowing one to be an
+// abbreviated (≥12 hex) prefix of the other.
+func sameContainer(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if a == b {
+		return true
+	}
+	if len(a) > len(b) {
+		a, b = b, a
+	}
+	return len(a) >= 12 && strings.HasPrefix(b, a)
 }
 
 // ServiceIP returns one routable bridge IP for a running replica of (project, service),

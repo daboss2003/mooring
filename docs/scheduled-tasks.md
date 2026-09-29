@@ -16,6 +16,12 @@ Any task currently executing appears at the top, with:
 
 Tasks run **one at a time** (they share the single docker slot with deploys), so this is usually empty or a single row — but when a nightly job is grinding, you can see it working and how much it's using.
 
+A task doesn't start while a deploy, certificate renewal or app delete is running on the server; it stays due and starts at the next minute's check after.
+
+## Which code a run uses
+
+A run uses the scheduled service's image as of the last deploy. Every deploy rebuilds all build services, scheduled ones included, and its log shows each image's id and creation time — so you can confirm a scheduled service was rebuilt.
+
 ## Run history
 
 Every run is recorded — one row per run, newest first:

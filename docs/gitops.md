@@ -35,7 +35,14 @@ To change the app's *shape* — services and edge/L4 routes — **edit `mooring.
 
 Once connected, **Mooring checks the repo for new commits on its own** — no webhook to set up, no file to add to your repo. When a new commit lands, the app shows **"update available"** with a summary of what changed (the commits and files).
 
-Click **Deploy** to ship it. Mooring deploys **exactly the commit you reviewed**, brings the app up, and **rolls back automatically** if anything fails — so a deploy either fully succeeds or leaves the previous version running. There's never a half-deploy.
+Click **Deploy** to ship it. Mooring deploys **exactly the commit you reviewed**, in these steps, and stops at the first one that fails:
+
+1. **Checks the Docker daemon.** The container view (the socket-proxy) must be current, and it and the `docker` CLI must reach the same Docker daemon — otherwise the deploy is refused (see [`mooring doctor`](./cli.md)).
+2. **Builds** every service that has a `build:` block, [scheduled services](./scheduled-tasks.md) included, and prints one line per image: its id, when it was created, and whether this deploy built it or it was unchanged (build cache).
+3. **Starts the app** with those images (`docker compose up`), and recreates services whose config files, secrets or certificates changed.
+4. **Applies the edge routes and verifies them:** every route must be served and must dial only this app's running containers of its service — one `✓`/`✗` line per route (see [the edge](./edge-and-tls.md#upstream-addresses-and-unavailable-routes)).
+
+A build failure leaves the running containers untouched. A failure at step 3 or 4 leaves the containers already started by the deploy running — there is no automatic rollback; use [Deploy history](#deploy-history--rolling-back) to return to an earlier commit. Until a deploy succeeds, the repository shows the update as blocked and auto-deploy waits.
 
 You'll find this on the app's page (a **Repository & updates** panel) and on the dedicated **Repository** page (with the full diff and history).
 
@@ -122,7 +129,7 @@ After that, **Connect with GitHub** appears on the Connect-a-repository page. Op
 
 ## Building images vs pulling them
 
-By default Mooring **pulls** the images your Compose references — it doesn't build on your server. If your app needs an on-box build, set the build option when connecting the repo; building requires a server with at least 1 GB of RAM.
+A service with an `image:` is pulled; a service with a `build:` block is built on the server from a Dockerfile Mooring generates (see [the definition file](./definition-file.md)). Every deploy builds all build services — scheduled ones too — before starting the app, and a cached build that changed nothing keeps the same image, so unchanged services aren't recreated.
 
 ## Preview environments (a deploy per pull request)
 

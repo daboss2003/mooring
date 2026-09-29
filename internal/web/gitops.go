@@ -784,6 +784,7 @@ func (s *Server) handleVersionDelete(w http.ResponseWriter, r *http.Request) {
 //  6. pin deployed_commit (ref + DB) so gc never prunes it (rollback stays valid).
 func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, source, actor string, rollback bool, onLine func(string)) error {
 	bg := context.Background() // FSM/DB writes persist even if the client disconnects
+	defer s.beginForeground()()
 	slug := cfg.Project
 	rd := filepath.Clean(s.appRunDir(slug))
 	if !filepath.IsAbs(rd) || rd == "/" || isSensitiveDir(rd) {
@@ -876,6 +877,13 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 
 	s.gitStore.SetState(bg, slug, "deploying")
 
+	// The deploy must be observable and must target the daemon Mooring watches: refuse while the
+	// container view is down or stale, or while the read and write planes reach different daemons.
+	if err := s.preDeployPlaneCheck(ctx, onLine); err != nil {
+		s.gitStore.SetState(bg, slug, "update_blocked")
+		return err
+	}
+
 	// (3) archive-extract the pinned tree (Mooring-owned run dir).
 	if err := os.MkdirAll(rd, 0o700); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
@@ -964,7 +972,31 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// the changed ones get force-recreated after the up (a cert renewal lands the same
 	// way). New services need no force — the up creates them.
 	newDigests := s.managedDigests(rd, def)
-	changed := changedServices(readDigestState(rd), newDigests)
+	// Scheduled-only services are never force-recreated: naming one in `up … -- <svc>` would start it.
+	changed := withoutScheduled(def, changedServices(readDigestState(rd), newDigests))
+
+	depID := s.recordRepoDeployStart(bg, slug, source, actor, "git_deploy")
+	// Suppress the self-healing supervisor for this app from here to the end of the deploy (plan §8.5):
+	// the build can starve the running app of CPU and the up recreates it — neither may read as a crash loop.
+	defer s.leaseExpectedDown(ctx, slug)()
+	declared := declaredServiceSet(def)
+
+	// (5a) Build every build service explicitly, scheduled ones included. `up --build` builds only the
+	// services it starts and the scheduled compose profile keeps scheduled services out of `up`, so a
+	// scheduled task would otherwise keep its first image forever. A build failure stops the deploy
+	// before any running container is touched.
+	if svcs := buildServiceNames(def); len(svcs) > 0 {
+		buildStart := time.Now()
+		onLine("$ docker compose build " + strings.Join(svcs, " "))
+		bjob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: buildAction(svcs)}
+		if berr := s.runner.Run(ctx, bjob, onLine); berr != nil {
+			code, outcome := classifyExit(berr)
+			s.recordDeployFinish(bg, depID, code, outcome)
+			s.gitStore.SetState(bg, slug, "update_blocked")
+			return fmt.Errorf("docker compose build failed: %w", berr)
+		}
+		s.reportBuiltImages(ctx, slug, svcs, buildStart, onLine)
+	}
 
 	// Heal data-volume ownership BEFORE `up`. A named volume left owned by a since-drifted build UID
 	// (or the one-time UID-pin transition) would otherwise leave the app silently unable to write its
@@ -973,36 +1005,30 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// blocks the deploy. See internal/builder.NonrootUID.
 	reconciledVols := s.reconcileVolumeOwnership(ctx, slug, def, nonrootSvcs, onLine)
 
-	// (5) docker compose up under the gate + one-docker-child semaphore.
-	action := []string{"up", "-d", "--remove-orphans"}
-	if defHasBuild(def) {
-		// The app declares build services — build the Mooring-generated Dockerfile(s).
-		action = append(action, "--build")
-	} else {
-		// All services pull pre-built images; never build on-box.
-		action = append(action, "--no-build")
-	}
-	depID := s.recordRepoDeployStart(bg, slug, source, actor, "git_deploy")
+	// (5b) docker compose up under the gate + one-docker-child semaphore. Build services were built in
+	// (5a), so the up never builds; pull-image services are never built on-box either.
+	action := []string{"up", "-d", "--remove-orphans", "--no-build"}
 	onLine("$ docker compose " + strings.Join(action, " "))
 	job := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: action}
-	// Suppress the self-healing supervisor for this app while we intentionally
-	// recreate it (plan §8.5) — a deploy mid-flight must not look like a crash loop.
-	defer s.leaseExpectedDown(ctx, slug)()
-	declared := declaredServiceSet(def)
 	runErr := s.runUpWithConflictReap(ctx, slug, declared,
 		func(c context.Context, ol func(string)) error { return s.runner.Run(c, job, ol) },
 		s.runner.RemoveContainers, onLine)
-	code, outcome := classifyExit(runErr)
-	s.recordDeployFinish(bg, depID, code, outcome)
+	// failed records the deploy's outcome for every failure after the build; a success is recorded only
+	// once the edge is verified below.
+	failed := func(err error) error {
+		code, outcome := classifyExit(err)
+		s.recordDeployFinish(bg, depID, code, outcome)
+		s.gitStore.SetState(bg, slug, "update_blocked")
+		return err
+	}
 	if runErr != nil {
 		// The `up` failed, so the OLD containers are still running. Roll any volume ownership we
 		// changed back to its prior UID, or that still-running old container (a different UID) would
 		// be left unable to write its own data until a deploy eventually succeeds. Detached context so
 		// it runs even if the request was cancelled.
 		s.rollbackVolumeOwnership(bg, reconciledVols, onLine)
-		s.gitStore.SetState(bg, slug, "update_blocked")
 		s.streamOOMHint(ctx, slug, declared, onLine)
-		return fmt.Errorf("docker compose up failed: %w", runErr)
+		return failed(fmt.Errorf("docker compose up failed: %w", runErr))
 	}
 
 	// Force-recreate ONLY the services whose managed file content changed, so the new
@@ -1015,9 +1041,8 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 			func(c context.Context, ol func(string)) error { return s.runner.Run(c, rjob, ol) },
 			s.runner.RemoveContainers, onLine)
 		if rerr != nil {
-			s.gitStore.SetState(bg, slug, "update_blocked")
 			s.streamOOMHint(ctx, slug, declared, onLine)
-			return fmt.Errorf("recreate of changed services failed: %w", rerr)
+			return failed(fmt.Errorf("recreate of changed services failed: %w", rerr))
 		}
 	}
 	if err := s.writeDigestState(rd, newDigests); err != nil {
@@ -1035,11 +1060,12 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		note = "rollback to " + shortSha(sha)
 	}
 	if err := s.applyDefinition(ctx, slug, def, note, sha); err != nil {
-		s.gitStore.SetState(bg, slug, "update_blocked")
-		return fmt.Errorf("apply definition: %w", err)
+		return failed(fmt.Errorf("apply definition: %w", err))
 	}
 
-	// (6) pin the deployed commit (ref keeps gc from pruning it; DB drives the FSM).
+	// (6) pin the deployed commit (ref keeps gc from pruning it; DB drives the FSM). The new containers
+	// are running this commit from here on, so it is recorded even if the edge check below fails (cert
+	// renewal and the next deploy work from the deployed commit).
 	if err := repo.SetDeployedRef(bg, sha); err != nil {
 		onLine("warning: could not pin deployed ref: " + err.Error())
 	}
@@ -1057,6 +1083,23 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	} else {
 		s.gitStore.SetDeployed(bg, slug, sha)
 	}
+
+	// Confirm the edge serves exactly what was just deployed: every route dials only this app's running
+	// containers of its service, and the docker CLI (the write plane) lists those containers too.
+	psIDs := func(c context.Context, svc string) ([]string, error) {
+		var ids []string
+		pjob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: []string{"ps", "-q"}, Service: svc}
+		err := s.runner.Run(c, pjob, func(l string) {
+			if l = strings.TrimSpace(l); hexIDRe.MatchString(l) {
+				ids = append(ids, l)
+			}
+		})
+		return ids, err
+	}
+	if verr := s.verifyEdgeTargets(ctx, slug, s.cfg.Edge.ApplyProbeWindow.D(), psIDs, onLine); verr != nil {
+		return failed(verr)
+	}
+	s.recordDeployFinish(bg, depID, 0, "ok")
 	onLine("deployed " + shortSha(sha))
 
 	// Reclaim build cache so the generated multi-stage builds' single-use runtime layers

@@ -162,6 +162,14 @@ type Server struct {
 	cronStore      *cronstore.Store                       // scheduled-task last-run bookkeeping (may be nil)
 	edgeRoutes     *edge.RouteStore                       // managed-edge routes (may be nil)
 	edgeRecon      *edge.Reconciler                       // edge config reconciler (nil when edge unowned)
+	edgeAlertMu    sync.Mutex                             // guards edgeAlerted
+	edgeAlerted    map[string]bool                        // route key → an "unroutable" alert is open (edge_status.go)
+	daemonMu       sync.Mutex                             // guards daemonMismatch/daemonDetail (daemon_check.go)
+	daemonMismatch bool                                   // the read and write planes reach different Docker daemons
+	daemonDetail   string                                 // what differs, for messages
+	daemonAlerted  bool                                   // a mismatch alert is open (re-adopted from the outbox at boot)
+	daemonSeeded   bool                                   // daemonAlerted has been seeded from the outbox
+	foreground     atomic.Int32                           // multi-step write operations running now (beginForeground)
 	edgeReason     string                                 // why the edge isn't owned (banner)
 	l4Routes       *l4.RouteStore                         // managed L4 (TCP/UDP) routes (nil when L4 LB disabled)
 	l4Reconcile    func(context.Context) error            // push the L4 route set to the LB (nil when disabled)

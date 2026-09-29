@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -529,6 +530,9 @@ func cmdServe(args []string) error {
 				return out
 			})
 			sup := &edge.Supervisor{CaddyBin: "caddy", AdminListen: base.AdminListen, Log: log}
+			// A (re)launched Caddy boots on the route-less base config: push the full config again at
+			// once (an unchanged render would otherwise be skipped as already applied → 404 everywhere).
+			sup.OnLaunch = func() { edgeRecon.ReloadAfterRestart(ctx) }
 
 			// Edge-measured autoscaling signals (source:edge). The edge emits a per-request access
 			// log to STDOUT (only while some enabled policy uses a source:edge metric — the reactive
@@ -619,6 +623,14 @@ func cmdServe(args []string) error {
 				Digest:     cfg.Edge.L4NginxDigest,
 				Log:        log,
 			}
+			// Last-known pools per route, used only while discovery itself is unavailable (a socket-proxy
+			// blip must not unbind every listener). Bounded like the edge's: past 5m a route is skipped.
+			var l4mu sync.Mutex
+			type l4Known struct {
+				pool []string
+				at   time.Time
+			}
+			l4LKG := map[string]l4Known{}
 			l4Reconcile = func(c context.Context) error {
 				rs, lerr := l4Routes.List()
 				if lerr != nil {
@@ -628,15 +640,35 @@ func cmdServe(args []string) error {
 				// can't resolve it, and one unresolvable upstream makes `nginx -t` reject the
 				// WHOLE config (every listener down). A route with no live replica is left
 				// pool-less → the renderer skips it (its listener binds once a replica is up).
-				pools := web.DiscoverL4Pools(c, dockerCli, log, rs)
+				pools, discovered := web.DiscoverL4Pools(c, dockerCli, log, rs, mon.Snapshot())
+				now := time.Now()
+				l4mu.Lock()
+				live := map[string]bool{}
 				for i := range rs {
-					if p, ok := pools[l4.PoolKey(rs[i])]; ok {
+					// Last-known pools are keyed by the owning app + service + port (not just the
+					// listener), so a listener re-claimed by another app never inherits this one's pool.
+					lkgKey := rs[i].AppID + "|" + rs[i].Service + "|" + strconv.Itoa(rs[i].Port)
+					live[lkgKey] = true
+					switch p := pools[l4.PoolKey(rs[i])]; {
+					case discovered && len(p) > 0:
 						rs[i].Pool = p
-					} else {
+						l4LKG[lkgKey] = l4Known{pool: p, at: now}
+					case discovered:
+						delete(l4LKG, lkgKey)
 						log.Debug("l4: route has no live replica yet; listener not bound until one is up",
 							"listen", rs[i].Listen, "protocol", rs[i].Protocol, "service", rs[i].Service)
+					default:
+						if k, ok := l4LKG[lkgKey]; ok && now.Sub(k.at) < 5*time.Minute {
+							rs[i].Pool = k.pool // discovery unavailable: keep the last-known replicas for now
+						}
 					}
 				}
+				for k := range l4LKG {
+					if !live[k] {
+						delete(l4LKG, k) // the route is gone
+					}
+				}
+				l4mu.Unlock()
 				return sup.Reconcile(c, rs)
 			}
 			if rerr := l4Reconcile(ctx); rerr != nil { // write the initial config from the store
@@ -748,15 +780,17 @@ func cmdServe(args []string) error {
 		log.Info("service log capture enabled")
 	}
 
-	// Wire the auto-scaling edge pool (plan §8A): each edge reconcile now discovers the
-	// live replica endpoints for every route via the read-only socket-proxy and dials
-	// that pool (least-conn + passive health) instead of a single service-name upstream.
-	// Discovery is fail-safe — an error/empty result keeps the single dial. Only when the
-	// edge is owned (edgeRecon != nil); leaving scale.Config.Edge nil otherwise (a typed
-	// nil would defeat the watcher's nil check and panic on a method call).
+	// Wire container discovery into the edge (plan §8A): each edge reconcile discovers every
+	// route's running container endpoints via the read-only socket-proxy and dials only those
+	// (a pool of >1 gets least-conn + passive health) — never the service name, which the host
+	// can't resolve. No container → the route answers 503; discovery unavailable → last-known
+	// addresses for a bounded time. Only when the edge is owned (edgeRecon != nil); leaving
+	// scale.Config.Edge nil otherwise (a typed nil would defeat the watcher's nil check and
+	// panic on a method call).
 	var edgePool scale.EdgeReconciler
 	if edgeRecon != nil {
 		edgeRecon.SetPoolDiscoverer(srv.DiscoverEdgePools)
+		edgeRecon.SetStatusHook(srv.OnEdgeRouteStatus)
 		edgePool = edgeRecon
 	}
 
@@ -795,6 +829,7 @@ func cmdServe(args []string) error {
 		Interval:     cfg.Monitor.PollInterval.D(),
 		FloorBytes:   256 << 20, // memory-headroom floor for a momentary old+new during a restart
 		WritePlaneOK: writeAllowed,
+		Paused:       srv.DaemonMismatch, // read/write planes on different Docker daemons → hold all remediation
 		Protected:    protected,
 	})
 	srv.SetCircuitClearer(func(p, svc string) { watcher.ClearCircuit(selfheal.Key{App: p, Service: svc}) })
@@ -826,6 +861,7 @@ func cmdServe(args []string) error {
 		Log:              log,
 		Interval:         cfg.Monitor.PollInterval.D(),
 		WritePlaneOK:     writeAllowed,
+		Paused:           srv.DaemonMismatch, // read/write planes on different Docker daemons → hold all scaling
 		HostCPUMilli:     uint64(runtime.NumCPU() * 1000),
 		// Edge-measured latency/req-rate for source:edge metrics, wired ONLY when the managed edge is
 		// owned (edgeAgg != nil). When it isn't, both are nil → the scaler OMITS source:edge signals
@@ -911,7 +947,14 @@ func cmdServe(args []string) error {
 	// a stable replica set costs one read-plane container list per tick and no reload.
 	if edgeRecon != nil {
 		wg.Add(1)
-		go func() { defer wg.Done(); runReconcileLoop(ctx, "edge", edgeRecon.Reconcile, log) }()
+		edgeRefresh := func(c context.Context) error {
+			err := edgeRecon.Reconcile(c)
+			if err == nil {
+				srv.CheckEdgeRouteAlerts(c) // alert on routes left with nothing to dial; resolve recovered ones
+			}
+			return err
+		}
+		go func() { defer wg.Done(); runReconcileLoop(ctx, "edge", edgeRefresh, log) }()
 	}
 
 	// Connected-repo auto-fetch poller (Netlify-style): a repo connected in the
@@ -929,6 +972,33 @@ func cmdServe(args []string) error {
 	// Preview-environment reaper: a TTL backstop that tears down abandoned per-PR previews.
 	wg.Add(1)
 	go func() { defer wg.Done(); srv.RunPreviewReaper(ctx) }()
+
+	// Docker daemon identity: the read plane (socket-proxy) and the write plane (docker CLI) must reach
+	// the same daemon. Checked every 30s after boot until the first comparison succeeds (the socket-proxy
+	// may still be starting), then every 5 minutes; a mismatch raises a CRITICAL alert, refuses deploys
+	// and pauses self-heal + scaler writes until fixed.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTimer(30 * time.Second)
+		defer t.Stop()
+		compared := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if srv.CheckDaemonIdentity(ctx) {
+					compared = true
+				}
+				if compared {
+					t.Reset(5 * time.Minute)
+				} else {
+					t.Reset(30 * time.Second)
+				}
+			}
+		}
+	}()
 
 	// Cert-renewal watcher: when the managed edge renews a leaf, re-sync each app's
 	// cert_bindings + recreate the affected TLS services so they pick it up WITHOUT a
@@ -1128,6 +1198,7 @@ func runReconcileLoop(ctx context.Context, name string, reconcile func(context.C
 	interval := fast
 	t := time.NewTimer(interval)
 	defer t.Stop()
+	succeeded, failing := false, false
 	for {
 		select {
 		case <-ctx.Done():
@@ -1137,9 +1208,21 @@ func runReconcileLoop(ctx context.Context, name string, reconcile func(context.C
 			err := reconcile(rctx)
 			cancel()
 			if err != nil {
-				log.Debug(name+" reconcile/pool refresh failed", "err", err)
+				// Before the first success the child's control surface may simply not be up yet (Debug).
+				// After that, a failure means the live config can no longer be updated: surface it once
+				// (Warn → Activity) and keep retrying quietly until it recovers.
+				if succeeded && !failing {
+					log.Warn(name+" reconcile failing; the live config is not being updated", "err", err)
+				} else {
+					log.Debug(name+" reconcile/pool refresh failed", "err", err)
+				}
+				failing = true
 				interval = fast // control surface not ready (or a blip) — retry soon
 			} else {
+				if failing && succeeded {
+					log.Info(name + " reconcile recovered")
+				}
+				succeeded, failing = true, false
 				interval = steady
 			}
 			t.Reset(interval)

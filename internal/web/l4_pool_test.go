@@ -15,15 +15,20 @@ import (
 func TestDiscoverL4Pools(t *testing.T) {
 	dc := dockerServingContainers(t, containersJSON)
 	routes := []l4.Route{{AppID: "shop", Listen: 53, Protocol: "udp", Service: "web", Port: 5353}}
-	got := DiscoverL4Pools(context.Background(), dc, quietWebLog(), routes)
+	got, ok := DiscoverL4Pools(context.Background(), dc, quietWebLog(), routes, nil)
 	want := map[string][]string{l4.PoolKey(routes[0]): {"172.18.0.5:5353", "172.18.0.6:5353"}}
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("DiscoverL4Pools = %v, want %v", got, want)
+	if !ok || !reflect.DeepEqual(got, want) {
+		t.Errorf("DiscoverL4Pools = %v, %v; want %v, true", got, ok, want)
 	}
-	none := DiscoverL4Pools(context.Background(), dc, quietWebLog(),
-		[]l4.Route{{AppID: "shop", Listen: 53, Protocol: "udp", Service: "ghost", Port: 53}})
-	if none != nil {
-		t.Errorf("a service with no replica must yield nil (route skipped), got %v", none)
+	none, ok := DiscoverL4Pools(context.Background(), dc, quietWebLog(),
+		[]l4.Route{{AppID: "shop", Listen: 53, Protocol: "udp", Service: "ghost", Port: 53}}, nil)
+	if !ok || len(none) != 0 {
+		t.Errorf("a service with no replica must yield no pool (route skipped) with ok=true, got %v, %v", none, ok)
+	}
+	// Discovery itself unavailable → ok=false, so the caller keeps last-known pools instead of
+	// unbinding every listener.
+	if _, ok := DiscoverL4Pools(context.Background(), nil, quietWebLog(), routes, nil); ok {
+		t.Error("a nil docker client must report ok=false")
 	}
 }
 

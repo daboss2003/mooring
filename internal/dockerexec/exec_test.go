@@ -39,6 +39,36 @@ func TestMinimalEnvDisablesAttestations(t *testing.T) {
 	}
 }
 
+// Compose reads its own settings from an env file (or the repo's committed .env) unless the process
+// environment defines them. minimalEnv must pin the dangerous ones — and a host value must never leak
+// through in their place.
+func TestMinimalEnvPinsComposeSettings(t *testing.T) {
+	t.Setenv("COMPOSE_PROFILES", "mooring-scheduled")
+	t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/amd64")
+	env := minimalEnv()
+	want := map[string]string{
+		"COMPOSE_PROFILES":        "",
+		"COMPOSE_COMPATIBILITY":   "false",
+		"COMPOSE_IGNORE_ORPHANS":  "false",
+		"DOCKER_DEFAULT_PLATFORM": "",
+	}
+	seen := map[string]int{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		if w, ok := want[k]; ok {
+			seen[k]++
+			if v != w {
+				t.Errorf("%s=%q, want %q", k, v, w)
+			}
+		}
+	}
+	for k := range want {
+		if seen[k] != 1 {
+			t.Errorf("%s must appear exactly once in minimalEnv (got %d): %v", k, seen[k], env)
+		}
+	}
+}
+
 func TestJobArgvIncludesEnvFile(t *testing.T) {
 	j := Job{Project: "shop", ConfigFiles: []string{"/c.yml"}, EnvFile: "/run/x.env", Action: []string{"up", "-d"}}
 	got := strings.Join(j.argv(), " ")

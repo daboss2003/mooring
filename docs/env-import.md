@@ -29,6 +29,8 @@ Mooring parses the file, classifies each key, and stores everything. The values 
 
 If an import would **change a secret that's already set** (a rotation) or turn a secret into a plain value, Mooring holds those back and asks you to confirm them explicitly, so you can't overwrite a live credential by accident. Everything else applies normally.
 
+**Keys Mooring ignores.** Docker Compose's own settings — its pre-defined variables such as `COMPOSE_PROJECT_NAME`, `COMPOSE_FILE`, `COMPOSE_PROFILES`, `COMPOSE_COMPATIBILITY` and `COMPOSE_IGNORE_ORPHANS` — and `DOCKER_DEFAULT_PLATFORM` are never passed to compose; Mooring sets project, files, profiles and build platform itself. They can still be stored but have no effect, and a `.env` committed to the app's repo can't change them either. Other names that merely start with `COMPOSE_` (an app's own `COMPOSE_TOKEN`, say) are ordinary variables.
+
 ## Referencing secrets in config
 
 In your app's definition or config files, refer to a secret **by name** rather than pasting its value:

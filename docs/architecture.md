@@ -214,7 +214,7 @@ A few principles make this load-bearing:
 
 After validation, the action is executed by shelling out to `docker compose` with **static argv** — no `sh -c`, no string interpolation, `--` terminators — and **one service at a time**, holding the one-docker-child semaphore. The app is brought up on its **internal port only**; then Mooring (never the app, never a script) wires the edge by adding the `app_routes` row, rendering the whole proxy document, and atomically `/load`ing the vhost + ACME HTTPS.
 
-The rule is symmetric: **apps can't define the edge, and the edge can't be routed into the control plane.** See [the edge doc](./edge-and-tls.md) for the pinned dialer and egress firewall that back this at dial time.
+The rule is symmetric: **apps can't define the edge, and the edge can't be routed into the control plane.** See [the edge doc](./edge-and-tls.md): the edge dials only discovered container addresses, validated when the config is rendered, never a hostname.
 
 ---
 
@@ -263,7 +263,7 @@ Mooring makes authenticated, secret-bearing outbound calls to apps (the App Ops 
 - The outbound client is **DNS-rebind-safe** (re-validates the resolved IP on every connection), **redirect-revalidating**, and **blocks** loopback, link-local, private, CGNAT, ULA, `169.254.169.254` (cloud metadata), and ports `2375/2019/9000`.
 - The secret-bearing call is proxied **server-side** — the shared secret never reaches the browser.
 
-This is enforced at two layers. The application client refuses bad destinations, and underneath it the systemd **egress allow-listing** (`IPAddressDeny=any` + a narrow `IPAddressAllow` for the edge, the docker-proxy, the internal app net, and the ACME endpoints) makes a forbidden destination *physically unreachable* from the cgroup. Even a perfect SSRF against an unknown 0-day cannot reach cloud metadata or exfiltrate the master key, because the network path does not exist. The plan ships a mandatory abuse test for exactly this — *"the descriptor cannot move the outbound host."* The edge gets the parallel treatment: its slice's egress is limited to the ACME CA/OCSP/CRL plus pinned app hosts, and its custom pinned dialer refuses `9000/2019/2375` and metadata on the *resolved* target.
+This is enforced at two layers. The application client refuses bad destinations, and underneath it the systemd **egress allow-listing** (`IPAddressDeny=any` + a narrow `IPAddressAllow` for the edge, the docker-proxy, the internal app net, and the ACME endpoints) makes a forbidden destination *physically unreachable* from the cgroup. Even a perfect SSRF against an unknown 0-day cannot reach cloud metadata or exfiltrate the master key, because the network path does not exist. The plan ships a mandatory abuse test for exactly this — *"the descriptor cannot move the outbound host."* The edge gets the parallel treatment: its slice's egress is limited to the ACME CA/OCSP/CRL plus pinned app hosts, and it dials only container IP addresses discovered from the read plane and validated at render — never a hostname — refusing `9000/2019/2375` and loopback/link-local addresses.
 
 ---
 
@@ -287,10 +287,10 @@ Core fans the same App Ops Interface out to agents. The v1 boundaries that make 
                               │  :80 / :443
                               ▼
         ┌──────────────────────────────────────────────┐
-        │  CADDY EDGE  (child process; co-resident in    │   pinned dialer (live):
-        │  the core unit today — own user/slice planned) │   :9000/:2019/:2375 +
-        │  CAP_NET_BIND_SERVICE (on the unit, default)   │   metadata UNREACHABLE.
-        │  owns ACME · terminates TLS · pinned dialer    │   cgroup egress filter =
+        │  CADDY EDGE  (child process; co-resident in    │   dials container IPs
+        │  the core unit today — own user/slice planned) │   only (never names),
+        │  CAP_NET_BIND_SERVICE (on the unit, default)   │   validated at render.
+        │  owns ACME · terminates TLS                    │   cgroup egress filter =
         │                                                │   opt-in (off by default)
         └───────┬───────────────────────────┬───────────┘
                 │ admin vhost (IP-allowlist  │ app vhosts → app
@@ -335,7 +335,7 @@ Read this diagram as a set of trust boundaries: internet → edge → app; edge 
 
 - [README](../README.md) — what Mooring is and how to install it.
 - [Security model](./security.md) — the middleware pipeline, the IP-allowlist/XFF invariant, secrets at rest.
-- [The managed edge](./edge-and-tls.md) — how Mooring owns Caddy, the pinned dialer, and the secure-by-default baseline.
+- [The managed edge](./edge-and-tls.md) — how Mooring owns Caddy, how routes are dialed, and the secure-by-default baseline.
 - [App provisioning](./gitops.md) — connecting a Git repo, the generated compose, and the §5.6 chokepoint in detail.
 - [The definition file](./definition-file.md) — `mooring.yaml`, the shared reconciler, and the CLI.
 - [Operations](./backup-and-recovery.md) — running on a small host, backups, and recovery.

@@ -127,10 +127,17 @@ type Scaler interface {
 }
 
 // EdgeReconciler updates the edge replica pool for a service after a count change
-// (discover live replicas → validated pool → reload). May be nil (then the route's
-// single upstream DNS-round-robins across replicas).
+// (discover live replicas → validated pool → reload). May be nil when Mooring doesn't own
+// the edge on this host (the pool then only updates with the edge's own refresh).
 type EdgeReconciler interface {
 	ReconcilePool(ctx context.Context, app, service string, replicas int) error
+}
+
+// EdgeDrainer is optionally implemented by the EdgeReconciler: stop dialing the given containers ahead
+// of their removal (the exclusion survives concurrent reconciles until the containers are gone).
+type EdgeDrainer interface {
+	DrainContainers(ctx context.Context, ids []string) error
+	UndrainContainers(ctx context.Context, ids []string) error
 }
 
 // Reserves are the host headroom the capacity guard subtracts before funding this
@@ -161,8 +168,11 @@ type Config struct {
 	Log              *slog.Logger
 	Interval         time.Duration
 	WritePlaneOK     bool
-	HostCPUMilli     uint64                                        // total host CPU (milli); 0 disables the CPU budget
-	IsCandidate      func(app, service string) (ServiceSpec, bool) // C1–C6 from compose; nil → trust the policy opt-in
+	// Paused, when set and true, holds every docker write this tick (e.g. the docker read and write planes
+	// reach different daemons, so a scale could act on containers the read plane doesn't see). nil = never.
+	Paused       func() bool
+	HostCPUMilli uint64                                        // total host CPU (milli); 0 disables the CPU budget
+	IsCandidate  func(app, service string) (ServiceSpec, bool) // C1–C6 from compose; nil → trust the policy opt-in
 	// EdgeStats returns the edge-measured p95 latency (ms) and request rate (req/s) for a service
 	// over the rolling window, plus whether ANY request was sampled in it. It backs source:edge
 	// metrics. nil = no managed edge on this host → source:edge metrics are OMITTED (inert), so they
@@ -430,7 +440,8 @@ func (w *Watcher) stepService(ctx context.Context, snap *monitor.Snapshot, k Key
 		if ok, reason := Candidacy(spec); !ok {
 			st.BreachSince = 0 // clear stale hysteresis so a later re-gain starts fresh
 			if st.Replicas > p.Min {
-				w.act(ctx, k, p.Min, st, now, "lost candidacy: "+reason)
+				// Through the same gates as every other scale (write plane, pause, the one docker slot).
+				w.scaleGated(ctx, k, Decision{Target: p.Min, Action: ActDown, Reason: "lost candidacy: " + reason, Next: st}, now)
 			} else {
 				w.save(ctx, k, st, now)
 			}
@@ -559,7 +570,7 @@ func (w *Watcher) removeReplicas(ctx context.Context, snap *monitor.Snapshot, k 
 		clear()
 		return true
 	}
-	if w.cfg.RemoveContainers == nil || !w.cfg.WritePlaneOK {
+	if w.cfg.RemoveContainers == nil || !w.writesAllowed() {
 		return false // can't act now; keep pending, don't freeze normal autoscaling
 	}
 	if !w.cfg.Sem.TryAcquire() {
@@ -571,14 +582,22 @@ func (w *Watcher) removeReplicas(ctx context.Context, snap *monitor.Snapshot, k 
 	if newDesired < 1 {
 		newDesired = 1
 	}
-	// Drain the edge pool to the new count first so the edge stops dialing the replicas about to go.
-	if w.cfg.Edge != nil {
-		_ = w.cfg.Edge.ReconcilePool(ctx, k.App, k.Service, newDesired)
+	// Drain first: the edge stops dialing exactly these containers before they go, and — because the
+	// exclusion lives in the edge — a concurrent reconcile can't put them back in the meantime.
+	drainer, _ := w.cfg.Edge.(EdgeDrainer)
+	if drainer != nil {
+		_ = drainer.DrainContainers(ctx, valid)
 	}
 	if err := w.cfg.RemoveContainers(ctx, k.App, valid); err != nil {
 		w.cfg.Log.Warn("scale: per-replica stop failed", "app", k.App, "service", k.Service, "err", err)
+		if drainer != nil {
+			_ = drainer.UndrainContainers(ctx, valid) // still running: let it serve again
+		}
 		clear() // drop rather than loop on a failing removal
 		return true
+	}
+	if w.cfg.Edge != nil {
+		_ = w.cfg.Edge.ReconcilePool(ctx, k.App, k.Service, newDesired) // settle the pool on what is left
 	}
 	st := w.states[k]
 	st.Replicas = newDesired
@@ -604,10 +623,15 @@ func runningReplicaIDs(snap *monitor.Snapshot, k Key) map[string]bool {
 	return out
 }
 
+// writesAllowed is the §0 write-plane gate plus any dynamic pause (Config.Paused).
+func (w *Watcher) writesAllowed() bool {
+	return w.cfg.WritePlaneOK && (w.cfg.Paused == nil || !w.cfg.Paused())
+}
+
 // scaleGated applies the §0 + semaphore gates, then scales + reconciles the pool.
 func (w *Watcher) scaleGated(ctx context.Context, k Key, d Decision, now int64) {
-	if !w.cfg.WritePlaneOK {
-		return // §0 write-plane gate closed — try next tick
+	if !w.writesAllowed() {
+		return // §0 write-plane gate closed, or writes paused — try next tick
 	}
 	if !w.cfg.Sem.TryAcquire() {
 		return // never queue a docker child — skip this tick (plan §8A)
@@ -622,14 +646,15 @@ func (w *Watcher) scaleGated(ctx context.Context, k Key, d Decision, now int64) 
 func (w *Watcher) act(ctx context.Context, k Key, target int, next State, now int64, reason string) {
 	next.Replicas = target
 	down := target < currentDesired(w.states[k])
-	if down && w.cfg.Edge != nil {
-		_ = w.cfg.Edge.ReconcilePool(ctx, k.App, k.Service, target)
-	}
 	if err := w.cfg.Scaler.Scale(ctx, k.App, k.Service, target); err != nil {
 		w.cfg.Log.Warn("scale: action failed", "app", k.App, "service", k.Service, "target", target, "err", err)
 		return // don't persist a desired we couldn't apply
 	}
-	if !down && w.cfg.Edge != nil {
+	// Re-discover right after the change in either direction: a scale-up adds the new copy (the edge
+	// admits it once it is ready), and a scale-down drops the removed copies' addresses at once rather
+	// than at the next periodic refresh. (compose picks which copies a scale-down removes, so they
+	// can't be drained by id beforehand; per-copy stop above can and does.)
+	if w.cfg.Edge != nil {
 		_ = w.cfg.Edge.ReconcilePool(ctx, k.App, k.Service, target)
 	}
 	if !down {

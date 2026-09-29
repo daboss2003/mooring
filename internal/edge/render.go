@@ -42,6 +42,10 @@ type Route struct {
 	SecurityHeaders bool
 	Enabled         bool
 	CA              string // "" = default issuer (BaseConfig.ACMECA); else a BaseConfig.CAs name
+	// Unroutable, set by the Reconciler (never persisted), renders the route as a 503 instead of a
+	// proxy: its (app, service) has no running container to dial. The host matcher, security headers
+	// and ACME subject stay, so the certificate keeps renewing and the host answers 503, not 404.
+	Unroutable bool
 }
 
 // CA is an additional ACME issuer (a private/internal CA) a subject can opt into by
@@ -84,16 +88,49 @@ type WildcardCert struct {
 	DNS01Token    string // provider credential (secret)
 }
 
-// dials returns the upstream host:port set for this route: the live replica pool
-// when set (M14 auto-scaling), else the single upstream.
+// dials returns the addresses this route proxies to: the discovered container endpoints (Pool). The
+// stored Upstream is a compose SERVICE-NAME selector ("web:3000") that the host process running Caddy
+// cannot resolve — only Docker's per-network DNS can — so it is dialed ONLY when its host is already an
+// IP literal. A route with no dial is rendered as a 503 (see unavailableHandler); the edge never asks
+// the host resolver for a service name, which could fail (502) or answer with the wrong container.
 func (r Route) dials() []string {
 	if len(r.Pool) > 0 {
 		return r.Pool
 	}
-	if r.Upstream != "" {
-		return []string{r.Upstream}
+	if host, _, err := net.SplitHostPort(r.Upstream); err == nil {
+		if _, perr := netip.ParseAddr(host); perr == nil {
+			return []string{r.Upstream}
+		}
 	}
 	return nil
+}
+
+// upstreamServiceName is the host part of the service:port selector — the name an https upstream's
+// certificate is verified against when the edge dials the container's IP.
+func (r Route) upstreamServiceName() string {
+	host, _, err := net.SplitHostPort(r.Upstream)
+	if err != nil {
+		return ""
+	}
+	if _, perr := netip.ParseAddr(host); perr == nil {
+		return "" // already an IP: verify against the dial host as usual
+	}
+	return host
+}
+
+// unavailableHandler is the response for a route with no container to dial: a fixed 503 with
+// Retry-After. The body is constant — it names no app, service or address.
+func unavailableHandler() caddyHandler {
+	return caddyHandler{
+		Handler:    "static_response",
+		StatusCode: 503,
+		StaticHeaders: map[string][]string{
+			"Content-Type":  {"text/plain; charset=utf-8"},
+			"Cache-Control": {"no-store"},
+			"Retry-After":   {"5"},
+		},
+		Body: "503 Service Unavailable\n",
+	}
 }
 
 // ValidateRoute enforces every route-level safety rule (SBD-4). Returns the first
@@ -107,11 +144,23 @@ func ValidateRoute(r Route) error {
 	if r.UpstreamScheme != "http" && r.UpstreamScheme != "https" {
 		return fmt.Errorf("upstream_scheme must be http or https")
 	}
-	// Every dial — the single upstream AND every pool member — is validated, so a
-	// scaled replica can never resolve to a control-plane port either (SBD-4).
-	for _, d := range r.dials() {
+	// The stored upstream selector AND every address the route may dial are validated (SBD-4). The
+	// selector is checked even though it is never dialed itself: it names the port every discovered
+	// replica is dialed on, and an unsafe one (a control-plane port, a loopback name) is rejected
+	// outright rather than being quietly rendered as a 503.
+	if err := validateUpstream(r.Upstream); err != nil {
+		return err
+	}
+	for _, d := range r.Pool {
 		if err := validateUpstream(d); err != nil {
 			return err
+		}
+		// A pool holds discovered container addresses only — never a name the edge would have to
+		// resolve (the host resolver can't answer compose names, and could answer wrongly).
+		if host, _, err := net.SplitHostPort(d); err != nil {
+			return fmt.Errorf("pool member %q must be ip:port", d)
+		} else if _, perr := netip.ParseAddr(host); perr != nil {
+			return fmt.Errorf("pool member %q is not an IP address", d)
 		}
 	}
 	if r.PathPrefix != "" && (!pathRe.MatchString(r.PathPrefix) || strings.Contains(r.PathPrefix, "..")) {
@@ -230,8 +279,20 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		if r.SecurityHeaders || r.HSTS {
 			handlers = append(handlers, caddyHandler{Handler: "headers", Response: &caddyHeaderOps{Set: securityHeaderBundle(r)}})
 		}
+		dials := r.dials()
+		if r.Unroutable || len(dials) == 0 {
+			// No container to dial: answer 503 for this host (and keep its certificate renewing).
+			handlers = append(handlers, unavailableHandler())
+			httpRoutes = append(httpRoutes, caddyRoute{Match: []caddyMatch{match}, Handle: handlers, Terminal: true})
+			if !seen[h] {
+				subjects = append(subjects, h)
+				seen[h] = true
+				subjectCA[h] = r.CA
+			}
+			continue
+		}
 		var ups []caddyUpstream
-		for _, d := range r.dials() {
+		for _, d := range dials {
 			ups = append(ups, caddyUpstream{Dial: d})
 		}
 		rp := caddyHandler{
@@ -246,7 +307,13 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			rp.HealthChecks = &caddyHealthChecks{Passive: &caddyPassiveHealth{FailDuration: "30s", MaxFails: 3}}
 		}
 		if r.UpstreamScheme == "https" {
-			rp.Transport = map[string]any{"protocol": "http", "tls": map[string]any{}}
+			tls := map[string]any{}
+			// The edge dials the container's IP; SNI and certificate verification still target the
+			// service name, exactly as a name dial would.
+			if name := r.upstreamServiceName(); name != "" {
+				tls["server_name"] = name
+			}
+			rp.Transport = map[string]any{"protocol": "http", "tls": tls}
 		}
 		handlers = append(handlers, rp)
 		httpRoutes = append(httpRoutes, caddyRoute{Match: []caddyMatch{match}, Handle: handlers, Terminal: true})

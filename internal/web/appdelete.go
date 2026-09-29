@@ -157,6 +157,7 @@ func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) 
 		return fmt.Errorf("another git/deploy operation is in progress, so %q's containers could not be stopped — nothing was deleted; try again in a moment", slug), nil
 	}
 	defer s.gitDeploy.Release()
+	defer s.beginForeground()()
 
 	// GATE: stop + remove containers, networks, AND named volumes (data) FIRST. This
 	// must SUCCEED before any irreversible deletion — a skipped/failed `down` would

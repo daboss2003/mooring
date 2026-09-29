@@ -644,5 +644,19 @@ func minimalEnv() []string {
 	// locally-built app image (that never leaves the host) adds no supply-chain value
 	// here; upstream-image integrity is handled by digest-pinning instead.
 	env = append(env, "BUILDX_NO_DEFAULT_ATTESTATIONS=1")
+	// Pin the compose settings compose would otherwise pick up from an env file. Compose fills any
+	// setting the process environment doesn't define from the --env-file — or, when none is passed,
+	// from <project-directory>/.env, which is the app REPO's own committed file. Defined here (even
+	// empty), the process value wins, so an app can't: enable the scheduled profile on every `up`
+	// (COMPOSE_PROFILES), rename containers and images to the v1 "_" scheme (COMPOSE_COMPATIBILITY),
+	// make `--remove-orphans` a hard error (COMPOSE_IGNORE_ORPHANS), or force a foreign build platform
+	// (DOCKER_DEFAULT_PLATFORM). COMPOSE_FILE / COMPOSE_PROJECT_NAME need no pin: Mooring always passes
+	// -f and -p, which take precedence.
+	env = append(env,
+		"COMPOSE_PROFILES=",
+		"COMPOSE_COMPATIBILITY=false",
+		"COMPOSE_IGNORE_ORPHANS=false",
+		"DOCKER_DEFAULT_PLATFORM=",
+	)
 	return env
 }

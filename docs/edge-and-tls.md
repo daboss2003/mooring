@@ -54,7 +54,7 @@ This is the path you get by doing nothing. Mooring **owns the edge**:
 - It supervises a child Caddy that binds the public ports `:80`/`:443`.
 - The child runs ACME/Let's Encrypt and terminates TLS.
 - The child reverse-proxies the admin vhost to `127.0.0.1:9000` (behind an injected IP-allowlist
-  matcher) and each app vhost to its allowlisted internal upstream.
+  matcher) and each app vhost to the discovered addresses of that app's running containers.
 - The admin UI **still** binds loopback `127.0.0.1:9000`. Only the *child* binds public ports.
 
 Required config:
@@ -63,7 +63,7 @@ Required config:
 |---|---|---|
 | `edge.acme_email` | Contact for the ACME account | **Fail-closed.** Onboarding refuses to mark setup "complete" and prints the exact CLI line to set it. |
 | `edge.acme_ca` | The single, pinned ACME issuer | No fallback issuer is ever used (see [ACME](#automatic-https--acme)). |
-| `edge.apply_probe_window` | Health-probe window after an apply | Defaults to `20s`. |
+| `edge.apply_probe_window` | How long a deploy waits for the edge to serve its routes before failing the deploy | Defaults to `20s`. |
 
 ### `external` (narrow advanced escape hatch)
 
@@ -207,33 +207,48 @@ incremental patches — a full re-render is far easier to keep bug-free.
 
 ### The structural backstops that keep the edge out of the control plane
 
-These are not "nice to have." They are the runtime controls that actually stop a misconfigured or
-compromised edge from reaching your secrets. Config validation is *necessary but not sufficient*
-(a linter cannot see the `127.0.0.1:9000` a DNS name becomes at dial time); these are what make it
-safe.
-
-- **Custom pinned dialer.** The edge dials every upstream through a dialer that **re-resolves and
-  refuses, on every connection**, loopback (`127.0.0.0/8`, `::1`), link-local/metadata
-  (`169.254.0.0/16`), and ports `9000`/`2019`/`2375`. The check is enforced on the **resolved
-  target**, not the literal config string — so a DNS name (or a DNS-rebind) that points at a
-  control-plane port is refused **at dial time**, not just at config time.
-- **`upstream` is an allowlist** of discovered app container endpoints. The only loopback target the
-  edge may proxy to is the admin vhost → `127.0.0.1:9000` route, which is identity-pinned and
-  **never operator- or app-editable**.
-- **Pinned dialer — the live backstop.** The pinned dialer above (re-resolve + refuse on every
-  connection) is the control that actually stops the edge reaching `9000`/`2019`/`2375` or cloud
-  metadata, even past a missed lint / edge RCE / SSRF. A **systemd cgroup egress filter**
-  (`IPAddressDeny`) is a deeper, defense-in-depth backstop, but it ships **opt-in / off by default**
-  (a strict deny breaks ACME — Let's Encrypt has no fixed CIDR — and proxying to app containers);
-  enable + tune it per the unit's egress block when you can pin your CA/app egress.
+- **Container addresses only.** The edge dials only IP addresses discovered from the read-only
+  container list — never a hostname or a compose service name — so nothing is resolved at dial time.
+  Every address is validated when the config is rendered: loopback, link-local and unspecified
+  addresses and the ports `9000`/`2019`/`2375` are refused. A route whose stored upstream is unsafe
+  fails the render, and the running config is kept.
+- **The admin route is the only loopback target** — the admin vhost → `127.0.0.1:9000`, identity-pinned
+  and **never operator- or app-editable**.
 - **Caddy admin on a unix socket** (preferred) so there is no TCP `:2019` to proxy to at all, with
   `enforce_origin:true` and origins pinned to loopback.
 - **Config is marshalled from typed structs.** Hostname/path/upstream are charset-validated first.
-- **Pooled upstreams (auto-scaling).** An app vhost's upstream may be a *pool* of discovered replica
-  endpoints. **Every pool member passes the same allowlist + pinned dialer + egress firewall** — a
-  scaled-up replica that mis-resolves to a control-plane port is refused at dial. Pool membership is
-  Mooring-managed state, recomputed from read-only container discovery and re-rendered as the whole
-  document.
+- **Optional egress filter.** A systemd cgroup egress filter (`IPAddressDeny`) ships in the unit
+  **commented out** (a strict deny breaks ACME — Let's Encrypt has no fixed CIDR — and proxying to app
+  containers); enable and tune it per the unit's egress block when you can pin your CA/app egress.
+
+### Upstream addresses and unavailable routes
+
+A route names a service and a port (`web:3000`). The Caddy that serves the edge runs on the host,
+where compose service names don't resolve, so Mooring resolves each route to addresses itself, on
+every reconcile (after deploys, scaling, restarts, and every 15 seconds):
+
+- **Discovery.** Mooring lists the running containers of the route's app and service over the read
+  plane and dials each one's address on the app's `<app>_default` network. One-off `compose run`
+  containers are never dialed. A service with several copies gets a pool (least connections, passive
+  health checks).
+- **New copies take traffic once ready.** When at least one copy is ready — healthy, or running
+  without a healthcheck — copies still `starting`, `unhealthy`, or not yet observed are left out of
+  the pool. If no copy is ready yet, every running copy is dialed.
+- **No running container → 503.** The route keeps its hostname and certificate but answers
+  `503 Service Unavailable` with `Retry-After: 5`. The body is fixed and names nothing internal.
+- **Discovery unavailable → last-known addresses for up to 5 minutes.** If the container list can't be
+  read (the socket-proxy is down), each route keeps dialing the addresses last confirmed; after 5
+  minutes it answers 503 instead, since a recreated container gets a new address.
+- **https upstreams** are dialed by address too, with the certificate verified against the service
+  name (TLS `server_name`), exactly as a name dial would.
+- **Removing a copy** (per-copy stop) takes it out of the pool before it is removed. A scale-down, a
+  self-heal restart, a lifecycle action or a certificate renewal re-points the edge right after it acts.
+- **Caddy restarts.** If the Caddy child restarts, Mooring re-applies the full config as soon as its
+  admin API answers.
+- **Visibility.** When a route stops being served normally (last-known addresses, or 503), the change
+  is logged to the Activity tab with the reason and the addresses dialed. A route that answers 503 for
+  more than 60 seconds raises a warning alert (not while its app is deploying); it resolves when the
+  route is served again.
 
 ### Example managed route
 
@@ -247,7 +262,7 @@ what Mooring renders on your behalf:
   "match": [{ "host": ["dashboard.example.com"] }],
   "handle": [{
     "handler": "reverse_proxy",
-    "upstreams": [{ "dial": "10.89.0.7:8080" }],   // discovered, allowlisted, dialed via the pinned dialer
+    "upstreams": [{ "dial": "10.89.0.7:8080" }],   // a discovered container address, validated at render
     "headers": {
       "request": {
         "set": { "X-Forwarded-For": ["{http.request.remote.host}"] }  // OVERWRITE, never append
@@ -287,30 +302,18 @@ for SBD-8.
 
 ### Apply pipeline (fail-closed)
 
-Every change to the route set re-renders the whole document and applies it atomically:
+Every change to the route set re-renders the whole document and applies it:
 
-1. **Invariant linter** on the rendered composite JSON. The linter REJECTs (control-plane tier,
-   never downgradable): any `on_demand.ask` that is not exactly the typed loopback validator (the
-   renderer **force-rewrites** it); a missing or non-`127.0.0.1:9000` admin route; the admin
-   allowlist matcher absent, widened, or **not structurally first**; any upstream resolving (at
-   **lint and dial**) to loopback/metadata/`9000`/`2019`/`2375`; a listener on
-   `80`/`443`/`9000`/`2019`/`2375`; any `header_up` on `X-Forwarded-For` / `X-Real-IP` / `Forwarded`;
-   any `events.exec` / process-spawn; file-read/template-execution directives (`templates`,
-   `respond {file.*}`, `php_fastcgi`); `file_server`/`root` under any sensitive dir.
-2. **Atomic apply + auto-rollback.** Snapshot the current live config (held by Mooring, not read
-   back from a possibly-broken instance) → `/load` the composite (atomic — a bad load leaves the old
-   one running) → **health probe within `apply_probe_window`**. The probe includes:
-   - a **negative from-internet test** — the admin vhost must return **403/404 from an
-     un-allowlisted vantage**, proving the allowlist *blocks*, not just admits;
-   - an assertion that **no live route's resolved upstream targets a control-plane port**;
-   - an assertion of **no established edge → control-plane / metadata connection**.
-
-   Any failure → **auto-rollback** + `level=security` audit. The operator cannot leave the edge down
-   by walking away.
-3. **Version history + recovery.** `edge_config_versions` stores the route set. Restore
-   **re-derives** (the protected base from code, routes from the stored route set) — it **never loads
-   a stored `composite_json`**. Version rows are HMAC-protected so a DB tamper cannot become a loaded
-   config.
+1. **Validate and render.** Every enabled route is validated (hostname, path, upstream selector, and
+   every discovered address — see [the backstops](#the-structural-backstops-that-keep-the-edge-out-of-the-control-plane)).
+   An invalid route fails the render and nothing is applied.
+2. **Atomic load.** The document is POSTed to the admin API's `/load`. Caddy swaps it in atomically;
+   a rejected document leaves the running config in place. A render identical to the last applied one
+   is not re-sent.
+3. **Deploy verification.** A deploy then checks, for up to `edge.apply_probe_window` (default
+   `20s`), that every route of the app is served and dials only running containers of that app's
+   route service that the `docker` CLI also lists. One line per route is written to the deploy log;
+   any failure fails the deploy (the new containers stay up; the app is marked `update_blocked`).
 
 > **Pool membership changes at deploy time.** Because an app's pool membership and hostname candidacy
 > can change when you deploy, the **full conflict check (including wildcard overlap) is re-run on
@@ -330,8 +333,8 @@ test on a fresh install.** These are **release-blocking** on the first edge-owni
 | **SBD-1** | Admin UI never reachable through the public edge by accident | Admin UI binds `127.0.0.1:9000` only. The edge serves **no admin vhost at all** unless you explicitly set `admin.hostname` (default: reach the UI via SSH tunnel / port-forward). If set, the admin vhost renders with the **IP allowlist as the first matcher, injected from typed config** (not operator text) → upstream `127.0.0.1:9000`. The allowlist cannot be omitted. |
 | **SBD-2** | Caddy admin API never public | `admin.listen = unix//run/mooring/caddy-admin.sock` (preferred) or `127.0.0.1:2019`, never routable; `enforce_origin:true`, origins loopback-only. No public vhost may proxy to `:2019`. |
 | **SBD-3** | On-demand TLS off; ACME bounded | Absent from the base; the renderer **force-rewrites any `ask` endpoint** to a fixed loopback validator that answers "yes" only for known route/allowlist hostnames, plus a rate limit. ACME issues only for configured app vhosts. |
-| **SBD-4** | Only configured app vhosts served; control-plane ports unreachable as upstreams | Exactly the route-derived vhost set (+ optional admin vhost); **no catch-all/wildcard proxy**; no upstream targets `9000`/`2019`/`2375` or any internal port (struct-validated **and** re-checked at render **and** refused at dial); default unmatched-Host = `404`/close, never proxy. |
-| **SBD-5** | Network isolation of edge from control plane | The structural backstop — pinned dialer + upstream allowlist + egress firewall + unix-socket admin (see [the backstops](#the-structural-backstops-that-keep-the-edge-out-of-the-control-plane)). |
+| **SBD-4** | Only configured app vhosts served; control-plane ports unreachable as upstreams | Exactly the route-derived vhost set (+ optional admin vhost); **no catch-all/wildcard proxy**; no upstream targets `9000`/`2019`/`2375` or a loopback/link-local address (validated when stored **and** re-checked at render; only discovered container addresses are dialed, never names); default unmatched-Host = `404`/close, never proxy. |
+| **SBD-5** | Network isolation of edge from control plane | The structural backstop — container-address-only dials validated at render + unix-socket admin + the optional egress filter (see [the backstops](#the-structural-backstops-that-keep-the-edge-out-of-the-control-plane)). |
 | **SBD-6** | Egress stays controlled by always-on | Outbound calls are **host-pinned in-process** (ops prober, edge upstreams, alert notifiers reject loopback/link-local/metadata). The systemd cgroup egress filter is an **opt-in** deeper backstop (off by default — a strict deny blocks ACME). |
 | **SBD-7** | Config rendering safety | Proxy config is marshalled from typed structs (never string concat), generated from the typed routes in `mooring.yaml` — there is no path by which an operator authors Caddy config. |
 | **SBD-8** | The edge can never go down irrecoverably | Every apply is validate → stage → load with a retained last-known-good and an armed health-probe watchdog; on failure, **auto-revert**. The typed base config is always loadable as the recovery floor; **SSH is the ultimate recovery floor.** |
@@ -433,11 +436,8 @@ The edge is designed so it can **never become irrecoverable**:
 
 - **Atomic load.** A bad `/load` leaves the previous config running — Caddy never serves a partial
   config.
-- **Auto-rollback.** A failed health probe within `apply_probe_window` reverts to the retained
-  last-known-good automatically. *You cannot leave the edge down by walking away.*
-- **Re-derived restore.** Restoring a version re-derives the protected base from code and the routes
-  from the stored route set. It never loads a stored composite. HMAC-protected version rows mean a DB
-  tamper cannot become a loaded config.
+- **Re-derived config.** The edge config is never stored as a document: every apply re-derives the
+  protected base from code and the routes from the stored route set.
 - **The protected base is always loadable.** Because it is rendered from typed structs, the
   minimum-safe base (admin allowlist + ACME, proxying nothing) is always available as the recovery
   floor — and **SSH is the ultimate recovery floor**, even if the UI itself is unreachable.
@@ -494,7 +494,7 @@ edge:
     api_token: "<dns-provider-token>"
   # base_domains: [...]         # optional: additional NAMED namespaces (prod + staging on one box)
   # cas: [...]                  # optional: extra named issuers (private/internal CAs) to opt into
-  apply_probe_window: 20s       # health-probe window after each apply (default 20s)
+  apply_probe_window: 20s       # how long a deploy waits for the edge to serve its routes (default 20s)
   l4_enabled: false             # managed L4 (TCP/UDP) load balancer via child nginx; needs nginx on host; default off
 
 admin:
@@ -513,7 +513,7 @@ trusted_proxies:
 | `edge.mode` | `managed` | Explicit; no auto-detect. `external` is config-file-only and not UI-reachable. |
 | `edge.acme_email` | *(empty)* | **Required** in `managed` mode; onboarding refuses to complete without it. |
 | `edge.acme_ca` | *(your CA)* | Single pinned issuer. **No fallback** — a fallback would diverge cert paths and break shared-cert readers. |
-| `edge.apply_probe_window` | `20s` | Window for the post-apply health probe (incl. the negative from-internet test) before auto-rollback. |
+| `edge.apply_probe_window` | `20s` | How long a deploy waits for the edge to serve every route of the app (dialing only that app's containers) before it fails the deploy. |
 | `edge.base_domain` | *(unset)* | Namespace apex for the `subdomain:` shorthand; point `*.<base_domain>` DNS at the box. |
 | `edge.dns01` | *(unset)* | `{provider, api_token}` → one **wildcard** cert for the namespace via DNS-01; the Caddy provider module is auto-installed. |
 | `edge.base_domains` | *(none)* | Additional **named** namespaces (e.g. prod + staging on one box); an app opts into one by name. |

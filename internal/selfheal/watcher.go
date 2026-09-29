@@ -31,10 +31,13 @@ type Config struct {
 	PolicyFor    func(app string) Policy // per-app override (nil → always Policy); see spec.self_healing
 	Log          *slog.Logger
 	Interval     time.Duration
-	FloorBytes   uint64          // memory-headroom floor (0 = gate disabled, e.g. no host metrics)
-	WritePlaneOK bool            // the §0 write-plane gate result
-	Protected    map[string]bool // project names that are the edge/control plane — never targets
-	Now          func() int64    // injectable clock; defaults to time.Now().Unix
+	FloorBytes   uint64 // memory-headroom floor (0 = gate disabled, e.g. no host metrics)
+	WritePlaneOK bool   // the §0 write-plane gate result
+	// Paused, when set and true, defers every remediation (e.g. the docker read and write planes reach
+	// different daemons, so an action would hit containers the read plane doesn't see). nil = never.
+	Paused    func() bool
+	Protected map[string]bool // project names that are the edge/control plane — never targets
+	Now       func() int64    // injectable clock; defaults to time.Now().Unix
 }
 
 // Watcher is the bounded self-healing supervisor loop (plan §8.5).
@@ -189,7 +192,7 @@ func (w *Watcher) stepService(ctx context.Context, app monitor.App, service stri
 func (w *Watcher) remediate(ctx context.Context, app monitor.App, service string, key Key, d Decision, pol Policy, now int64, headroom, floor uint64) {
 	gi := GateInput{
 		Rung:                 d.Rung,
-		WritePlaneOK:         w.cfg.WritePlaneOK,
+		WritePlaneOK:         w.cfg.WritePlaneOK && (w.cfg.Paused == nil || !w.cfg.Paused()),
 		RedeployEnabled:      pol.RedeployEnabled,
 		AcquireSemaphore:     w.cfg.Sem.TryAcquire,
 		HeadroomBytes:        headroom,

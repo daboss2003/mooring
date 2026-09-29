@@ -6,6 +6,34 @@ import (
 	"testing"
 )
 
+// Info decodes the daemon identity fields (ID, Name, DockerRootDir) next to the
+// counters from a real-shaped /info body; fields Mooring doesn't use are ignored.
+func TestInfoDecode(t *testing.T) {
+	const body = `{
+		"ID": "4f2b8d0e-3c1a-4e8b-9d6f-0a7c5e2b1d93",
+		"Containers": 14, "ContainersRunning": 11, "ContainersPaused": 0, "ContainersStopped": 3,
+		"Images": 22, "Driver": "overlay2", "DriverStatus": [["Backing Filesystem", "extfs"]],
+		"NCPU": 4, "MemTotal": 8323051520,
+		"DockerRootDir": "/var/snap/docker/common/var-lib-docker",
+		"Name": "vps-1", "ServerVersion": "27.3.1",
+		"Swarm": {"LocalNodeState": "inactive"},
+		"SecurityOptions": ["name=apparmor", "name=seccomp,profile=builtin"]
+	}`
+	var got Info
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := Info{
+		Containers: 14, ContainersRunning: 11, ContainersStopped: 3, Images: 22,
+		NCPU: 4, MemTotal: 8323051520, ServerVersion: "27.3.1",
+		ID: "4f2b8d0e-3c1a-4e8b-9d6f-0a7c5e2b1d93", Name: "vps-1",
+		DockerRootDir: "/var/snap/docker/common/var-lib-docker",
+	}
+	if got != want {
+		t.Errorf("Info decode:\n got %+v\nwant %+v", got, want)
+	}
+}
+
 // IPs() unmarshals /containers/json's NetworkSettings, returns non-empty IPs sorted
 // by network name (deterministic), and copes with empty IPs / no networks.
 func TestContainerIPs(t *testing.T) {

@@ -185,6 +185,40 @@ func (s *Store) EnqueueInfra(ctx context.Context, o alert.Outbox) error {
 
 // ChannelsForRule returns the channels a rule routes to (its channel_id, or all
 // enabled channels when channel_id is NULL/0).
+// OpenInfraAlerts returns, for every dedupe key of the given infra alert kind whose most recent outbox
+// row is a "firing" transition, that row's target. A restarted process uses it to re-adopt the alerts it
+// raised before the restart, so their "resolved" is still sent. (Rows past the outbox retention are
+// gone, and with them any memory of the alert.)
+func (s *Store) OpenInfraAlerts(ctx context.Context, kind string) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT dedupe_key, target, transition FROM alert_outbox WHERE rule_id=0 AND kind=? AND dedupe_key<>'' ORDER BY id`, kind)
+	if err != nil {
+		return nil, err
+	}
+	type last struct{ target, transition string }
+	latest := map[string]last{}
+	for rows.Next() {
+		var key, target, transition string
+		if err := rows.Scan(&key, &target, &transition); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		latest[key] = last{target, transition} // ordered by id: the last row per key wins
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	out := map[string]string{}
+	for key, l := range latest {
+		if l.transition == "firing" {
+			out[key] = l.target
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) ChannelsForRule(channelID int64) ([]alert.Channel, error) {
 	if channelID != 0 {
 		c, err := s.channel(channelID)
