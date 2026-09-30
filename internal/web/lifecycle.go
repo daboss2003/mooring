@@ -489,10 +489,19 @@ func lifecycleStep(def *definition.Definition, svc string, gs config.StartGateSe
 			hc = sd.Healthcheck
 			st.Notify = sd.OnUnhealthy() == definition.OnUnhealthyNotify
 			st.Restarts = restartPolicy(sd.Restart)
+			st.StopGrace = stopGrace(sd.StopGracePeriod)
 		}
 	}
 	st.Deadline = settleDeadline(hc, gs.MaxSettle, gs.ServiceSettle)
 	return st
+}
+
+// stopGrace parses a service's stop_grace_period (0 when unset or invalid).
+func stopGrace(p string) time.Duration {
+	if d, err := time.ParseDuration(p); err == nil && d > 0 {
+		return d
+	}
+	return 0
 }
 
 // lifecycleServices lists the services an app-level action covers: the definition's non-scheduled

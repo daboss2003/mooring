@@ -165,12 +165,13 @@ func deployRolloutSteps(def *definition.Definition, services []string, unchanged
 		}
 		job.Service = name
 		steps = append(steps, rolloutStep{
-			Service:  name,
-			Job:      job,
-			Reap:     true,
-			Deadline: settleDeadline(svc.Healthcheck, gs.MaxSettle, gs.ServiceSettle),
-			Notify:   svc.OnUnhealthy() == definition.OnUnhealthyNotify,
-			Restarts: restartPolicy(svc.Restart),
+			Service:   name,
+			Job:       job,
+			Reap:      true,
+			Deadline:  settleDeadline(svc.Healthcheck, gs.MaxSettle, gs.ServiceSettle),
+			Notify:    svc.OnUnhealthy() == definition.OnUnhealthyNotify,
+			Restarts:  restartPolicy(svc.Restart),
+			StopGrace: stopGrace(svc.StopGracePeriod),
 		})
 	}
 	return steps

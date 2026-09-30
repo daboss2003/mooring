@@ -546,7 +546,7 @@ func TestRolloutBudgetEndsPacing(t *testing.T) {
 	}
 	// The service being waited on when the budget ran out isn't blamed; the rollout reports once that
 	// what followed went unchecked.
-	if len(res.problems) != 1 || res.problems[0].Service != "(rollout)" || !strings.Contains(res.problems[0].Reason, "without checking their health") {
+	if len(res.problems) != 1 || res.problems[0].Service != "(rollout)" || !strings.Contains(res.problems[0].Reason, "not every service was checked") {
 		t.Fatalf("problems = %v", res.problems)
 	}
 	if n := res.count("  pacing budget (300ms) used up — starting the remaining services without waiting"); n != 1 {

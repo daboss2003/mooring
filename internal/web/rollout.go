@@ -41,8 +41,10 @@ type rolloutStep struct {
 	Notify bool
 	// Restarts: the service has a restart policy, so a copy that exited may still come back.
 	Restarts bool
-	// Timeout bounds the step's docker call (0: 3m for a copy, 10m for a compose call).
-	Timeout time.Duration
+	// Timeout bounds the step's docker call (0: 3m for a copy, 10m for a compose call); the service's
+	// StopGrace (stop_grace_period) is added, as stopping a copy may take all of it.
+	Timeout   time.Duration
+	StopGrace time.Duration
 }
 
 // rolloutProblem is a service the rollout couldn't bring up cleanly; the rollout went on regardless.
@@ -140,7 +142,7 @@ func (s *Server) runRollout(ctx context.Context, steps []rolloutStep, o rolloutO
 		// Intentional: reported as a problem, so the deploy doesn't claim a clean result (or clear an
 		// open alert) for services it started without checking.
 		r.problems = append(r.problems, rolloutProblem{Service: "(rollout)",
-			Reason: fmt.Sprintf("pacing budget (%s) used up: the services after that were started without checking their health", rolloutRound(r.set.RolloutBudget))})
+			Reason: fmt.Sprintf("pacing budget (%s) used up: not every service was checked for health", rolloutRound(r.set.RolloutBudget))})
 	}
 	return r.problems, nil
 }
@@ -182,14 +184,7 @@ func (r *rolloutRun) run(ctx context.Context, u rolloutUnit) (bool, error) {
 		return false, err
 	}
 	start := time.Now()
-	timeout := u.st.Timeout
-	if timeout <= 0 {
-		timeout = 10 * time.Minute
-		if u.copy != "" {
-			timeout = 3 * time.Minute
-		}
-	}
-	cctx, ccancel := context.WithTimeout(ctx, timeout)
+	cctx, ccancel := context.WithTimeout(ctx, rolloutCallTimeout(u.st, u.copy != ""))
 	callErr := r.call(cctx, u)
 	ccancel()
 	end := time.Now()
@@ -550,6 +545,22 @@ func (r *rolloutRun) renew() {
 	if r.o.Renew != nil {
 		r.o.Renew()
 	}
+}
+
+// rolloutCallTimeout bounds one docker call of st: its Timeout (default 3m for a copy, 10m for a compose
+// call) plus the service's stop grace, which stopping a copy may take in full.
+func rolloutCallTimeout(st rolloutStep, copy bool) time.Duration {
+	d := st.Timeout
+	if d <= 0 {
+		d = 10 * time.Minute
+		if copy {
+			d = 3 * time.Minute
+		}
+	}
+	if st.StopGrace > 0 {
+		d += st.StopGrace
+	}
+	return d
 }
 
 // rolloutJobLine is a step's compose call, for its header line.

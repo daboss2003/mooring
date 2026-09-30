@@ -54,3 +54,26 @@ func TestRestartPolicy(t *testing.T) {
 		}
 	}
 }
+
+func TestRolloutCallTimeout(t *testing.T) {
+	if got := rolloutCallTimeout(rolloutStep{}, true); got != 3*time.Minute {
+		t.Fatalf("copy default: %s", got)
+	}
+	if got := rolloutCallTimeout(rolloutStep{}, false); got != 10*time.Minute {
+		t.Fatalf("compose default: %s", got)
+	}
+	if got := rolloutCallTimeout(rolloutStep{StopGrace: 5 * time.Minute}, true); got != 8*time.Minute {
+		t.Fatalf("a copy's stop grace is added: %s", got)
+	}
+	if got := rolloutCallTimeout(rolloutStep{Timeout: 30 * time.Minute, StopGrace: time.Minute}, false); got != 31*time.Minute {
+		t.Fatalf("explicit timeout plus grace: %s", got)
+	}
+}
+
+func TestStopGrace(t *testing.T) {
+	for in, want := range map[string]time.Duration{"": 0, "90s": 90 * time.Second, "1m30s": 90 * time.Second, "bogus": 0, "-5s": 0} {
+		if got := stopGrace(in); got != want {
+			t.Errorf("stopGrace(%q) = %s, want %s", in, got, want)
+		}
+	}
+}
