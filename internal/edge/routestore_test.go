@@ -82,3 +82,34 @@ func TestReplaceProject(t *testing.T) {
 		t.Fatalf("owner's route must survive a rejected collision, got %d routes", len(routes))
 	}
 }
+
+// Apps may share a hostname on different path prefixes, but an equivalent spelling of a prefix
+// another app holds ("" for "/", "/api/" for "/api") is the same claim and is refused, inside
+// the write transaction.
+func TestReplaceProjectRefusesEquivalentPrefixOfAnotherApp(t *testing.T) {
+	s := newRouteStore(t)
+	ctx := context.Background()
+	route := func(prefix string) Route {
+		return Route{Hostname: "a.example.com", PathPrefix: prefix, Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}
+	}
+	if err := s.ReplaceProject(ctx, "alpha", []Route{route("/"), route("/api")}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"", "/", "/api/", "/api"} {
+		if err := s.ReplaceProject(ctx, "beta", []Route{route(p)}); err == nil {
+			t.Errorf("beta claiming %q on alpha's hostname was accepted", p)
+		}
+		if owner, taken, err := s.HostnameOwner(ctx, "A.example.com", p, "beta"); err != nil || !taken || owner != "alpha" {
+			t.Errorf("HostnameOwner(%q) = %q, %v, %v; want alpha", p, owner, taken, err)
+		}
+		if err := s.Save(ctx, Route{AppID: "beta", Hostname: "a.example.com", PathPrefix: p, Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}); err == nil {
+			t.Errorf("Save: beta claiming %q on alpha's hostname was accepted", p)
+		}
+	}
+	if err := s.ReplaceProject(ctx, "beta", []Route{route("/blog")}); err != nil {
+		t.Errorf("a distinct prefix on a shared hostname must still be allowed: %v", err)
+	}
+	if err := s.ReplaceProject(ctx, "alpha", []Route{route(""), route("/api/")}); err != nil {
+		t.Errorf("an app re-spelling its own prefixes must be allowed: %v", err)
+	}
+}

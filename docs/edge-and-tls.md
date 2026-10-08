@@ -224,6 +224,10 @@ spec:
 itself and everything below it: `/v1` matches `/v1` and `/v1/users`, not `/v1beta`. `/` (or an empty
 prefix) matches every path.
 
+Routes on one hostname may belong to different apps, each on its own prefix. A prefix another app
+already uses is refused, including an equivalent spelling of it: `""` and `/` are the same prefix, and so
+are `/api` and `/api/`.
+
 **Reconciliation is declarative and whole-document.** Mooring holds the desired set in SQLite,
 renders the **entire** proxy JSON, and POSTs the whole document to the admin API. It never sends
 incremental patches — a full re-render is far easier to keep bug-free.

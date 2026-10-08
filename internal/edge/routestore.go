@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -42,6 +43,14 @@ func (s *RouteStore) ReplaceProject(ctx context.Context, project string, routes 
 		return err
 	}
 	defer tx.Rollback()
+	// Checked inside the transaction so a concurrent claim can't slip between check and insert.
+	for _, r := range routes {
+		if owner, taken, err := pathOwner(ctx, tx, r.Hostname, r.PathPrefix, project); err != nil {
+			return err
+		} else if taken {
+			return fmt.Errorf("hostname %q path %q is already in use by app %q", r.Hostname, displayPrefix(r.PathPrefix), owner)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM app_routes WHERE app_id = ?`, project); err != nil {
 		return err
 	}
@@ -69,6 +78,11 @@ func (s *RouteStore) Save(ctx context.Context, r Route) error {
 	if err := ValidateRoute(r); err != nil {
 		return err
 	}
+	if owner, taken, err := pathOwner(ctx, s.db, r.Hostname, r.PathPrefix, r.AppID); err != nil {
+		return err
+	} else if taken {
+		return fmt.Errorf("hostname %q path %q is already in use by app %q", r.Hostname, displayPrefix(r.PathPrefix), owner)
+	}
 	if r.id == 0 {
 		_, err := s.db.ExecContext(ctx,
 			`INSERT INTO app_routes(app_id, hostname, upstream, upstream_scheme, path_prefix, redirect_http, hsts, security_headers, enabled, tls_ca, created_at)
@@ -84,19 +98,24 @@ func (s *RouteStore) Save(ctx context.Context, r Route) error {
 	return err
 }
 
-// HostnameOwner reports which OTHER app already claims (hostname, pathPrefix), so a caller
-// can reject a collision with a clear "already taken" message before the
-// UNIQUE(hostname, path_prefix) constraint would trip with a cryptic DB error. It matches the
-// constraint EXACTLY — same hostname AND same path prefix — so two apps legitimately sharing
-// a hostname on different path prefixes are NOT falsely rejected. Matching is
-// case-insensitive on the hostname; exceptProject (the app being deployed) is excluded so a
-// redeploy never collides with itself. Returns ("", false, nil) when the pair is free.
+// HostnameOwner reports which OTHER app already claims hostname at an equivalent path prefix,
+// so a caller can reject a collision with a clear "already taken" message. Different apps may
+// share a hostname on different prefixes; equivalent spellings of one prefix ("" and "/",
+// "/api" and "/api/") are the same claim, since the edge matches them identically. Matching is
+// case-insensitive on the hostname; exceptProject (the app being deployed) is excluded.
 func (s *RouteStore) HostnameOwner(ctx context.Context, hostname, pathPrefix, exceptProject string) (string, bool, error) {
-	hostname = strings.ToLower(strings.TrimSpace(hostname))
+	return pathOwner(ctx, s.db, hostname, pathPrefix, exceptProject)
+}
+
+type queryRower interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func pathOwner(ctx context.Context, q queryRower, hostname, pathPrefix, exceptProject string) (string, bool, error) {
 	var owner string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT app_id FROM app_routes WHERE hostname = ? AND path_prefix = ? AND app_id <> ? LIMIT 1`,
-		hostname, pathPrefix, exceptProject).Scan(&owner)
+	err := q.QueryRowContext(ctx,
+		`SELECT app_id FROM app_routes WHERE hostname = ? AND rtrim(path_prefix, '/') = ? AND app_id <> ? LIMIT 1`,
+		strings.ToLower(strings.TrimSpace(hostname)), strings.TrimRight(pathPrefix, "/"), exceptProject).Scan(&owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -104,6 +123,13 @@ func (s *RouteStore) HostnameOwner(ctx context.Context, hostname, pathPrefix, ex
 		return "", false, err
 	}
 	return owner, true, nil
+}
+
+func displayPrefix(p string) string {
+	if p == "" {
+		return "/"
+	}
+	return p
 }
 
 // List returns all routes (for rendering + the UI).
