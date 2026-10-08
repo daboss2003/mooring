@@ -315,3 +315,68 @@ func TestRenderCertOnlySubject(t *testing.T) {
 		t.Errorf("proxy host must appear in route + subjects + automate (>=3), got %d:\n%s", n, s)
 	}
 }
+
+// Routes sharing a hostname are tried longest path prefix first, so "/" stored first
+// can't swallow "/socket.io" (Caddy stops at the first matching terminal route).
+func TestRenderPathRoutesMostSpecificFirst(t *testing.T) {
+	out, err := Render(baseCfg(), []Route{
+		{Hostname: "api.example.com", PathPrefix: "/", Upstream: "api:3000", Pool: []string{"172.18.0.5:3000"}, UpstreamScheme: "http", Enabled: true},
+		{Hostname: "other.example.com", Upstream: "web:80", Pool: []string{"172.18.0.9:80"}, UpstreamScheme: "http", Enabled: true},
+		{Hostname: "api.example.com", PathPrefix: "/socket.io/", Upstream: "realtime:3001", Pool: []string{"172.18.0.6:3001"}, UpstreamScheme: "http", Enabled: true},
+		{Hostname: "API.example.com", PathPrefix: "/v1", Upstream: "api:3000", Pool: []string{"172.18.0.5:3000"}, UpstreamScheme: "http", Enabled: true},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Match []struct {
+							Host []string `json:"host"`
+							Path []string `json:"path"`
+						} `json:"match"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	var paths [][]string
+	for _, srv := range doc.Apps.HTTP.Servers {
+		for _, r := range srv.Routes {
+			if len(r.Match) == 1 && len(r.Match[0].Host) == 1 && r.Match[0].Host[0] == "api.example.com" {
+				paths = append(paths, r.Match[0].Path)
+			}
+		}
+	}
+	want := [][]string{{"/socket.io", "/socket.io/*"}, {"/v1", "/v1/*"}, {"/*"}}
+	if len(paths) != len(want) {
+		t.Fatalf("api.example.com routes = %v, want %v", paths, want)
+	}
+	for i := range want {
+		if strings.Join(paths[i], ",") != strings.Join(want[i], ",") {
+			t.Fatalf("api.example.com route order = %v, want %v", paths, want)
+		}
+	}
+}
+
+// Reordering by specificity must not change which CA issues a host's certificate: it is
+// still the host's first enabled route in stored order.
+func TestRenderPathOrderKeepsHostCA(t *testing.T) {
+	base := baseCfg()
+	base.CAs = []CA{{Name: "internal", DirectoryURL: "https://ca.lan/acme/acme/directory", Email: "pki@lan"}}
+	out, err := Render(base, []Route{
+		{Hostname: "api.lan", PathPrefix: "/", Upstream: "api:3000", Pool: []string{"172.18.0.5:3000"}, UpstreamScheme: "http", Enabled: true, CA: "internal"},
+		{Hostname: "api.lan", PathPrefix: "/ws", Upstream: "rt:3001", Pool: []string{"172.18.0.6:3001"}, UpstreamScheme: "http", Enabled: true},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "https://ca.lan/acme/acme/directory") {
+		t.Errorf("api.lan lost its private CA after route reordering:\n%s", out)
+	}
+}

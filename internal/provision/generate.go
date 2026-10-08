@@ -2,6 +2,7 @@ package provision
 
 import (
 	"fmt"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -138,11 +139,18 @@ func Generate(spec Spec) ([]byte, error) {
 		for _, e := range svc.Env {
 			if e.Secret != "" {
 				// Secret reference: ${NAME} resolved from the 0600 --env-file at deploy
-				// (the encrypted store), never baked into the YAML.
-				cs.Environment = append(cs.Environment, e.Key+"=${"+e.Secret+"}")
+				// (the encrypted store), never baked into the YAML. An optional one is ${NAME:-}:
+				// empty when unset, without compose's "variable is not set" warning.
+				ref := "${" + e.Secret + "}"
+				if e.Optional {
+					ref = "${" + e.Secret + ":-}"
+				}
+				cs.Environment = append(cs.Environment, e.Key+"="+ref)
 			} else {
-				// Non-secret literal — safe inline (validated: no ${...}, no control chars).
-				cs.Environment = append(cs.Environment, e.Key+"="+e.Value)
+				// Non-secret literal (validated: no ${...}, no control chars). Compose interpolates
+				// the whole file, so every `$` is escaped as `$$`: the container gets the value
+				// exactly as written (`a$b` stays `a$b`, `x$$y` stays `x$$y`).
+				cs.Environment = append(cs.Environment, e.Key+"="+strings.ReplaceAll(e.Value, "$", "$$"))
 			}
 		}
 		if len(svc.Command) > 0 {

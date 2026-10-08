@@ -360,38 +360,76 @@ func (s Service) OnUnhealthy() string {
 }
 
 // EnvValue is a per-service env var: a literal value XOR a `{secret: NAME}` reference.
-// A scalar is a literal; a mapping must be exactly `{ secret: NAME }`.
+// A scalar is a literal; a mapping is `{ secret: NAME }` or `{ secret: NAME, optional: true }`.
+// Optional lets a deploy go ahead when NAME has no stored value (the variable is then empty);
+// without it a missing value fails the deploy.
 type EnvValue struct {
-	Value  string
-	Secret string
+	Value    string
+	Secret   string
+	Optional bool
+}
+
+// envSecretRef is the canonical mapping form of a secret reference. `optional` is omitted when
+// false, so a plain reference renders `secret: NAME` exactly as before Optional existed.
+type envSecretRef struct {
+	Secret   string `yaml:"secret"`
+	Optional bool   `yaml:"optional,omitempty"`
 }
 
 // MarshalYAML renders the canonical form: a `{secret: NAME}` mapping for a reference,
 // else the scalar literal — so Canonical round-trips back through UnmarshalYAML.
 func (e EnvValue) MarshalYAML() (any, error) {
 	if e.Secret != "" {
-		return map[string]string{"secret": e.Secret}, nil
+		return envSecretRef{Secret: e.Secret, Optional: e.Optional}, nil
 	}
 	return e.Value, nil
 }
 
-// UnmarshalYAML accepts a scalar literal or a `{ secret: NAME }` mapping (only).
+// UnmarshalYAML accepts a scalar literal or a `{ secret: NAME[, optional: BOOL] }` mapping. A
+// custom unmarshaler doesn't inherit the decoder's KnownFields, so unknown keys are rejected here.
 func (e *EnvValue) UnmarshalYAML(n *yaml.Node) error {
+	const shape = "{ secret: NAME } or { secret: NAME, optional: true }"
 	switch n.Kind {
 	case yaml.ScalarNode:
 		e.Value = n.Value
 		return nil
 	case yaml.MappingNode:
-		if len(n.Content) != 2 || n.Content[0].Value != "secret" {
-			return fmt.Errorf("env value mapping must be exactly { secret: NAME }")
+		seen := map[string]bool{}
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k, v := n.Content[i], n.Content[i+1]
+			if seen[k.Value] {
+				return fmt.Errorf("line %d: env value key %q is repeated", k.Line, k.Value)
+			}
+			seen[k.Value] = true
+			switch k.Value {
+			case "secret":
+				if v.Kind != yaml.ScalarNode {
+					return fmt.Errorf("line %d: env value { secret: } must be a secret name", v.Line)
+				}
+				e.Secret = v.Value
+			case "optional":
+				if v.Kind != yaml.ScalarNode || v.ShortTag() != "!!bool" {
+					return fmt.Errorf("line %d: env value optional must be true or false", v.Line)
+				}
+				if err := v.Decode(&e.Optional); err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("line %d: env value mapping must be %s (unknown key %q)", k.Line, shape, k.Value)
+			}
 		}
-		e.Secret = n.Content[1].Value
+		if !seen["secret"] {
+			if seen["optional"] {
+				return fmt.Errorf("line %d: env value optional applies only to a secret reference: %s", n.Line, shape)
+			}
+			return fmt.Errorf("line %d: env value mapping must be %s", n.Line, shape)
+		}
 		if e.Secret == "" {
 			return fmt.Errorf("env value { secret: } requires a name")
 		}
 		return nil
 	default:
-		return fmt.Errorf("env value must be a literal or { secret: NAME }")
+		return fmt.Errorf("env value must be a literal or %s", shape)
 	}
 }
 
@@ -1246,6 +1284,9 @@ func validateServiceEnv(svc string, env map[string]EnvValue, declaredSecrets map
 			return fmt.Errorf("service %q env key %q is invalid", svc, k)
 		}
 		v := env[k]
+		if v.Optional && v.Secret == "" {
+			return fmt.Errorf("service %q env %q: optional applies only to a { secret: NAME } reference", svc, k)
+		}
 		if v.Secret != "" {
 			if !secretRe.MatchString(v.Secret) {
 				return fmt.Errorf("service %q env %q references an invalid secret name %q", svc, k, v.Secret)

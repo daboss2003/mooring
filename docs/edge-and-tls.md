@@ -201,6 +201,29 @@ app_routes(
 )
 ```
 
+### Path routes on one hostname
+
+Several routes can share a hostname with different `path_prefix` values. A request goes to the route
+with the longest matching prefix, whatever order the routes are declared in:
+
+```yaml
+spec:
+  edge:
+    routes:
+      - hostname: api.example.com
+        path_prefix: /
+        service: api
+        port: 3000
+      - hostname: api.example.com
+        path_prefix: /socket.io/
+        service: realtime
+        port: 3001
+```
+
+`/socket.io/?EIO=4` goes to `realtime`; every other path goes to `api`. A prefix matches the path
+itself and everything below it: `/v1` matches `/v1` and `/v1/users`, not `/v1beta`. `/` (or an empty
+prefix) matches every path.
+
 **Reconciliation is declarative and whole-document.** Mooring holds the desired set in SQLite,
 renders the **entire** proxy JSON, and POSTs the whole document to the admin API. It never sends
 incremental patches — a full re-render is far easier to keep bug-free.

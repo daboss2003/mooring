@@ -2,7 +2,7 @@
 
 The **definition file** (`mooring.yaml`) lives in your app's Git repo and is the **single source of truth** for the app. You describe your **stack** — one or more services, each either pulling an image or built from your repo, plus env, secrets (by reference), config files, cert bindings, edge routes, scaling, and GitOps behaviour — and **Mooring generates and owns the `docker-compose.yml` and the Dockerfile**. You never hand-write a compose file or a Dockerfile.
 
-**To create an app you connect its repo.** There is no dashboard "New app" form; "New app" is the **connect-a-repo** flow. If the repo has no `mooring.yaml` yet, Mooring scaffolds a starter from the detected stack so the first deploy works — commit a real one when you want full control.
+**To create an app you connect its repo.** There is no dashboard "New app" form; "New app" is the **connect-a-repo** flow. If the repo has no mooring file yet, Mooring scaffolds a starter from the detected stack so the first deploy works — commit a real one at the repository root when you want full control (see [where the file is read from](#where-the-file-is-read-from)).
 
 **The dashboard is read-only for the app's deploy-time shape.** A service's image/build, ports, volumes, depends_on, and the **edge & L4 routes** are read from this file — the dashboard *shows* them and you change them by editing `mooring.yaml` and deploying. The **operational** pieces stay editable in the dashboard (and config files, cert bindings, and scaling can also be declared here, where this file seeds them):
 
@@ -82,7 +82,18 @@ spec:
 
 ## How parsing works (and what is rejected)
 
-`mooring.yaml` is the expected name. The loader also accepts `.yml` and `.toml`, but **all three normalize through one JSON intermediate** into a single typed definition before anything is validated. The format you author in is an input encoding; the typed model is what every validator and generator sees.
+### Where the file is read from
+
+A deploy reads the mooring file from the **root of the repository** at the deployed commit: `mooring.yaml`, or the named variant the app was connected to (`mooring.<variant>.yaml`). `.yml` is accepted for both. Files in subfolders are never read.
+
+| Repository at the deployed commit | Result |
+|---|---|
+| The app's root-level mooring file is present | It is parsed and deployed. |
+| No root-level `mooring.yaml`, and a `mooring*.yaml` / `mooring*.yml` file in a subfolder (e.g. `deploy/mooring.yaml`) | The deploy fails with an error naming that file. Move it to the repository root. |
+| No mooring file anywhere | Mooring scaffolds a default app: one service, `app`, built from the stack detected at the root (`go.mod`, `package.json`, …). |
+| The app was connected to a variant and that file is missing | The deploy fails. |
+
+The file is parsed into one typed definition before anything is validated.
 
 Hard rejections at parse time (fail-closed, every one is a stop, not a warning):
 
@@ -155,7 +166,7 @@ compose:
 | `image` **XOR** `build` | pull a registry image, or have Mooring build it from your repo (below). Exactly one. |
 | `ports` | a list of `{ internal, publish, public, protocol, published }`. `internal` is the container port; omit `publish` for internal-only (the usual case — expose it with an `edge` route). `publish: true` maps it to the host loopback; add `public: true` for all interfaces (e.g. a non-HTTP TLS port like MQTT). `protocol` is `tcp` (default) or `udp` — declare two entries to publish both on one port (e.g. DNS on 53). `published` is the **host** port (defaults to `internal`); set it to map a privileged host port to an unprivileged container port — see below. Control-plane ports (9000/2019/2375) are rejected; host ports 80/443 belong to the edge and are rejected too. |
 | | **Binding privileged ports (<1024) without root:** Mooring runs containers as non-root, which can't bind ports like 53/853. Instead of running as root, let the container listen on a high port and map the privileged host port to it — Docker's (root) daemon does the privileged bind, your app stays non-root: `{ internal: 8853, published: 853, publish: true, public: true }` → clients reach `:853`, the resolver binds `8853`. |
-| `env` | a **map**: `KEY: value` (a non-secret literal, rendered inline) or `KEY: { secret: NAME }` (a reference to a declared secret, resolved from the encrypted store at deploy — the value never touches the YAML). A literal containing `${…}` is rejected (use a secret reference). |
+| `env` | a **map**: `KEY: value` (a non-secret literal, rendered inline) or `KEY: { secret: NAME }` (a reference to a declared secret, resolved from the encrypted store at deploy — the value never touches the YAML). Add `optional: true` to a reference to deploy without a stored value. A literal containing `${…}` is rejected (use a secret reference). See [`env` values](#env-values). |
 | `secret_files` | a list of declared secret names; each is written to a file and mounted at `/run/secrets/<name>` (the `*_FILE` pattern). |
 | `config_files` | app config files Mooring renders and bind-mounts read-only — see [`config_files`](#specconfig_files). |
 | `cert_bindings` | a managed cert synced into the service — see [`cert_bindings`](#speccert_bindings). |
@@ -171,6 +182,26 @@ compose:
 The dangerous keys (`privileged`, `cap_add`, host namespaces, host binds, host-publish) **cannot be
 expressed** — no input can generate them, and the generated compose is re-checked by the validator
 anyway.
+
+#### `env` values
+
+```yaml
+env:
+  NODE_ENV: production                               # a literal
+  PRICE_LABEL: "from $5"                             # the container gets: from $5
+  DB_PASSWORD: { secret: DB_PASSWORD }               # required: the deploy fails without a stored value
+  SENTRY_DSN: { secret: SENTRY_DSN, optional: true } # empty when no value is stored
+```
+
+- **Values arrive exactly as written.** A literal in this file and a value in the env store reach the container byte for byte — `$`, `$$`, `#`, quotes, backslashes and surrounding spaces included. `$VAR` and `${VAR}` are not expanded in either.
+- **A literal can't contain `${`.** Use a secret reference.
+- **A missing secret fails the deploy.** When a `{ secret: NAME }` reference has no value in the app's env store, the deploy stops before anything is written to the app's directory, built or started. The error names the service, the env key and the secret:
+  ```
+  service "api" env DB_PASSWORD: secret "DB_PASSWORD" has no value — set it before deploying, or mark it optional: true
+  ```
+  A value set to the empty string counts as set; a value in a committed `.env` file does not. [`generate:`](#auto-generating-a-secret) secrets are minted before this check.
+- **`optional: true`** deploys without a stored value; the variable is then empty. `optional` is valid only with `secret`.
+- **PR previews** don't inherit the base app's stored secrets, so a missing secret doesn't fail a [preview](./gitops.md#preview-environments-a-deploy-per-pull-request) deploy: the deploy log shows a `warning:` line naming it, and the variable is empty.
 
 #### `healthcheck`
 
@@ -318,7 +349,7 @@ secrets:
 | `name` | string | required | The secret's name within **this app's** namespace. |
 | `generate` | string | — | Auto-mint the value on first deploy (see below). Omit it and you provide the value yourself. |
 
-A secret you don't `generate` is set out-of-band — `mooring secret import` (from a `.env`) or the dashboard. The file holds **names only**, never values, which is what keeps it safe to commit.
+A secret you don't `generate` is set out-of-band — `mooring secret import` (from a `.env`) or the dashboard. The file holds **names only**, never values, which is what keeps it safe to commit. A deploy fails while an `env` reference to a secret has no stored value, unless the reference is `optional: true` — see [`env` values](#env-values).
 
 #### Auto-generating a secret
 
@@ -777,7 +808,7 @@ Each entry in a config file's `bindings` maps a `KEY` to a value. It is a scalar
 |---|---|---|
 | a literal scalar | itself | a plain config value. |
 | `{ secret: NAME }` | the named secret from the encrypted store | **Marks the file secret-bearing** → rendered `0600`. |
-| `{ env: NAME }` | this service's `env` value for `NAME` | If that env value is itself a `{secret: …}`, the file is secret-bearing. |
+| `{ env: NAME }` | this service's `env` value for `NAME` | If that env value is itself a `{secret: …}`, the file is secret-bearing. An `optional: true` secret with no stored value resolves to an empty string. |
 | `{ app: slug }` | the app's slug | The only app field exposed today. |
 | `{ cert: HOSTNAME.crt\|key\|ca }` | the **container path** of a same-service `cert_binding`'s file | e.g. `cert: mqtt.example.com.crt` → `<that binding's mount>/tls.crt`. The hostname must be a `cert_binding` on the **same service**; the deploy already blocks until the edge issues it. |
 
@@ -815,29 +846,28 @@ The rules, all enforced:
 
 **The repo file is the source; the dashboard reflects it.** To change app structure you edit `mooring.yaml`, push, and deploy. Mooring **fetches** your repo (read-only — it never pushes back), and an explicit, **sha-pinned Deploy** is what advances the live app. A push by itself only marks an update *available*; nothing goes live until you deploy (unless you opt into [`git.auto_deploy`](#specgit), which auto-clicks the **same** gated deploy path).
 
-Whatever triggers it, a deploy runs the **one reconciler** — there is no second path that does more:
+Whatever triggers it — Deploy, auto-deploy, a webhook, a rollback, a PR preview — a deploy runs the same steps, in this order:
 
 ```
-parse → typed definition
-  → resolve ${VAR}/.env FIRST
-  → fan out into the typed sub-structs
-  → allowlist validator
-  → edge conflict gate              (edge.routes re-rendered; fail-to-save on shadow/admin/TLS/PKI/:80:443/XFF)
-  → secret-literal lint
-  → verify required secrets provisioned
-  → resource gate + host-capacity guard
-  → diff vs the live state
-  → gated apply, in dependency order:
-        env  →  render config files  →  cert-sync (deploy waits)  →  compose up  →  edge route re-render LAST
-  → on ANY step failure: auto-rollback the WHOLE app to its prior definition  (no partial apply)
+read the root mooring file at the reviewed commit → parse → typed definition
+  → definition checks (e.g. a depends_on cycle)
+  → generate the compose
+  → mint missing generate: secrets → check every env secret reference has a value
+  → resolve ${VAR} → allowlist validator
+  → check the Docker daemon
+  → write the app directory: the commit's files, the generated compose and Dockerfiles,
+    config files, secret files, certificates (waits for the edge to issue them)
+  → build every build: service
+  → start the services one at a time, dependencies first (or all at once)
+  → apply edge and L4 routes, scaling, self-healing and ops settings
+  → verify every edge route
 ```
 
-Properties to rely on:
-
-- **Idempotent.** A deploy with no changes produces an **empty plan = no-op**.
-- **Ordered.** Env first, edge route re-render last. Cert-sync makes the deploy wait until the cert files exist.
-- **All-or-nothing.** Any step failing rolls the **entire app** back to its prior definition. There is no half-applied state.
-- **Checkable ahead of time.** `mooring validate` runs the **exact same validator** read-only, so you can verify a `mooring.yaml` in CI before it ever reaches the write plane — a file that validates there is one a deploy accepts.
+- **A failure before the start replaces nothing that is running.** A failed check, validation, file render, certificate wait or build stops the deploy before any running container is stopped or recreated. The repository shows the update as blocked.
+- **A paced start carries on past a failing service.** A service that fails to start or become healthy is reported with `✗` and the rest of the new version still ships; the deploy ends as deployed with problems. Only a deploy in which no service started is a failed deploy. See [paced starts](./gitops.md#paced-starts). With **all at once**, a failed `docker compose up` fails the deploy.
+- **There is no automatic rollback.** Containers a deploy started keep running after a later step fails, including a failed edge check. To return to an earlier commit, use **Roll back to this** in [deploy history](./gitops.md#deploy-history--rolling-back).
+- **Unchanged services keep running.** A service whose configuration and image didn't change is not recreated.
+- **Checkable ahead of time.** `mooring validate` runs the same parse, definition checks and validator read-only, so you can check a `mooring.yaml` in CI. Checks that need the server — stored secret values, the Docker daemon, certificates, the build — run only at deploy.
 
 You can **download the deployed definition** at any time from the app page (`GET /apps/<slug>/definition.yaml`). That is how you capture a dashboard-set [auto-scaling](#specscaling) policy back into your repo so the file and the live app agree — Mooring never writes to your repo for you.
 
@@ -1040,7 +1070,8 @@ spec:
 | `…services.<name>.ports[]` | `{internal, publish, public, protocol, published}` | no | — |
 | `…services.<name>.ports[].protocol` | `tcp` \| `udp` | no | `tcp` |
 | `…services.<name>.ports[].published` | int (host port) | no | = `internal` |
-| `…services.<name>.env.<KEY>` | literal \| `{secret: NAME}` | no | — |
+| `…services.<name>.env.<KEY>` | literal \| `{secret: NAME}` \| `{secret: NAME, optional: true}` | no | — |
+| `…services.<name>.env.<KEY>.optional` | bool (with `secret` only) | no | `false` |
 | `…services.<name>.secret_files[]` | string (a declared secret name) | no | — |
 | `…services.<name>.config_files[]` | `{repo\|template, mount, bindings}` | no | — |
 | `…services.<name>.config_files[].bindings.<KEY>` | literal \| `{secret\|env\|app\|cert: ARG}` | no | — |

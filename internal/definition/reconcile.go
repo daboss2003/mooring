@@ -118,7 +118,7 @@ func toProvisionSpec(d *Definition) provision.Spec {
 		sort.Strings(ekeys)
 		for _, k := range ekeys {
 			ev := svc.Env[k]
-			s.Env = append(s.Env, provision.EnvVar{Key: k, Value: ev.Value, Secret: ev.Secret})
+			s.Env = append(s.Env, provision.EnvVar{Key: k, Value: ev.Value, Secret: ev.Secret, Optional: ev.Optional})
 		}
 		ps.Services = append(ps.Services, s)
 	}

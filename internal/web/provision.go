@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/daboss2003/mooring/internal/audit"
-	"github.com/daboss2003/mooring/internal/compose"
 	"github.com/daboss2003/mooring/internal/dockerexec"
 	"github.com/daboss2003/mooring/internal/monitor"
 )
@@ -176,21 +175,6 @@ func (s *Server) handleProvisionDelete(w http.ResponseWriter, r *http.Request) {
 	_ = s.provStore.Delete(r.Context(), slug)
 	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "provision_delete", Target: slug, Outcome: audit.OK, Level: audit.Security})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
-}
-
-// provEnv builds the env used to validate a candidate (the encrypted store only;
-// a not-yet-committed app has no on-disk .env). Resolved to a fixpoint so
-// validate == deploy.
-func (s *Server) provEnv(slug string) compose.Env {
-	env := compose.Env{}
-	if s.envStore != nil {
-		if rendered, err := s.envStore.Render(slug); err == nil {
-			for k, v := range rendered {
-				env[k] = v
-			}
-		}
-	}
-	return resolveEnvValues(env)
 }
 
 // provisionedApps returns the registry rows annotated with live deploy status

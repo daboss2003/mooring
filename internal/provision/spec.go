@@ -47,11 +47,13 @@ type Volume struct {
 
 // EnvVar is a generated service's env entry: a literal Value XOR a Secret reference.
 // A secret renders as ${Secret} (resolved from the encrypted store's 0600 --env-file
-// at deploy); a literal renders inline. Exactly one of Value/Secret.
+// at deploy), or ${Secret:-} when Optional; a literal renders inline with `$` escaped.
+// Exactly one of Value/Secret; Optional only with Secret.
 type EnvVar struct {
-	Key    string `json:"key"`
-	Value  string `json:"value"`
-	Secret string `json:"secret"`
+	Key      string `json:"key"`
+	Value    string `json:"value"`
+	Secret   string `json:"secret"`
+	Optional bool   `json:"optional,omitempty"`
 }
 
 // Service is one generated service. Only safe fields exist here by construction. A
@@ -214,6 +216,9 @@ func (svc Service) validate(siblings map[string]bool) error {
 		}
 		if e.Secret != "" && !envKeyRe.MatchString(e.Secret) {
 			return fmt.Errorf("env %q secret name %q is invalid", e.Key, e.Secret)
+		}
+		if e.Optional && e.Secret == "" {
+			return fmt.Errorf("env %q: optional applies only to a secret reference", e.Key)
 		}
 		// A literal must not smuggle a compose ${...} interpolation or control chars.
 		if strings.Contains(e.Value, "${") || strings.ContainsAny(e.Value, "\x00\n") {

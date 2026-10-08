@@ -24,7 +24,7 @@ All three are declared **per service**, under `spec.compose.services.<svc>`. Onl
 
 ### When to use each
 
-**Use an env var when** the value is a flat `KEY: value` the app reads from the environment. It lands in an encrypted env blob and is materialized as a `0600 --env-file` at deploy time — it never gets baked into the generated compose. A literal value or a `{ secret: NAME }` reference can both live here:
+**Use an env var when** the value is a flat `KEY: value` the app reads from the environment. A `{ secret: NAME }` reference reads the encrypted env store, materialized as a `0600 --env-file` at deploy time, and is never written into the generated compose. A literal value is written into the generated compose as is. Both reach the container exactly as written, `$` included:
 
 ```yaml
 spec:

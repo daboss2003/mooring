@@ -889,7 +889,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// flow into validation and the deploy --env-file.
 	if err := s.ensureGeneratedSecrets(ctx, slug, def, onLine); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return nil, fmt.Errorf("generate secrets: %w", err)
+		return nil, fmt.Errorf("secrets: %w", err)
 	}
 	env := s.repoComposeEnv(ctx, repo, sha, cfg)
 	res := compose.ValidateBytes(composeBytes, env, rd, compose.Options{ProtectedPaths: s.protectedHostPaths()})
@@ -994,7 +994,8 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	defer cleanup()
 	if ferr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
-		return nil, errors.New("could not render env file")
+		// The error names a key, never a value.
+		return nil, fmt.Errorf("could not render env file: %w", ferr)
 	}
 
 	// Compose only diffs a service's CONFIG, not its bind-mounted file CONTENT — so a
@@ -1285,20 +1286,13 @@ func removeDeletedTrackedFiles(oldFiles, newFiles []string, rd string) int {
 
 // repoComposeEnv builds the env used for BOTH §5.6 validation and the deploy
 // --env-file from the repo's pinned .env (cat-file, not on-disk) overlaid by the
-// env store, so validate == deploy.
+// env store, so validate == deploy. Stored values stay literal (see mergeEnv).
 func (s *Server) repoComposeEnv(ctx context.Context, repo *git.Repo, sha string, cfg gitstore.Config) compose.Env {
-	env := compose.Env{}
+	file := compose.Env{}
 	if b, err := repo.CatFile(ctx, sha, ".env"); err == nil {
-		env = compose.ParseEnvFile(b)
+		file = compose.ParseEnvFile(b)
 	}
-	if s.envStore != nil {
-		if rendered, err := s.envStore.Render(cfg.Project); err == nil {
-			for k, v := range rendered {
-				env[k] = v // store overrides repo .env
-			}
-		}
-	}
-	return resolveEnvValues(env)
+	return mergeEnv(file, s.storeEnv(cfg.Project))
 }
 
 func (s *Server) recordRepoDeployStart(ctx context.Context, project, source, actor, action string) int64 {

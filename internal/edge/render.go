@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -225,6 +226,30 @@ type CertHost struct {
 	CA       string
 }
 
+// bySpecificity orders routes so Caddy, which stops at the first matching terminal route,
+// tries a hostname's longest path prefix first: /socket.io wins over / whatever order the
+// routes were stored in. Hosts keep their first-appearance order (distinct hosts never
+// overlap), and equal-length prefixes keep their relative order.
+func bySpecificity(routes []Route) []Route {
+	hostRank := map[string]int{}
+	for _, r := range routes {
+		h := strings.ToLower(strings.TrimSpace(r.Hostname))
+		if _, ok := hostRank[h]; !ok {
+			hostRank[h] = len(hostRank)
+		}
+	}
+	out := append([]Route(nil), routes...)
+	sort.SliceStable(out, func(i, j int) bool {
+		hi := hostRank[strings.ToLower(strings.TrimSpace(out[i].Hostname))]
+		hj := hostRank[strings.ToLower(strings.TrimSpace(out[j].Hostname))]
+		if hi != hj {
+			return hi < hj
+		}
+		return len(strings.TrimRight(out[i].PathPrefix, "/")) > len(strings.TrimRight(out[j].PathPrefix, "/"))
+	})
+	return out
+}
+
 func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error) {
 	persistOff := false
 	admin := &caddyAdmin{Listen: base.AdminListen, EnforceOrigin: true, Origins: []string{"127.0.0.1", "::1", "localhost"}, Config: &caddyAdminConfig{Persist: &persistOff}}
@@ -260,7 +285,17 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		seen[ah] = true
 	}
 
+	// A host's certificate issuer comes from its first enabled route in the caller's order,
+	// independent of the specificity ordering below.
+	hostCA := map[string]string{}
 	for _, r := range routes {
+		if h := strings.ToLower(strings.TrimSpace(r.Hostname)); r.Enabled {
+			if _, ok := hostCA[h]; !ok {
+				hostCA[h] = r.CA
+			}
+		}
+	}
+	for _, r := range bySpecificity(routes) {
 		if !r.Enabled {
 			continue
 		}
@@ -272,8 +307,11 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			return nil, fmt.Errorf("route %q collides with the admin vhost", r.Hostname)
 		}
 		match := caddyMatch{Host: []string{h}}
-		if r.PathPrefix != "" {
-			match.Path = []string{strings.TrimRight(r.PathPrefix, "/") + "/*"}
+		if p := strings.TrimRight(r.PathPrefix, "/"); p != "" {
+			// The prefix itself (/api) and everything under it (/api/…), never a sibling (/apiv2).
+			match.Path = []string{p, p + "/*"}
+		} else if r.PathPrefix != "" {
+			match.Path = []string{"/*"}
 		}
 		var handlers []caddyHandler
 		if r.SecurityHeaders || r.HSTS {
@@ -287,7 +325,7 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			if !seen[h] {
 				subjects = append(subjects, h)
 				seen[h] = true
-				subjectCA[h] = r.CA
+				subjectCA[h] = hostCA[h]
 			}
 			continue
 		}
@@ -320,7 +358,7 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		if !seen[h] {
 			subjects = append(subjects, h)
 			seen[h] = true
-			subjectCA[h] = r.CA
+			subjectCA[h] = hostCA[h]
 		}
 	}
 

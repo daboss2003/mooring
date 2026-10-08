@@ -96,11 +96,11 @@ func TestEnvBadKeyRejected(t *testing.T) {
 	}
 }
 
-// review #2: env values containing ${VAR} are expanded to a fixpoint so the
+// review #2: repo .env values containing ${VAR} are resolved against each other so the
 // validator sees what docker compose will render.
-func TestResolveEnvValuesFixpoint(t *testing.T) {
+func TestMergeEnvResolvesDotEnvReferences(t *testing.T) {
 	env := compose.Env{"IMG": "alpine:${TAG}", "TAG": "latest", "FULL": "${IMG}-${SUFFIX}", "SUFFIX": "x"}
-	out := resolveEnvValues(env)
+	out := mergeEnv(env, nil)
 	if out["IMG"] != "alpine:latest" {
 		t.Errorf("IMG = %q, want alpine:latest", out["IMG"])
 	}
@@ -167,7 +167,7 @@ func TestRenderEnvFileDropsComposeControlVars(t *testing.T) {
 	if strings.Contains(got, "COMPOSE_PROFILES") || strings.Contains(got, "COMPOSE_PROJECT_NAME") || strings.Contains(got, "DOCKER_DEFAULT_PLATFORM") {
 		t.Errorf("compose control variables must be dropped:\n%s", got)
 	}
-	if !strings.Contains(got, "K=v\n") || !strings.Contains(got, "COMPOSER_HOME=/c\n") || !strings.Contains(got, "COMPOSE_TOKEN=app-secret\n") {
+	if !strings.Contains(got, "K='v'\n") || !strings.Contains(got, "COMPOSER_HOME='/c'\n") || !strings.Contains(got, "COMPOSE_TOKEN='app-secret'\n") {
 		t.Errorf("ordinary keys (incl. an app's own COMPOSE_TOKEN) must still render:\n%s", got)
 	}
 }

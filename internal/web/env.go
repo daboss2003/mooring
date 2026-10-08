@@ -2,6 +2,7 @@ package web
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -425,43 +426,197 @@ func (s *Server) fileSecretsForApp(project string) []fileSecretView {
 // --env-file, so validate == deploy. The store overlays the project .env (M5);
 // after env-import (M17) the store becomes authoritative.
 func (s *Server) composeEnv(app *monitor.App) compose.Env {
-	env := compose.Env{}
+	file := compose.Env{}
 	if app.WorkingDir != "" {
 		if data, err := os.ReadFile(filepath.Join(app.WorkingDir, ".env")); err == nil {
-			env = compose.ParseEnvFile(data)
+			file = compose.ParseEnvFile(data)
 		}
 	}
-	if s.envStore != nil {
-		if rendered, err := s.envStore.Render(app.Project); err == nil {
-			for k, v := range rendered {
-				env[k] = v // store overrides .env
-			}
-		}
-	}
-	// docker compose recursively expands ${VAR} inside env values; our YAML
-	// interpolation is single-pass, so a value like IMG="alpine:${TAG}" would be
-	// validated un-expanded (validate != deploy, review #2). Pre-expand env values
-	// to a fixpoint so the validator sees the fully-resolved values compose will.
-	return resolveEnvValues(env)
+	return mergeEnv(file, s.storeEnv(app.Project))
 }
 
-// resolveEnvValues expands ${VAR} references that appear INSIDE env values, using
-// the env map itself, until stable (capped). Over-resolving relative to compose's
-// forward-reference rules is safe for validation (the validator only gets stricter).
-func resolveEnvValues(env compose.Env) compose.Env {
-	for pass := 0; pass < 10; pass++ {
-		changed := false
-		for k, v := range env {
-			if nv := compose.Interpolate(v, env); nv != v {
-				env[k] = nv
-				changed = true
+// storeEnv is the app's encrypted env store as key → value (nil when there is no store or it
+// can't be read, which leaves the .env values alone, as before).
+func (s *Server) storeEnv(project string) map[string]string {
+	if s.envStore == nil {
+		return nil
+	}
+	rendered, err := s.envStore.Render(project)
+	if err != nil {
+		return nil
+	}
+	return rendered
+}
+
+// mergeEnv builds the env compose interpolates the generated compose with — what the validator
+// sees and what renderEnvFile writes. Store values are literal: never expanded, and a reference to
+// one inserts its exact bytes (a stored `pa$$word` stays `pa$$word`). Values from the app's .env
+// file keep compose syntax: `${VAR}` / `$VAR` resolve once against the store and the file's other
+// values (any order; a cycle resolves to ""), and `$$` is a literal `$`. A store key overrides the
+// same .env key.
+func mergeEnv(file compose.Env, store map[string]string) compose.Env {
+	out := make(compose.Env, len(file)+len(store))
+	const (
+		unseen = iota
+		visiting
+		done
+	)
+	state := make(map[string]int, len(file))
+	var resolve func(k string) string
+	resolve = func(k string) string {
+		if state[k] == done {
+			return out[k]
+		}
+		state[k] = visiting
+		raw := file[k]
+		look := compose.Env{}
+		for _, ref := range envRefs(raw) {
+			if v, ok := store[ref]; ok {
+				look[ref] = v
+			} else if _, ok := file[ref]; ok && state[ref] != visiting {
+				look[ref] = resolve(ref)
 			}
 		}
-		if !changed {
-			break
+		// One substitution pass: a substituted value is inserted as-is, never re-scanned.
+		v := compose.Interpolate(raw, look)
+		out[k] = v
+		state[k] = done
+		return v
+	}
+	keys := make([]string, 0, len(file))
+	for k := range file {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // a cycle resolves the same way every time
+	for _, k := range keys {
+		if _, ok := store[k]; !ok {
+			resolve(k)
 		}
 	}
-	return env
+	for k, v := range store {
+		out[k] = v
+	}
+	return out
+}
+
+// envRefs lists the variable names raw references, in compose.Interpolate's grammar: `$NAME`,
+// `${NAME}` and `${NAME<op>…}`; `$$` is an escaped `$`.
+func envRefs(raw string) []string {
+	var refs []string
+	for i := 0; i+1 < len(raw); i++ {
+		if raw[i] != '$' {
+			continue
+		}
+		switch c := raw[i+1]; {
+		case c == '$':
+			i++
+		case c == '{':
+			end := strings.IndexByte(raw[i+2:], '}')
+			if end < 0 {
+				continue
+			}
+			expr := raw[i+2 : i+2+end]
+			if j := strings.IndexAny(expr, ":-?+"); j >= 0 {
+				expr = expr[:j]
+			}
+			refs = append(refs, expr)
+			i += 2 + end
+		case envNameStart(c):
+			j := i + 2
+			for j < len(raw) && (envNameStart(raw[j]) || raw[j] >= '0' && raw[j] <= '9') {
+				j++
+			}
+			refs = append(refs, raw[i+1:j])
+			i = j - 1
+		}
+	}
+	return refs
+}
+
+func envNameStart(c byte) bool { return c == '_' || c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' }
+
+// errEnvValueNUL: a NUL byte can't be carried by an env file (or a process environment).
+var errEnvValueNUL = errors.New("the value contains a NUL byte, which an env file can't carry")
+
+// encodeEnvFileValue quotes v so Docker Compose's env-file parser (compose-go dotenv, Compose v2.20
+// through v5) reads back exactly v: no variable expansion, no escape processing, no comment
+// stripping, no trimming. Verified against `docker compose config` (envfile_encode_test.go):
+//   - single quotes when v has no `'`, `\`, LF or CR — the parser takes those bytes literally;
+//   - otherwise double quotes with `\` → `\\`, `"` → `\"`, `$` → `$$`, LF → `\n`, CR → `\r`.
+//
+// Single quotes can't hold a `'`, and the parser turns `\'` into `'`, so a value with either goes
+// in double quotes. A NUL byte has no representation: it is an error, never dropped.
+func encodeEnvFileValue(v string) (string, error) {
+	if strings.IndexByte(v, 0) >= 0 {
+		return "", errEnvValueNUL
+	}
+	if !strings.ContainsAny(v, "'\\\n\r") {
+		return "'" + v + "'", nil
+	}
+	var b strings.Builder
+	b.Grow(len(v) + 8)
+	b.WriteByte('"')
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; c {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '$':
+			b.WriteString(`$$`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	b.WriteByte('"')
+	return b.String(), nil
+}
+
+// envFileBody renders env as compose --env-file lines (sorted by key, values encoded by
+// encodeEnvFileValue). It returns the compose control keys it left out; a value it can't encode
+// is an error naming the key only, never the value.
+func envFileBody(env compose.Env) (string, []string, error) {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	var dropped []string
+	for _, k := range keys {
+		// Sanitize against env-file injection on the .env-merge path (review #5/#10): the store
+		// validates keys on save, but .env keys from disk do not go through it. A key that isn't a
+		// plain variable name is left out rather than emitted as a broken line.
+		if !envKeyRe.MatchString(k) {
+			continue
+		}
+		// This file is compose's --env-file (interpolation only — container env comes from the
+		// generated `environment:` entries). Compose also reads its own control variables from it, so
+		// an app env key like COMPOSE_PROFILES=mooring-scheduled would start scheduled services on every
+		// `up`, COMPOSE_PROJECT_NAME / COMPOSE_FILE / COMPOSE_COMPATIBILITY would change what a compose
+		// command acts on, and DOCKER_DEFAULT_PLATFORM would force a foreign build platform. Mooring owns
+		// all of that: those keys are never passed through. Other COMPOSE_-prefixed names (an app's own
+		// COMPOSE_TOKEN, say) are ordinary variables and still render. (dockerexec's minimalEnv also pins
+		// the dangerous ones in the process environment, which covers the repo's own .env when no
+		// --env-file is passed.)
+		if composeControlKeys[k] {
+			dropped = append(dropped, k)
+			continue
+		}
+		q, err := encodeEnvFileValue(env[k])
+		if err != nil {
+			return "", nil, fmt.Errorf("env %s: %w", k, err)
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(q)
+		b.WriteByte('\n')
+	}
+	return b.String(), dropped, nil
 }
 
 // renderEnvFile writes the merged env to a 0600 Mooring-owned file and returns
@@ -475,6 +630,13 @@ func (s *Server) renderEnvFile(app *monitor.App, env compose.Env) (string, func(
 	entries, _, err := s.envStore.Current(app.Project)
 	if err != nil || len(entries) == 0 {
 		return "", noop, nil
+	}
+	body, dropped, err := envFileBody(env)
+	if err != nil {
+		if s.log != nil {
+			s.log.Warn("env file not written", "app", app.Project, "err", err) // names the key, never the value
+		}
+		return "", noop, err
 	}
 	dir := filepath.Join(s.cfg.DataDir, "envfiles")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -492,43 +654,7 @@ func (s *Server) renderEnvFile(app *monitor.App, env compose.Env) (string, func(
 	cleanup := func() { _ = os.Remove(path) }
 	_ = f.Chmod(0o600)
 
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	var b strings.Builder
-	var dropped []string
-	for _, k := range keys {
-		// Sanitize against env-file injection on the .env-merge path (review
-		// #5/#10): the store validates on save, but .env values from disk do not
-		// go through it. Skip any unsafe key/value rather than emit a broken line.
-		if !envKeyRe.MatchString(k) {
-			continue
-		}
-		// This file is compose's --env-file (interpolation only — container env comes from the
-		// generated `environment:` entries). Compose also reads its own control variables from it, so
-		// an app env key like COMPOSE_PROFILES=mooring-scheduled would start scheduled services on every
-		// `up`, COMPOSE_PROJECT_NAME / COMPOSE_FILE / COMPOSE_COMPATIBILITY would change what a compose
-		// command acts on, and DOCKER_DEFAULT_PLATFORM would force a foreign build platform. Mooring owns
-		// all of that: those keys are never passed through. Other COMPOSE_-prefixed names (an app's own
-		// COMPOSE_TOKEN, say) are ordinary variables and still render. (dockerexec's minimalEnv also pins
-		// the dangerous ones in the process environment, which covers the repo's own .env when no
-		// --env-file is passed.)
-		if composeControlKeys[k] {
-			dropped = append(dropped, k)
-			continue
-		}
-		v := strings.TrimRight(env[k], "\r")
-		if strings.ContainsAny(v, "\x00\n\r") {
-			continue
-		}
-		b.WriteString(k)
-		b.WriteByte('=')
-		b.WriteString(v)
-		b.WriteByte('\n')
-	}
-	if _, err := f.WriteString(b.String()); err != nil {
+	if _, err := f.WriteString(body); err != nil {
 		f.Close()
 		cleanup()
 		return "", noop, err

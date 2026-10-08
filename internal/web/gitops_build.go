@@ -64,7 +64,14 @@ func (s *Server) configBindingResolver(project, service string, svc definition.S
 				return "", false, fmt.Errorf("env key %q is not set on service %q", b.Env, service)
 			}
 			if ev.Secret != "" {
-				return revealSecret(ev.Secret, fmt.Sprintf(" (via env %q)", b.Env))
+				v, bearing, err := revealSecret(ev.Secret, fmt.Sprintf(" (via env %q)", b.Env))
+				if err != nil && ev.Optional && s.envStore != nil {
+					// An optional secret with no value is an empty env var; the file gets the same "".
+					if _, ok, gerr := s.envStore.Get(project, ev.Secret); gerr == nil && !ok {
+						return "", true, nil
+					}
+				}
+				return v, bearing, err
 			}
 			return ev.Value, false, nil // an empty literal is a legitimate value
 		case b.App != "":
@@ -127,6 +134,11 @@ func (s *Server) loadRepoDefinition(ctx context.Context, repo *git.Repo, sha, sl
 	files, err := repo.LsFiles(ctx, sha)
 	if err != nil {
 		return nil, false, fmt.Errorf("list repo files: %w", err)
+	}
+	// Only root-level mooring files are read. One in a subfolder means the operator meant it to
+	// be the app's definition: fail instead of deploying a guessed app in its place.
+	if nested := nestedMooringFile(files); nested != "" {
+		return nil, false, fmt.Errorf("no %s at the repository root, but the repo has %s — Mooring reads only root-level mooring.yaml / mooring.<variant>.yaml files; move it to the repository root", mooringFile, nested)
 	}
 	b, derr := builder.Resolve(builder.Spec{Language: "auto"}, topLevelSet(files))
 	if derr != nil {
@@ -365,7 +377,81 @@ func buildSpecFor(name string, svc definition.Service) builder.Spec {
 // generate (rsa/ed25519) mints two entries: the private key under <NAME> and the
 // derived public key under <NAME>_PUB, both base64-encoded (Enc="b64") so the
 // PEM survives the no-newline store and is decoded when written as a secret_file.
+//
+// After minting it runs checkEnvSecrets, so a `generate:` secret referenced from env never
+// reads as missing: the deploy calls this once, before the env is read.
 func (s *Server) ensureGeneratedSecrets(ctx context.Context, project string, def *definition.Definition, onLine func(string)) error {
+	if err := s.mintGeneratedSecrets(ctx, project, def, onLine); err != nil {
+		return err
+	}
+	// Intentional: the env-secret check rides on this call because it is the deploy's one step that
+	// runs right after minting and before the env is read or the run dir is touched.
+	return s.checkEnvSecrets(project, def, onLine)
+}
+
+// checkEnvSecrets fails the deploy when a service env `{secret: NAME}` (not optional) has no
+// entry in the app's env store — compose would otherwise start the container with the variable
+// empty. A value explicitly set to "" counts as set. A PR preview never inherits the base app's
+// pasted secrets, so there each missing one is a warning on the deploy log and the deploy goes on.
+// Messages name the service, key and secret, never a value.
+func (s *Server) checkEnvSecrets(project string, def *definition.Definition, onLine func(string)) error {
+	type ref struct{ svc, key, secret string }
+	var refs []ref
+	for _, name := range sortedServiceNames(def) {
+		env := def.Spec.Compose.Services[name].Env
+		keys := make([]string, 0, len(env))
+		for k := range env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if ev := env[k]; ev.Secret != "" && !ev.Optional {
+				refs = append(refs, ref{name, k, ev.Secret})
+			}
+		}
+	}
+	if len(refs) == 0 {
+		return nil
+	}
+	// Intentional: only the env store counts. A value in the repo's committed .env would still
+	// satisfy ${NAME} in compose, but a secret must be provisioned out-of-band, not committed.
+	have := map[string]bool{}
+	if s.envStore != nil {
+		entries, _, err := s.envStore.Current(project)
+		if err != nil {
+			return fmt.Errorf("read env store: %w", err)
+		}
+		for _, e := range entries {
+			have[e.Key] = true
+		}
+	}
+	preview := false
+	if s.gitStore != nil {
+		if cfg, ok, err := s.gitStore.Get(project); err == nil && ok && cfg.PreviewOf != "" {
+			preview = true
+		}
+	}
+	var missing []string
+	for _, r := range refs {
+		if have[r.secret] {
+			continue
+		}
+		if preview {
+			// Intentional: a preview deploys without the base app's pasted secrets by design
+			// (preview.go), so failing here would make every such preview undeployable.
+			onLine(fmt.Sprintf("warning: service %q env %s: secret %q has no value in this preview — the variable is empty", r.svc, r.key, r.secret))
+			continue
+		}
+		missing = append(missing, fmt.Sprintf("service %q env %s: secret %q has no value", r.svc, r.key, r.secret))
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s — set it before deploying, or mark it optional: true", strings.Join(missing, "; "))
+}
+
+// mintGeneratedSecrets is the minting half of ensureGeneratedSecrets.
+func (s *Server) mintGeneratedSecrets(ctx context.Context, project string, def *definition.Definition, onLine func(string)) error {
 	type want struct{ name, spec string }
 	var wants []want
 	for _, sec := range def.Spec.Secrets {
@@ -879,6 +965,22 @@ func defHasBuild(def *definition.Definition) bool {
 		}
 	}
 	return false
+}
+
+// nestedMooringFile returns the first (git order) repo path below the root whose file name is
+// mooring*.yaml / mooring*.yml, or "" when there is none.
+func nestedMooringFile(files []string) string {
+	for _, f := range files {
+		f = strings.TrimPrefix(f, "./")
+		if !strings.Contains(f, "/") {
+			continue
+		}
+		base := path.Base(f)
+		if strings.HasPrefix(base, "mooring") && (strings.HasSuffix(base, ".yaml") || strings.HasSuffix(base, ".yml")) {
+			return f
+		}
+	}
+	return ""
 }
 
 // topLevelSet is the set of a repo's top-level file names (for stack detection).
