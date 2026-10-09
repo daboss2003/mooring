@@ -25,9 +25,11 @@ import (
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/monitor"
+	"github.com/daboss2003/mooring/internal/scale"
 	"github.com/daboss2003/mooring/internal/secret"
 	"github.com/daboss2003/mooring/internal/selfheal"
 	"github.com/daboss2003/mooring/internal/startgate"
+	"github.com/daboss2003/mooring/internal/store"
 )
 
 // fakeDockerScript is the body of a `docker` CLI stand-in ($d is its directory). It logs every call, one
@@ -583,9 +585,101 @@ func TestUnchangedSetTreatsMissingDataAsChanged(t *testing.T) {
 		{"running another image", nil, map[string]string{"web": hash}, map[string]string{"web": image}, app(copyOf("running", hash, testImageID("nginx:1.26"))), false},
 	}
 	for _, tc := range cases {
-		if got := unchangedSet([]string{"web"}, tc.changed, tc.hashes, tc.images, tc.app)["web"]; got != tc.want {
+		if got := unchangedSet([]string{"web"}, tc.changed, tc.hashes, tc.images, nil, tc.app)["web"]; got != tc.want {
 			t.Errorf("%s: unchanged = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// compose's config hash leaves out `scale`, so a service is unchanged only while it runs the number of
+// copies the deploy would give it: its fixed `replicas` count; any number for an autoscaled service;
+// otherwise one — a deploy that only changes or removes `replicas` starts the service.
+func TestUnchangedSetComparesTheCopyCount(t *testing.T) {
+	hash, image := testConfigHash("web"), testImageID("nginx:1.27")
+	cp := func(id byte) monitor.ServiceStatus {
+		return monitor.ServiceStatus{Service: "web", ContainerID: strings.Repeat(string(id), 64), State: "running", ConfigHash: hash, ImageID: image}
+	}
+	hashes, images := map[string]string{"web": hash}, map[string]string{"web": image}
+	cases := []struct {
+		name       string
+		replicas   int
+		autoscaled bool
+		copies     []monitor.ServiceStatus
+		want       bool
+	}{
+		{"replicas raised 2 → 3", 3, false, []monitor.ServiceStatus{cp('a'), cp('b')}, false},
+		{"replicas lowered 3 → 2", 2, false, []monitor.ServiceStatus{cp('a'), cp('b'), cp('c')}, false},
+		{"exactly the declared count", 3, false, []monitor.ServiceStatus{cp('a'), cp('b'), cp('c')}, true},
+		{"replicas: 1 with one copy", 1, false, []monitor.ServiceStatus{cp('a')}, true},
+		{"replicas with a leftover policy: still the declared count", 3, true, []monitor.ServiceStatus{cp('a'), cp('b')}, false},
+		{"autoscaled: any number of current copies", 0, true, []monitor.ServiceStatus{cp('a'), cp('b')}, true},
+		{"autoscaled with one copy", 0, true, []monitor.ServiceStatus{cp('a')}, true},
+		{"replicas removed, not autoscaled: two copies left", 0, false, []monitor.ServiceStatus{cp('a'), cp('b')}, false},
+		{"no replicas, not autoscaled, one copy", 0, false, []monitor.ServiceStatus{cp('a')}, true},
+	}
+	for _, tc := range cases {
+		app := &monitor.App{Project: "shop", Services: tc.copies}
+		counts := deployCopyCounts([]string{"web"}, map[string]int{"web": tc.replicas}, map[string]bool{"web": tc.autoscaled})
+		if got := unchangedSet([]string{"web"}, nil, hashes, images, counts, app)["web"]; got != tc.want {
+			t.Errorf("%s: unchanged = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A paced deploy starts a service without `replicas` that runs several copies (its `replicas` was just
+// removed) — as an all-at-once deploy would bring it to one copy — unless the autoscaler keeps its count:
+// an enabled spec.scaling entry, or an enabled policy set on the dashboard that the definition leaves
+// alone. spec.scaling disabling that policy makes it count as not autoscaled.
+func TestPacedDeployStartsAnUnscaledServiceWithExtraCopies(t *testing.T) {
+	const twoServices = `apiVersion: mooring/v1
+kind: App
+metadata: {slug: app}
+spec:
+  compose:
+    source: generated
+    services:
+      cache:
+        image: redis:7
+      db:
+        image: postgres:16
+`
+	current := func(svc, ref string, id byte) monitor.ServiceStatus {
+		return monitor.ServiceStatus{Service: svc, ContainerID: strings.Repeat(string(id), 64), State: "running", Health: "healthy",
+			Inspected: true, ConfigHash: testConfigHash(svc), ImageID: testImageID(ref)}
+	}
+	for _, tc := range []struct {
+		name    string
+		yaml    string
+		policy  bool // an enabled policy for cache in the scale store
+		started bool // the deploy starts cache
+	}{
+		{"not autoscaled", twoServices, false, true},
+		{"dashboard policy", twoServices, true, false},
+		{"spec.scaling entry", twoServices + "  scaling:\n    - {service: cache, enabled: true, min: 1, max: 3, per_replica_mem_mib: 64, per_replica_cpu_milli: 100}\n", false, false},
+		{"spec.scaling disables the dashboard policy", twoServices + "  scaling:\n    - {service: cache, enabled: false, min: 1, max: 3, per_replica_mem_mib: 64, per_replica_cpu_milli: 100}\n", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPacedServer(t, map[string]string{"cache": "redis:7", "db": "postgres:16"}, []monitor.ServiceStatus{
+				current("cache", "redis:7", 'a'), current("cache", "redis:7", 'b'), current("db", "postgres:16", 'c'),
+			})
+			p.e.srv.scaling = scale.NewStore(p.e.srv.db)
+			if tc.policy {
+				if err := p.e.srv.scaling.SavePolicy(context.Background(), scale.Key{App: "shop", Service: "cache"}, enabledTestPolicy()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			p.connect(t, tc.yaml)
+			if problems, err := p.deploy(false); err != nil || len(problems) != 0 {
+				t.Fatalf("deploy: problems=%v err=%v\n%s", problems, err, p.output())
+			}
+			var want []string
+			if tc.started {
+				want = []string{"cache"}
+			}
+			if got := p.docker.ups(); !slices.Equal(got, want) {
+				t.Fatalf("per-service starts = %v, want %v (db is unchanged)\n%s", got, want, p.output())
+			}
+		})
 	}
 }
 
@@ -749,5 +843,41 @@ func TestVolumesOnlyForFailedServices(t *testing.T) {
 	}
 	if got := volumesOnlyFor(def, "shop", vols, []string{"api", "worker"}); len(got) != 2 {
 		t.Fatalf("every user failed: both roll back: %+v", got)
+	}
+}
+
+// An unreadable scale store must not cut a dashboard-autoscaled service to one copy: services spec.scaling
+// leaves out and that have no replicas then accept any copy count.
+func TestDeployAutoscaledOnAStoreReadError(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "broken.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close() // every query on it now fails
+	s := &Server{scaling: scale.NewStore(db)}
+	def, err := definition.Parse([]byte(`apiVersion: mooring/v1
+kind: App
+metadata: {slug: shop}
+spec:
+  compose:
+    services:
+      web: {image: nginx:1}
+      worker: {image: alpine:3, replicas: 3}
+      api: {image: nginx:1}
+  edge: {routes: [{hostname: a.example.com, service: api, port: 80}]}
+  scaling: [{service: api, enabled: false, min: 1, max: 3}]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := s.deployAutoscaled("shop", def)
+	if !got["web"] {
+		t.Error("web (no replicas, not in spec.scaling) must count as autoscaled when the store can't be read")
+	}
+	if got["worker"] {
+		t.Error("worker declares replicas: its count is fixed")
+	}
+	if got["api"] {
+		t.Error("api's spec.scaling entry is disabled: the definition decides")
 	}
 }

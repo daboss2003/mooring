@@ -32,6 +32,7 @@ type serviceView struct {
 	Phase                     string              // self-heal supervisor phase, e.g. CIRCUIT_OPEN
 	Held                      bool                // operator-held: stopped + auto-restart paused
 	DesiredReplicas           int                 // 0 when scaling isn't active
+	FixedReplicas             int                 // `replicas` from the deployed mooring.yaml; 0 = none
 	Policy                    *definition.Scaling // current scaling policy; nil = none yet
 	HasOps                    bool                // the service declares an enabled (non-basic) ops endpoint → live-poll its fragment
 	Ops                       *ops.Result         // live ops probe (RICH queues/metrics); nil if no ops endpoint or unreachable
@@ -217,7 +218,11 @@ func (s *Server) handleServiceGet(w http.ResponseWriter, r *http.Request) {
 	}
 	sv.Phase = s.supervisorStates(project)[service]
 	sv.Held = s.heldServices(project)[service]
-	sv.DesiredReplicas = s.scalingDesired(project)[service]
+	sv.FixedReplicas = svcDef.Replicas
+	if sv.FixedReplicas == 0 {
+		// A fixed count has no autoscaler target (a scaling_state row may be left from before).
+		sv.DesiredReplicas = s.scalingDesired(project)[service]
+	}
 	sv.MetricsRetentionText = metricsRetentionText(s.cfg.Monitor.MetricsRetention.D())
 
 	// Per-service ops: probe THIS service's ops endpoint (from the canonical) on demand,

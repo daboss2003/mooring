@@ -30,6 +30,27 @@ func TestEdgeRoutesReadOnly(t *testing.T) {
 	}
 }
 
+// The edge page shows each route's lb; a route without one shows the default, least_conn.
+func TestEdgeRoutesShowLB(t *testing.T) {
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	sess, _ := e.authed(t)
+	ctx := context.Background()
+	for _, r := range []edge.Route{
+		{AppID: "shop", Hostname: "app.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true, LB: "cookie"},
+		{AppID: "shop", Hostname: "plain.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true},
+	} {
+		if err := e.srv.edgeRoutes.Save(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page := readBody(e.req(t, "GET", "/edge", "127.0.0.1:1", nil, []*http.Cookie{sess}, nil))
+	for _, want := range []string{"<th>LB</th>", `<td class="mono">cookie</td>`, `<td class="mono">least_conn</td>`} {
+		if !strings.Contains(page, want) {
+			t.Errorf("edge page missing %q", want)
+		}
+	}
+}
+
 // The dashboard write path is gone: POST /edge/routes is no longer registered.
 func TestEdgeRouteWriteRemoved(t *testing.T) {
 	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")

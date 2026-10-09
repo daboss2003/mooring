@@ -68,6 +68,7 @@ func (s *Server) applyDefinition(ctx context.Context, project string, def *defin
 		if _, err := s.defStore.SaveCanonical(ctx, def, note, commit); err != nil {
 			return fmt.Errorf("save canonical: %w", err)
 		}
+		s.forgetSelfHealInfo(project) // e.g. a changed `replicas`: self-heal must not act on the old count
 	}
 	if err := s.applyRoutes(ctx, project, def); err != nil {
 		return err
@@ -350,6 +351,7 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 				RedirectHTTP:    r.RedirectHTTP,
 				Enabled:         true,
 				CA:              r.CA,
+				LB:              r.LB,
 			})
 		}
 		if err := s.edgeRoutes.ReplaceProject(ctx, project, routes); err != nil {
@@ -388,16 +390,52 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 // applyScaling persists this app's mooring.yaml scaling policies (one per service)
 // into the scale store, so a repo's yaml drives auto-scaling for SEVERAL services —
 // e.g. an HTTP api and an L4 resolver in one app. Additive + gated: it only runs when
-// the scaler is owned and the def declares scaling; SavePolicy validates each policy
+// the scaler is owned; SavePolicy validates each policy
 // (and a bad one — e.g. too-small dead band — blocks the deploy, fail-closed). It does
-// not touch services the def omits, so dashboard-managed policies are left alone.
+// not touch services the def omits, so dashboard-managed policies are left alone — except
+// that a service declaring a fixed `replicas` count has any enabled policy disabled (kept,
+// not deleted): the autoscaler would otherwise fight compose's `scale:` for its copy count.
 func (s *Server) applyScaling(ctx context.Context, project string, def *definition.Definition) error {
-	if s.scaling == nil || len(def.Spec.Scaling) == 0 {
+	if s.scaling == nil {
 		return nil
+	}
+	if err := s.disableFixedScaling(ctx, project, def); err != nil {
+		return err
 	}
 	for _, sc := range def.Spec.Scaling {
 		if err := s.scaling.SavePolicy(ctx, scale.Key{App: project, Service: sc.Service}, scalingPolicyRow(sc)); err != nil {
 			return fmt.Errorf("apply scaling for %q: %w", sc.Service, err)
+		}
+	}
+	return nil
+}
+
+// disableFixedScaling disables the enabled scaling policy of every service of def that declares a fixed
+// `replicas` count (validation keeps such a service out of spec.scaling, so a row left over from before
+// is the only way one exists). The row keeps its thresholds; a row that no longer passes validation is
+// replaced by a disabled default one.
+func (s *Server) disableFixedScaling(ctx context.Context, project string, def *definition.Definition) error {
+	var fixed []string
+	for name, svc := range def.Spec.Compose.Services {
+		if svc.Replicas > 0 {
+			fixed = append(fixed, name)
+		}
+	}
+	sort.Strings(fixed)
+	for _, name := range fixed {
+		k := scale.Key{App: project, Service: name}
+		pr, ok, err := s.scaling.PolicyFor(k)
+		if err != nil {
+			return fmt.Errorf("read scaling policy for %q: %w", name, err)
+		}
+		if !ok || !pr.Enabled {
+			continue
+		}
+		pr.Enabled = false
+		if err := s.scaling.SavePolicy(ctx, k, pr); err != nil {
+			if err := s.scaling.SavePolicy(ctx, k, scalingPolicyRow(definition.Scaling{Service: name})); err != nil {
+				return fmt.Errorf("disable autoscaling for %q (it sets replicas): %w", name, err)
+			}
 		}
 	}
 	return nil

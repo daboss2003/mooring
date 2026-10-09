@@ -8,14 +8,15 @@
   {{if not .Enabled}}
   <section class="panel">
     <p class="muted">Retained log search is off (<code>server.service_log_enabled: false</code>). Enable it to capture
-      each running service's stdout/stderr into a searchable history. The capture file is <code>0600</code> in the
-      data dir with a 48-hour retention and holds the app's own output, which may contain secrets the app prints.
-      Set in <code>/etc/mooring/config.yaml</code> and reload:</p>
+      each running service's stdout/stderr into a searchable history. Captured output is kept in <code>0600</code> files
+      in the data dir (48 hours per service by default) and holds the app's own output, which may contain secrets the
+      app prints. Set in <code>/etc/mooring/config.yaml</code> and restart Mooring:</p>
     <pre class="stream">server:
   service_log_enabled: true</pre>
     <p class="muted small">The live <a href="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}">log tail</a> works regardless and writes nothing to disk.</p>
   </section>
   {{else}}
+  {{if .Paused}}<div class="notice">Log capture is paused: disk usage is at or above {{.ThresholdPct}}% (<code>server.disk_gc_threshold</code>). New lines are not kept and every service's history is cut to {{.DefaultWindow}} / {{.DefaultMaxLines}} lines until usage drops.</div>{{end}}
   <section class="panel">
     <form method="get" class="row" style="flex-wrap:wrap;align-items:flex-end;gap:.75rem">
       {{if .At}}<input type="hidden" name="at" value="{{.At}}">{{end}}
@@ -25,11 +26,7 @@
       {{if not .At}}
       <label>Range
         <select name="range">
-          <option value="15m"{{if eq .Range "15m"}} selected{{end}}>Last 15 min</option>
-          <option value="1h"{{if eq .Range "1h"}} selected{{end}}>Last hour</option>
-          <option value="6h"{{if eq .Range "6h"}} selected{{end}}>Last 6 hours</option>
-          <option value="24h"{{if eq .Range "24h"}} selected{{end}}>Last 24 hours</option>
-          <option value="all"{{if eq .Range "all"}} selected{{end}}>All retained</option>
+          {{range .Presets}}<option value="{{.Value}}"{{if eq .Value $.ServiceLog.Range}} selected{{end}}>{{.Label}}</option>{{end}}
         </select>
       </label>
       {{end}}
@@ -47,7 +44,7 @@
   </section>
 
   <section class="panel">
-    <p class="muted small">{{if not .At}}Updates live. {{end}}Click a line to see its full content.</p>
+    <p class="muted small">Keeps the last {{.Window}}, up to {{.MaxLines}} lines. {{if not .At}}Updates live. {{end}}Click a line to see its full content.</p>
     {{/* The .log-lines container is the scroll box AND (when not viewing a fixed point in time) the
          live-refresh fragment; scroll position is preserved across a refresh. */}}
     <div class="log-lines mono"{{if not .At}} data-poll-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/logs/history/rows?range={{.Range}}&copy={{urlquery .Copy}}&q={{urlquery .Query}}" data-poll-interval="5000" data-poll-preserve-scroll{{end}}>
@@ -75,7 +72,7 @@
 {{/* The log-lines list — rendered inline AND returned by .../logs/history/rows for the live poll, so it
      operates on the root tmplData (.ServiceLog) and is identical in both paths. */}}
 {{define "servicelogrows"}}{{with .ServiceLog}}
-{{if .Capped}}<div class="muted small mb1">Showing the most recent {{len .Lines}} matching lines — narrow the filter or range to see more.</div>{{end}}
+{{if .Capped}}{{if .Lines}}<div class="muted small mb1">Showing the most recent {{len .Lines}} matching lines — narrow the filter or range to see more.</div>{{else}}<div class="muted small mb1">The search stopped before it found a matching line — narrow the filter or range.</div>{{end}}{{end}}
 {{range .Lines}}
 <div class="log-line{{if .Level}} lvl-{{.Level}}{{end}}" title="Click to see the full line">
   <span class="log-t muted">{{template "ts" .At}}</span>
@@ -83,5 +80,5 @@
   <span class="log-text">{{.Text}}</span>
 </div>
 {{end}}
-{{if not .Lines}}<div class="muted" style="padding:.35rem .1rem">No retained log lines match. Lines appear once the service is running and producing output; capture begins from when it is enabled and is retained for 48 hours.</div>{{end}}
+{{if and (not .Lines) (not .Capped)}}<div class="muted" style="padding:.35rem .1rem">No retained log lines match. Lines appear once the service is running and producing output, and are kept for {{.Window}} (up to {{.MaxLines}} lines).</div>{{end}}
 {{end}}{{end}}

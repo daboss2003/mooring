@@ -106,7 +106,7 @@ type Deps struct {
 	UpdateCheck  *updatecheck.Checker // self-update / security-advisory posture (nil when disabled)
 	ImageScans   *imagescan.Store     // per-app Trivy scan results (surface on the Server tab)
 	ImageUpdates *imageupdate.Store   // per-service pull-image update state (surface on the Server tab; may be nil)
-	ServiceLogs  *servicelog.Store    // retained per-service container logs for search (opt-in; may be nil)
+	ServiceLogs  *servicelog.Store    // retained per-service container logs for search (on by default; nil when off)
 	EventLog     *eventlog.Store      // deduped operational events for the Activity tab (may be nil)
 	EdgeErrors   *edgeerr.Store       // per-route edge 4xx/5xx error log (may be nil)
 	Log          *slog.Logger
@@ -208,7 +208,7 @@ type Server struct {
 	updateCheck    *updatecheck.Checker         // self-update / security-advisory posture (may be nil)
 	imageScans     *imagescan.Store             // per-app Trivy scan results (may be nil)
 	imageUpdates   *imageupdate.Store           // per-service pull-image update state (may be nil)
-	serviceLogs    *servicelog.Store            // retained per-service logs for search (opt-in; may be nil)
+	serviceLogs    *servicelog.Store            // retained per-service logs for search (on by default; nil when off)
 	eventLog       *eventlog.Store              // deduped operational events for the Activity tab (may be nil)
 	edgeErrors     *edgeerr.Store               // per-route edge 4xx/5xx error log (may be nil)
 	pendingApps    atomic.Pointer[[]pendingApp] // undeployed mooring.*.yaml siblings found in connected repos
@@ -509,7 +509,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /apps/{project}/scaling", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleScalingSave))))
 	mux.HandleFunc("POST /apps/{project}/services/{service}/replicas/{dir}", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleReplicaNudge))))
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs", s.requireAuth(s.handleServiceLogs))
-	// Retained log SEARCH (opt-in): the service's captured stdout/stderr history, filterable.
+	// Retained log SEARCH (on by default): the service's captured stdout/stderr history, filterable.
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs/history", s.requireAuth(s.handleServiceLogHistory))
 	mux.HandleFunc("GET /apps/{project}/services/{service}/logs/history/rows", s.requireAuth(s.handleServiceLogRows))
 	// withCSRFToken so the live-polled ops fragment carries a CSRF token for its

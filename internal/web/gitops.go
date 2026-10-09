@@ -220,6 +220,7 @@ type gitView struct {
 	VersionsPrevURL string
 	VersionsNextURL string
 	FirstPage       bool
+	ReleaseID       int64 // the deployed release's version: never offered for deletion
 }
 
 func shortSha(s string) string {
@@ -361,6 +362,7 @@ func (s *Server) handleGitHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	gv.FirstPage = page == 1
 	if s.defStore != nil {
+		gv.ReleaseID, _ = s.defStore.ReleaseVersionID(project)
 		rows, hasMore, err := s.defStore.ListPage(project, pageSize, (page-1)*pageSize)
 		if err == nil {
 			gv.Versions = rows
@@ -657,7 +659,7 @@ func (s *Server) streamDeploy(w http.ResponseWriter, opening string, run func(bg
 	go func() {
 		defer s.gitDeploy.Release()
 		defer close(lines)
-		bg, cancel := context.WithTimeout(context.Background(), s.deployTimeout())
+		bg, cancel := context.WithTimeout(context.Background(), s.repoDeployTimeout())
 		defer cancel()
 		emit := func(line string) {
 			select {
@@ -1014,6 +1016,16 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// the build can starve the running app of CPU and the up recreates it — neither may read as a crash loop.
 	defer s.leaseExpectedDown(ctx, slug)()
 	declared := declaredServiceSet(def)
+	upJob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile}
+	paced := !atOnce && s.startGate != nil && s.cfg.Server.StartGateSettings().Enabled
+	// spec.release: a failed build or job puts back the previous release's compose and images (release.go).
+	var rel *releaseRun
+	if release := s.releaseToRun(cfg.PreviewOf, def, onLine); release != nil {
+		rel = &releaseRun{slug: slug, dir: rd, def: def, rel: release, base: upJob, env: env, paced: paced, prev: &releasePrev{}}
+		// Keep each built ref's current image alive across the build, for a failed build or job to go back to.
+		rel.prev.images = s.backupBuildImages(ctx, slug, def, onLine)
+		defer s.dropBuildImageBackups(slug, rel.prev, onLine)
+	}
 
 	// (5a) Build every build service explicitly, scheduled ones included. `up --build` builds only the
 	// services it starts and the scheduled compose profile keeps scheduled services out of `up`, so a
@@ -1038,6 +1050,10 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 			bjob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile, Action: buildAction(g)}
 			if berr := s.runner.Run(bctx, bjob, onLine); berr != nil {
 				bcancel()
+				if rel != nil {
+					// A group built before this one moved its refs to new images (a scheduled service among them).
+					s.restoreRelease(ctx, *rel, false, onLine)
+				}
 				code, outcome := classifyExit(berr)
 				s.recordDeployFinish(bg, depID, code, outcome)
 				s.gitStore.SetState(bg, slug, "update_blocked")
@@ -1065,10 +1081,22 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return err
 	}
-	upJob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile}
 	digests := newDigests
 	var problems []rolloutProblem
-	paced := !atOnce && s.startGate != nil && s.cfg.Server.StartGateSettings().Enabled
+	// (5a') spec.release runs here: after the build, before anything below replaces or removes a running service.
+	var relProblems []rolloutProblem
+	var relStarted []string // dependencies the job started: they run the new version whatever happens next
+	if rel != nil {
+		rel.vols = reconciledVols
+		rr, rerr := s.runRelease(ctx, *rel, onLine)
+		if rerr != nil {
+			return nil, failed(rerr)
+		}
+		// A dependency the job started already runs the new version with its current files.
+		changed = withoutServices(changed, rr.started)
+		relProblems, relStarted = rr.problems, rr.started
+		s.renewExpectedDown(bg, slug)
+	}
 	if paced {
 		// Remove the containers of services no longer in the definition first, as the whole-project
 		// `up --remove-orphans` did: a renamed service may need the host port its old name still holds.
@@ -1077,12 +1105,13 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		// services were built in (5a), so no `up` builds.
 		out, rerr := s.runDeployRollout(ctx, deployRollout{slug: slug, def: def, base: upJob, changed: changed}, onLine)
 		if out.allFailed() {
-			// Nothing started, so the OLD containers are still running: undo as for a failed whole-project up.
-			s.rollbackVolumeOwnership(bg, reconciledVols, onLine)
+			// Nothing started, so the OLD containers are still running: undo as for a failed whole-project up
+			// (a volume a dependency the job started uses keeps the new owner).
+			s.rollbackVolumeOwnership(bg, volumesNotUsedBy(def, slug, reconciledVols, relStarted), onLine)
 			s.streamOOMHint(ctx, slug, declared, onLine)
 			return nil, failed(fmt.Errorf("docker compose up failed: %s", deployProblemsText(out.problems)))
 		}
-		problems = out.problems
+		problems = withReleaseProblems(relProblems, out.problems, out.steps)
 		if len(problems) > 0 {
 			// Intentional: the deploy carries on past a service that failed to start or settle, so the rest of
 			// the new version still ships (it may be the fix). The problems are streamed last and alerted.
@@ -1118,8 +1147,9 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 			// The `up` failed, so the OLD containers are still running. Roll any volume ownership we
 			// changed back to its prior UID, or that still-running old container (a different UID) would
 			// be left unable to write its own data until a deploy eventually succeeds. Detached context so
-			// it runs even if the request was cancelled.
-			s.rollbackVolumeOwnership(bg, reconciledVols, onLine)
+			// it runs even if the request was cancelled. A volume a dependency the job started uses keeps
+			// the new owner: that dependency runs the new image.
+			s.rollbackVolumeOwnership(bg, volumesNotUsedBy(def, slug, reconciledVols, relStarted), onLine)
 			s.streamOOMHint(ctx, slug, declared, onLine)
 			return nil, failed(fmt.Errorf("docker compose up failed: %w", runErr))
 		}
@@ -1158,9 +1188,9 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	// The repo's mooring.yaml is the source of truth: record it as the canonical and
 	// reconcile every projection (edge/L4 routes, scaling) from it. This also clears
 	// any prior dashboard drift, since the canonical is now the freshly-deployed file.
-	note := "git deploy: " + shortSha(sha)
+	note := noteGitDeploy + shortSha(sha)
 	if rollback {
-		note = "rollback to " + shortSha(sha)
+		note = noteRollback + shortSha(sha)
 	}
 	if err := s.applyDefinition(ctx, slug, def, note, sha); err != nil {
 		return nil, failed(fmt.Errorf("apply definition: %w", err))
@@ -1316,6 +1346,12 @@ func (s *Server) recordRepoDeployStart(ctx context.Context, project, source, act
 	return id
 }
 
+// Definition-version notes for git deploys; pausedAfterRollback reads them back.
+const (
+	noteGitDeploy = definition.NoteGitDeploy
+	noteRollback  = definition.NoteRollback
+)
+
 // --- webhook (trigger-only, plan §5.7) ---
 
 // handleWebhook is allowlist-exempt + auth-exempt but HMAC-gated, replay-protected,
@@ -1378,7 +1414,7 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	s.auditWebhook(r, project, audit.OK, "accepted")
 	go func() {
 		defer s.gitDeploy.Release()
-		ctx, cancel := context.WithTimeout(context.Background(), s.deployTimeout())
+		ctx, cancel := context.WithTimeout(context.Background(), s.repoDeployTimeout())
 		defer cancel()
 		s.fetchAndMaybeDeploy(ctx, project, "webhook")
 	}()

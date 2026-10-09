@@ -28,10 +28,13 @@ func apiErr(w http.ResponseWriter, status int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func apiJSON(w http.ResponseWriter, v any) {
+func apiJSON(w http.ResponseWriter, v any) { apiJSONStatus(w, http.StatusOK, v) }
+
+// apiJSONStatus writes v as JSON with the given status.
+func apiJSONStatus(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
@@ -243,16 +246,6 @@ func (s *Server) writeAPIEvents(w http.ResponseWriter, r *http.Request, level st
 	}{Events: out})
 }
 
-// handleAPIDeploy (deploy:write:<project>) is the write-plane API entry. The scope
-// binding (the token must hold deploy:write for THIS exact project) is the
-// security-critical part and is enforced in requireToken; the orchestration itself
-// is write-plane and lands with the deploy runner integration (continuation). It
-// returns 501 rather than faking success.
-func (s *Server) handleAPIDeploy(w http.ResponseWriter, r *http.Request) {
-	project := r.PathValue("project")
-	s.auditAPI(r, TokenID(r.Context()), audit.OK, "deploy accepted (scope ok) for "+project)
-	apiErr(w, http.StatusNotImplemented, "deploy over the API is not enabled in this build")
-}
-
-// deployScope derives the per-project scope a deploy request requires.
+// deployScope derives the per-project scope a deploy request requires. The deploy
+// handler itself is handleAPIDeploy (api_deploy.go).
 func deployScope(r *http.Request) string { return "deploy:write:" + r.PathValue("project") }

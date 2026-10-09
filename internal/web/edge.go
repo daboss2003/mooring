@@ -21,6 +21,7 @@ type edgeRouteView struct {
 	HSTS            bool
 	SecurityHeaders bool
 	Enabled         bool
+	LB              string // replica selection; "least_conn" when the route sets none
 }
 
 type edgeView struct {
@@ -36,10 +37,14 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 	ev := &edgeView{Reason: s.edgeReason}
 	if routes, err := s.edgeRoutes.List(); err == nil {
 		for _, rt := range routes {
+			lb := rt.LB
+			if lb == "" {
+				lb = "least_conn"
+			}
 			ev.Routes = append(ev.Routes, edgeRouteView{
 				ID: rt.ID(), AppID: rt.AppID, Hostname: rt.Hostname, Upstream: rt.Upstream,
 				UpstreamScheme: rt.UpstreamScheme, PathPrefix: rt.PathPrefix,
-				HSTS: rt.HSTS, SecurityHeaders: rt.SecurityHeaders, Enabled: rt.Enabled,
+				HSTS: rt.HSTS, SecurityHeaders: rt.SecurityHeaders, Enabled: rt.Enabled, LB: lb,
 			})
 		}
 	}

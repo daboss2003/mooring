@@ -154,6 +154,9 @@ server:
   route_error_log_enabled: true       # the per-route edge error log (Errors tab); on by default
   service_log_enabled: true           # capture+retain each service's stdout/stderr for search; on by default
                                       # (writes app output to disk; see docs/service-trends-and-logs.md)
+  service_log_max_retain: 30d         # cap on any service's logs.retain (1h–365d); the default is 48h
+  service_log_max_lines: 200000       # cap on any service's logs.max_lines (100–10000000); the default is 2000
+  service_log_max_disk_mb: 2048       # disk budget for all captured logs; oldest files removed first (64–102400)
   disk_gc_enabled: true               # reclaim dangling images + build cache when disk is tight
   disk_gc_threshold: 75               # % disk usage that triggers it (50–95)
   build_cache_keep_enabled: true      # trim BuildKit cache after each build-deploy

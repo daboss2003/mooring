@@ -529,3 +529,48 @@ func TestStartGateSettings(t *testing.T) {
 	mustReject(t, validYAML(t, "server:\n  start_gate:\n    service_settle: 5s\n"), "service_settle")
 	mustReject(t, validYAML(t, "server:\n  start_gate:\n    rollout_budget: 5h\n"), "rollout_budget")
 }
+
+func TestParseDurationDays(t *testing.T) {
+	for in, want := range map[string]time.Duration{"30d": 720 * time.Hour, "1d": 24 * time.Hour, "0d": 0, "48h": 48 * time.Hour, "90m": 90 * time.Minute} {
+		if got, err := ParseDuration(in); err != nil || got != want {
+			t.Errorf("ParseDuration(%q) = %v, %v; want %v", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"d", "1d12h", "-1d", "1.5d", "99999999999999999999d", "36501d", "x"} {
+		if _, err := ParseDuration(in); err == nil {
+			t.Errorf("ParseDuration(%q) should fail", in)
+		}
+	}
+}
+
+func TestServiceLogLimits(t *testing.T) {
+	cfg, err := Parse([]byte(validYAML(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Server.ServiceLogLimits(); got.MaxRetain != 30*24*time.Hour || got.MaxLines != 200000 || got.MaxDiskBytes != 2048<<20 {
+		t.Errorf("defaults: %+v", got)
+	}
+	set, err := Parse([]byte(validYAML(t, "server:\n  service_log_max_retain: 90d\n  service_log_max_lines: 500000\n  service_log_max_disk_mb: 4096\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := set.Server.ServiceLogLimits(); got.MaxRetain != 90*24*time.Hour || got.MaxLines != 500000 || got.MaxDiskBytes != 4096<<20 {
+		t.Errorf("set: %+v", got)
+	}
+	if _, err := Parse([]byte(validYAML(t, "server:\n  service_log_max_retain: 1h\n  service_log_max_lines: 100\n  service_log_max_disk_mb: 64\n"))); err != nil {
+		t.Errorf("lower bounds must be accepted: %v", err)
+	}
+	if _, err := Parse([]byte(validYAML(t, "server:\n  service_log_max_retain: 365d\n  service_log_max_lines: 10000000\n  service_log_max_disk_mb: 102400\n"))); err != nil {
+		t.Errorf("upper bounds must be accepted: %v", err)
+	}
+	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: 30m\n"), "service_log_max_retain")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: 366d\n"), "service_log_max_retain")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: -2h\n"), "service_log_max_retain")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: 1d12h\n"), "invalid duration")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_lines: 99\n"), "service_log_max_lines")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_lines: 10000001\n"), "service_log_max_lines")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_lines: -1\n"), "service_log_max_lines")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_disk_mb: 63\n"), "service_log_max_disk_mb")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_disk_mb: 102401\n"), "service_log_max_disk_mb")
+}

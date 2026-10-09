@@ -80,6 +80,11 @@ type Service struct {
 	// Ulimits are per-container limits (currently only nofile). Validated in the
 	// definition layer; allow-listed in compose (§5.6). nil omits the compose key.
 	Ulimits *Ulimits `json:"ulimits,omitempty"`
+	// Replicas is a fixed copy count (compose `scale`); 0 omits the key (one copy, or the
+	// autoscaler's count). CPUs is a per-copy CPU cap in cores ("1.5"); empty omits it. Both
+	// validated in the definition layer.
+	Replicas int    `json:"replicas,omitempty"`
+	CPUs     string `json:"cpus,omitempty"`
 	// Scheduled marks a SCHEDULED-ONLY service (referenced by a scheduled_task): the generator
 	// gives it a compose profile so `up` never starts it; Mooring runs it on its interval via
 	// `compose run --rm`. Not a security-relevant field (no compose privilege), just placement.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -32,6 +33,20 @@ var rungAction = map[selfheal.Rung][]string{
 	selfheal.RungRestart:  {"restart"},
 	selfheal.RungRecreate: {"up", "-d", "--no-deps", "--no-build", "--force-recreate"},
 	selfheal.RungRedeploy: {"up", "-d", "--no-deps", "--no-build", "--force-recreate"},
+	// restore adds one copy to a fixed-count service without recreating the copies it still has; Remediate
+	// appends `--scale <svc>=<n>`.
+	selfheal.RungRestore: {"up", "-d", "--no-deps", "--no-build", "--no-recreate"},
+}
+
+// serviceCopies counts service's containers in app (from the snapshot), whatever their state.
+func serviceCopies(app monitor.App, service string) int {
+	n := 0
+	for _, c := range app.Services {
+		if c.Service == service {
+			n++
+		}
+	}
+	return n
 }
 
 // serviceHasCopy reports whether id is one of service's containers in app (from the snapshot).
@@ -62,7 +77,11 @@ func (s *Server) scalerManages(project, service string) bool {
 //
 // With t.CopyID, the restart rung restarts only that copy (`docker restart <id>`). With t.Remove,
 // the sick copies are removed (the autoscaler starts fresh ones, paced by the start gate) while the
-// service's other copies keep serving. Copy ids must be containers of this app's service.
+// service's other copies keep serving. With t.Restore (or the restore rung), a service whose deployed
+// definition declares a fixed count N of two or more copies has t.Remove removed and then gets ONE copy
+// more with `up --no-recreate --scale <svc>=min(left+1, N)`, which leaves its other copies untouched;
+// when nothing is missing it starts nothing (and without removals refuses with ErrNothingMissing). Copy
+// ids must be containers of this app's service.
 func (s *Server) Remediate(ctx context.Context, app monitor.App, service string, rung selfheal.Rung, t selfheal.Target) (err error) {
 	defer func() {
 		if err == nil {
@@ -85,9 +104,40 @@ func (s *Server) Remediate(ctx context.Context, app monitor.App, service string,
 		}
 	}
 	logLine := func(l string) { s.log.Debug("selfheal", "service", service, "out", l) }
+	restore := t.Restore || rung == selfheal.RungRestore
 	switch {
-	case t.CopyID != "" && (len(t.Remove) > 0 || rung != selfheal.RungRestart):
+	case t.CopyID != "" && (len(t.Remove) > 0 || restore || rung != selfheal.RungRestart):
 		return fmt.Errorf("a single-copy target is only valid for a restart")
+	case restore:
+		// Intentional: read the deployed definition fresh rather than trust the supervisor's cached facts
+		// or the run dir's compose `scale:` (a deploy that failed after writing it may have changed it).
+		// The count is passed with --scale; without a count, `up -- <svc>` would converge the service to
+		// ONE copy — removing the copies of a service the autoscaler manages.
+		n := declaredReplicas(s.currentDef(app.Project), service)
+		if n < 2 || s.scalerManages(app.Project, service) {
+			return fmt.Errorf("%s/%s: %w", app.Project, service, selfheal.ErrNotFixed)
+		}
+		left := max(serviceCopies(app, service)-len(t.Remove), 0)
+		if left >= n && len(t.Remove) == 0 {
+			return fmt.Errorf("%s/%s: %w", app.Project, service, selfheal.ErrNothingMissing)
+		}
+		if len(t.Remove) > 0 {
+			if s.edgeRecon != nil {
+				_ = s.edgeRecon.DrainContainers(ctx, t.Remove) // stop dialing them before they go
+			}
+			if err := s.runner.RemoveContainersHeld(ctx, t.Remove, logLine); err != nil {
+				if s.edgeRecon != nil {
+					_ = s.edgeRecon.UndrainContainers(ctx, t.Remove)
+				}
+				return err
+			}
+		}
+		if left >= n {
+			return nil // the copies left after the removals are the declared count
+		}
+		// One copy per restore (the supervisor comes back for the next one), as every automatic start
+		// is paced: never jump straight to the declared count.
+		args = append(append([]string(nil), rungAction[selfheal.RungRestore]...), "--scale", service+"="+strconv.Itoa(left+1))
 	case len(t.Remove) > 0:
 		// Intentional: never fall back to recreating the service here — that would start containers the
 		// supervisor didn't pace. It decides between removal and a recreate itself.
@@ -115,9 +165,9 @@ func (s *Server) Remediate(ctx context.Context, app monitor.App, service string,
 		return fmt.Errorf("render env file: %w", err)
 	}
 
-	// recreate/redeploy re-apply the compose → run the chokepoint validator + heal
-	// managed config files (never deploy unsafe/un-rendered config, even to self-heal).
-	if rung == selfheal.RungRecreate || rung == selfheal.RungRedeploy {
+	// recreate/redeploy/restore create containers from the compose → run the chokepoint validator +
+	// heal managed config files (never deploy unsafe/un-rendered config, even to self-heal).
+	if rung == selfheal.RungRecreate || rung == selfheal.RungRedeploy || restore {
 		if res := s.validateAppCompose(&app, env); !res.OK() && s.cfg.ComposeValidation.Mode != "review" {
 			return fmt.Errorf("§5.6 compose validation failed (%d findings)", len(res.Violations))
 		}

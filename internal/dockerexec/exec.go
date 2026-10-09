@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,6 +71,9 @@ type Job struct {
 	EnvFile     string   // optional 0600 --env-file rendered from the env store
 	Action      []string // e.g. ["up","-d","--force-recreate"]
 	Service     string   // optional; appended after a "--" terminator
+	// Args follow the service (`run … -- <svc> <args…>`): a one-off's command, handed to the container
+	// as-is. Ignored without Service, since nothing would separate them from compose's own flags.
+	Args []string
 }
 
 // defaultWritePlaneFloor is the §0 write-plane resource gate, against RAM + swap. It is 900 MiB, NOT
@@ -135,6 +139,7 @@ func (j Job) argv() []string {
 	argv = append(argv, j.Action...)
 	if j.Service != "" {
 		argv = append(argv, "--", j.Service) // -- terminator before the service
+		argv = append(argv, j.Args...)
 	}
 	return argv
 }
@@ -466,6 +471,78 @@ func (r *Runner) ReapOneOffHeld(ctx context.Context, project string) {
 		return
 	}
 	_ = r.runArgv(ctx, "", append([]string{"rm", "-f"}, ids...), nil)
+}
+
+var (
+	imageIDRe  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	imageRefRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_.-]{0,127}(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$`)
+)
+
+// validImageRef reports whether ref is a local repository name (compose's <project>-<service>) with an
+// optional tag: no option, registry host or digest, and not "sha256:<hex>", which docker reads as an image id.
+func validImageRef(ref string) bool {
+	return imageRefRe.MatchString(ref) && !strings.HasPrefix(ref, "sha256:")
+}
+
+// tagArgv is `docker tag -- <id> <ref>`: id a full sha256 image id, ref a validImageRef.
+func tagArgv(id, ref string) ([]string, error) {
+	if !imageIDRe.MatchString(id) || !validImageRef(ref) {
+		return nil, fmt.Errorf("tag: invalid image id %q or reference %q", id, ref)
+	}
+	return []string{"tag", "--", id, ref}, nil
+}
+
+// untagArgv is `docker rmi -- <ref>` for a reference with an explicit tag other than latest, so it can only
+// ever drop a tag Mooring added, never a service's own image name or an image by id.
+func untagArgv(ref string) ([]string, error) {
+	_, tag, ok := strings.Cut(ref, ":")
+	if !validImageRef(ref) || !ok || tag == "latest" {
+		return nil, fmt.Errorf("untag: invalid reference %q", ref)
+	}
+	return []string{"rmi", "--", ref}, nil
+}
+
+// TagImage points the local reference ref at image id (`docker tag -- <id> <ref>`) under the §0 gate and
+// the one-docker-child semaphore.
+func (r *Runner) TagImage(ctx context.Context, id, ref string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.TagImageHeld(ctx, id, ref, onLine)
+}
+
+// TagImageHeld is TagImage for a caller that ALREADY HOLDS the one-docker-child semaphore.
+func (r *Runner) TagImageHeld(ctx context.Context, id, ref string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	argv, err := tagArgv(id, ref)
+	if err != nil {
+		return err
+	}
+	return r.runArgv(ctx, "", argv, onLine)
+}
+
+// UntagImage removes the reference ref (`docker rmi -- <ref>`), which must carry an explicit tag other
+// than latest. Docker deletes the image too when that was its last reference and no container uses it,
+// and refuses (an error) while a container still does. Under the §0 gate and the semaphore.
+func (r *Runner) UntagImage(ctx context.Context, ref string, onLine func(string)) error {
+	if !r.writeAllowed {
+		return ErrWritePlaneDisabled
+	}
+	argv, err := untagArgv(ref)
+	if err != nil {
+		return err
+	}
+	if err := r.sem.Acquire(ctx); err != nil {
+		return err
+	}
+	defer r.sem.Release()
+	return r.runArgv(ctx, "", argv, onLine)
 }
 
 // RemoveContainers force-removes containers by id (`docker rm -f <id>...`) — write-plane, §0

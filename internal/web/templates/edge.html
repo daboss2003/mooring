@@ -14,13 +14,14 @@
     <h2>Routes</h2>
     {{if .Routes}}
     <div class="table-scroll"><table class="grid">
-      <thead><tr><th>Hostname</th><th>Path</th><th>→ Upstream</th><th>HSTS</th><th>On</th></tr></thead>
+      <thead><tr><th>Hostname</th><th>Path</th><th>→ Upstream</th><th>LB</th><th>HSTS</th><th>On</th></tr></thead>
       <tbody>
         {{range .Routes}}
         <tr>
           <td class="mono">{{.Hostname}}</td>
           <td class="mono">{{if .PathPrefix}}{{.PathPrefix}}{{else}}/{{end}}</td>
           <td class="mono">{{.UpstreamScheme}}://{{.Upstream}}</td>
+          <td class="mono">{{.LB}}</td>
           <td>{{if .HSTS}}yes{{else}}no{{end}}</td>
           <td>{{if .Enabled}}yes{{else}}no{{end}}</td>
         </tr>

@@ -33,6 +33,8 @@ Everything reaches the runtime through **one validator** — the same one whethe
   - [`edge.routes`](#specedgeroutes)
   - [`edge.l4_routes`](#specedgel4_routes-tcpudp-load-balancing)
   - [`scaling`](#specscaling)
+  - [`scheduled_tasks`](#specscheduled_tasks-cron-jobs)
+  - [`release`](#specrelease-a-job-before-each-deploy)
   - [`self_healing`](#specself_healing)
   - [`ops_interface`](#specops_interface--servicesnameops_interface)
   - [`git`](#specgit)
@@ -122,6 +124,8 @@ After a clean parse, `${VAR}` / `.env` interpolation is **resolved first** (vali
 | `edge.routes` | public HTTPS routes (the managed edge) | empty (no public exposure) |
 | `edge.l4_routes` | TCP/UDP stream listeners (the L4 load balancer) | empty |
 | `scaling` | opt-in auto-scaling, one policy per service | disabled |
+| `scheduled_tasks` | commands run on an interval | none |
+| `release` | a command run before each deploy replaces any service (e.g. a migration) | none |
 | `self_healing` | per-app tuning of the self-healing supervisor | built-in defaults |
 | `ops_interface` | an ops endpoint Mooring probes for rich health/metrics | disabled |
 | `git` | GitOps behaviour (repo, ref, auto-deploy) | `auto_deploy: false` |
@@ -177,6 +181,9 @@ compose:
 | `command` / `restart` | exec array / enum (`no`, `always`, `on-failure`, `unless-stopped`). |
 | `mem_limit` / `mem_reservation` | optional cgroup memory cap / soft reservation per replica, as a size string (`768m`, `1g`). A limit hard-bounds each replica (per-container OOM protection) **and** makes the auto-scaler's `up_mem_pct`/`down_mem_pct` measure against *this* budget instead of the host's total RAM — i.e. a true per-service signal. Omit both to leave the container unbounded (the default). Size comfortably above measured RSS so the kernel doesn't OOM-kill it. |
 | `stop_grace_period` | optional duration (`60s`, `1m30s`) the container gets between `SIGTERM` and `SIGKILL` on stop (scale-down / redeploy), widening docker's 10s default so the app can drain long in-flight requests. Pairs with the app's graceful-shutdown hooks. Omit for the default. |
+| `replicas` | optional fixed number of copies (`1`–`20`). Deploys start that many. Self-healing restarts a stopped copy as for any service and, with 2 or more, also starts copies that are missing. More than one copy is refused for a [stateful image](./scaling-and-self-healing.md) (database, broker, store), a service with a writable volume, or a service that publishes a host port. Can't be combined with `spec.scaling` for the same service, or with a scheduled task. A PR preview runs one copy. Omit for one copy. |
+| `cpus` | optional CPU cap per copy, in cores with up to two decimals (`"0.5"`, `"1.5"`, `"2"`). Docker refuses a value above the host's CPU count, which fails the deploy. Omit for no cap. |
+| `logs` | optional `{ retain, max_lines }`: how far back this service's [captured logs](./service-trends-and-logs.md) are kept (`72h`, `30d`) and how many recent lines are kept. Each value is capped by the server's `service_log_max_retain` / `service_log_max_lines` in [`config.yaml`](./host-file.md). Omit for the server default (48h, 2000 lines). Ignored on PR previews. |
 | `ulimits` | optional per-container open-file limit — only `nofile: { soft, hard }` is supported. Raise it for a service holding many concurrent sockets, whose `max_connections` would otherwise be clamped by docker's default `nofile` of 1024 (e.g. an MQTT broker). `1 ≤ soft ≤ hard`; `hard` can't exceed the host kernel's `fs.nr_open` (commonly `1048576`) — higher needs a host `sysctl` (Mooring forbids in-container `sysctls`). Omit for the docker default. |
 
 The dangerous keys (`privileged`, `cap_add`, host namespaces, host binds, host-publish) **cannot be
@@ -530,6 +537,7 @@ spec:
 | `redirect_http` | bool | `true` | HTTP→HTTPS redirect. |
 | `hsts` | bool | per-edge | HSTS is only emitted **after** a cert exists. |
 | `security_headers` | bool | per-edge | Emit the baseline security-header set for this vhost. |
+| `lb` | `least_conn` \| `round_robin` \| `ip_hash` \| `cookie` | `least_conn` | How the edge picks a copy when the service runs more than one. `ip_hash` keeps a client on one copy by the address the edge sees (behind a CDN or proxy, that is the proxy's address). `cookie` keeps a browser session on one copy with an edge-set cookie; a session moves when its copy is replaced. Use `cookie` or `ip_hash` for Socket.IO long-polling. |
 | `ca` | string | default issuer | Name of a **private CA** to issue this route's cert from, instead of the default `edge.acme_ca`. The CA must be defined in the operator's `config.yaml` under [`edge.cas`](#using-a-private-ca) — referencing an undefined name fails the deploy. Omit it and the route uses the default CA (Let's Encrypt, typically), exactly as before. |
 
 (Need the edge to issue a certificate for a hostname it shouldn't proxy — a broker that terminates its own TLS, say? That's a [`cert_binding`](#speccert_bindings), not a route.)
@@ -713,6 +721,31 @@ Notes:
 - A task doesn't start while a deploy, certificate renewal or app delete is running on the server, or while its own app is mid-deploy or mid lifecycle action; it stays due and starts at the next minute's check after. The [start gate](./scaling-and-self-healing.md#start-pacing) can also hold a due task back — while other containers are still starting or the host CPU is busy — for at most `max_wait`. A task already running when a deploy starts keeps the single docker slot until it finishes, and the deploy waits for it. A failed task raises an alert; the last run is remembered across restarts (a restart doesn't re-fire everything).
 - **See what ran:** the dashboard's **[Scheduled tasks](./scheduled-tasks.md)** tab shows what's running right now (with live CPU/memory and the owning app), plus the recent run history with results and captured logs (kept 7 days).
 
+### `spec.release` (a job before each deploy)
+
+Runs one command from a service's newly built image after the build and before the deploy replaces any running service. The usual use is a database migration.
+
+```yaml
+spec:
+  release:
+    service: api                       # whose image, env, secrets, networks, volumes and limits to use
+    command: [node, dist/migrate.js]   # exec form, no shell
+    timeout: 10m                       # optional; 10s–1h, default 10m
+    previews: false                    # optional; run on PR preview deploys too
+```
+
+- The job runs as a one-off `docker compose run --rm` container of `service` with `command` in place of the service's own command. It gets the service's environment, secrets, networks, volumes, `mem_limit` and `cpus`. It publishes no host ports.
+- It runs once per deploy, including rollbacks and redeploys of the same commit. Keeping migrations backward compatible is up to the app.
+- A dependency of `service` (its `depends_on`, transitively) that has no running container is started first with the new version, one at a time like any deploy (with **all at once**, together, with up to 5 minutes to become healthy). This includes a dependency you stopped by hand; its hold is released. Dependencies that are already running are left as they are until the rollout.
+- A dependency is not started while a service no longer in `mooring.yaml` (removed or renamed) still has a running container that mounts one of its volumes or run-dir binds, or publishes one of its host ports. The deploy then fails before starting anything and names both services. Stop the old service, or deploy the change once without `spec.release`: a deploy without a release job removes the old service's containers before it starts the new ones.
+- The job holds the server's single docker slot for its whole run, up to `timeout`. Until it ends, self-healing and autoscaling of every app on the server wait; scheduled tasks and backups of every app wait for the whole deploy, as for any deploy.
+- A non-zero exit or the timeout fails the deploy before any service is replaced. The previous release keeps running, and the deploy puts back the previous release's compose file and images, as it also does when the build fails: the app's `docker-compose.yml` is generated again from the previous deployed release's definition and written if it passes the compose validator, and each build service's image goes back to the one it had before the build. A restart, a scale-up or a scheduled task then still runs the previous code. On a first deploy there is nothing to put back.
+- What is not put back: dependencies the job started keep running the new version, and config files, secret files and certificates the deploy wrote stay in place.
+- An image that can't be put back is named in the deploy log and keeps the tag `<slug>-<service>:mooring-previous` until the next deploy with a release job; `docker tag <slug>-<service>:mooring-previous <slug>-<service>` restores it by hand.
+- The job's output is shown in the deploy log.
+- On a PR preview the job runs only when the base app's deployed definition sets `previews: true`; the preview's own file can't turn it on.
+- Self-healing, the autoscaler and the edge ignore the job's container.
+
 ### `spec.self_healing`
 
 Per-app tuning of the self-healing supervisor (§8.5). Every service is supervised with a conservative built-in default; this block overrides the ladder tunables for **this app**. **Every field is optional** — an omitted field keeps the built-in default, and an omitted block leaves the app entirely on the default. All durations are seconds.
@@ -858,12 +891,13 @@ read the root mooring file at the reviewed commit → parse → typed definition
   → write the app directory: the commit's files, the generated compose and Dockerfiles,
     config files, secret files, certificates (waits for the edge to issue them)
   → build every build: service
+  → run spec.release, if set (fails the deploy on a non-zero exit or timeout)
   → start the services one at a time, dependencies first (or all at once)
   → apply edge and L4 routes, scaling, self-healing and ops settings
   → verify every edge route
 ```
 
-- **A failure before the start replaces nothing that is running.** A failed check, validation, file render, certificate wait or build stops the deploy before any running container is stopped or recreated. The repository shows the update as blocked.
+- **A failure before the start replaces nothing that is running.** A failed check, validation, file render, certificate wait, build or [release job](#specrelease-a-job-before-each-deploy) stops the deploy before any running container is stopped or recreated. The repository shows the update as blocked.
 - **A paced start carries on past a failing service.** A service that fails to start or become healthy is reported with `✗` and the rest of the new version still ships; the deploy ends as deployed with problems. Only a deploy in which no service started is a failed deploy. See [paced starts](./gitops.md#paced-starts). With **all at once**, a failed `docker compose up` fails the deploy.
 - **There is no automatic rollback.** Containers a deploy started keep running after a later step fails, including a failed edge check. To return to an earlier commit, use **Roll back to this** in [deploy history](./gitops.md#deploy-history--rolling-back).
 - **Unchanged services keep running.** A service whose configuration and image didn't change is not recreated.
@@ -1088,6 +1122,10 @@ spec:
 | `…services.<name>.mem_limit` / `.mem_reservation` | size string (`768m`, `1g`) | no | unbounded |
 | `…services.<name>.stop_grace_period` | duration string (`60s`, `1m30s`) | no | docker 10s |
 | `…services.<name>.ulimits.nofile` | `{ soft, hard }` ints (`1 ≤ soft ≤ hard`) | no | docker default (1024) |
+| `…services.<name>.replicas` | int (`1`–`20`) | no | one copy |
+| `…services.<name>.cpus` | string (cores, up to two decimals) | no | no cap |
+| `…services.<name>.logs.retain` | duration (`72h`, `30d`) | no | server default (48h) |
+| `…services.<name>.logs.max_lines` | int | no | server default (2000) |
 | `…services.<name>.ops_interface` | object (see `spec.ops_interface`) | no | — |
 | `spec.secrets[].name` | string | yes (per entry) | — |
 | `spec.secrets[].generate` | string (`hex:N`\|`base64:N`\|`password:N`\|`rsa:BITS`\|`ed25519`) | no | — |
@@ -1099,10 +1137,15 @@ spec:
 | `spec.edge.routes[].redirect_http` | bool | no | `true` |
 | `spec.edge.routes[].hsts` | bool | no | per-edge |
 | `spec.edge.routes[].security_headers` | bool | no | per-edge |
+| `spec.edge.routes[].lb` | `least_conn` \| `round_robin` \| `ip_hash` \| `cookie` | no | `least_conn` |
 | `spec.edge.l4_routes[]` | `{listen, protocol, service, port, lb, tls}` | no | — |
 | `spec.edge.l4_routes[].protocol` | `tcp` \| `udp` | required | — |
 | `spec.edge.l4_routes[].lb` | `round_robin` \| `least_conn` \| `hash_client_ip` | no | `round_robin` |
 | `spec.edge.l4_routes[].tls` | `passthrough` | no | `passthrough` |
+| `spec.release.service` | string (a declared service) | with `release` | — |
+| `spec.release.command` | exec array | with `release` | — |
+| `spec.release.timeout` | duration (`10s`–`1h`) | no | `10m` |
+| `spec.release.previews` | bool | no | `false` |
 | `spec.scaling[]` | list of per-service policies | no | — |
 | `spec.scaling[].service` | string | required | must exist + be unique across entries |
 | `spec.scaling[].enabled` | bool | no | `false` |

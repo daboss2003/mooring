@@ -21,10 +21,13 @@ import (
 // A git deploy is paced whenever the start gate is enabled: instead of one whole-project `up`, the new
 // version starts one service at a time through a rollout (rollout.go), dependencies first.
 //   - A service whose containers all run its current compose definition and image, and whose managed
-//     files didn't change, is left running untouched (an autoscaled one keeps every copy).
+//     files didn't change, is left running untouched — when it runs the copies the deploy would give it:
+//     an autoscaled one keeps every copy, one with a fixed `replicas` count needs exactly that many, and
+//     any other service exactly one.
 //   - Every other service gets its own `up -d --no-deps --no-build [--force-recreate] -- <svc>`. That
 //     also starts a service the operator stopped (its hold is released once it started), and brings a
-//     scaled service back as one fresh copy (no --scale) that the autoscaler then adds to.
+//     scaled service back as one fresh copy (no --scale) that the autoscaler then adds to. A service with
+//     a fixed `replicas` count gets all its copies in that one step (compose `scale:`), replaced together.
 //   - A service that fails to start or to settle is reported and the rest still ship: the deploy ends
 //     "deployed with problems" and raises a WARNING alert.
 //   - First, containers of services no longer in the definition are removed (what the whole-project
@@ -191,14 +194,71 @@ func (s *Server) unchangedServices(ctx context.Context, d deployRollout, service
 		onLine("could not compare the running services with this deploy (container view unavailable); starting every service")
 		return nil
 	}
-	return unchangedSet(services, changed, hashes, images, snap.AppByProject(d.slug))
+	replicas := make(map[string]int, len(services))
+	for _, name := range services {
+		replicas[name] = declaredReplicas(d.def, name)
+	}
+	counts := deployCopyCounts(services, replicas, s.deployAutoscaled(d.slug, d.def))
+	return unchangedSet(services, changed, hashes, images, counts, snap.AppByProject(d.slug))
+}
+
+// deployAutoscaled reports which services the autoscaler keeps the copy count of once the deploy's
+// definition is applied: an enabled spec.scaling entry, or — for a service spec.scaling leaves out — an
+// enabled policy in the scale store (applyScaling leaves those alone).
+func (s *Server) deployAutoscaled(slug string, def *definition.Definition) map[string]bool {
+	out := map[string]bool{}
+	inDef := map[string]bool{}
+	for _, sc := range def.Spec.Scaling {
+		inDef[sc.Service] = true
+		out[sc.Service] = sc.Enabled
+	}
+	if s.scaling == nil {
+		return out
+	}
+	enabled, err := s.scaling.EnabledPolicies()
+	if err != nil {
+		// Intentional: when the store can't be read, every service spec.scaling leaves out and that has no
+		// replicas counts as autoscaled (any copy count), so a dashboard-autoscaled service isn't cut to one
+		// copy because of a read error — the count check then only catches a changed replicas.
+		for name, svc := range def.Spec.Compose.Services {
+			if !inDef[name] && svc.Replicas == 0 {
+				out[name] = true
+			}
+		}
+		return out
+	}
+	for k := range enabled {
+		if k.App == slug && !inDef[k.Service] {
+			out[k.Service] = true
+		}
+	}
+	return out
+}
+
+// deployCopyCounts returns how many copies each service must run for a paced deploy to leave it as it is:
+// its fixed `replicas` count; 0 (any number) when the autoscaler keeps its count; otherwise 1 — what the
+// service's own `up` would converge it to, since its compose file then has no `scale:`.
+func deployCopyCounts(services []string, replicas map[string]int, autoscaled map[string]bool) map[string]int {
+	out := make(map[string]int, len(services))
+	for _, name := range services {
+		switch {
+		case replicas[name] > 0:
+			out[name] = replicas[name] // applyScaling disables a policy left over for it
+		case autoscaled[name]:
+			out[name] = 0
+		default:
+			out[name] = 1
+		}
+	}
+	return out
 }
 
 // unchangedSet decides which services are unchanged. A service is unchanged when its managed files didn't
 // change and it has at least one container, every one of them running, created from the service's current
 // compose definition (its config-hash label equals `compose config --hash`) and running the service's
-// current image. Anything missing — no hash, no image id, no container — counts as changed.
-func unchangedSet(services []string, changed map[string]bool, hashes, images map[string]string, app *monitor.App) map[string]bool {
+// current image — and, when counts[name] > 0, exactly that many. Anything missing — no hash, no image id,
+// no container — counts as changed.
+func unchangedSet(services []string, changed map[string]bool, hashes, images map[string]string, counts map[string]int, app *monitor.App) map[string]bool {
 	out := map[string]bool{}
 	if app == nil {
 		return out
@@ -210,6 +270,11 @@ func unchangedSet(services []string, changed map[string]bool, hashes, images map
 	for _, name := range services {
 		hash, image, cs := hashes[name], images[name], copies[name]
 		if changed[name] || hash == "" || image == "" || len(cs) == 0 {
+			continue
+		}
+		// Intentional: compose's config hash leaves out `scale`, so a changed or removed `replicas` alone
+		// shows up only in the copy count.
+		if n := counts[name]; n > 0 && len(cs) != n {
 			continue
 		}
 		same := true

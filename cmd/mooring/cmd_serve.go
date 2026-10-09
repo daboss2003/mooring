@@ -85,19 +85,37 @@ func cmdServe(args []string) error {
 	log = slog.New(eventlog.NewHandler(baseLogHandler, eventStore))
 	// Per-route edge error log (4xx/5xx), fed by the edge access-log stream when the edge is managed.
 	edgeErrStore := edgeerr.New(filepath.Join(cfg.DataDir, "edge-errors.jsonl"))
-	// Retained per-service log capture (OPT-IN): only constructed when enabled, since it persists the
-	// app's own stdout/stderr to disk. nil (feature off) makes the Logs page show how to turn it on.
+	// Retained per-service log capture (ON by default): per-service segment files under
+	// <data_dir>/service-logs, since it persists the app's own stdout/stderr to disk. nil (feature off)
+	// makes the Logs page show how to turn it on. The pre-segment single file is imported once.
 	var serviceLogStore *servicelog.Store
-	serviceLogPath := filepath.Join(cfg.DataDir, "service-logs.jsonl")
+	serviceLogDir := filepath.Join(cfg.DataDir, "service-logs")
+	legacyServiceLogPath := filepath.Join(cfg.DataDir, "service-logs.jsonl")
 	if cfg.Server.ServiceLogOn() {
-		serviceLogStore = servicelog.New(serviceLogPath, log)
+		lim := cfg.Server.ServiceLogLimits()
+		logDiskSampler := hostmon.New(cfg.DataDir)
+		serviceLogStore = servicelog.New(servicelog.Options{
+			Dir: serviceLogDir, LegacyFile: legacyServiceLogPath,
+			Ceiling:      servicelog.Policy{Retain: lim.MaxRetain, MaxLines: lim.MaxLines},
+			MaxDiskBytes: lim.MaxDiskBytes,
+			// The data dir shares its filesystem with mooring.db: at the disk-pressure threshold capture
+			// pauses and history is cut to the default, so logs can't fill the disk under SQLite.
+			DiskUsage: func() (uint64, uint64, bool) {
+				hs, herr := logDiskSampler.Sample()
+				if herr != nil {
+					return 0, 0, false
+				}
+				return hs.DiskUsed, hs.DiskTotal, true
+			},
+			DiskThresholdPct: float64(cfg.Server.DiskGCThresholdPct()),
+			Log:              log,
+		})
 	} else {
 		// Opt-out must PURGE previously-captured app output, not freeze it on disk. With the store never
-		// constructed, nothing else prunes or deletes this file, so its (possibly secret-bearing) contents
-		// would outlive the 48h TTL indefinitely — the opposite of what turning the feature off intends.
-		// Remove it (best-effort) on boot when the feature is off.
-		_ = os.Remove(serviceLogPath)
-		_ = os.Remove(serviceLogPath + ".tmp")
+		// constructed, nothing else prunes or deletes these files, so their (possibly secret-bearing)
+		// contents would outlive their retention indefinitely — the opposite of what turning the feature
+		// off intends. Remove them (best-effort) on boot when the feature is off.
+		servicelog.Purge(serviceLogDir, legacyServiceLogPath)
 	}
 
 	// Fail-closed: probe that the sandbox actually lets us write the dirs we need,
@@ -503,6 +521,10 @@ func cmdServe(args []string) error {
 			AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
 			AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
 		}
+		// Keys the cookie of routes with lb: cookie. Never logged (it is part of the /load payload only).
+		if dk, derr := config.DecodeKey(cfg.EncryptionKey); derr == nil {
+			base.LBCookieSecret = edge.DeriveLBCookieSecret(dk)
+		}
 		// Per-namespace DNS-01 wildcards. Install each DISTINCT provider's Caddy plugin (add-package
 		// accumulates modules into the binary), and include a namespace's wildcard in the rendered
 		// config ONLY if its provider module is actually present. This ISOLATES failures: one
@@ -736,6 +758,12 @@ func cmdServe(args []string) error {
 	busy := srv.ForegroundBusy
 	foregroundBusy.Store(&busy)
 
+	// Each service's log retention comes from its deployed definition's `logs:`. Wired before the
+	// flusher below starts, since a flush prunes to the policy it knows.
+	if serviceLogStore != nil {
+		serviceLogStore.SetPolicySource(srv.ServiceLogPolicySource())
+	}
+
 	// Persist the Activity event store on a cadence + at shutdown (the store dedups in bounded memory;
 	// the flush is a cheap atomic rewrite of the small deduped set). Joined before the deferred close.
 	wg.Add(1)
@@ -762,10 +790,11 @@ func cmdServe(args []string) error {
 		}
 	}()
 
-	// Retained per-service log capture (opt-in). A manager tails every running, non-protected service
-	// container's stdout/stderr through the read-only socket-proxy — the SAME stream the live tail uses
-	// — teeing it into the bounded servicelog store. It reconciles off the monitor snapshot (attach new
-	// containers, drop vanished ones) on a 15s cadence, like the edge-pool discovery refresher.
+	// Retained per-service log capture (on by default). A manager tails every running, non-protected
+	// service container's stdout/stderr through the read-only socket-proxy — the SAME stream the live
+	// tail uses — teeing it into the bounded servicelog store. It reconciles off the monitor snapshot
+	// (attach new containers, drop vanished ones) on a 15s cadence, like the edge-pool discovery
+	// refresher.
 	if serviceLogStore != nil {
 		logTargets := func() []servicelog.Target {
 			snap := mon.Snapshot()

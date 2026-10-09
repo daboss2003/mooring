@@ -32,10 +32,27 @@ type Actioner interface {
 // attempt is consumed, and the next decision recreates the service instead.
 var ErrNoReplacement = errors.New("no autoscaling policy would replace the removed copies")
 
+// ErrNotFixed is returned by an Actioner that refuses to restore a fixed copy count because the app's
+// deployed definition no longer declares one for the service. The watcher treats it like a deferral.
+var ErrNotFixed = errors.New("the deployed definition declares no fixed copy count for the service")
+
+// ErrNothingMissing is returned by an Actioner that refuses a restore because the service already has
+// as many copies as its deployed definition declares (the count was lowered since the service facts
+// were read). The watcher treats it like a deferral.
+var ErrNothingMissing = errors.New("the service already runs the copy count its deployed definition declares")
+
+// refused reports an Actioner error that means nothing ran.
+func refused(err error) bool {
+	return errors.Is(err, ErrNoReplacement) || errors.Is(err, ErrNotFixed) || errors.Is(err, ErrNothingMissing)
+}
+
 // Target narrows a remediation to specific copies of the service.
 type Target struct {
 	CopyID string   // restart only this copy; "" = act on the whole service
-	Remove []string // remove these sick copies instead (the autoscaler starts fresh ones); never set with CopyID
+	Remove []string // remove these sick copies instead (the autoscaler, or Restore, starts fresh ones); never set with CopyID
+	// Restore: after removing Remove, start one copy the service's fixed count is missing
+	// (`up --no-recreate --scale`), leaving its other copies as they are. Never set with CopyID.
+	Restore bool
 }
 
 // ServiceInfo is what the supervisor needs from an app's definition about one service.
@@ -46,6 +63,7 @@ type ServiceInfo struct {
 	Scheduled bool          // runs only on its schedule, so it is never running as a dependency
 	Scaled    bool          // an enabled autoscaling policy keeps its copy count, so a removed copy is replaced
 	StopGrace time.Duration // stop_grace_period (0 = Docker's default, 10s)
+	Replicas  int           // fixed copy count (`replicas: N`); 0 = none
 }
 
 // Config configures a Watcher. The function/clock fields are injectable for tests.
@@ -189,6 +207,9 @@ func (w *Watcher) Tick(ctx context.Context) {
 			info, _ = w.cfg.Services(app.Project)
 		}
 		groups, names := groupCopies(app, info)
+		if !snap.Truncated {
+			names = seedFixedWithoutCopies(app, info, held, groups, names)
+		}
 		// Dependencies first, so a dependency's state this tick is known when its dependents step.
 		for _, name := range dependencyOrder(names, info) {
 			key := Key{App: app.Project, Service: name}
@@ -198,6 +219,11 @@ func (w *Watcher) Tick(ctx context.Context) {
 			obs.ExpectedDown = leases[app.Project]
 			obs.Held = held[key]
 			obs.Scaled = info[name].Scaled
+			if !snap.Truncated && !info[name].Scheduled {
+				// Intentional: a capped container list may omit copies that exist, so a truncated
+				// snapshot never counts copies as missing.
+				obs.Declared = info[name].Replicas
+			}
 			// WaitingOnEdge is refined once the cert inventory lands (M19); until
 			// then it is conservatively false (never suppress a real failure).
 			if !obs.Held && !obs.ExpectedDown && obs.failing() {
@@ -214,7 +240,11 @@ func (w *Watcher) Tick(ctx context.Context) {
 		}
 	}
 	if !snap.Truncated {
-		w.prune(ctx, seen, leases, now) // a truncated list may omit services that still exist
+		listed := make(map[string]bool, len(snap.Apps))
+		for _, app := range snap.Apps {
+			listed[app.Project] = true
+		}
+		w.prune(ctx, seen, leases, listed) // a truncated list may omit services that still exist
 	}
 }
 
@@ -279,6 +309,30 @@ func groupCopies(app monitor.App, info map[string]ServiceInfo) (map[string]*copy
 		sort.Strings(g.sickIDs)
 	}
 	return groups, names
+}
+
+// seedFixedWithoutCopies adds an empty group for each long-running service of app whose definition
+// declares a fixed count of two or more copies but that has no container at all, so the supervisor
+// restores it. Only while some container of the app runs: an app stopped as a whole is never partly
+// started again. A held service is seeded even then — it is never started, but its state (an open
+// circuit and its alert) is kept instead of pruned. The caller skips this on a truncated snapshot.
+func seedFixedWithoutCopies(app monitor.App, info map[string]ServiceInfo, held map[Key]bool, groups map[string]*copyGroup, names []string) []string {
+	running := false
+	for _, c := range app.Services {
+		running = running || c.Running()
+	}
+	var add []string
+	for name, si := range info {
+		if si.Replicas > 1 && !si.Scheduled && !si.Scaled && groups[name] == nil &&
+			(running || held[Key{App: app.Project, Service: name}]) {
+			add = append(add, name)
+		}
+	}
+	sort.Strings(add)
+	for _, name := range add {
+		groups[name] = &copyGroup{allSeen: true}
+	}
+	return append(names, add...)
 }
 
 func appendID(ids []string, id string) []string {
@@ -446,7 +500,7 @@ func (w *Watcher) remediate(ctx context.Context, app monitor.App, service string
 		FloorBytes:           floor,
 		IsEdgeOrControlPlane: w.cfg.Protected[app.Project],
 	}
-	starts := w.cfg.Gate != nil && len(d.Remove) == 0 // removing copies starts nothing
+	starts := w.cfg.Gate != nil && (len(d.Remove) == 0 || d.Restore) // removing copies alone starts nothing
 	if starts {
 		wait := w.waits[key]
 		if wait == nil {
@@ -474,9 +528,9 @@ func (w *Watcher) remediate(ctx context.Context, app monitor.App, service string
 		}
 		actx, cancel := context.WithTimeout(ctx, timeout)
 		started := time.Now()
-		err := w.cfg.Act.Remediate(actx, app, service, d.Rung, Target{CopyID: d.Target, Remove: d.Remove})
+		err := w.cfg.Act.Remediate(actx, app, service, d.Rung, Target{CopyID: d.Target, Remove: d.Remove, Restore: d.Restore})
 		cancel()
-		if starts {
+		if starts && !refused(err) {
 			w.cfg.Gate.Record(app.Project, service, started, time.Now(), err == nil) // even on error: it may have started something
 		}
 		delete(w.waits, key)
@@ -488,13 +542,20 @@ func (w *Watcher) remediate(ctx context.Context, app monitor.App, service string
 			w.cfg.Log.Warn("selfheal: sick copies not removed (not autoscaled); recreating the service next", "app", app.Project, "service", service)
 			return
 		}
+		if errors.Is(err, ErrNotFixed) || errors.Is(err, ErrNothingMissing) {
+			// Intentional: no attempt consumed — nothing ran. The definition changed since the service
+			// facts were read; the next decision uses the fresh ones.
+			w.commit(ctx, key, d.Next, now)
+			w.cfg.Log.Warn("selfheal: copies not restored (the deployed definition declares no missing copy)", "app", app.Project, "service", service, "err", err)
+			return
+		}
 		// The attempt is consumed whether or not the action succeeded (a failed
 		// rung still counts toward the cap → the circuit eventually opens).
 		w.commit(ctx, key, Commit(d, obs, pol, now), now)
 		if err != nil {
-			w.cfg.Log.Warn("selfheal: remediation failed", "app", app.Project, "service", service, "rung", d.Rung, "copy", shortID(d.Target), "remove", shortIDs(d.Remove), "err", err)
+			w.cfg.Log.Warn("selfheal: remediation failed", "app", app.Project, "service", service, "rung", d.Rung, "copy", shortID(d.Target), "remove", shortIDs(d.Remove), "restore", d.Restore, "err", err)
 		} else {
-			w.cfg.Log.Info("selfheal: remediated", "app", app.Project, "service", service, "rung", d.Rung, "copy", shortID(d.Target), "remove", shortIDs(d.Remove))
+			w.cfg.Log.Info("selfheal: remediated", "app", app.Project, "service", service, "rung", d.Rung, "copy", shortID(d.Target), "remove", shortIDs(d.Remove), "restore", d.Restore)
 		}
 	case GateDefer:
 		// No attempt consumed; re-checked next tick.
@@ -534,11 +595,17 @@ func shortIDs(ids []string) []string {
 }
 
 // prune drops FSM state for services that no longer exist (and whose app isn't
-// mid-deploy under a lease), so the table doesn't grow unbounded.
-func (w *Watcher) prune(ctx context.Context, seen map[Key]bool, leases map[string]bool, now int64) {
-	for key := range w.fsms {
+// mid-deploy under a lease), so the table doesn't grow unbounded. A dropped service of an app still
+// listed whose alert is open gets it resolved, so the alert isn't left open forever. Intentional: not
+// for an app gone from the list — a deleted app's alerts are erased with it, and a resolution sent
+// after the delete would only be noise.
+func (w *Watcher) prune(ctx context.Context, seen map[Key]bool, leases, listed map[string]bool) {
+	for key, f := range w.fsms {
 		if seen[key] || leases[key.App] {
 			continue
+		}
+		if f.Open && listed[key.App] {
+			w.emitInfra(ctx, monitor.App{Project: key.App}, key.Service, "service_gone", "resolved")
 		}
 		delete(w.fsms, key)
 		delete(w.stable, key)
@@ -592,6 +659,9 @@ func (w *Watcher) emitInfra(ctx context.Context, app monitor.App, service, kind,
 // infraSummary builds the bounded, fixed-section body (plan §8.4) — no log dump.
 func infraSummary(kind, transition, target string) string {
 	if transition == "resolved" {
+		if kind == "service_gone" {
+			return "Service " + target + " has no containers any more and is no longer supervised; this alert is closed."
+		}
 		return "Service " + target + " recovered and is healthy again."
 	}
 	switch kind {
@@ -603,6 +673,8 @@ func infraSummary(kind, transition, target string) string {
 		return "Service " + target + " is crash-looping and Mooring's restart/recreate attempts did not recover it. Manual investigation needed."
 	case "unhealthy_capped":
 		return "Service " + target + " is up but failing its healthcheck and did not recover after restart/recreate. Manual investigation needed."
+	case "copies_missing":
+		return "Service " + target + " runs fewer copies than its replicas count and Mooring could not start the missing ones. Manual investigation needed."
 	case "dependency_wait":
 		return "Service " + target + " has been failing for 10 minutes while a service it depends on is failing or recovering. Mooring held off restarting it meanwhile and now resumes its normal restart/recreate attempts. Check the dependency."
 	case "unhealthy_reported":

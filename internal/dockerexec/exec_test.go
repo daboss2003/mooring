@@ -69,6 +69,83 @@ func TestMinimalEnvPinsComposeSettings(t *testing.T) {
 	}
 }
 
+// A one-off's command arguments go AFTER `-- <service>`, so compose hands them to the container
+// verbatim (`--rm -x` included) and never parses them as its own flags. Without a service they are
+// dropped: they could only land where compose reads flags.
+func TestJobArgsFollowTheServiceTerminator(t *testing.T) {
+	j := Job{Project: "shop", ConfigFiles: []string{"/c.yml"}, Action: []string{"run", "--rm", "--no-deps", "-T"},
+		Service: "api", Args: []string{"node", "--rm", "-x", "--", "--entrypoint=sh"}}
+	got := strings.Join(j.argv(), " ")
+	want := "compose -p shop -f /c.yml run --rm --no-deps -T -- api node --rm -x -- --entrypoint=sh"
+	if got != want {
+		t.Errorf("argv:\n got %q\nwant %q", got, want)
+	}
+	argv := j.argv()
+	term := -1
+	for i, a := range argv {
+		if a == "--" {
+			term = i
+			break
+		}
+	}
+	if term < 0 || argv[term+1] != "api" {
+		t.Fatalf("the service must directly follow the first --: %q", argv)
+	}
+	for _, a := range argv[:term] {
+		if a == "node" || a == "-x" || a == "--entrypoint=sh" {
+			t.Errorf("a command argument %q appears before `-- <service>`: %q", a, argv)
+		}
+	}
+	j.Service = ""
+	if got := strings.Join(j.argv(), " "); got != "compose -p shop -f /c.yml run --rm --no-deps -T" {
+		t.Errorf("args without a service must be dropped, got %q", got)
+	}
+}
+
+// Tag and untag take only a full image id and a compose-style reference, so no value can smuggle an
+// option or a second image into `docker tag` / `docker rmi`.
+func TestImageTagValidation(t *testing.T) {
+	id := "sha256:" + strings.Repeat("ab", 32)
+	if argv, err := tagArgv(id, "shop-api"); err != nil || strings.Join(argv, " ") != "tag -- "+id+" shop-api" {
+		t.Errorf("tag argv = %q, %v", argv, err)
+	}
+	if argv, err := tagArgv(id, "shop-api:mooring-previous"); err != nil || argv[len(argv)-1] != "shop-api:mooring-previous" {
+		t.Errorf("a tagged reference must be accepted: %q, %v", argv, err)
+	}
+	for _, bad := range [][2]string{
+		{"-f", "shop-api"},
+		{"sha256:" + strings.Repeat("ab", 31), "shop-api"},
+		{"shop-api", "shop-api"},
+		{id + " x", "shop-api"},
+		{id, "-x"},
+		{id, "--help"},
+		{id, "shop api"},
+		{id, "shop-api;rm"},
+		{id, "registry.example.com/shop-api"},
+		{id, "Shop-api"},
+		{id, ""},
+		{id, "shop-api:"},
+		{id, "shop-api:-x"},
+		{id, id},
+	} {
+		if _, err := tagArgv(bad[0], bad[1]); err == nil {
+			t.Errorf("tagArgv(%q, %q) must be refused", bad[0], bad[1])
+		}
+	}
+	if argv, err := untagArgv("shop-api:mooring-previous"); err != nil || strings.Join(argv, " ") != "rmi -- shop-api:mooring-previous" {
+		t.Errorf("untag argv = %q, %v", argv, err)
+	}
+	for _, bad := range []string{"shop-api", "shop-api:latest", "-f", id, "shop-api:mooring-previous -f", "--force"} {
+		if _, err := untagArgv(bad); err == nil {
+			t.Errorf("untagArgv(%q) must be refused (only an explicit non-latest tag can be removed)", bad)
+		}
+	}
+	r := NewRunner(NewSemaphore(), false, "test")
+	if err := r.TagImageHeld(context.Background(), id, "shop-api", nil); err != ErrWritePlaneDisabled {
+		t.Errorf("tag on a disabled write plane: %v", err)
+	}
+}
+
 func TestJobArgvIncludesEnvFile(t *testing.T) {
 	j := Job{Project: "shop", ConfigFiles: []string{"/c.yml"}, EnvFile: "/run/x.env", Action: []string{"up", "-d"}}
 	got := strings.Join(j.argv(), " ")

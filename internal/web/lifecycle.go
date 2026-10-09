@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -87,6 +88,13 @@ func (s *Server) runLifecycle(w http.ResponseWriter, r *http.Request, project, s
 		return
 	}
 	paced := action != "stop" && r.URL.Query().Get("now") != "1" && s.pacedStartsEnabled()
+
+	// A fixed-count service (`replicas` in mooring.yaml) has no per-copy stop: the autoscaler doesn't
+	// manage it, and self-healing starts a missing copy again.
+	if action == "stop" && r.URL.Query().Get("copy") != "" && declaredReplicas(def, service) > 0 {
+		http.Error(w, "this service runs a fixed number of copies — stop the service instead", http.StatusConflict)
+		return
+	}
 
 	// Per-copy stop of a SCALED service: remove just the chosen replica instead of every copy. The
 	// auto-scaler applies it race-free and lowers desired so it isn't relaunched. Falls through to the
@@ -591,7 +599,7 @@ func (s *Server) applyHoldForAction(project, service, action, actor string, app 
 			_ = s.selfHeal.SetHeld(ctx, selfheal.Key{App: project, Service: service}, actor, now)
 			return
 		}
-		for _, svc := range distinctServiceNames(app) { // app-level stop holds every service
+		for _, svc := range appStopHolds(app, s.currentDef(project)) {
 			_ = s.selfHeal.SetHeld(ctx, selfheal.Key{App: project, Service: svc}, actor, now)
 		}
 	case "start", "restart", "redeploy":
@@ -601,6 +609,29 @@ func (s *Server) applyHoldForAction(project, service, action, actor string, app 
 		}
 		_ = s.selfHeal.ClearHeldApp(ctx, project) // app-level start/redeploy releases every hold
 	}
+}
+
+// appStopHolds lists the services an app-level stop holds: every service the app has a container for,
+// and every long-running service of its deployed definition — also one with no container at all (a
+// fixed count self-healing gave up on), which self-heal would otherwise start again as soon as one
+// sibling is started.
+func appStopHolds(app *monitor.App, def *definition.Definition) []string {
+	out := distinctServiceNames(app)
+	seen := make(map[string]bool, len(out))
+	for _, svc := range out {
+		seen[svc] = true
+	}
+	if def == nil {
+		return out
+	}
+	declared := lifecycleServices(app, def)
+	sort.Strings(declared)
+	for _, svc := range declared {
+		if !seen[svc] {
+			out = append(out, svc)
+		}
+	}
+	return out
 }
 
 // serviceCopyStats returns how many containers a service has (running OR stopped) and whether copyID

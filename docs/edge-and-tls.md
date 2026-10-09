@@ -256,8 +256,21 @@ every reconcile (after deploys, scaling, restarts, and every 15 seconds):
 
 - **Discovery.** Mooring lists the running containers of the route's app and service over the read
   plane and dials each one's address on the app's `<app>_default` network. One-off `compose run`
-  containers are never dialed. A service with several copies gets a pool (least connections, passive
-  health checks).
+  containers are never dialed. A service with several copies gets a pool with passive health checks
+  (a copy with 3 failed requests within 30 seconds gets no traffic until those failures expire). The
+  route's [`lb`](./definition-file.md#specedgeroutes) picks the copy for each request:
+  - `least_conn` (default): the copy with the fewest active requests.
+  - `round_robin`: each copy in turn.
+  - `ip_hash`: the same copy for the same client address. This is the address the edge sees; behind
+    a CDN or proxy it is the proxy's address, so all traffic through that proxy goes to one copy.
+  - `cookie`: the same copy for the same browser session. The edge sets a session cookie named `mlb_`
+    followed by 10 hex characters (a different name for each route, path `/`). A request without a
+    valid cookie goes to a random copy and gets a new cookie. The cookie value is a keyed hash of the
+    copy's address, so a session moves to another copy when its copy is replaced (redeploy, restart,
+    scale-down) or taken out by the health checks. The key is derived from `encryption_key`; changing
+    that key moves every session once.
+
+  With a single copy, `lb` has no effect.
 - **New copies take traffic once ready.** When at least one copy is ready — healthy, or running
   without a healthcheck — copies still `starting`, `unhealthy`, or not yet observed are left out of
   the pool. If no copy is ready yet, every running copy is dialed.

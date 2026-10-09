@@ -654,12 +654,18 @@ func restartPolicy(p string) bool {
 	return strings.HasPrefix(strings.TrimSpace(p), "on-failure:")
 }
 
-// deployTimeout bounds a whole git deploy: the build (and the fetch before it, gitDeployTimeout) plus
-// the rollout's pacing budget, with room for the docker calls themselves.
+// deployTimeout bounds a build-and-rollout action (lifecycle redeploys, certificate renewals): the build
+// (and the fetch before it, gitDeployTimeout) and the rollout's pacing budget, with room for the docker
+// calls themselves.
 func (s *Server) deployTimeout() time.Duration {
 	budget := 45 * time.Minute // server.start_gate.rollout_budget's default
 	if s.cfg != nil {
 		budget = s.cfg.Server.StartGateSettings().RolloutBudget
 	}
 	return gitDeployTimeout + budget + 10*time.Minute
+}
+
+// repoDeployTimeout bounds a whole git deploy: deployTimeout plus the longest spec.release job.
+func (s *Server) repoDeployTimeout() time.Duration {
+	return s.deployTimeout() + definition.ReleaseTimeoutMax
 }

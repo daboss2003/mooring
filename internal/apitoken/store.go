@@ -106,18 +106,97 @@ func (s *Store) Revoke(ctx context.Context, id string) error {
 	return nil
 }
 
-// RevokeAppScoped revokes any token whose ONLY capability is deploying THIS app
-// (scopes == "deploy:write:<slug>"), used by the app-delete teardown. It deliberately
-// leaves multi-scope tokens alone — yanking a token that also serves other apps would
-// be collateral damage, and a leftover scope for a now-gone app is inert (its deploy
-// route no longer resolves). Returns the number of tokens revoked.
+// RevokeAppScoped takes deploy:write:<slug> off every token, revoked ones included, and
+// revokes each token that had no other scope. The app-delete teardown calls it: a scope
+// left behind would let the token deploy a later app connected under the same slug. Other
+// scopes are kept, so a token that also serves other apps keeps working for them. Returns
+// the number of tokens it revoked.
 func (s *Store) RevokeAppScoped(ctx context.Context, slug string) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE api_tokens SET revoked=1 WHERE revoked=0 AND scopes=?`, "deploy:write:"+slug)
+	scope := "deploy:write:" + slug
+	if !deployRe.MatchString(scope) {
+		return 0, nil // no token can hold a scope outside the grammar
+	}
+	type tokenScopes struct {
+		id, scopes string
+		revoked    bool
+	}
+	// Read every token first and close the rows before any update (one connection: an UPDATE
+	// while the rows are open would deadlock).
+	rows, err := s.db.QueryContext(ctx, `SELECT id, scopes, revoked FROM api_tokens`)
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	var holders []tokenScopes
+	for rows.Next() {
+		var (
+			t       tokenScopes
+			revoked int
+		)
+		if err := rows.Scan(&t.id, &t.scopes, &revoked); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		t.revoked = revoked != 0
+		if _, held := withoutScope(t.scopes, scope); held {
+			holders = append(holders, t)
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return 0, err
+	}
+	var revokedN int64
+	for _, t := range holders {
+		for attempt := 0; ; attempt++ {
+			kept, held := withoutScope(t.scopes, scope)
+			if !held {
+				break
+			}
+			revoke := len(kept) == 0 && !t.revoked
+			q := `UPDATE api_tokens SET scopes=? WHERE id=? AND scopes=?`
+			if revoke {
+				q = `UPDATE api_tokens SET scopes=?, revoked=1 WHERE id=? AND scopes=?`
+			}
+			// The update matches the scopes it was computed from, so a row another process changed in
+			// between is re-read rather than overwritten with a stale scope list.
+			res, err := s.db.ExecContext(ctx, q, joinScopes(kept), t.id, t.scopes)
+			if err != nil {
+				return revokedN, err
+			}
+			if n, _ := res.RowsAffected(); n > 0 {
+				if revoke {
+					revokedN++
+				}
+				break
+			}
+			if attempt >= 2 {
+				return revokedN, errors.New("apitoken: a token kept changing while its app's scope was removed")
+			}
+			var revoked int
+			err = s.db.QueryRowContext(ctx, `SELECT scopes, revoked FROM api_tokens WHERE id=?`, t.id).Scan(&t.scopes, &revoked)
+			if errors.Is(err, sql.ErrNoRows) {
+				break
+			}
+			if err != nil {
+				return revokedN, err
+			}
+			t.revoked = revoked != 0
+		}
+	}
+	return revokedN, nil
+}
+
+// withoutScope returns the stored scope list minus every occurrence of scope, and whether it held it.
+func withoutScope(stored, scope string) (kept []string, held bool) {
+	for _, sc := range splitScopes(stored) {
+		if sc == scope {
+			held = true
+			continue
+		}
+		kept = append(kept, sc)
+	}
+	return kept, held
 }
 
 // TouchLastUsed records a best-effort last-use timestamp (never gates auth — a

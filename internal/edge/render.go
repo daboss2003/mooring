@@ -9,6 +9,9 @@
 package edge
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -43,6 +46,7 @@ type Route struct {
 	SecurityHeaders bool
 	Enabled         bool
 	CA              string // "" = default issuer (BaseConfig.ACMECA); else a BaseConfig.CAs name
+	LB              string // replica selection: "" (= least_conn) | least_conn | round_robin | ip_hash | cookie
 	// Unroutable, set by the Reconciler (never persisted), renders the route as a 503 instead of a
 	// proxy: its (app, service) has no running container to dial. The host matcher, security headers
 	// and ACME subject stay, so the certificate keeps renewing and the host answers 503, not 404.
@@ -78,6 +82,52 @@ type BaseConfig struct {
 	// errors on STDERR (→ journald). Enabled only when a scaled service opts into an edge metric,
 	// so most edges pay nothing for it.
 	AccessLog bool
+	// LBCookieSecret keys the cookie values of routes with lb: cookie (DeriveLBCookieSecret of the
+	// master key; never from mooring.yaml). Secret: never log it. "" renders those routes as ip_hash.
+	LBCookieSecret string
+}
+
+// lbCookieSecretLabel domain-separates the lb cookie key from every other use of the master key.
+const lbCookieSecretLabel = "mooring edge lb cookie v1"
+
+// DeriveLBCookieSecret derives BaseConfig.LBCookieSecret from Mooring's master encryption key:
+// hex(HMAC-SHA256(key, "mooring edge lb cookie v1")). The result reveals nothing about the key, and
+// is stable across restarts so sessions stay on their copy. An empty key derives "".
+func DeriveLBCookieSecret(dataKey []byte) string {
+	if len(dataKey) == 0 {
+		// Intentional: HMAC under an empty key is a public constant, i.e. no secret at all; ""
+		// makes Render fall back to ip_hash instead of signing cookies with it.
+		return ""
+	}
+	m := hmac.New(sha256.New, dataKey)
+	m.Write([]byte(lbCookieSecretLabel))
+	return hex.EncodeToString(m.Sum(nil))
+}
+
+// lbCookieName is the cookie a route with lb: cookie uses: "mlb_" + 10 hex of
+// sha256(hostname + NUL + prefix). Caddy sets it on path "/", so path routes sharing a hostname each
+// need their own name; equivalent spellings ("" and "/", "/api" and "/api/", hostname case) match
+// the same route at the edge and get the same name.
+func lbCookieName(hostname, pathPrefix string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(hostname)) + "\x00" + strings.TrimRight(pathPrefix, "/")))
+	return "mlb_" + hex.EncodeToString(sum[:])[:10]
+}
+
+// selectionPolicy maps a route's lb onto Caddy's selection policy ("" = least_conn).
+func selectionPolicy(r Route, cookieSecret string) *caddySelectionPolicy {
+	switch r.LB {
+	case "round_robin", "ip_hash":
+		return &caddySelectionPolicy{Policy: r.LB}
+	case "cookie":
+		if cookieSecret == "" {
+			// Intentional: with no secret Caddy would sign with an empty HMAC key, and the cookie
+			// would be an unkeyed hash of the copy's private address that a client can reverse by
+			// trying the address space. ip_hash is sticky too and exposes nothing.
+			return &caddySelectionPolicy{Policy: "ip_hash"}
+		}
+		return &caddySelectionPolicy{Policy: "cookie", Name: lbCookieName(r.Hostname, r.PathPrefix), Secret: cookieSecret}
+	}
+	return &caddySelectionPolicy{Policy: "least_conn"}
 }
 
 // WildcardCert is one *.<Domain> DNS-01 wildcard: a namespace apex + the DNS provider
@@ -167,7 +217,19 @@ func ValidateRoute(r Route) error {
 	if r.PathPrefix != "" && (!pathRe.MatchString(r.PathPrefix) || strings.Contains(r.PathPrefix, "..")) {
 		return fmt.Errorf("path_prefix %q is invalid", r.PathPrefix)
 	}
+	if !ValidLB(r.LB) {
+		return fmt.Errorf("lb %q is invalid (least_conn, round_robin, ip_hash or cookie)", r.LB)
+	}
 	return nil
+}
+
+// ValidLB reports whether lb is an accepted route replica-selection policy ("" = least_conn).
+func ValidLB(lb string) bool {
+	switch lb {
+	case "", "least_conn", "round_robin", "ip_hash", "cookie":
+		return true
+	}
+	return false
 }
 
 // validateUpstream rejects a control-plane port and any loopback/link-local
@@ -338,10 +400,10 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			Upstreams: ups,
 			Headers:   xffOverwrite(),
 		}
-		// A replica pool (M14): least-conn LB + passive health checks so a sick
+		// A replica pool (M14): the route's selection policy + passive health checks so a sick
 		// replica is taken out until it recovers. A single upstream needs neither.
 		if len(ups) > 1 {
-			rp.LoadBalancing = &caddyLoadBalancing{SelectionPolicy: map[string]any{"policy": "least_conn"}}
+			rp.LoadBalancing = &caddyLoadBalancing{SelectionPolicy: selectionPolicy(r, base.LBCookieSecret)}
 			rp.HealthChecks = &caddyHealthChecks{Passive: &caddyPassiveHealth{FailDuration: "30s", MaxFails: 3}}
 		}
 		if r.UpstreamScheme == "https" {

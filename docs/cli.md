@@ -185,9 +185,9 @@ Scoped machine-API tokens for the read-mostly `/api/v1` JSON API. Tokens are **m
 $ mooring token mint --scopes status:read,metrics:read --cidrs 203.0.113.0/24 --ttl 720h --label ci-readonly
 token minted — copy the value below, it is shown ONCE and cannot be recovered:
 
-  hmtok_...
+  hmt_9c1e4b7a2d5f8e0b3a6c9d1e_...
 
-id:      tok_8f3c1d
+id:      9c1e4b7a2d5f8e0b3a6c9d1e
 scopes:  status:read metrics:read
 cidrs:   203.0.113.0/24
 expires: 2026-07-16T00:00:00Z
@@ -200,8 +200,8 @@ expires: 2026-07-16T00:00:00Z
 
 ```console
 $ mooring token list
-ID          STATE    EXPIRES               SCOPES
-tok_8f3c1d  active   2026-07-16T00:00:00Z  status:read metrics:read
+ID                        STATE    EXPIRES               SCOPES
+9c1e4b7a2d5f8e0b3a6c9d1e  active   2026-07-16T00:00:00Z  status:read metrics:read
 ```
 
 #### `mooring token revoke`
@@ -210,8 +210,8 @@ tok_8f3c1d  active   2026-07-16T00:00:00Z  status:read metrics:read
 - **Usage:** `mooring token revoke --id <id> [--config PATH]`
 
 ```console
-$ mooring token revoke --id tok_8f3c1d
-token tok_8f3c1d revoked — it is rejected at auth immediately; reload to drop it from the IP gate union
+$ mooring token revoke --id 9c1e4b7a2d5f8e0b3a6c9d1e
+token 9c1e4b7a2d5f8e0b3a6c9d1e revoked — it is rejected at auth immediately; reload to drop it from the IP gate union
 ```
 
 ---

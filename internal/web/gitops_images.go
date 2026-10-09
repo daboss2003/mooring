@@ -131,6 +131,29 @@ func (s *Server) serviceImageIDs(ctx context.Context, slug string, def *definiti
 	return ids
 }
 
+// imageIDHeld returns the local image id ref points at, or "" when no such image exists (a service never built
+// yet). Any other failure is an error. The caller holds the docker slot.
+func (s *Server) imageIDHeld(ctx context.Context, ref string) (string, error) {
+	var out bytes.Buffer
+	var stderr []string
+	if err := s.runner.RunStreamHeld(ctx, imageIDArgv(ref), &out, func(l string) { stderr = append(stderr, l) }); err != nil {
+		for _, l := range stderr {
+			if strings.Contains(strings.ToLower(l), "no such image") {
+				return "", nil
+			}
+		}
+		if len(stderr) > 0 {
+			return "", fmt.Errorf("%w: %s", err, deployText(stderr[len(stderr)-1], 300))
+		}
+		return "", err
+	}
+	id := parseImageID(out.String())
+	if id == "" {
+		return "", fmt.Errorf("unexpected docker image inspect output %q", deployText(out.String(), 200))
+	}
+	return id, nil
+}
+
 type imageInfo struct {
 	ID      string
 	Created time.Time

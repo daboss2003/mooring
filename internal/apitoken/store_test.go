@@ -104,6 +104,83 @@ func TestStoreUnionExcludesExpired(t *testing.T) {
 	}
 }
 
+// Deleting an app takes its deploy scope off every token: a token with other scopes keeps them, a
+// token left with none is revoked, and tokens for other apps are untouched.
+func TestRevokeAppScopedStripsTheScopeFromEveryToken(t *testing.T) {
+	s := newStore(t)
+	ctx := context.Background()
+	now := mustTime()
+	mint := func(scopes ...string) string {
+		t.Helper()
+		m, err := Mint(scopes, []string{"10.0.0.0/8"}, time.Hour, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Insert(ctx, m.Record, "", now); err != nil {
+			t.Fatal(err)
+		}
+		return m.Record.ID
+	}
+	only := mint("deploy:write:shop")
+	multi := mint("status:read", "deploy:write:shop", "deploy:write:blog")
+	other := mint("deploy:write:blog")
+	prefix := mint("deploy:write:shop-api") // a slug that merely starts with "shop"
+	revokedBefore := mint("deploy:write:shop", "audit:read")
+	if err := s.Revoke(ctx, revokedBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	// Several rows on the single-connection store: a nested query would deadlock here.
+	done := make(chan struct{})
+	var n int64
+	var err error
+	go func() { n, err = s.RevokeAppScoped(ctx, "shop"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("RevokeAppScoped did not return (nested query on the single connection?)")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("revoked %d tokens, want 1 (the token whose only scope was the deleted app)", n)
+	}
+
+	get := func(id string) Record {
+		t.Helper()
+		r, err := s.Get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	if r := get(only); !r.Revoked || r.Allows("deploy:write:shop") {
+		t.Errorf("single-scope token: revoked=%v scopes=%v, want revoked without the scope", r.Revoked, r.Scopes)
+	}
+	if r := get(multi); r.Revoked || r.Allows("deploy:write:shop") || !r.Allows("status:read") || !r.Allows("deploy:write:blog") || len(r.Scopes) != 2 {
+		t.Errorf("multi-scope token: revoked=%v scopes=%v, want active with status:read deploy:write:blog", r.Revoked, r.Scopes)
+	}
+	if r := get(other); r.Revoked || len(r.Scopes) != 1 || !r.Allows("deploy:write:blog") {
+		t.Errorf("another app's token was touched: revoked=%v scopes=%v", r.Revoked, r.Scopes)
+	}
+	if r := get(prefix); r.Revoked || !r.Allows("deploy:write:shop-api") {
+		t.Errorf("a token for an app whose name starts with the slug was touched: revoked=%v scopes=%v", r.Revoked, r.Scopes)
+	}
+	if r := get(revokedBefore); !r.Revoked || r.Allows("deploy:write:shop") || !r.Allows("audit:read") {
+		t.Errorf("an already revoked token: revoked=%v scopes=%v, want still revoked without the scope", r.Revoked, r.Scopes)
+	}
+
+	// Idempotent: a second run changes nothing.
+	if n, err := s.RevokeAppScoped(ctx, "shop"); err != nil || n != 0 {
+		t.Errorf("second run: revoked %d, %v", n, err)
+	}
+	// A slug outside the scope grammar matches nothing.
+	if n, err := s.RevokeAppScoped(ctx, ""); err != nil || n != 0 {
+		t.Errorf("empty slug: revoked %d, %v", n, err)
+	}
+}
+
 func TestStoreRejectsMalformedRecord(t *testing.T) {
 	s := newStore(t)
 	ctx := context.Background()

@@ -8,9 +8,8 @@ import (
 	"time"
 )
 
-// serviceLogDisplayCap bounds how many retained lines the history page renders at once. It matches
-// the per-service ring size, so "All retained" shows everything kept for a single copy of the service
-// (the text filter + time range narrow within that).
+// serviceLogDisplayCap bounds how many retained lines the history page renders at once (a display
+// limit: the text filter + time range narrow within a service's whole retained history).
 const serviceLogDisplayCap = 2000
 
 // deepLinkHalfWindow is the default ± seconds around an Errors-tab entry's timestamp when jumping to
@@ -24,10 +23,77 @@ type serviceLogView struct {
 	Query            string   // current text filter
 	Copy             string   // selected replica id ("" = all copies merged)
 	Copies           []string // replica ids seen in the retained window
-	Range            string   // selected preset: "15m" | "1h" | "6h" | "24h" | "all" (ignored when At>0)
-	At               int64    // Errors-tab deep-link center (0 = none)
+	Range            string   // selected preset (see logRangePresets; ignored when At>0)
+	Presets          []logRangePreset
+	At               int64 // Errors-tab deep-link center (0 = none)
 	Lines            []serviceLogLineView
-	Capped           bool // hit the display cap (older matches exist — narrow the filter/range)
+	Capped           bool   // hit the display cap or the search budget (older matches may exist — narrow the filter/range)
+	Window           string // the service's retention, e.g. "48 hours"
+	MaxLines         string // the service's line cap, e.g. "2,000"
+	Paused           bool   // capture paused for disk pressure
+	ThresholdPct     int    // the disk-pressure threshold (server.disk_gc_threshold)
+	DefaultWindow    string // the default policy, shown while paused
+	DefaultMaxLines  string
+}
+
+// logRangePreset is one time-range choice on the log page.
+type logRangePreset struct {
+	Value, Label string
+	secs         int64
+}
+
+// logRangePresets are the time-range choices; one is offered when the service retains at least
+// that long ("all" always).
+var logRangePresets = []logRangePreset{
+	{"15m", "Last 15 min", 15 * 60},
+	{"1h", "Last hour", 60 * 60},
+	{"6h", "Last 6 hours", 6 * 60 * 60},
+	{"24h", "Last 24 hours", 24 * 60 * 60},
+	{"7d", "Last 7 days", 7 * 24 * 60 * 60},
+	{"30d", "Last 30 days", 30 * 24 * 60 * 60},
+	{"all", "All retained", 0},
+}
+
+// presetsFor returns the presets a service retaining for retain can use.
+func presetsFor(retain time.Duration) []logRangePreset {
+	var out []logRangePreset
+	for _, p := range logRangePresets {
+		if p.secs == 0 || time.Duration(p.secs)*time.Second <= retain {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// retainLabel renders a retention for the page: "90 minutes", "48 hours", "30 days".
+func retainLabel(d time.Duration) string {
+	plural := func(n int64, unit string) string {
+		if n == 1 {
+			return "1 " + unit
+		}
+		return strconv.FormatInt(n, 10) + " " + unit + "s"
+	}
+	switch {
+	case d >= 72*time.Hour && d%(24*time.Hour) == 0:
+		return plural(int64(d/(24*time.Hour)), "day")
+	case d >= time.Hour && d%time.Hour == 0:
+		return plural(int64(d/time.Hour), "hour")
+	case d >= time.Minute:
+		return plural(int64(d/time.Minute), "minute")
+	}
+	return plural(int64(d/time.Second), "second")
+}
+
+// groupDigits renders n with thousands separators: 200000 → "200,000".
+func groupDigits(n int) string {
+	s := strconv.Itoa(n)
+	if n < 0 {
+		return s
+	}
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	return s
 }
 
 // serviceLogLineView is one retained log line for the template. Level is a best-effort severity
@@ -105,25 +171,9 @@ func logLevel(text string) string {
 	return ""
 }
 
-// rangePresetSeconds maps a time-range preset to a lookback in seconds (0 = no lower bound / "all").
-func rangePresetSeconds(preset string) int64 {
-	switch preset {
-	case "15m":
-		return 15 * 60
-	case "1h":
-		return 60 * 60
-	case "6h":
-		return 6 * 60 * 60
-	case "24h":
-		return 24 * 60 * 60
-	default:
-		return 0
-	}
-}
-
 // serviceLogView builds the retained-log view model from the request (q / range / copy / at). Shared
-// by the full page and the live-refresh rows fragment so the two can't drift. Reads ONLY the
-// in-memory/file-backed servicelog store — never the SQLite DB.
+// by the full page and the live-refresh rows fragment so the two can't drift. Reads the servicelog
+// store; the retention shown is the one the store applies (servicelog.Store.Policy).
 func (s *Server) serviceLogView(r *http.Request) *serviceLogView {
 	project := r.PathValue("project")
 	service := r.PathValue("service")
@@ -133,6 +183,14 @@ func (s *Server) serviceLogView(r *http.Request) *serviceLogView {
 	}
 	if !v.Enabled {
 		return v
+	}
+	pol := s.serviceLogs.Policy(project, service)
+	v.Window, v.MaxLines = retainLabel(pol.Retain), groupDigits(pol.MaxLines)
+	v.Presets = presetsFor(pol.Retain)
+	if v.Paused = s.serviceLogs.Paused(); v.Paused {
+		def := s.serviceLogs.Default()
+		v.ThresholdPct = s.cfg.Server.DiskGCThresholdPct()
+		v.DefaultWindow, v.DefaultMaxLines = retainLabel(def.Retain), groupDigits(def.MaxLines)
 	}
 
 	q := r.URL.Query().Get("q")
@@ -157,15 +215,29 @@ func (s *Server) serviceLogView(r *http.Request) *serviceLogView {
 		if v.Range == "" {
 			v.Range = "1h"
 		}
-		if d := rangePresetSeconds(v.Range); d > 0 {
-			since = time.Now().Unix() - d
+		// Only an offered preset applies; anything else (a stale link, a range longer than the
+		// service keeps) shows everything retained.
+		var secs int64
+		found := false
+		for _, p := range v.Presets {
+			if p.Value == v.Range {
+				secs, found = p.secs, true
+			}
+		}
+		if !found {
+			v.Range = "all"
+		}
+		if secs > 0 {
+			since = time.Now().Unix() - secs
 		}
 	}
 
-	for _, l := range s.serviceLogs.Search(project, service, copyID, q, since, until, serviceLogDisplayCap) {
+	// The request's context: a viewer who leaves (or a live poll that is superseded) stops the search.
+	lines, more := s.serviceLogs.Search(r.Context(), project, service, copyID, q, since, until, serviceLogDisplayCap)
+	for _, l := range lines {
 		v.Lines = append(v.Lines, serviceLogLineView{At: l.At, Copy: l.Copy, Text: l.Text, Level: logLevel(l.Text)})
 	}
-	v.Capped = len(v.Lines) >= serviceLogDisplayCap
+	v.Capped = more
 	return v
 }
 

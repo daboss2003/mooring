@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"strings"
 
 	"github.com/daboss2003/mooring/internal/store"
 )
@@ -14,9 +15,9 @@ import (
 // Mooring). It is never loaded — fail-closed.
 var ErrTampered = errors.New("definition HMAC mismatch (tampered)")
 
-// ErrNotDeletable means a version delete targeted a non-existent id or the current live version
-// (the latest row, which cannot be deleted). It maps to a 400 (a raw DB error maps to a 500).
-var ErrNotDeletable = errors.New("version not found, or it is the current live version (which cannot be deleted)")
+// ErrNotDeletable means a version delete targeted a non-existent id, the current live version (the latest
+// row) or the deployed release's version (the newest a git deploy or rollback saved). It maps to a 400 (a raw DB error maps to a 500).
+var ErrNotDeletable = errors.New("version not found, or it is the live version or the deployed release's version (which cannot be deleted)")
 
 // Store persists applied canonical definitions (the history; the latest per slug is
 // the live canonical). Every read RE-PARSES + RE-VALIDATES the stored YAML through
@@ -85,6 +86,41 @@ func (s *Store) SaveCanonical(ctx context.Context, d *Definition, note, commit s
 	return res.LastInsertId()
 }
 
+// Notes of the versions git deploys and rollbacks save. The newest such version is the deployed release.
+const (
+	NoteGitDeploy = "git deploy: "
+	NoteRollback  = "rollback to "
+)
+
+// ReleaseVersionID returns the id of the newest version a git deploy or rollback saved (0 when none).
+func (s *Store) ReleaseVersionID(slug string) (int64, error) {
+	var id sql.NullInt64
+	err := s.db.QueryRow(`SELECT MAX(id) FROM definition_versions WHERE slug=? AND (note LIKE ? OR note LIKE ?)`,
+		slug, NoteGitDeploy+"%", NoteRollback+"%").Scan(&id)
+	return id.Int64, err
+}
+
+// LatestNote returns the note of the newest version whose note starts with one of prefixes ("" when none).
+func (s *Store) LatestNote(slug string, prefixes ...string) (string, error) {
+	rows, err := s.db.Query(`SELECT note FROM definition_versions WHERE slug=? ORDER BY id DESC`, slug)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var note string
+		if err := rows.Scan(&note); err != nil {
+			return "", err
+		}
+		for _, p := range prefixes {
+			if strings.HasPrefix(note, p) {
+				return note, nil
+			}
+		}
+	}
+	return "", rows.Err()
+}
+
 // DeleteApp removes ALL canonical-definition versions for a slug (the whole history).
 // Used by the app-delete teardown.
 func (s *Store) DeleteApp(ctx context.Context, slug string) error {
@@ -98,9 +134,12 @@ func (s *Store) DeleteApp(ctx context.Context, slug string) error {
 // this only frees the (tiny) history row; disk from superseded build images is reclaimed by
 // the image-prune path, not here.
 func (s *Store) DeleteVersion(ctx context.Context, slug string, id int64) error {
+	// Neither the live version nor the deployed release's version: the release's note says whether it came
+	// from a rollback (API deploys pause on it) and a failed release job regenerates its compose from it.
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM definition_versions WHERE slug=? AND id=? AND id <> (SELECT MAX(id) FROM definition_versions WHERE slug=?)`,
-		slug, id, slug)
+		`DELETE FROM definition_versions WHERE slug=? AND id=? AND id <> (SELECT MAX(id) FROM definition_versions WHERE slug=?)
+		 AND id <> COALESCE((SELECT MAX(id) FROM definition_versions WHERE slug=? AND (note LIKE ? OR note LIKE ?)), 0)`,
+		slug, id, slug, slug, NoteGitDeploy+"%", NoteRollback+"%")
 	if err != nil {
 		return err
 	}

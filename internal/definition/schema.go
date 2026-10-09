@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/daboss2003/mooring/internal/config"
+	"github.com/daboss2003/mooring/internal/edge"
 	"github.com/daboss2003/mooring/internal/ops"
 	"github.com/daboss2003/mooring/internal/opsclient"
 	"github.com/daboss2003/mooring/internal/sandbox"
@@ -118,6 +120,41 @@ type Spec struct {
 	ScheduledTasks []ScheduledTask `yaml:"scheduled_tasks,omitempty"`
 	Git            *Git            `yaml:"git,omitempty"`
 	Setup          *Setup          `yaml:"setup,omitempty"`
+
+	// Release is a one-off command (typically a database migration) run in a fresh container
+	// of a service's newly built image after the build and before the deploy replaces any
+	// service. A non-zero exit or a timeout aborts the deploy and the previous release keeps
+	// running.
+	Release *Release `yaml:"release,omitempty"`
+}
+
+// Release is spec.release.
+type Release struct {
+	Service string   `yaml:"service"`           // whose image, env, secrets, networks and limits the job uses
+	Command []string `yaml:"command"`           // exec form, no shell
+	Timeout string   `yaml:"timeout,omitempty"` // default 10m, 10s–1h
+	// Previews runs the job on PR preview deploys too. Only the BASE app's deployed value
+	// counts: a preview's own file is untrusted fork input.
+	Previews bool `yaml:"previews,omitempty"`
+}
+
+// Release timeout bounds: the job holds the docker slot and the deploy gate for its whole run.
+const (
+	ReleaseTimeoutDefault = 10 * time.Minute
+	ReleaseTimeoutMin     = 10 * time.Second
+	ReleaseTimeoutMax     = time.Hour
+)
+
+// TimeoutD returns the job's run-time cap: the declared timeout, or the 10m default when unset.
+func (r *Release) TimeoutD() time.Duration {
+	if r == nil || r.Timeout == "" {
+		return ReleaseTimeoutDefault
+	}
+	d, err := time.ParseDuration(r.Timeout)
+	if err != nil || d < ReleaseTimeoutMin || d > ReleaseTimeoutMax {
+		return ReleaseTimeoutDefault
+	}
+	return d
 }
 
 // Compose is GENERATED-ONLY: Mooring owns the compose. `source` defaults to and may
@@ -164,7 +201,25 @@ type Service struct {
 	// beyond the docker daemon default of 1024 (e.g. an MQTT broker whose
 	// max_connections is otherwise clamped to the fd limit). nil = daemon default.
 	Ulimits *Ulimits `yaml:"ulimits,omitempty"`
+	// Replicas runs a fixed number of copies. 0 = unset: one copy, or the autoscaler's count
+	// for a service under spec.scaling (the two are mutually exclusive).
+	Replicas int `yaml:"replicas,omitempty"`
+	// CPUs caps the CPU each copy may use, in cores ("0.5", "1.5"). Empty = no cap.
+	CPUs string `yaml:"cpus,omitempty"`
+	// Logs widens this service's captured log history, clamped to the server's ceilings.
+	Logs *ServiceLogs `yaml:"logs,omitempty"`
 }
+
+// ServiceLogs is a service's log-capture retention.
+type ServiceLogs struct {
+	Retain   string `yaml:"retain,omitempty"`    // how far back history is kept: "72h", "30d"; empty = server default
+	MaxLines int    `yaml:"max_lines,omitempty"` // most recent lines kept for the service; 0 = server default
+}
+
+// MaxReplicas bounds a fixed replica count.
+const MaxReplicas = 20
+
+var cpusRe = regexp.MustCompile(`^[0-9]{1,3}(\.[0-9]{1,2})?$`)
 
 // Ulimits is the per-service ulimit block. Only `nofile` (max open file
 // descriptors) is supported — the knob that gates concurrent connection count.
@@ -603,6 +658,7 @@ type Route struct {
 	RedirectHTTP    bool   `yaml:"redirect_http"`
 	UpstreamScheme  string `yaml:"upstream_scheme,omitempty"` // "" (=http) | http | https — how the edge dials the upstream
 	CA              string `yaml:"ca,omitempty"`              // "" = default issuer; else a named CA from config.yaml edge.cas
+	LB              string `yaml:"lb,omitempty"`              // copy selection when scaled: "" (=least_conn) | least_conn | round_robin | ip_hash | cookie
 }
 
 // Scaling is the opt-in auto-scaling policy (§8A) for one service.
@@ -888,7 +944,86 @@ func (s *Spec) validate() error {
 	if err := s.validateOpsInterface(); err != nil {
 		return err
 	}
+	if err := s.validateRelease(); err != nil {
+		return err
+	}
 	return s.validateSetup()
+}
+
+// validateRelease checks spec.release names a declared service and a well-formed command.
+func (s *Spec) validateRelease() error {
+	r := s.Release
+	if r == nil {
+		return nil
+	}
+	if !svcRe.MatchString(r.Service) {
+		return fmt.Errorf("release must name a valid service")
+	}
+	if _, ok := s.Compose.Services[r.Service]; !ok {
+		return fmt.Errorf("release targets unknown service %q", r.Service)
+	}
+	if len(r.Command) == 0 {
+		return fmt.Errorf("release needs a command (exec form, e.g. [node, dist/migrate.js])")
+	}
+	if err := validateExec("release command", r.Service, r.Command); err != nil {
+		return err
+	}
+	if r.Timeout != "" {
+		if err := validDurationRange("release timeout", r.Timeout, ReleaseTimeoutMin, ReleaseTimeoutMax); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateServiceSizing checks replicas, cpus and logs. More than one fixed copy is refused for
+// anything two copies can't safely share: a writable volume, a published host port (a stateful
+// image is refused at submit, see ValidateForSubmit). A fixed count can't be combined with
+// autoscaling or a scheduled task.
+func (s *Spec) validateServiceSizing(name string, svc Service) error {
+	if svc.Replicas < 0 || svc.Replicas > MaxReplicas {
+		return fmt.Errorf("service %q replicas %d must be between 1 and %d", name, svc.Replicas, MaxReplicas)
+	}
+	if svc.Replicas > 0 {
+		for _, sc := range s.Scaling {
+			if sc.Service == name {
+				return fmt.Errorf("service %q sets replicas and is under spec.scaling — use one or the other", name)
+			}
+		}
+		for _, t := range s.ScheduledTasks {
+			if t.Service == name {
+				return fmt.Errorf("service %q sets replicas but runs only as scheduled_task %q", name, t.Name)
+			}
+		}
+	}
+	if svc.Replicas > 1 {
+		for _, v := range svc.Volumes {
+			if !v.ReadOnly {
+				return fmt.Errorf("service %q replicas %d: volume %q is writable — copies can't share it (mount it read_only or run one copy)", name, svc.Replicas, v.Target)
+			}
+		}
+		for _, p := range svc.Ports {
+			if p.Publish {
+				return fmt.Errorf("service %q replicas %d: port %d is published on the host — copies would collide (route it through the edge or run one copy)", name, svc.Replicas, p.Internal)
+			}
+		}
+	}
+	if svc.CPUs != "" {
+		if !cpusRe.MatchString(svc.CPUs) || strings.Trim(svc.CPUs, "0.") == "" {
+			return fmt.Errorf("service %q cpus %q must be a positive number of cores with at most two decimals (e.g. 0.5, 2)", name, svc.CPUs)
+		}
+	}
+	if l := svc.Logs; l != nil {
+		if l.Retain != "" {
+			if d, err := config.ParseDuration(l.Retain); err != nil || d <= 0 {
+				return fmt.Errorf("service %q logs.retain %q is not a valid duration (e.g. 72h, 30d)", name, l.Retain)
+			}
+		}
+		if l.MaxLines < 0 || l.MaxLines > 10_000_000 {
+			return fmt.Errorf("service %q logs.max_lines %d must be between 1 and 10000000", name, l.MaxLines)
+		}
+	}
+	return nil
 }
 
 // validateSelfHealing checks the per-app self-healing tunables are structurally sane.
@@ -1143,6 +1278,9 @@ func (s *Spec) validateServices() error {
 			return err
 		}
 		if err := validateHealthcheck(name, svc.Healthcheck); err != nil {
+			return err
+		}
+		if err := s.validateServiceSizing(name, svc); err != nil {
 			return err
 		}
 		if sh := svc.SelfHealing; sh != nil {
@@ -1515,6 +1653,9 @@ func (s *Spec) validateEdge() error {
 		}
 		if r.UpstreamScheme != "" && r.UpstreamScheme != "http" && r.UpstreamScheme != "https" {
 			return fmt.Errorf("edge route %q upstream_scheme %q must be http or https", id, r.UpstreamScheme)
+		}
+		if !edge.ValidLB(r.LB) {
+			return fmt.Errorf("edge route %q lb %q must be least_conn, round_robin, ip_hash or cookie", id, r.LB)
 		}
 		if r.CA != "" && !edgeCANameRe.MatchString(r.CA) {
 			return fmt.Errorf("edge route %q ca %q must match [a-z][a-z0-9-]{0,30} (a CA defined in config.yaml edge.cas)", id, r.CA)

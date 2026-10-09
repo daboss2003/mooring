@@ -202,3 +202,39 @@ func TestStoreHMACTamperRejected(t *testing.T) {
 		t.Errorf("a tampered definition must surface ErrTampered, got %v", err)
 	}
 }
+
+// The deployed release's version (the newest a git deploy or rollback saved) can't be deleted either, even
+// when dashboard edits made a newer one live: API deploys pause on its note and a failed release job
+// regenerates the previous compose from it.
+func TestStoreDeleteVersionKeepsTheDeployedRelease(t *testing.T) {
+	s, _ := testStore(t)
+	ctx := context.Background()
+	save := func(note string) int64 {
+		id, err := s.SaveCanonical(ctx, base(), note, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	gitID := save(NoteGitDeploy + "aaaaaaa")
+	rbID := save(NoteRollback + "bbbbbbb")
+	editID := save("dashboard: scaling for api")
+	save("dashboard: scaling for web")
+	if id, err := s.ReleaseVersionID("shop"); err != nil || id != rbID {
+		t.Fatalf("ReleaseVersionID = %d, %v; want %d", id, err, rbID)
+	}
+	if err := s.DeleteVersion(ctx, "shop", rbID); err == nil {
+		t.Fatal("deleting the deployed release's version must be refused")
+	}
+	if note, _ := s.LatestNote("shop", NoteGitDeploy, NoteRollback); note != NoteRollback+"bbbbbbb" {
+		t.Fatalf("the rollback note must survive, got %q", note)
+	}
+	for _, id := range []int64{gitID, editID} {
+		if err := s.DeleteVersion(ctx, "shop", id); err != nil {
+			t.Errorf("an older version should be deletable: %v", err)
+		}
+	}
+	if id, _ := s.ReleaseVersionID("other"); id != 0 {
+		t.Errorf("an app with no versions has release id %d, want 0", id)
+	}
+}

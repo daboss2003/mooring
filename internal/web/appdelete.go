@@ -158,6 +158,10 @@ func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) 
 	}
 	defer s.gitDeploy.Release()
 	defer s.beginForeground()()
+	// Suspend self-heal and the autoscaler for the app until the teardown is over: a snapshot taken
+	// mid-`down` (some services gone, others still running) would otherwise read as copies to restore.
+	// Released last; selfHeal.DeleteApp below also drops the lease row, after the containers are gone.
+	defer s.leaseExpectedDown(ctx, slug)()
 
 	// GATE: stop + remove containers, networks, AND named volumes (data) FIRST. This
 	// must SUCCEED before any irreversible deletion — a skipped/failed `down` would

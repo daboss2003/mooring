@@ -141,3 +141,20 @@ func TestApplyPreviewPrefixPinsNamespace(t *testing.T) {
 		t.Error("a per-route fork namespace override must be cleared on a preview")
 	}
 }
+
+// A fork can't claim host capacity or log storage through a preview: replicas clamp to one copy
+// and per-service log retention falls back to the server default.
+func TestApplyPreviewPrefixClampsReplicasAndLogs(t *testing.T) {
+	def := &definition.Definition{}
+	def.Spec.Compose.Services = map[string]definition.Service{
+		"worker": {Image: "alpine:3", Replicas: 20, Logs: &definition.ServiceLogs{Retain: "30d", MaxLines: 10_000_000}},
+		"api":    {Image: "alpine:3", CPUs: "0.5"},
+	}
+	applyPreviewPrefix(def, "shop-pr9", "")
+	if w := def.Spec.Compose.Services["worker"]; w.Replicas != 1 || w.Logs != nil {
+		t.Fatalf("preview worker = %+v, want 1 copy and no logs override", w)
+	}
+	if a := def.Spec.Compose.Services["api"]; a.Replicas != 0 || a.CPUs != "0.5" {
+		t.Fatalf("preview api = %+v, want replicas unset and cpus kept", a)
+	}
+}

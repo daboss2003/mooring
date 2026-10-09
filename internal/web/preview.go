@@ -145,6 +145,12 @@ func applyPreviewPrefix(def *definition.Definition, slug, baseNamespace string) 
 			svc.Ports[i].Public = false
 			svc.Ports[i].Published = 0
 		}
+		// A preview runs one copy of each service with the server's default log retention, so a
+		// fork can't claim host capacity or log storage.
+		if svc.Replicas > 1 {
+			svc.Replicas = 1
+		}
+		svc.Logs = nil
 		def.Spec.Compose.Services[name] = svc
 	}
 	def.Spec.Edge.L4Routes = nil
@@ -312,7 +318,7 @@ func (s *Server) handlePRWebhook(w http.ResponseWriter, r *http.Request) {
 				s.log.Error("preview webhook panic recovered", "base", base, "pr", ev.Number, "panic", rec)
 			}
 		}()
-		ctx, cancel := context.WithTimeout(context.Background(), s.deployTimeout())
+		ctx, cancel := context.WithTimeout(context.Background(), s.repoDeployTimeout())
 		defer cancel()
 		onLine := func(l string) { s.log.Info("preview", "base", base, "pr", ev.Number, "line", l) }
 		if open {

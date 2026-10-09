@@ -2,6 +2,7 @@ package provision
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -31,6 +32,8 @@ type composeService struct {
 	MemReservation  string          `yaml:"mem_reservation,omitempty"`
 	StopGracePeriod string          `yaml:"stop_grace_period,omitempty"`
 	Ulimits         *composeUlimits `yaml:"ulimits,omitempty"`
+	CPUs            float64         `yaml:"cpus,omitempty"`
+	Scale           int             `yaml:"scale,omitempty"`
 	// Profiles gates a service out of the default `up` (compose only starts a profiled service
 	// when its profile is enabled or via `compose run`). Mooring uses it for scheduled-only
 	// (cron) services so they exist in the compose but never run as long-lived containers.
@@ -91,6 +94,14 @@ func Generate(spec Spec) ([]byte, error) {
 		if svc.Scheduled {
 			cs.Profiles = []string{scheduledProfile} // present in compose, NOT started by `up`
 		}
+		if svc.CPUs != "" {
+			cpus, err := strconv.ParseFloat(svc.CPUs, 64)
+			if err != nil || cpus <= 0 {
+				return nil, fmt.Errorf("service %q cpus %q is invalid", svc.Name, svc.CPUs)
+			}
+			cs.CPUs = cpus
+		}
+		cs.Scale = svc.Replicas
 		if svc.Ulimits != nil && svc.Ulimits.Nofile != nil {
 			cs.Ulimits = &composeUlimits{Nofile: &composeNofile{Soft: svc.Ulimits.Nofile.Soft, Hard: svc.Ulimits.Nofile.Hard}}
 		}

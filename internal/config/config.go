@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -161,10 +162,18 @@ type ServerConfig struct {
 
 	// ServiceLogEnabled controls capturing + retaining each running service's own container output
 	// (stdout/stderr) for the per-service log search. ON by default (a *bool: unset = on). Output is
-	// kept in a 0600 file in the data dir with a 48h TTL, bounded per service, readable only by an
-	// authenticated operator. It writes the app's own output to disk, which may contain secrets the app
-	// prints; set false to disable, which also removes the capture file on the next start.
+	// kept in 0600 files under the data dir (48h / 2000 lines per service unless the service's
+	// mooring.yaml `logs:` asks for more), readable only by an authenticated operator. It writes the
+	// app's own output to disk, which may contain secrets the app prints; set false to disable, which
+	// also removes the captured files on the next start.
 	ServiceLogEnabled *bool `yaml:"service_log_enabled"`
+	// ServiceLogMaxRetain caps any service's `logs.retain` (default 30d, 1h–365d).
+	ServiceLogMaxRetain Duration `yaml:"service_log_max_retain"`
+	// ServiceLogMaxLines caps any service's `logs.max_lines` (default 200000, 100–10000000).
+	ServiceLogMaxLines int `yaml:"service_log_max_lines"`
+	// ServiceLogMaxDiskMB is the on-disk budget for all captured service logs together; past it the
+	// oldest files are removed first (default 2048, 64–102400).
+	ServiceLogMaxDiskMB int `yaml:"service_log_max_disk_mb"`
 
 	// BuildCacheKeepEnabled controls automatic reclamation of Docker/BuildKit build cache
 	// after a build-deploy. Mooring's generated multi-stage Dockerfiles emit a unique,
@@ -313,6 +322,60 @@ func (s ServerConfig) ServiceLogOn() bool {
 	return s.ServiceLogEnabled == nil || *s.ServiceLogEnabled
 }
 
+// Service log retention ceilings and their defaults/bounds (server.service_log_max_*).
+const (
+	DefaultServiceLogMaxRetain = 30 * 24 * time.Hour
+	DefaultServiceLogMaxLines  = 200_000
+	DefaultServiceLogMaxDiskMB = 2048
+
+	serviceLogMaxRetainMin = time.Hour
+	serviceLogMaxRetainMax = 365 * 24 * time.Hour
+	serviceLogMaxLinesMin  = 100
+	serviceLogMaxLinesMax  = 10_000_000
+	serviceLogMaxDiskMBMin = 64
+	serviceLogMaxDiskMBMax = 102_400
+)
+
+// ServiceLogLimits are the server-wide ceilings on captured service logs, defaults applied.
+type ServiceLogLimits struct {
+	MaxRetain    time.Duration // longest `logs.retain` any service gets
+	MaxLines     int           // most `logs.max_lines` any service gets
+	MaxDiskBytes int64         // total on-disk budget for every service's captured logs
+}
+
+// ServiceLogLimits resolves server.service_log_max_retain / _max_lines / _max_disk_mb.
+func (s ServerConfig) ServiceLogLimits() ServiceLogLimits {
+	out := ServiceLogLimits{
+		MaxRetain:    DefaultServiceLogMaxRetain,
+		MaxLines:     DefaultServiceLogMaxLines,
+		MaxDiskBytes: int64(DefaultServiceLogMaxDiskMB) << 20,
+	}
+	if s.ServiceLogMaxRetain > 0 {
+		out.MaxRetain = s.ServiceLogMaxRetain.D()
+	}
+	if s.ServiceLogMaxLines > 0 {
+		out.MaxLines = s.ServiceLogMaxLines
+	}
+	if s.ServiceLogMaxDiskMB > 0 {
+		out.MaxDiskBytes = int64(s.ServiceLogMaxDiskMB) << 20
+	}
+	return out
+}
+
+// validateServiceLogLimits rejects out-of-range ceilings (0 / unset = default).
+func (s ServerConfig) validateServiceLogLimits() error {
+	if d := s.ServiceLogMaxRetain.D(); d != 0 && (d < serviceLogMaxRetainMin || d > serviceLogMaxRetainMax) {
+		return fmt.Errorf("server.service_log_max_retain %s must be between 1h and 365d", d)
+	}
+	if n := s.ServiceLogMaxLines; n != 0 && (n < serviceLogMaxLinesMin || n > serviceLogMaxLinesMax) {
+		return fmt.Errorf("server.service_log_max_lines %d must be between %d and %d", n, serviceLogMaxLinesMin, serviceLogMaxLinesMax)
+	}
+	if n := s.ServiceLogMaxDiskMB; n != 0 && (n < serviceLogMaxDiskMBMin || n > serviceLogMaxDiskMBMax) {
+		return fmt.Errorf("server.service_log_max_disk_mb %d must be between %d and %d", n, serviceLogMaxDiskMBMin, serviceLogMaxDiskMBMax)
+	}
+	return nil
+}
+
 // DiskGCOn reports whether disk-pressure auto-reclaim is enabled (default ON). When disk
 // crosses the threshold Mooring reclaims DANGLING docker images + build cache (safe garbage —
 // never a tagged/in-use image or any app data) and alerts. Set false to disable.
@@ -450,6 +513,9 @@ func (c *Config) validateServer() error {
 	case "", "auto", "serial", "parallel":
 	default:
 		return fmt.Errorf("server.build_concurrency %q must be auto, serial or parallel", c.Server.BuildConcurrency)
+	}
+	if err := c.Server.validateServiceLogLimits(); err != nil {
+		return err
 	}
 	return c.Server.StartGate.validate()
 }
@@ -856,12 +922,25 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	if err := value.Decode(&s); err != nil {
 		return err
 	}
-	parsed, err := time.ParseDuration(s)
+	parsed, err := ParseDuration(s)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", s, err)
 	}
 	*d = Duration(parsed)
 	return nil
+}
+
+// ParseDuration is time.ParseDuration plus a whole-day form, "30d", for retention-style
+// windows. Days can't be mixed with other units ("1d12h" is rejected).
+func ParseDuration(s string) (time.Duration, error) {
+	if n, ok := strings.CutSuffix(s, "d"); ok && n != "" && strings.Trim(n, "0123456789") == "" {
+		days, err := strconv.Atoi(n)
+		if err != nil || days > 36500 {
+			return 0, fmt.Errorf("day count %q out of range", n)
+		}
+		return time.Duration(days) * 24 * time.Hour, nil
+	}
+	return time.ParseDuration(s)
 }
 
 // D returns the value as a time.Duration.

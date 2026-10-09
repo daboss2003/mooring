@@ -1,7 +1,12 @@
 package edge
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -378,5 +383,228 @@ func TestRenderPathOrderKeepsHostCA(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "https://ca.lan/acme/acme/directory") {
 		t.Errorf("api.lan lost its private CA after route reordering:\n%s", out)
+	}
+}
+
+// renderedProxy is the load-balancing part of a rendered reverse_proxy handler.
+type renderedProxy struct {
+	LoadBalancing *struct {
+		SelectionPolicy map[string]any `json:"selection_policy"`
+	} `json:"load_balancing"`
+	HealthChecks *struct {
+		Passive *struct {
+			FailDuration string `json:"fail_duration"`
+			MaxFails     int    `json:"max_fails"`
+		} `json:"passive"`
+	} `json:"health_checks"`
+}
+
+// renderedProxies maps "host path" (path = the route's first path matcher, "" for none) to its
+// reverse_proxy handler.
+func renderedProxies(t *testing.T, out []byte) map[string]renderedProxy {
+	t.Helper()
+	var doc struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Match []struct {
+							Host []string `json:"host"`
+							Path []string `json:"path"`
+						} `json:"match"`
+						Handle []json.RawMessage `json:"handle"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]renderedProxy{}
+	for _, srv := range doc.Apps.HTTP.Servers {
+		for _, r := range srv.Routes {
+			if len(r.Match) != 1 || len(r.Match[0].Host) != 1 {
+				continue
+			}
+			key := r.Match[0].Host[0] + " "
+			if len(r.Match[0].Path) > 0 {
+				key += r.Match[0].Path[0]
+			}
+			for _, raw := range r.Handle {
+				var h struct {
+					Handler string `json:"handler"`
+					renderedProxy
+				}
+				if err := json.Unmarshal(raw, &h); err != nil {
+					t.Fatal(err)
+				}
+				if h.Handler == "reverse_proxy" {
+					got[key] = h.renderedProxy
+				}
+			}
+		}
+	}
+	return got
+}
+
+// wantCookieName recomputes the per-route cookie name independently of the renderer, so a change
+// to the formula (which would move every live session) fails here.
+func wantCookieName(host, prefix string) string {
+	sum := sha256.Sum256([]byte(host + "\x00" + prefix))
+	return "mlb_" + hex.EncodeToString(sum[:])[:10]
+}
+
+// Each lb value maps onto its Caddy selection policy, and every policy keeps the passive health
+// checks that take a failing copy out of the pool.
+func TestRenderLBPolicies(t *testing.T) {
+	base := baseCfg()
+	base.LBCookieSecret = "5ec2e7c00c1e5ec2e7c00c1e5ec2e7c00c1e5ec2e7c00c1e5ec2e7c00c1e5ec2"
+	cases := []struct {
+		lb   string
+		want map[string]any
+	}{
+		{"", map[string]any{"policy": "least_conn"}},
+		{"least_conn", map[string]any{"policy": "least_conn"}},
+		{"round_robin", map[string]any{"policy": "round_robin"}},
+		{"ip_hash", map[string]any{"policy": "ip_hash"}},
+		{"cookie", map[string]any{"policy": "cookie", "name": wantCookieName("app.example.com", ""), "secret": base.LBCookieSecret}},
+	}
+	for _, c := range cases {
+		out, err := Render(base, []Route{{
+			Hostname: "app.example.com", Upstream: "web:8080", Pool: []string{"172.18.0.4:8080", "172.18.0.5:8080"},
+			UpstreamScheme: "http", Enabled: true, LB: c.lb,
+		}}, nil)
+		if err != nil {
+			t.Fatalf("lb %q: %v", c.lb, err)
+		}
+		rp, ok := renderedProxies(t, out)["app.example.com "]
+		if !ok || rp.LoadBalancing == nil {
+			t.Fatalf("lb %q: no load_balancing rendered:\n%s", c.lb, out)
+		}
+		if !reflect.DeepEqual(rp.LoadBalancing.SelectionPolicy, c.want) {
+			t.Errorf("lb %q: selection_policy = %v, want %v", c.lb, rp.LoadBalancing.SelectionPolicy, c.want)
+		}
+		if rp.HealthChecks == nil || rp.HealthChecks.Passive == nil || rp.HealthChecks.Passive.FailDuration != "30s" || rp.HealthChecks.Passive.MaxFails != 3 {
+			t.Errorf("lb %q: passive health checks missing or changed:\n%s", c.lb, out)
+		}
+		if c.lb != "cookie" && strings.Contains(string(out), base.LBCookieSecret) {
+			t.Errorf("lb %q: the cookie secret must appear only in a cookie policy", c.lb)
+		}
+	}
+}
+
+// One copy needs no balancing: no load_balancing or health_checks, whatever lb says.
+func TestRenderLBSingleUpstreamHasNoPolicy(t *testing.T) {
+	base := baseCfg()
+	base.LBCookieSecret = "5ec2e7"
+	for _, lb := range []string{"", "least_conn", "round_robin", "ip_hash", "cookie"} {
+		out, err := Render(base, []Route{{
+			Hostname: "app.example.com", Upstream: "web:8080", Pool: []string{"172.18.0.4:8080"},
+			UpstreamScheme: "http", Enabled: true, LB: lb,
+		}}, nil)
+		if err != nil {
+			t.Fatalf("lb %q: %v", lb, err)
+		}
+		if s := string(out); strings.Contains(s, "load_balancing") || strings.Contains(s, "health_checks") || strings.Contains(s, base.LBCookieSecret) {
+			t.Errorf("lb %q: a single upstream must not render pool machinery:\n%s", lb, s)
+		}
+	}
+}
+
+// Caddy sets the cookie on path "/", so path routes sharing a hostname need their own cookie
+// names or each would overwrite the other's. Equivalent spellings of a prefix and hostname case
+// give the same name.
+func TestRenderLBCookieNamePerRoute(t *testing.T) {
+	base := baseCfg()
+	base.LBCookieSecret = "5ec2e7"
+	pool := []string{"172.18.0.4:8080", "172.18.0.5:8080"}
+	out, err := Render(base, []Route{
+		{Hostname: "app.example.com", PathPrefix: "/", Upstream: "web:8080", Pool: pool, UpstreamScheme: "http", Enabled: true, LB: "cookie"},
+		{Hostname: "app.example.com", PathPrefix: "/socket.io/", Upstream: "rt:8080", Pool: pool, UpstreamScheme: "http", Enabled: true, LB: "cookie"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := renderedProxies(t, out)
+	root, sock := got["app.example.com /*"], got["app.example.com /socket.io"]
+	if root.LoadBalancing == nil || sock.LoadBalancing == nil {
+		t.Fatalf("both path routes must render a cookie policy:\n%s", out)
+	}
+	rootName, _ := root.LoadBalancing.SelectionPolicy["name"].(string)
+	sockName, _ := sock.LoadBalancing.SelectionPolicy["name"].(string)
+	if rootName != wantCookieName("app.example.com", "") || sockName != wantCookieName("app.example.com", "/socket.io") {
+		t.Errorf("cookie names = %v, %v; want %v, %v", rootName, sockName, wantCookieName("app.example.com", ""), wantCookieName("app.example.com", "/socket.io"))
+	}
+	if rootName == sockName {
+		t.Errorf("two path routes on one host share cookie name %v", rootName)
+	}
+	if !regexp.MustCompile(`^mlb_[0-9a-f]{10}$`).MatchString(rootName) {
+		t.Errorf("cookie name %q is not mlb_ + 10 hex", rootName)
+	}
+	if lbCookieName("API.Example.com ", "/api/") != lbCookieName("api.example.com", "/api") || lbCookieName("a.example.com", "/") != lbCookieName("a.example.com", "") {
+		t.Error("equivalent hostname/prefix spellings must give the same cookie name")
+	}
+	if lbCookieName("a.example.com", "/api") == lbCookieName("b.example.com", "/api") {
+		t.Error("different hostnames must give different cookie names")
+	}
+}
+
+// Without a secret the cookie value would be an unkeyed hash of the copy's address, which anyone
+// can reverse over the private address space. The route stays sticky by client address instead.
+func TestRenderLBCookieWithoutSecretUsesIPHash(t *testing.T) {
+	out, err := Render(baseCfg(), []Route{{
+		Hostname: "app.example.com", Upstream: "web:8080", Pool: []string{"172.18.0.4:8080", "172.18.0.5:8080"},
+		UpstreamScheme: "http", Enabled: true, LB: "cookie",
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp := renderedProxies(t, out)["app.example.com "]
+	if rp.LoadBalancing == nil || !reflect.DeepEqual(rp.LoadBalancing.SelectionPolicy, map[string]any{"policy": "ip_hash"}) {
+		t.Errorf("cookie without a secret must render ip_hash:\n%s", out)
+	}
+}
+
+// ValidateRoute (and so Render) refuses an lb value outside the accepted set.
+func TestValidateRouteRejectsInvalidLB(t *testing.T) {
+	for _, lb := range []string{"sticky", "LEAST_CONN", "random", " cookie", "first", "uri_hash"} {
+		r := Route{Hostname: "app.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true, LB: lb}
+		if err := ValidateRoute(r); err == nil {
+			t.Errorf("lb %q must be rejected", lb)
+		}
+		if _, err := Render(baseCfg(), []Route{r}, nil); err == nil {
+			t.Errorf("Render must refuse lb %q", lb)
+		}
+	}
+	for _, lb := range []string{"", "least_conn", "round_robin", "ip_hash", "cookie"} {
+		if err := ValidateRoute(Route{Hostname: "app.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true, LB: lb}); err != nil {
+			t.Errorf("lb %q must be accepted: %v", lb, err)
+		}
+	}
+}
+
+func TestDeriveLBCookieSecret(t *testing.T) {
+	k1 := bytes.Repeat([]byte{0x11}, 32)
+	k2 := bytes.Repeat([]byte{0x22}, 32)
+	s1 := DeriveLBCookieSecret(k1)
+	if s1 != DeriveLBCookieSecret(append([]byte(nil), k1...)) {
+		t.Error("derivation must be deterministic")
+	}
+	if s1 == DeriveLBCookieSecret(k2) {
+		t.Error("different keys must derive different secrets")
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(s1) {
+		t.Errorf("secret %q is not 64 hex chars", s1)
+	}
+	if s1 == hex.EncodeToString(k1) || s1 == string(k1) || strings.Contains(s1, hex.EncodeToString(k1)) {
+		t.Error("the derived secret must not be the key")
+	}
+	// Domain separation: not the plain hash of the key, nor the key-HMAC of another label.
+	if sum := sha256.Sum256(k1); s1 == hex.EncodeToString(sum[:]) {
+		t.Error("the derived secret must be domain-separated, not sha256(key)")
+	}
+	if DeriveLBCookieSecret(nil) != "" {
+		t.Error("an empty key must derive no secret")
 	}
 }

@@ -130,10 +130,11 @@ func TestAPIScopeEnforced(t *testing.T) {
 
 func TestAPIDeployScopeBoundToProject(t *testing.T) {
 	e, _, pt := buildAPIServer(t, true, seedToken{[]string{"deploy:write:web"}, []string{"198.51.100.0/24"}})
-	// Correct project → scope matches → 501 (orchestration is continuation).
+	// Correct project → scope matches → the handler runs; this server has no git store or write
+	// plane, so it answers 503 (api_deploy_test.go covers the deploy itself).
 	ok := e.req(t, "POST", "/api/v1/apps/web/deploy", "198.51.100.5:1", bearer(pt[0]), nil, nil)
-	if ok.StatusCode != http.StatusNotImplemented {
-		t.Errorf("in-scope deploy = %d, want 501", ok.StatusCode)
+	if ok.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("in-scope deploy without a write plane = %d, want 503", ok.StatusCode)
 	}
 	// Different project → scope deploy:write:other not granted → 403.
 	bad := e.req(t, "POST", "/api/v1/apps/other/deploy", "198.51.100.5:1", bearer(pt[0]), nil, nil)

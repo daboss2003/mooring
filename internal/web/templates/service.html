@@ -7,7 +7,7 @@
   {{if .Copies}}<p class="muted mono" title="the specific copy shown">copy: {{.ContainerName}}</p>{{end}}
   {{if .Copies}}
   {{$proj := .Project}}{{$svc := .Service}}
-  <nav class="copy-switcher"><span class="muted">This service is scaled — pick a copy:</span>
+  <nav class="copy-switcher"><span class="muted">{{if .FixedReplicas}}This service runs several copies{{else}}This service is scaled{{end}} — pick a copy:</span>
     {{range .Copies}} <a class="pill{{if .Selected}} pill-ok{{end}}" href="/apps/{{pathEscape $proj}}/services/{{pathEscape $svc}}?copy={{pathEscape .ID}}">{{.Name}}</a>{{end}}
   </nav>
   {{end}}
@@ -25,7 +25,8 @@
         {{end}}
         {{if .Held}}<tr><td>Auto-restart</td><td><span class="badge badge-warn">held — stopped by operator, won't auto-restart</span></td></tr>
         {{else if .Phase}}<tr><td>Self-heal</td><td>{{if eq .Phase "CIRCUIT_OPEN"}}<span class="badge badge-warn">circuit open — needs attention</span>{{else if eq .Phase "WAITING_ON_DEPENDENCY"}}<span class="badge badge-warn">waiting on a dependency</span> <span class="muted">a service it depends on is failing or still recovering, so it isn't restarted until that one is healthy again (at most 10 minutes, then it is paged and restarted normally)</span>{{else if eq .Phase "UNHEALTHY"}}<span class="badge badge-warn">failing its healthcheck</span> <span class="muted">on_unhealthy: notify, so it is reported, not restarted</span>{{else}}<span class="muted">{{.Phase}}</span>{{end}}</td></tr>{{end}}
-        {{if .DesiredReplicas}}<tr><td>Desired replicas</td><td class="mono">{{.DesiredReplicas}}</td></tr>{{end}}
+        {{if .FixedReplicas}}<tr><td>Copies</td><td>Fixed: {{.FixedReplicas}} {{if eq .FixedReplicas 1}}copy{{else}}copies{{end}} <span class="muted">(replicas in mooring.yaml)</span></td></tr>
+        {{else if .DesiredReplicas}}<tr><td>Desired replicas</td><td class="mono">{{.DesiredReplicas}}</td></tr>{{end}}
         {{if .StatusText}}<tr><td>Status</td><td class="muted">{{.StatusText}}</td></tr>{{end}}
       </tbody>
     </table></div>
@@ -39,12 +40,14 @@
       {{else}}
       {{if gt (len .Copies) 1}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart just this copy ({{.ContainerName}})? The other copies keep serving." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart?copy={{pathEscape .ContainerID}}">Restart this copy</button>
+      {{if not .FixedReplicas}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop just this copy ({{.ContainerName}})? The autoscaler removes it and keeps the other copies running." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/stop?copy={{pathEscape .ContainerID}}">Stop this copy</button>
+      {{end}}
       {{end}}
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Restart the {{.Service}} service{{if gt (len .Copies) 1}} (all copies){{end}}?" data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/restart">Restart{{if gt (len .Copies) 1}} service{{end}}</button>
       <button type="button" class="btn btn-sm lc-btn" data-lc-confirm="Stop the {{.Service}} service{{if gt (len .Copies) 1}} (all copies){{end}}? It stays stopped (auto-restart paused) until you start it — the rest of the app keeps running." data-lc-url="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/stop">Stop{{if gt (len .Copies) 1}} service{{end}}</button>
       <label class="check muted"><input type="checkbox" class="lc-now"> all at once</label>
-      {{if and .Policy .Policy.Enabled}}
+      {{if and .Policy .Policy.Enabled (not .FixedReplicas)}}
       <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/up" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Add one replica now — auto-scaling still manages it (sheds it under sustained no load, keeps it under load)">+1 replica</button></form>
       <form method="post" action="/apps/{{pathEscape .Project}}/services/{{pathEscape .Service}}/replicas/down" class="inline"><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="btn btn-sm" title="Remove one replica now — never below the minimum">−1 replica</button></form>
       {{end}}
@@ -106,6 +109,12 @@
 
   {{if and (not $.WriteDisabledReason) (not $.Protected)}}
   {{$p := .Policy}}
+  {{if .FixedReplicas}}
+  <section class="panel">
+    <h2>Auto-scaling</h2>
+    <p class="muted">This service runs a fixed number of copies (<code>replicas: {{.FixedReplicas}}</code> in <code>mooring.yaml</code>). To scale it with load, remove <code>replicas</code> and add a <code>spec.scaling</code> entry for it.</p>
+  </section>
+  {{else}}
   <section class="panel">
     <h2>Auto-scaling</h2>
     <p class="muted">Scale replicas of <strong>this service</strong> with load. Only safe for a
@@ -148,6 +157,7 @@
     <p class="muted small mt1">No custom scaling signals. Add <code>scaling[].metrics</code> in <code>mooring.yaml</code> to scale on queue depth or edge latency (<a href="https://github.com/daboss2003/mooring/blob/main/docs/definition-file.md#custom-scaling-signals-metrics">docs</a>).</p>
     {{end}}
   </section>
+  {{end}}
   {{end}}
   {{end}}
 </main>

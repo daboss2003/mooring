@@ -125,9 +125,19 @@ func (h caddyHandler) MarshalJSON() ([]byte, error) {
 	return json.Marshal(plain(h))
 }
 
-// caddyLoadBalancing selects across a replica pool (least_conn for M14 edge pools).
+// caddyLoadBalancing selects across a replica pool (the route's lb; least_conn by default).
 type caddyLoadBalancing struct {
-	SelectionPolicy map[string]any `json:"selection_policy,omitempty"`
+	SelectionPolicy *caddySelectionPolicy `json:"selection_policy,omitempty"`
+}
+
+// caddySelectionPolicy is a reverse_proxy selection-policy module, named by its inline key
+// "policy" (least_conn | round_robin | ip_hash | cookie). Name and Secret are the cookie policy's
+// fields (Caddy ≥ 2.4); the others take none. Secret is key material: it lives only in the
+// rendered document (autosave is off) and must never be logged.
+type caddySelectionPolicy struct {
+	Policy string `json:"policy"`
+	Name   string `json:"name,omitempty"`
+	Secret string `json:"secret,omitempty"`
 }
 
 // caddyHealthChecks holds the passive health policy applied to a pool — a replica

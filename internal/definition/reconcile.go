@@ -13,6 +13,7 @@ import (
 	"github.com/daboss2003/mooring/internal/compose"
 	"github.com/daboss2003/mooring/internal/edge"
 	"github.com/daboss2003/mooring/internal/provision"
+	"github.com/daboss2003/mooring/internal/scale"
 )
 
 // memSizeRe matches a compose/docker byte-size string (mem_limit / mem_reservation):
@@ -63,6 +64,9 @@ func boundString(d time.Duration) string {
 	if strings.HasSuffix(s, "m0s") {
 		s = strings.TrimSuffix(s, "0s")
 	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
 	return s
 }
 
@@ -84,7 +88,8 @@ func toProvisionSpec(d *Definition) provision.Spec {
 			Name:    name,
 			Command: svc.Command, Healthcheck: toProvisionHealthcheck(svc.Healthcheck), Restart: svc.Restart, DependsOn: svc.DependsOn,
 			MemLimit: svc.MemLimit, MemReservation: svc.MemReservation, StopGracePeriod: svc.StopGracePeriod,
-			Ulimits:   toProvisionUlimits(svc.Ulimits),
+			Ulimits:  toProvisionUlimits(svc.Ulimits),
+			Replicas: svc.Replicas, CPUs: svc.CPUs,
 			Scheduled: scheduled[name],
 		}
 		if svc.Build != nil {
@@ -165,6 +170,12 @@ func ValidateForSubmit(d *Definition) error {
 	if cycle := d.Spec.DependencyCycle(); cycle != nil {
 		return fmt.Errorf("depends_on has a cycle: %s", strings.Join(cycle, " → "))
 	}
+	// The stateful image list grows between versions, so this check can't live in Parse.
+	for _, name := range d.Spec.serviceNames() {
+		if svc := d.Spec.Compose.Services[name]; svc.Replicas > 1 && svc.Image != "" && scale.StatefulImage(svc.Image) {
+			return fmt.Errorf("service %q replicas %d: %q is a stateful image (database, broker or store) — run one copy", name, svc.Replicas, svc.Image)
+		}
+	}
 	return nil
 }
 
@@ -227,6 +238,7 @@ func Validate(d *Definition, runDir string, env compose.Env, protectedPaths []st
 			HSTS:            r.HSTS,
 			SecurityHeaders: r.SecurityHeaders,
 			RedirectHTTP:    r.RedirectHTTP,
+			LB:              r.LB,
 			Enabled:         true,
 		}
 		if err := edge.ValidateRoute(er); err != nil {

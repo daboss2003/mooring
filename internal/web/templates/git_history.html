@@ -8,6 +8,7 @@
   {{template "git_subnav" .}}
   {{$proj := .Project}}
   {{$firstPage := .FirstPage}}
+  {{$releaseID := .ReleaseID}}
   {{if .Versions}}
   <section class="panel">
     <p class="muted">Rolling back re-checks out and redeploys that commit — <strong>build services rebuild</strong>; pull-image services reuse their pinned image. Progress streams below.</p>
@@ -22,7 +23,7 @@
           <td class="row-actions">
             <div class="queue-actions">
               {{if $v.Commit}}<span class="lc-group queue-actions"><button type="button" class="btn btn-sm btn-ghost lc-btn" data-lc-confirm="Roll back {{$proj}} to {{shortSha $v.Commit}}? This recreates its containers." data-lc-url="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/rollback">Roll back to this</button><label class="check muted"><input type="checkbox" class="lc-now"> all at once</label></span>{{end}}
-              {{if not (and $firstPage (not $i))}}<form method="post" action="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/delete" class="inline" data-confirm="Delete this deploy from history? It only trims the list — disk from old build images is reclaimed separately on the Server tab."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">delete</button></form>{{end}}
+              {{if not (or (and $firstPage (not $i)) (eq $v.ID $releaseID))}}<form method="post" action="/apps/{{pathEscape $proj}}/versions/{{$v.ID}}/delete" class="inline" data-confirm="Delete this deploy from history? It only trims the list — disk from old build images is reclaimed separately on the Server tab."><input type="hidden" name="csrf_token" value="{{$.CSRFToken}}"><button type="submit" class="link">delete</button></form>{{end}}
             </div>
           </td>
         </tr>

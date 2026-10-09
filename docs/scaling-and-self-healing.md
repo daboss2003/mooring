@@ -41,9 +41,34 @@ You configure min/max replicas, per-replica memory and CPU, and the up/down thre
 
 > Never enable this for a database, message broker, or anything that owns data — those are meant to run as a single instance.
 
+## Fixed copies (`replicas`)
+
+Set [`replicas`](./definition-file.md#a-service) on a service in `mooring.yaml` to run a fixed number of copies (1–20):
+
+```yaml
+spec:
+  compose:
+    services:
+      api:
+        image: ghcr.io/example/api:1.4
+        replicas: 3
+```
+
+- **Deploys.** A deploy starts that many copies. A service whose configuration or image changed has all its copies replaced together, in its one step of the [paced start](./gitops.md#paced-starts); the step waits for every new copy to become healthy. A deploy that changes only `replicas` starts the service with the new count. A deploy after `replicas` was removed from a service that isn't auto-scaled starts it as one copy.
+- **Self-healing keeps the count.** A copy that stops is restarted. With `replicas` of 2 or more:
+  - when fewer copies exist than `replicas` (a copy was removed outside Mooring), the missing copies are started one per check with `docker compose up --no-recreate --scale <service>=<n>` for that service, where `<n>` is one more than the copies that exist and the count comes from the deployed `mooring.yaml`. Each start goes through the [start gate](#start-pacing), so the next one waits until the last new copy is healthy. The first start uses up one self-healing attempt; a later one uses one only when the start before it didn't add its copy. A service whose missing copies can't be started ends in the "gave up" state and raises an alert;
+  - a service with no container at all is started again, one copy per check, while another service of its app is running;
+  - on the recreate rung, the sick copies are removed and one replacement is started while the other copies keep running; the remaining copies come back one per check. If every copy is sick, the service is recreated.
+
+  A service with `replicas: 1` is supervised like a service without `replicas`.
+- **Not combined with auto-scaling.** A service can't have both `replicas` and a `spec.scaling` entry. Deploying `replicas` for a service that has an enabled auto-scaling policy disables that policy.
+- **Dashboard.** The service page shows **Fixed: N copies**. Each copy can be restarted on its own (**Restart this copy**). There is no per-copy stop and no ±1 replica: stop the whole service with **Stop**, and change the count by changing `replicas` and deploying.
+- The edge and the L4 load balancer send traffic to every running copy.
+- More than one copy is refused for a stateful image, a service with a writable volume, or a service that publishes a host port. A PR preview runs one copy.
+
 ## Self-healing
 
-The self-healing supervisor watches your services and **recovers ones that crash or get stuck** — restarting a failed container, and escalating if a restart isn't enough. It restarts one container at a time, paced by the [start gate](#start-pacing).
+The self-healing supervisor watches your services and **recovers ones that crash or get stuck** — restarting a failed container, and escalating if a restart isn't enough. It restarts or starts one container at a time, paced by the [start gate](#start-pacing).
 
 **How it escalates.** For a crashed or unhealthy service it climbs a short ladder — **restart**, then **recreate** (which also re-renders the service's config files and re-syncs its certificates, healing config drift), and, only if you opt in on a box with enough RAM, **redeploy**. Each rung is tried at most once per window, with back-off between attempts. Two cases short-circuit the ladder because retrying wouldn't help: a service being **OOM-killed repeatedly** (it needs more memory, not another restart), and a restart that would need memory the host can't spare (Mooring **pages you instead of acting**). It also covers the **deploy path** — if an interrupted recreate strands a container holding a service's name, Mooring reclaims that app's own stuck container and retries once (see [self-healing a stuck container](./gitops.md#how-updates-work)).
 
@@ -51,12 +76,12 @@ The self-healing supervisor watches your services and **recovers ones that crash
 
 - **Restart** restarts one sick copy (`docker restart <copy>`); the other copies keep serving.
 - Every other sick copy is then restarted the same way, one per action, before the service moves up the ladder. Only the first of these restarts uses up an attempt — so after a reboot that left several copies stopped, they come back one at a time.
-- **Recreate**, for an auto-scaled service with at least one copy that isn't sick, removes the sick copies and the auto-scaler starts fresh ones, one at a time. Otherwise the service is recreated (`docker compose up --force-recreate --no-deps` for that service).
+- **Recreate**, for an auto-scaled service with at least one copy that isn't sick, removes the sick copies and the auto-scaler starts fresh ones, one at a time. For a service with [fixed copies](#fixed-copies-replicas), it removes the sick copies and starts one replacement; the others follow one per check up to the `replicas` count. Otherwise the service is recreated (`docker compose up --force-recreate --no-deps` for that service).
 - The attempt count isn't reset while the service keeps running with several copies, until the attempt window (30 minutes by default) ends. A copy that keeps failing — even minutes after each restart — ends in the "gave up" state below instead of being restarted forever.
 
 When it **can't** recover a service after trying, it stops retrying (to avoid a crash-loop hammering the box), **flags the service on the Incidents screen**, and alerts you. That's the "self-healing gave up" state — you investigate, fix the underlying problem, and click **clear & retry** to let Mooring try again. The state holds while the service waits on a dependency or on its certificate.
 
-**Stopping a service on purpose won't fight you.** When you **Stop** a service (or a whole app), Mooring records a *hold*: the supervisor and the auto-scaler both leave it down and won't restart it. A held service stays stopped until you **Start**, **Restart**, or **Redeploy** it — so planned downtime is just Stop, with no window to set or expire. (See [Starting and stopping services](./gitops.md#starting-and-stopping-services).)
+**Stopping a service on purpose won't fight you.** When you **Stop** a service (or a whole app), Mooring records a *hold*: the supervisor and the auto-scaler both leave it down and won't restart it. Stopping a whole app holds every service it has containers for and every long-running service in its `mooring.yaml`, including one that has no container. A held service stays stopped until you **Start**, **Restart**, or **Redeploy** it — so planned downtime is just Stop, with no window to set or expire. (See [Starting and stopping services](./gitops.md#starting-and-stopping-services).)
 
 Self-healing is conservative for the same reason auto-scaling is: a recovery action that needs to recreate a container runs only when there's room, so healing one app can't knock over the server.
 

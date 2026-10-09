@@ -50,6 +50,10 @@ const (
 	RungRestart  Rung = "restart"
 	RungRecreate Rung = "recreate" // --force-recreate: re-runs host-side template render + cert-sync
 	RungRedeploy Rung = "redeploy" // off by default, ≥1 GB only
+	// RungRestore starts one copy a fixed-count service is missing (`up --no-recreate --scale`). It is
+	// not a ladder rung: it never moves LastRung, and it consumes an attempt unless the restore before it
+	// added its copy.
+	RungRestore Rung = "restore"
 )
 
 // ladderOrder is the escalation order; each rung is tried at most once per window.
@@ -81,7 +85,7 @@ type Observation struct {
 
 	// Replicas is how many copies the service has; Sick of them are down or failing their
 	// healthcheck, with container ids SickIDs (sorted). Zero Replicas means a single-copy
-	// observation built without counts.
+	// observation built without counts — or, with Declared set, that no copy exists.
 	Replicas int
 	Sick     int
 	SickIDs  []string
@@ -94,14 +98,34 @@ type Observation struct {
 	Dependency          string
 	// Scaled: an enabled autoscaling policy keeps the copy count, so a removed copy is replaced.
 	Scaled bool
+	// Declared is the fixed copy count from the service's definition (`replicas: N`); 0 = none. With
+	// two or more (and no autoscaling), fewer copies than declared is a failure, the missing ones are
+	// started, and the recreate rung replaces only the sick copies.
+	Declared int
 }
 
-// replicas is the number of copies (at least 1).
+// fixed reports a fixed count of at least two copies. A single fixed copy is supervised like any
+// unscaled service.
+func (o Observation) fixed() bool { return o.Declared > 1 && !o.Scaled }
+
+// missing is how many copies of a fixed count don't exist.
+func (o Observation) missing() int {
+	if !o.fixed() || o.Replicas >= o.Declared {
+		return 0
+	}
+	return o.Declared - o.Replicas
+}
+
+// replicas is the number of copies (at least 1); for a fixed count, at least the declared count.
 func (o Observation) replicas() int {
-	if o.Replicas < 1 {
+	n := o.Replicas
+	if o.fixed() && o.Declared > n {
+		n = o.Declared
+	}
+	if n < 1 {
 		return 1
 	}
-	return o.Replicas
+	return n
 }
 
 // oomKilled reports an OOM kill, counting exit-137 / at-limit kills too (plan §8.5),
@@ -117,11 +141,11 @@ func (o Observation) unhealthy() bool { return o.Running && o.Health == "unhealt
 // healthyNow reports the service is up and not failing (a "starting" healthcheck is
 // not yet healthy but is benign until the slow-start watchdog deadline).
 func (o Observation) healthyNow() bool {
-	return o.Running && o.Health != "unhealthy"
+	return o.Running && o.Health != "unhealthy" && o.missing() == 0
 }
 
-// failing reports a remediable failure signal (down or unhealthy).
-func (o Observation) failing() bool { return o.down() || o.unhealthy() }
+// failing reports a remediable failure signal (down, unhealthy, or copies of a fixed count missing).
+func (o Observation) failing() bool { return o.down() || o.unhealthy() || o.missing() > 0 }
 
 // FSM is the persisted per-(app,service) state.
 type FSM struct {
@@ -140,6 +164,12 @@ type FSM struct {
 	Restarted        []string // copies restarted in the current window (oldest first, bounded)
 	DepWaitSince     int64    // unix sec; start of the current WAITING_ON_DEPENDENCY stretch
 	DepPaged         bool     // that stretch outlived DependencyWaitSecs and was paged
+
+	// RestoreTarget is the copy count the last restore of a fixed count aimed for (0 = none since the
+	// last recovery or suspension): seeing at least that many copies means it added its copy, so the next
+	// restore consumes no attempt. Intentional: not persisted — after a restart of Mooring the next
+	// restore consumes an attempt, which can only open the circuit sooner, never later.
+	RestoreTarget int
 }
 
 // Policy holds the tunables (plan §8.5 / Tier-1 selfheal.* config).
@@ -174,11 +204,17 @@ type Decision struct {
 	// Target is the one copy a restart acts on ("" = the whole service).
 	Target string
 	// Remove: the recreate rung removes these sick copies instead of recreating the service — another
-	// copy isn't sick, and the service's autoscaling policy starts fresh ones.
+	// copy isn't sick, and the service's autoscaling policy (or, with Restore, its fixed count) starts
+	// fresh ones.
 	Remove []string
+	// Restore: start one copy a fixed-count service is missing (after removing Remove), leaving its
+	// other copies as they are.
+	Restore bool
 	// FreeRestart: a restart of a sick copy not yet restarted this window, which consumes no attempt
 	// and doesn't climb the ladder.
 	FreeRestart bool
+	// FreeRestore: a restore after one that added its copy, which consumes no attempt.
+	FreeRestore bool
 }
 
 // nextRung returns the lowest ladder rung above lastRung that is currently
@@ -229,7 +265,7 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 	if o.Held {
 		f.Phase = Held
 		f.UnhealthyStreak, f.HealthyStreak, f.DegradedSince = 0, 0, 0
-		f.DepWaitSince, f.DepPaged = 0, false
+		f.DepWaitSince, f.DepPaged, f.RestoreTarget = 0, false, 0
 		return Decision{Next: f, Act: ActNone, Reason: "operator hold (auto-restart paused)"}
 	}
 	if o.ExpectedDown {
@@ -237,7 +273,7 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 		// failure accounting so a deploy doesn't look like a crash loop.
 		f.Phase = ExpectedDown
 		f.UnhealthyStreak, f.HealthyStreak, f.DegradedSince = 0, 0, 0
-		f.DepWaitSince, f.DepPaged = 0, false
+		f.DepWaitSince, f.DepPaged, f.RestoreTarget = 0, false, 0
 		return Decision{Next: f, Act: ActNone, Reason: "expected_down lease held"}
 	}
 
@@ -330,7 +366,7 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 				// restarted or replaced and fails again escalates instead of starting over, so a
 				// flapping copy ends in the circuit rather than a restart loop.
 				f.Phase, f.HealthyStreak, f.Open, f.OOMStrikes = Healthy, 0, false, 0
-				f.DepWaitSince, f.DepPaged = 0, false
+				f.DepWaitSince, f.DepPaged, f.RestoreTarget = 0, false, 0
 			} else {
 				f = FSM{Phase: Healthy} // full reset: attempts/window/backoff cleared
 			}
@@ -398,11 +434,31 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 		}
 	}
 
+	// Every copy that exists is fine, but a fixed count is short: a restore starts ONE missing copy. When
+	// the restore before it added its copy (at least RestoreTarget copies now), this one consumes no
+	// attempt, even at the cap — the missing copies come back one per check however many there are.
+	// Intentional: a restore whose copy didn't show up makes the next one consume an attempt, so a restore
+	// that keeps failing still ends in the circuit (copies_missing).
+	if o.Sick == 0 && o.missing() > 0 && f.RestoreTarget > 0 && o.Replicas >= f.RestoreTarget {
+		f.Phase = Remediating
+		return Decision{Next: f, Act: ActRemediate, Rung: RungRestore, Restore: true, FreeRestore: true,
+			Reason: "remediating: start the next missing copy"}
+	}
+
 	// Out of attempts this window → open the circuit and page.
 	if f.Attempts >= p.AttemptCap {
 		f.Phase = CircuitOpen
 		f.Open = true
 		return Decision{Next: f, Act: ActPage, Kind: capKind(o), Reason: "remediation cap reached"}
+	}
+
+	// The first restore (or one after a restore that added nothing) consumes an attempt once it runs, but
+	// doesn't climb the ladder. Sick copies are handled by the ladder first; its recreate rung restores
+	// a copy too.
+	if o.Sick == 0 && o.missing() > 0 {
+		f.Phase = Remediating
+		return Decision{Next: f, Act: ActRemediate, Rung: RungRestore, Restore: true,
+			Reason: "remediating: start a missing copy"}
 	}
 
 	// Choose the next rung; if the ladder is exhausted, open the circuit.
@@ -429,6 +485,11 @@ func Decide(prev FSM, o Observation, p Policy, now int64) Decision {
 		// Another copy isn't sick: remove every sick copy rather than recreating the healthy ones too;
 		// the autoscaling policy starts fresh copies. Without a policy nothing would replace them.
 		d.Remove = append([]string(nil), o.SickIDs...)
+	case (rung == RungRecreate || rung == RungRedeploy) && o.fixed() && o.Sick < o.Replicas:
+		// A fixed count with a copy that isn't sick: remove the sick copies and start one replacement (the
+		// restores bring back the rest). The healthy copies are never recreated with them.
+		d.Remove = append([]string(nil), o.SickIDs...)
+		d.Restore = true
 	}
 	return d
 }
@@ -472,18 +533,29 @@ func CommitRemediation(f FSM, rung Rung, p Policy, now int64) FSM {
 }
 
 // Commit records an executed remediation d taken on observation o. A free restart consumes no
-// attempt and leaves the ladder where it is (it still arms the backoff); every action records the
-// sick and total copies it found and the copy it restarted.
+// attempt and leaves the ladder where it is (it still arms the backoff); a free restore consumes no
+// attempt and arms no backoff (the start gate holds the next start until this copy settles). Every
+// action records the sick and total copies it found and the copy it restarted; one that restores a
+// copy records the count it aims for.
 func Commit(d Decision, o Observation, p Policy, now int64) FSM {
 	f := d.Next
-	if d.FreeRestart {
+	switch {
+	case d.FreeRestart:
 		n := f.Attempts
 		if n < 1 {
 			n = 1
 		}
 		f.BackoffUntil = backoff(now, n, p)
-	} else {
+	case d.FreeRestore:
+	case d.Rung == RungRestore:
+		// An attempt, but not a rung: the ladder stays where it is.
+		f.Attempts++
+		f.BackoffUntil = backoff(now, f.Attempts, p)
+	default:
 		f = CommitRemediation(f, d.Rung, p, now)
+	}
+	if d.Restore {
+		f.RestoreTarget = restoreTarget(o, len(d.Remove))
 	}
 	f.ReplicasAtAction = o.replicas()
 	if d.Rung == RungRestart && d.Target != "" {
@@ -495,6 +567,20 @@ func Commit(d Decision, o Observation, p Policy, now int64) FSM {
 	return f
 }
 
+// restoreTarget is the copy count a restore aims for: one more than the copies left after removing
+// removed of them, at most the declared count. The Actioner computes the same from the same snapshot.
+func restoreTarget(o Observation, removed int) int {
+	n := o.Replicas - removed
+	if n < 0 {
+		n = 0
+	}
+	n++
+	if o.Declared > 0 && n > o.Declared {
+		n = o.Declared
+	}
+	return n
+}
+
 // capKind maps a capped failure to its can't-fix taxonomy kind (plan §8.4).
 func capKind(o Observation) string {
 	switch {
@@ -502,6 +588,8 @@ func capKind(o Observation) string {
 		return "oom_killed_repeated"
 	case o.unhealthy():
 		return "unhealthy_capped"
+	case o.Sick == 0 && o.missing() > 0:
+		return "copies_missing"
 	default:
 		return "crashloop_capped"
 	}
