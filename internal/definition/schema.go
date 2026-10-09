@@ -208,6 +208,8 @@ type Service struct {
 	CPUs string `yaml:"cpus,omitempty"`
 	// Logs widens this service's captured log history, clamped to the server's ceilings.
 	Logs *ServiceLogs `yaml:"logs,omitempty"`
+	// ShmSize sizes the container's /dev/shm ("256m", "1g"); empty = docker's 64m default.
+	ShmSize string `yaml:"shm_size,omitempty"`
 }
 
 // ServiceLogs is a service's log-capture retention.
@@ -1007,6 +1009,9 @@ func (s *Spec) validateServiceSizing(name string, svc Service) error {
 				return fmt.Errorf("service %q replicas %d: port %d is published on the host — copies would collide (route it through the edge or run one copy)", name, svc.Replicas, p.Internal)
 			}
 		}
+	}
+	if svc.ShmSize != "" && !memSizeRe.MatchString(svc.ShmSize) {
+		return fmt.Errorf("service %q shm_size %q is not a valid size (e.g. 256m, 1g)", name, svc.ShmSize)
 	}
 	if svc.CPUs != "" {
 		if !cpusRe.MatchString(svc.CPUs) || strings.Trim(svc.CPUs, "0.") == "" {

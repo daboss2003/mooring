@@ -85,6 +85,7 @@ type Service struct {
 	// validated in the definition layer.
 	Replicas int    `json:"replicas,omitempty"`
 	CPUs     string `json:"cpus,omitempty"`
+	ShmSize  string `json:"shm_size,omitempty"` // compose byte-size string; validated in the definition layer
 	// Scheduled marks a SCHEDULED-ONLY service (referenced by a scheduled_task): the generator
 	// gives it a compose profile so `up` never starts it; Mooring runs it on its interval via
 	// `compose run --rm`. Not a security-relevant field (no compose privilege), just placement.
@@ -142,13 +143,23 @@ func (b Build) validate() error {
 type Spec struct {
 	Slug     string    `json:"slug"`
 	Services []Service `json:"services"`
+	// Commit is the git commit being deployed (full hex SHA); every build service gets it as MOORING_COMMIT.
+	Commit string `json:"commit,omitempty"`
 }
+
+// CommitEnvKey is the env var a build service reads its deployed commit from.
+const CommitEnvKey = "MOORING_COMMIT"
+
+var commitRe = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
 // Validate enforces every field-level safety rule BEFORE generation (the first
 // defense, plan §7). It returns the first violation as an operator-facing error.
 func (s Spec) Validate() error {
 	if !slugRe.MatchString(s.Slug) {
 		return fmt.Errorf("app id must match [a-z][a-z0-9-]{1,30} (got %q)", s.Slug)
+	}
+	if s.Commit != "" && !commitRe.MatchString(s.Commit) {
+		return fmt.Errorf("commit %q is not a full hex SHA", s.Commit)
 	}
 	if len(s.Services) == 0 {
 		return fmt.Errorf("at least one service is required")

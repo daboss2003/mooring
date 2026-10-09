@@ -89,7 +89,7 @@ func toProvisionSpec(d *Definition) provision.Spec {
 			Command: svc.Command, Healthcheck: toProvisionHealthcheck(svc.Healthcheck), Restart: svc.Restart, DependsOn: svc.DependsOn,
 			MemLimit: svc.MemLimit, MemReservation: svc.MemReservation, StopGracePeriod: svc.StopGracePeriod,
 			Ulimits:  toProvisionUlimits(svc.Ulimits),
-			Replicas: svc.Replicas, CPUs: svc.CPUs,
+			Replicas: svc.Replicas, CPUs: svc.CPUs, ShmSize: svc.ShmSize,
 			Scheduled: scheduled[name],
 		}
 		if svc.Build != nil {
@@ -133,11 +133,16 @@ func toProvisionSpec(d *Definition) provision.Spec {
 // ComposeBytes returns the compose document this definition would deploy: ALWAYS
 // generated from the typed services — Mooring owns the compose. There is no raw
 // (repo_path/inline) source.
-func ComposeBytes(d *Definition) ([]byte, error) {
+func ComposeBytes(d *Definition) ([]byte, error) { return ComposeBytesAt(d, "") }
+
+// ComposeBytesAt is ComposeBytes for a deploy of commit: every build service gets MOORING_COMMIT=<commit> in its
+// environment ("" = none, as for `mooring validate`).
+func ComposeBytesAt(d *Definition, commit string) ([]byte, error) {
 	if src := d.Spec.Compose.Source; src != "" && src != SourceGenerated {
 		return nil, fmt.Errorf("compose.source %q is not supported — Mooring generates the compose", src)
 	}
 	ps := toProvisionSpec(d)
+	ps.Commit = commit
 	if err := ps.Validate(); err != nil { // field-level gate before generation
 		return nil, err
 	}
@@ -174,6 +179,10 @@ func ValidateForSubmit(d *Definition) error {
 	for _, name := range d.Spec.serviceNames() {
 		if svc := d.Spec.Compose.Services[name]; svc.Replicas > 1 && svc.Image != "" && scale.StatefulImage(svc.Image) {
 			return fmt.Errorf("service %q replicas %d: %q is a stateful image (database, broker or store) — run one copy", name, svc.Replicas, svc.Image)
+		}
+		// Here rather than in Parse: a release deployed before Mooring set the variable may still be regenerated.
+		if _, ok := d.Spec.Compose.Services[name].Env[provision.CommitEnvKey]; ok {
+			return fmt.Errorf("service %q env %s is set by Mooring (the deployed commit) — remove it", name, provision.CommitEnvKey)
 		}
 	}
 	return nil

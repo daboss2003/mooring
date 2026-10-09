@@ -114,9 +114,9 @@ func (s *Server) releaseOnPreview(base string) (bool, string) {
 // deployedDefinition returns the definition of slug's running release: the latest version a git deploy or
 // rollback recorded (one with a commit), or, in a history from before versions carried a commit, the latest
 // version. nil, nil when there is none (a first deploy).
-func (s *Server) deployedDefinition(slug string) (*definition.Definition, error) {
+func (s *Server) deployedDefinition(slug string) (*definition.Definition, string, error) {
 	if s.defStore == nil {
-		return nil, errors.New("the definition store is unavailable")
+		return nil, "", errors.New("the definition store is unavailable")
 	}
 	// Intentional: not defStore.Current — a dashboard edit saves a newer version without a commit, and only a
 	// git deploy writes the run dir's compose, so that version never ran.
@@ -124,14 +124,15 @@ func (s *Server) deployedDefinition(slug string) (*definition.Definition, error)
 	for off := 0; ; off += 50 {
 		page, more, err := s.defStore.ListPage(slug, 50, off)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		for _, v := range page {
 			if latest == 0 {
 				latest = v.ID
 			}
 			if v.Commit != "" {
-				return s.defStore.Version(slug, v.ID)
+				def, err := s.defStore.Version(slug, v.ID)
+				return def, v.Commit, err
 			}
 		}
 		if !more {
@@ -139,9 +140,10 @@ func (s *Server) deployedDefinition(slug string) (*definition.Definition, error)
 		}
 	}
 	if latest == 0 {
-		return nil, nil
+		return nil, "", nil
 	}
-	return s.defStore.Version(slug, latest)
+	def, err := s.defStore.Version(slug, latest)
+	return def, "", err
 }
 
 // previousReleaseCompose returns the compose file of the release r replaces: generated again from its deployed
@@ -149,17 +151,23 @@ func (s *Server) deployedDefinition(slug string) (*definition.Definition, error)
 // otherwise: no previous release (a first deploy), a definition that can't be read or generated, or a
 // validator finding (in review mode a finding is only a warning, as for a deploy).
 func (s *Server) previousReleaseCompose(r releaseRun, onLine func(string)) (b []byte, why string) {
-	def, err := s.deployedDefinition(r.slug)
+	return s.deployedCompose(r.slug, r.dir, r.env, onLine)
+}
+
+// deployedCompose is the compose of the release deployed in dir: generated again from its definition and
+// commit, then checked by the §5.6 validator as a deploy checks its own (see previousReleaseCompose).
+func (s *Server) deployedCompose(slug, dir string, env compose.Env, onLine func(string)) (b []byte, why string) {
+	def, commit, err := s.deployedDefinition(slug)
 	switch {
 	case err != nil:
 		return nil, "the deployed definition can't be read: " + err.Error()
 	case def == nil:
-		return nil, "there is no previous release (first deploy)"
+		return nil, noPreviousRelease
 	}
-	if b, err = definition.ComposeBytes(def); err != nil {
+	if b, err = definition.ComposeBytesAt(def, commit); err != nil {
 		return nil, "the previous release's compose can't be generated: " + err.Error()
 	}
-	res := compose.ValidateBytes(b, r.env, r.dir, compose.Options{ProtectedPaths: s.protectedHostPaths()})
+	res := compose.ValidateBytes(b, env, dir, compose.Options{ProtectedPaths: s.protectedHostPaths()})
 	if !res.OK() {
 		res.SortViolations()
 		if s.cfg.ComposeValidation.Mode != "review" {
@@ -650,6 +658,28 @@ func (s *Server) restoreRelease(ctx context.Context, r releaseRun, holdsSlot boo
 		}
 		onLine(fmt.Sprintf("release: %s points at its previous image %s again", ref, strings.TrimPrefix(id, "sha256:")[:12]))
 	}
+}
+
+// noPreviousRelease is deployedCompose's reason on a first deploy.
+const noPreviousRelease = "there is no previous release (first deploy)"
+
+// putBackDeployedCompose writes the deployed release's compose back over the one a deploy wrote, when the deploy
+// stopped before starting any service. Restarts, scale-ups and scheduled tasks read the run dir's compose, so
+// they keep running the release that is actually deployed, with its MOORING_COMMIT. Nothing on a first deploy.
+func (s *Server) putBackDeployedCompose(slug, dir string, env compose.Env, onLine func(string)) {
+	b, why := s.deployedCompose(slug, dir, env, onLine)
+	switch {
+	case why == noPreviousRelease:
+		return
+	case why != "":
+		onLine("warning: docker-compose.yml not put back: " + why)
+		return
+	}
+	if err := atomicWrite(filepath.Join(dir, "docker-compose.yml"), b, 0o644, dir); err != nil {
+		onLine("warning: could not put back the deployed release's docker-compose.yml: " + err.Error())
+		return
+	}
+	onLine("put back the deployed release's docker-compose.yml")
 }
 
 // releaseFailed gives the volumes the deploy re-owned their previous owner — except one a dependency the job

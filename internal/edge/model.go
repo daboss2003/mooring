@@ -74,6 +74,25 @@ type caddyServer struct {
 	Listen []string         `json:"listen"`
 	Logs   *caddyServerLogs `json:"logs,omitempty"`
 	Routes []caddyRoute     `json:"routes"`
+	// Trusted upstream proxies (config.yaml edge.trusted_proxies), all omitted when none are set.
+	// Requests from a trusted peer get their client address from ClientIPHeaders, parsed right to
+	// left when TrustedProxiesStrict is 1 (Caddy ≥ 2.8; trusted_proxies ≥ 2.6.3, client_ip_headers
+	// ≥ 2.7). The address Caddy derives is the {http.vars.client_ip} placeholder.
+	TrustedProxies       *caddyIPSource `json:"trusted_proxies,omitempty"`
+	ClientIPHeaders      []string       `json:"client_ip_headers,omitempty"`
+	TrustedProxiesStrict int            `json:"trusted_proxies_strict,omitempty"`
+	// Allow0RTT false refuses QUIC 0-RTT early data (Caddy ≥ 2.11.0; nil = Caddy's default, allowed).
+	// Caddy applies it only when it opens the QUIC listener, which then survives /load (BootFloor).
+	Allow0RTT *bool `json:"allow_0rtt,omitempty"`
+	// Protocols limits the HTTP versions served (nil = Caddy's default h1, h2, h3).
+	Protocols []string `json:"protocols,omitempty"`
+}
+
+// caddyIPSource is an http.ip_sources module, named by its inline key "source". Mooring only uses
+// "static": a fixed list of CIDRs.
+type caddyIPSource struct {
+	Source string   `json:"source"`
+	Ranges []string `json:"ranges"`
 }
 
 type caddyRoute struct {

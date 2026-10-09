@@ -158,3 +158,41 @@ func TestGeneratedEnvLiteralsRoundTripThroughDockerCompose(t *testing.T) {
 		t.Errorf("unset optional ref = %q, want empty", got)
 	}
 }
+
+// A deploy's commit reaches every build service as MOORING_COMMIT and no image service; without a commit
+// (mooring validate) nothing is added. The commit must be a full hex SHA, and an app can't set the variable.
+func TestGenerateInjectsTheCommitIntoBuildServices(t *testing.T) {
+	sha := strings.Repeat("ab", 20)
+	spec := Spec{Slug: "shop", Commit: sha, Services: []Service{
+		{Name: "api", Build: &Build{Context: ".", Dockerfile: ".mooring/Dockerfile.api"}},
+		{Name: "db", Image: "postgres:16"},
+	}}
+	out, err := Generate(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if strings.Count(s, "MOORING_COMMIT="+sha) != 1 || !strings.Contains(s, "api:") {
+		t.Fatalf("api must get MOORING_COMMIT and db must not:\n%s", s)
+	}
+	spec.Commit = ""
+	if out, _ := Generate(spec); strings.Contains(string(out), "MOORING_COMMIT") {
+		t.Fatalf("no commit, no variable:\n%s", out)
+	}
+	for _, bad := range []string{"abc", strings.Repeat("g", 40), strings.Repeat("ab", 20) + "\n", "$(id)"} {
+		spec.Commit = bad
+		if _, err := Generate(spec); err == nil {
+			t.Errorf("commit %q must be rejected", bad)
+		}
+	}
+	// An app's own MOORING_COMMIT (a release deployed before Mooring set it) gives way to the deployed commit.
+	spec.Commit = sha
+	spec.Services[0].Env = []EnvVar{{Key: "MOORING_COMMIT", Value: "mine"}}
+	out, err = Generate(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := string(out); strings.Contains(s, "MOORING_COMMIT=mine") || !strings.Contains(s, "MOORING_COMMIT="+sha) {
+		t.Fatalf("Mooring's commit must replace the app's value:\n%s", s)
+	}
+}

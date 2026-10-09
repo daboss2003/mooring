@@ -882,7 +882,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return nil, err
 	}
-	composeBytes, gerr := definition.ComposeBytes(def)
+	composeBytes, gerr := definition.ComposeBytesAt(def, sha)
 	if gerr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return nil, fmt.Errorf("generate compose: %w", gerr)
@@ -953,6 +953,16 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return nil, fmt.Errorf("write generated compose: %w", err)
 	}
+	// Until a service of the new version is started, a failure puts back the deployed release's compose: the
+	// new one names this deploy's commit (MOORING_COMMIT) and config, which restarts and scale-ups would
+	// otherwise apply to the old images. A deploy with a release job does this on each of its failure paths.
+	var rel *releaseRun
+	startedNew := false
+	defer func() {
+		if !startedNew && rel == nil {
+			s.putBackDeployedCompose(slug, rd, env, onLine)
+		}
+	}()
 	nonrootSvcs, dfErr := s.writeGeneratedDockerfiles(ctx, repo, sha, rd, def, onLine)
 	if dfErr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
@@ -1019,7 +1029,6 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	upJob := dockerexec.Job{Project: slug, Dir: rd, ConfigFiles: app.ConfigFiles, EnvFile: envFile}
 	paced := !atOnce && s.startGate != nil && s.cfg.Server.StartGateSettings().Enabled
 	// spec.release: a failed build or job puts back the previous release's compose and images (release.go).
-	var rel *releaseRun
 	if release := s.releaseToRun(cfg.PreviewOf, def, onLine); release != nil {
 		rel = &releaseRun{slug: slug, dir: rd, def: def, rel: release, base: upJob, env: env, paced: paced, prev: &releasePrev{}}
 		// Keep each built ref's current image alive across the build, for a failed build or job to go back to.
@@ -1097,6 +1106,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		relProblems, relStarted = rr.problems, rr.started
 		s.renewExpectedDown(bg, slug)
 	}
+	startedNew = true // from here on containers of the new version may run
 	if paced {
 		// Remove the containers of services no longer in the definition first, as the whole-project
 		// `up --remove-orphans` did: a renamed service may need the host port its old name still holds.
@@ -1108,6 +1118,9 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 			// Nothing started, so the OLD containers are still running: undo as for a failed whole-project up
 			// (a volume a dependency the job started uses keeps the new owner).
 			s.rollbackVolumeOwnership(bg, volumesNotUsedBy(def, slug, reconciledVols, relStarted), onLine)
+			if rel == nil {
+				s.putBackDeployedCompose(slug, rd, env, onLine)
+			}
 			s.streamOOMHint(ctx, slug, declared, onLine)
 			return nil, failed(fmt.Errorf("docker compose up failed: %s", deployProblemsText(out.problems)))
 		}

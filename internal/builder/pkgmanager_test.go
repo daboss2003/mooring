@@ -137,7 +137,7 @@ func TestStaticPnpm(t *testing.T) {
 func TestPythonPipByteIdentical(t *testing.T) {
 	df := must(t, Spec{Language: "python", Start: []string{"python", "app.py"}, Nonroot: true},
 		map[string]bool{"requirements.txt": true})
-	mustHave(t, df, "RUN pip install --no-cache-dir -r requirements.txt")
+	mustHave(t, df, "RUN /bin/sh -c 'pip install --no-cache-dir -r requirements.txt' && ")
 	mustNotHave(t, df, "poetry", "pipenv")
 }
 

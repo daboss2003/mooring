@@ -153,3 +153,40 @@ func TestStatefulReplicasRejectedAtSubmitOnly(t *testing.T) {
 		t.Errorf("one stateful copy and a replicated stateless service must pass: %v", err)
 	}
 }
+
+func TestShmSize(t *testing.T) {
+	d, err := Parse([]byte(docWith(`  compose: {services: {osrm: {image: osrm/osrm-backend:v5.27.1, shm_size: 1g}}}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := ComposeBytes(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "shm_size: 1g") {
+		t.Fatalf("shm_size must reach the compose:\n%s", out)
+	}
+	if canon, _ := Canonical(d); !strings.Contains(string(canon), "shm_size: 1g") {
+		t.Fatalf("shm_size must survive the canonical:\n%s", canon)
+	}
+	for _, bad := range []string{"1 g", "lots", "-1g"} {
+		if _, err := Parse([]byte(docWith(`  compose: {services: {osrm: {image: osrm/osrm-backend:v5.27.1, shm_size: "` + bad + `"}}}`))); err == nil {
+			t.Errorf("shm_size %q must be rejected", bad)
+		}
+	}
+}
+
+// A new definition can't set MOORING_COMMIT (Mooring sets it on build services), but a stored one that did
+// still parses, so a release deployed before Mooring set the variable can be regenerated.
+func TestCommitEnvKeyIsRefusedAtSubmitOnly(t *testing.T) {
+	d, err := Parse([]byte(docWith(`  compose: {services: {api: {build: {language: go}, env: {MOORING_COMMIT: mine}}}}`)))
+	if err != nil {
+		t.Fatalf("a stored definition setting MOORING_COMMIT must still parse: %v", err)
+	}
+	if err := ValidateForSubmit(d); err == nil || !strings.Contains(err.Error(), "MOORING_COMMIT") {
+		t.Fatalf("submit must refuse MOORING_COMMIT, got %v", err)
+	}
+	if _, err := ComposeBytesAt(d, strings.Repeat("ab", 20)); err != nil {
+		t.Fatalf("regenerating it must work: %v", err)
+	}
+}

@@ -143,8 +143,8 @@ func (pythonBuilder) Dockerfile(s Spec, files map[string]bool) (string, error) {
 		pkgs,
 	}
 	lines = append(lines, envs...)
-	lines = append(lines, "COPY "+s.src(".")+" .", "RUN "+install, runIf(build))
-	lines = append(lines, nonrootIf(s.Nonroot, nonrootDebian())...)
+	lines = append(lines, "COPY "+runtimeChown(s.Nonroot)+s.src(".")+" .", runOwned(s.Nonroot, install), runOwned(s.Nonroot, build), ownAppDir(s.Nonroot, install, build))
+	lines = append(lines, nonrootIf(s.Nonroot, nonrootUserDebian())...)
 	lines = append(lines, cmd)
 	return join(lines...), nil
 }
@@ -194,10 +194,10 @@ func (goBuilder) Dockerfile(s Spec, _ map[string]bool) (string, error) {
 		"RUN "+build,
 		"FROM alpine:3",
 		"WORKDIR /app",
-		"RUN apk add --no-cache ca-certificates",
-		"COPY --from=build /out/app /app/app",
+		"RUN apk add --no-cache ca-certificates"+ifNonroot(s.Nonroot, " && chown 10001:10001 /app"),
+		"COPY --from=build "+runtimeChown(s.Nonroot)+"/out/app /app/app",
 	)
-	lines = append(lines, nonrootIf(s.Nonroot, nonrootAlpine())...)
+	lines = append(lines, nonrootIf(s.Nonroot, nonrootUserAlpine())...)
 	lines = append(lines, cmd)
 	return join(lines...), nil
 }
@@ -241,8 +241,8 @@ func (rubyBuilder) Dockerfile(s Spec, _ map[string]bool) (string, error) {
 	// Skip development/test gems in the shipped image.
 	lines = append(lines, `ENV BUNDLE_WITHOUT="development:test"`)
 	lines = append(lines, envs...)
-	lines = append(lines, "COPY "+s.src(".")+" .", "RUN "+install, runIf(build))
-	lines = append(lines, nonrootIf(s.Nonroot, nonrootAlpine())...)
+	lines = append(lines, "COPY "+runtimeChown(s.Nonroot)+s.src(".")+" .", runOwned(s.Nonroot, install), runOwned(s.Nonroot, build), ownAppDir(s.Nonroot, install, build))
+	lines = append(lines, nonrootIf(s.Nonroot, nonrootUserAlpine())...)
 	lines = append(lines, cmd)
 	return join(lines...), nil
 }
@@ -388,8 +388,8 @@ func (genericBuilder) Dockerfile(s Spec, _ map[string]bool) (string, error) {
 		lines = append(lines, pkgs)
 	}
 	lines = append(lines, envs...)
-	lines = append(lines, "COPY "+s.src(".")+" .", runIf(install), runIf(build))
-	lines = append(lines, nonrootIf(s.Nonroot, nonrootDebian())...)
+	lines = append(lines, "COPY "+runtimeChown(s.Nonroot)+s.src(".")+" .", runOwned(s.Nonroot, install), runOwned(s.Nonroot, build), ownAppDir(s.Nonroot, install, build))
+	lines = append(lines, nonrootIf(s.Nonroot, nonrootUserDebian())...)
 	lines = append(lines, cmd)
 	return join(lines...), nil
 }
@@ -409,6 +409,14 @@ func runIf(cmd string) string {
 		return ""
 	}
 	return "RUN " + cmd
+}
+
+// ifNonroot returns s for a non-root image, else "".
+func ifNonroot(on bool, s string) string {
+	if !on {
+		return ""
+	}
+	return s
 }
 
 // nonrootIf returns the non-root snippet when enabled, else nil.

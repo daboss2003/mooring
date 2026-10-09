@@ -620,6 +620,72 @@ type EdgeConfig struct {
 	ApplyProbeWindow Duration         `yaml:"apply_probe_window"`
 	L4Enabled        bool             `yaml:"l4_enabled"`      // own a managed L4 (TCP/UDP) load balancer (nginx-stream)
 	L4NginxDigest    string           `yaml:"l4_nginx_digest"` // pinned SHA-256 of the nginx binary (optional)
+	// TrustedProxies are the proxies in front of the managed edge (a CDN or load balancer): CIDRs,
+	// IP addresses and preset names (cloudflare). A request whose TCP peer is in one of them gets
+	// its client address from ClientIPHeader, and apps receive that address as X-Forwarded-For.
+	// Empty = no proxy is trusted (X-Forwarded-For is the TCP peer). Managed mode only, and only
+	// here: a trusted proxy chooses the client address every app on the server sees.
+	TrustedProxies []string `yaml:"trusted_proxies"`
+	// ClientIPHeader names the header a trusted proxy's client address is read from (parsed right to
+	// left: the last address outside TrustedProxies). Only valid with TrustedProxies. Default when
+	// TrustedProxies is set: CF-Connecting-IP if the cloudflare preset is listed, else
+	// X-Forwarded-For (edgeDefaultClientIPHeader).
+	ClientIPHeader string `yaml:"client_ip_header"`
+}
+
+// edgeTrustedProxyPresets maps the preset names edge.trusted_proxies accepts to the client IP
+// header each defaults to. The ranges live in internal/edge (cdnranges.go), which re-validates
+// every entry at render; a config test checks both tables match.
+var edgeTrustedProxyPresets = map[string]string{"cloudflare": "CF-Connecting-IP"}
+
+// edgeDefaultClientIPHeader is edge.client_ip_header when unset: the header of the first listed
+// preset, else X-Forwarded-For. Same rule as edge.DefaultClientIPHeader.
+func edgeDefaultClientIPHeader(trustedProxies []string) string {
+	for _, e := range trustedProxies {
+		if h := edgeTrustedProxyPresets[strings.TrimSpace(e)]; h != "" {
+			return h
+		}
+	}
+	return "X-Forwarded-For"
+}
+
+// validateEdgeTrustedProxy accepts a CIDR, an IP address (no zone) or a preset name, and refuses a
+// prefix that contains every address of its family. Same rule as edge.ParseTrustedProxy.
+func validateEdgeTrustedProxy(s string) error {
+	e := strings.TrimSpace(s)
+	if e == "" {
+		return errors.New("empty entry")
+	}
+	if _, ok := edgeTrustedProxyPresets[e]; ok {
+		return nil
+	}
+	p, err := parsePrefix(e)
+	if err != nil || strings.Contains(e, "%") {
+		return fmt.Errorf("%q is not a CIDR, an IP address or a preset (cloudflare)", s)
+	}
+	if p.Bits() == 0 {
+		return fmt.Errorf("%s trusts every address (any client could set its own address)", e)
+	}
+	return nil
+}
+
+// edgeClientIPHeaderRe is the accepted edge.client_ip_header syntax: letters, digits and '-'.
+var edgeClientIPHeaderRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}$`)
+
+// edgeNonClientIPHeaders never carry a client address (Forwarded uses for= syntax, which Caddy
+// doesn't parse). Same list as edge.ValidateClientIPHeader.
+var edgeNonClientIPHeaders = []string{"Host", "Forwarded", "Cookie", "Authorization", "Proxy-Authorization", "Connection", "Content-Length", "Transfer-Encoding", "Upgrade"}
+
+func validateEdgeClientIPHeader(h string) error {
+	if !edgeClientIPHeaderRe.MatchString(h) {
+		return fmt.Errorf("%q is not a header name (letters, digits and '-', at most 64)", h)
+	}
+	for _, n := range edgeNonClientIPHeaders {
+		if strings.EqualFold(h, n) {
+			return fmt.Errorf("%q does not carry a client address", h)
+		}
+	}
+	return nil
 }
 
 // EdgeBaseDomain is a NAMED subdomain namespace — an additional apex the operator declares so
@@ -955,6 +1021,9 @@ func applyDefaults(c *Config) {
 	}
 	if c.Edge.ApplyProbeWindow == 0 {
 		c.Edge.ApplyProbeWindow = Duration(20 * time.Second)
+	}
+	if len(c.Edge.TrustedProxies) > 0 && c.Edge.ClientIPHeader == "" {
+		c.Edge.ClientIPHeader = edgeDefaultClientIPHeader(c.Edge.TrustedProxies)
 	}
 	if c.Session.IdleTimeout == 0 {
 		// 10m: the dashboard only sends its keepalive (and live polls) WHILE focused, so a
@@ -1338,6 +1407,23 @@ func (c *Config) Validate() error {
 			if strings.TrimSpace(d.APIToken) == "" {
 				add("edge.base_domains[%d] (%s): dns01.api_token is required for the wildcard cert", i, b.Name)
 			}
+		}
+	}
+
+	// --- edge.trusted_proxies: proxies in front of the managed edge ---
+	if len(c.Edge.TrustedProxies) > 0 && c.Edge.Mode != EdgeManaged {
+		add("edge.trusted_proxies applies only to edge.mode: managed (Mooring renders no edge in %s mode)", c.Edge.Mode)
+	}
+	for i, s := range c.Edge.TrustedProxies {
+		if err := validateEdgeTrustedProxy(s); err != nil {
+			add("edge.trusted_proxies[%d]: %v", i, err)
+		}
+	}
+	if h := c.Edge.ClientIPHeader; h != "" {
+		if len(c.Edge.TrustedProxies) == 0 {
+			add("edge.client_ip_header is set but edge.trusted_proxies is empty (the header is read only from a trusted proxy)")
+		} else if err := validateEdgeClientIPHeader(h); err != nil {
+			add("edge.client_ip_header: %v", err)
 		}
 	}
 

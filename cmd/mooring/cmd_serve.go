@@ -520,6 +520,8 @@ func cmdServe(args []string) error {
 			AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
 			AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
 			AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
+			TrustedProxies: cfg.Edge.TrustedProxies,     // CDN/LB in front of the edge; app routes only, never the admin gate
+			ClientIPHeader: cfg.Edge.ClientIPHeader,
 		}
 		// Keys the cookie of routes with lb: cookie. Never logged (it is part of the /load payload only).
 		if dk, derr := config.DecodeKey(cfg.EncryptionKey); derr == nil {
@@ -623,9 +625,9 @@ func cmdServe(args []string) error {
 			// DNS provider module, it must fail the first (transactional) reconcile — not the
 			// boot — so a missing module never bricks the whole edge (:80/:443 + all HTTP-01
 			// apps + the admin vhost). The wildcard is then introduced by the first Reconcile.
-			floor := base
-			floor.Wildcards = nil
-			if initCfg, rerr := edge.Render(floor, nil, nil); rerr == nil {
+			// Likewise without the trusted-proxy fields (Caddy ≥ 2.11), and then without HTTP/3 so
+			// the first reconcile opens QUIC with 0-RTT refused (see edge.BootFloor).
+			if initCfg, rerr := edge.Render(edge.BootFloor(base), nil, nil); rerr == nil {
 				sup.InitialCfg = initCfg
 			}
 			wg.Add(1)

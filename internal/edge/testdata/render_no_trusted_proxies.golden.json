@@ -1,0 +1,498 @@
+{
+  "admin": {
+    "listen": "unix//run/mooring/caddy-admin.sock",
+    "enforce_origin": true,
+    "origins": [
+      "127.0.0.1",
+      "::1",
+      "localhost"
+    ],
+    "config": {
+      "persist": false
+    }
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "writer": {
+          "output": "stderr"
+        },
+        "exclude": [
+          "http.log.access.mooring_access"
+        ]
+      },
+      "mooring_access": {
+        "writer": {
+          "output": "stdout"
+        },
+        "encoder": {
+          "format": "json"
+        },
+        "include": [
+          "http.log.access.mooring_access"
+        ]
+      }
+    }
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "edge": {
+          "listen": [
+            ":443",
+            ":80"
+          ],
+          "logs": {
+            "default_logger_name": "mooring_access"
+          },
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": [
+                    "admin.example.com"
+                  ],
+                  "remote_ip": {
+                    "ranges": [
+                      "203.0.113.0/24",
+                      "2001:db8::/32"
+                    ]
+                  }
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "127.0.0.1:9001"
+                    }
+                  ],
+                  "headers": {
+                    "request": {
+                      "set": {
+                        "X-Forwarded-For": [
+                          "{http.request.remote.host}"
+                        ]
+                      }
+                    }
+                  }
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "match": [
+                {
+                  "host": [
+                    "shop.example.com"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "headers",
+                  "response": {
+                    "set": {
+                      "Referrer-Policy": [
+                        "no-referrer"
+                      ],
+                      "Strict-Transport-Security": [
+                        "max-age=31536000; includeSubDomains"
+                      ],
+                      "X-Content-Type-Options": [
+                        "nosniff"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "172.18.0.5:8080"
+                    }
+                  ],
+                  "headers": {
+                    "request": {
+                      "set": {
+                        "X-Forwarded-For": [
+                          "{http.request.remote.host}"
+                        ]
+                      }
+                    }
+                  }
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "match": [
+                {
+                  "host": [
+                    "api.apps.example.com"
+                  ],
+                  "path": [
+                    "/socket.io",
+                    "/socket.io/*"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "172.18.0.8:3001"
+                    },
+                    {
+                      "dial": "172.18.0.9:3001"
+                    }
+                  ],
+                  "headers": {
+                    "request": {
+                      "set": {
+                        "X-Forwarded-For": [
+                          "{http.request.remote.host}"
+                        ]
+                      }
+                    }
+                  },
+                  "load_balancing": {
+                    "selection_policy": {
+                      "policy": "ip_hash"
+                    }
+                  },
+                  "health_checks": {
+                    "passive": {
+                      "fail_duration": "30s",
+                      "max_fails": 3
+                    }
+                  }
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "match": [
+                {
+                  "host": [
+                    "api.apps.example.com"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "172.18.0.6:3000"
+                    },
+                    {
+                      "dial": "172.18.0.7:3000"
+                    }
+                  ],
+                  "headers": {
+                    "request": {
+                      "set": {
+                        "X-Forwarded-For": [
+                          "{http.request.remote.host}"
+                        ]
+                      }
+                    }
+                  },
+                  "load_balancing": {
+                    "selection_policy": {
+                      "policy": "cookie",
+                      "name": "mlb_43fa9ade1b",
+                      "secret": "5ec2e7c00c1e5ec2e7c00c1e5ec2e7c00c1e5ec2e7c00c1e5ec2e7c00c1e5ec2"
+                    }
+                  },
+                  "health_checks": {
+                    "passive": {
+                      "fail_duration": "30s",
+                      "max_fails": 3
+                    }
+                  }
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "match": [
+                {
+                  "host": [
+                    "vault.lan"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "172.19.0.2:8200"
+                    }
+                  ],
+                  "transport": {
+                    "protocol": "http",
+                    "tls": {
+                      "server_name": "vault"
+                    }
+                  },
+                  "headers": {
+                    "request": {
+                      "set": {
+                        "X-Forwarded-For": [
+                          "{http.request.remote.host}"
+                        ]
+                      }
+                    }
+                  }
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "match": [
+                {
+                  "host": [
+                    "down.example.com"
+                  ]
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "headers",
+                  "response": {
+                    "set": {
+                      "Referrer-Policy": [
+                        "no-referrer"
+                      ],
+                      "X-Content-Type-Options": [
+                        "nosniff"
+                      ]
+                    }
+                  }
+                },
+                {
+                  "handler": "static_response",
+                  "status_code": 503,
+                  "body": "503 Service Unavailable\n",
+                  "headers": {
+                    "Cache-Control": [
+                      "no-store"
+                    ],
+                    "Content-Type": [
+                      "text/plain; charset=utf-8"
+                    ],
+                    "Retry-After": [
+                      "5"
+                    ]
+                  }
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "status_code": 404
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "certificates": {
+        "automate": [
+          "admin.example.com",
+          "shop.example.com",
+          "vault.lan",
+          "down.example.com",
+          "mqtt.example.com",
+          "mqtt.lan",
+          "*.apps.example.com"
+        ]
+      },
+      "automation": {
+        "policies": [
+          {
+            "subjects": [
+              "admin.example.com",
+              "shop.example.com",
+              "down.example.com",
+              "mqtt.example.com"
+            ],
+            "issuers": [
+              {
+                "module": "acme",
+                "ca": "https://acme.example/directory",
+                "email": "ops@example.com"
+              }
+            ]
+          },
+          {
+            "subjects": [
+              "vault.lan",
+              "mqtt.lan"
+            ],
+            "issuers": [
+              {
+                "module": "acme",
+                "ca": "https://ca.lan/acme/acme/directory",
+                "email": "pki@lan",
+                "trusted_roots_pem_files": [
+                  "/etc/mooring/internal-ca.pem"
+                ]
+              }
+            ]
+          },
+          {
+            "subjects": [
+              "*.apps.example.com"
+            ],
+            "issuers": [
+              {
+                "module": "acme",
+                "ca": "https://acme.example/directory",
+                "email": "ops@example.com",
+                "challenges": {
+                  "dns": {
+                    "provider": {
+                      "api_token": "tok",
+                      "name": "cloudflare"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
+{
+  "admin": {
+    "listen": "unix//run/mooring/caddy-admin.sock",
+    "enforce_origin": true,
+    "origins": [
+      "127.0.0.1",
+      "::1",
+      "localhost"
+    ],
+    "config": {
+      "persist": false
+    }
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "writer": {
+          "output": "stderr"
+        },
+        "exclude": [
+          "http.log.access.mooring_access"
+        ]
+      },
+      "mooring_access": {
+        "writer": {
+          "output": "stdout"
+        },
+        "encoder": {
+          "format": "json"
+        },
+        "include": [
+          "http.log.access.mooring_access"
+        ]
+      }
+    }
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "edge": {
+          "listen": [
+            ":443",
+            ":80"
+          ],
+          "logs": {
+            "default_logger_name": "mooring_access"
+          },
+          "routes": [
+            {
+              "match": [
+                {
+                  "host": [
+                    "admin.example.com"
+                  ],
+                  "remote_ip": {
+                    "ranges": [
+                      "203.0.113.0/24",
+                      "2001:db8::/32"
+                    ]
+                  }
+                }
+              ],
+              "handle": [
+                {
+                  "handler": "reverse_proxy",
+                  "upstreams": [
+                    {
+                      "dial": "127.0.0.1:9001"
+                    }
+                  ],
+                  "headers": {
+                    "request": {
+                      "set": {
+                        "X-Forwarded-For": [
+                          "{http.request.remote.host}"
+                        ]
+                      }
+                    }
+                  }
+                }
+              ],
+              "terminal": true
+            },
+            {
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "status_code": 404
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "tls": {
+      "certificates": {
+        "automate": [
+          "admin.example.com"
+        ]
+      },
+      "automation": {
+        "policies": [
+          {
+            "subjects": [
+              "admin.example.com"
+            ],
+            "issuers": [
+              {
+                "module": "acme",
+                "ca": "https://acme.example/directory",
+                "email": "ops@example.com"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

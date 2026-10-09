@@ -235,23 +235,51 @@ const (
 	NonrootUser = "app"
 )
 
-// nonrootAlpine / nonrootDebian add an unprivileged user pinned to NonrootUID + the USER directive.
-func nonrootAlpine() []string {
+// nonrootUserDebian is nonrootUserAlpine for Debian-based images.
+func nonrootUserDebian() []string {
 	return []string{
-		"RUN addgroup -g 10001 app && adduser -D -H -u 10001 -G app app && chown -R app:app /app",
+		"RUN groupadd -g 10001 app && useradd -u 10001 -g app -M -d /app app",
 		"USER app",
 	}
 }
 
-func nonrootDebian() []string {
-	return []string{
-		"RUN groupadd -g 10001 app && useradd -u 10001 -g app -M -d /app app && chown -R app:app /app",
-		"USER app",
+// runOwned is an install/build step of a single-stage image. For a non-root image the step also gives the
+// pinned UID what it created or changed under /app, inside its own layer: the source is already owned at
+// COPY time (runtimeChown), so no file from an earlier layer is copied up into a second one, which is what a
+// trailing `chown -R /app` did (doubling the image). -h changes a symlink itself, never what it points to.
+// The step runs in its own `sh -c` so nothing in it (a `#` comment, an unbalanced parenthesis) can swallow
+// or alter the ownership step after it.
+func runOwned(nonroot bool, cmd string) string {
+	if cmd == "" {
+		return ""
 	}
+	if !nonroot {
+		return "RUN " + cmd
+	}
+	return "RUN /bin/sh -c " + shSingleQuote(cmd) + " && find /app ! -user 10001 -exec chown -h 10001:10001 {} +"
+}
+
+// shSingleQuote quotes s as one POSIX shell word.
+func shSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// ownAppDir gives the pinned UID the /app directory itself when no install/build step did (WORKDIR creates it
+// root-owned); "" when a step ran runOwned or the image runs as root.
+func ownAppDir(nonroot bool, steps ...string) string {
+	if !nonroot {
+		return ""
+	}
+	for _, st := range steps {
+		if st != "" {
+			return ""
+		}
+	}
+	return "RUN chown 10001:10001 /app"
 }
 
 // nonrootUserAlpine adds the pinned non-root user + USER directive WITHOUT a `chown -R /app`. It's for
-// a multi-stage builder whose runtime /app is populated solely by a `COPY --chown` (see runtimeChown),
+// an image whose /app is owned at COPY time (runtimeChown) and by runOwned steps,
 // so ownership is set at copy time in one layer. A trailing `chown -R /app` there is pure waste: it
 // copies-up every file into a SECOND layer (for Node, a duplicate of the whole node_modules tree),
 // which is what made a large image's chown + layer export — and so the deploy — crawl. Ordering: the

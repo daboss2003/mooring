@@ -183,6 +183,7 @@ compose:
 | `stop_grace_period` | optional duration (`60s`, `1m30s`) the container gets between `SIGTERM` and `SIGKILL` on stop (scale-down / redeploy), widening docker's 10s default so the app can drain long in-flight requests. Pairs with the app's graceful-shutdown hooks. Omit for the default. |
 | `replicas` | optional fixed number of copies (`1`–`20`). Deploys start that many. Self-healing restarts a stopped copy as for any service and, with 2 or more, also starts copies that are missing. More than one copy is refused for a [stateful image](./scaling-and-self-healing.md) (database, broker, store), a service with a writable volume, or a service that publishes a host port. Can't be combined with `spec.scaling` for the same service, or with a scheduled task. A PR preview runs one copy. Omit for one copy. |
 | `cpus` | optional CPU cap per copy, in cores with up to two decimals (`"0.5"`, `"1.5"`, `"2"`). Docker refuses a value above the host's CPU count, which fails the deploy. Omit for no cap. |
+| `shm_size` | optional size of the container's `/dev/shm` (`256m`, `1g`). Shared memory counts toward `mem_limit`. Omit for docker's 64 MB. |
 | `logs` | optional `{ retain, max_lines }`: how far back this service's [captured logs](./service-trends-and-logs.md) are kept (`72h`, `30d`) and how many recent lines are kept. Each value is capped by the server's `service_log_max_retain` / `service_log_max_lines` in [`config.yaml`](./host-file.md). Omit for the server default (48h, 2000 lines). Ignored on PR previews. |
 | `ulimits` | optional per-container open-file limit — only `nofile: { soft, hard }` is supported. Raise it for a service holding many concurrent sockets, whose `max_connections` would otherwise be clamped by docker's default `nofile` of 1024 (e.g. an MQTT broker). `1 ≤ soft ≤ hard`; `hard` can't exceed the host kernel's `fs.nr_open` (commonly `1048576`) — higher needs a host `sysctl` (Mooring forbids in-container `sysctls`). Omit for the docker default. |
 
@@ -209,6 +210,7 @@ env:
   A value set to the empty string counts as set; a value in a committed `.env` file does not. [`generate:`](#auto-generating-a-secret) secrets are minted before this check.
 - **`optional: true`** deploys without a stored value; the variable is then empty. `optional` is valid only with `secret`.
 - **PR previews** don't inherit the base app's stored secrets, so a missing secret doesn't fail a [preview](./gitops.md#preview-environments-a-deploy-per-pull-request) deploy: the deploy log shows a `warning:` line naming it, and the variable is empty.
+- **`MOORING_COMMIT`** is set by Mooring on every service with a `build:` block: the full SHA of the commit the deploy is running (on a PR preview, the pull request's head). A deploy of a new commit therefore recreates every `build:` service, even one whose image didn't change; `image:` services don't get the variable. An app can't set `MOORING_COMMIT` itself.
 
 #### `healthcheck`
 
@@ -1124,6 +1126,7 @@ spec:
 | `…services.<name>.ulimits.nofile` | `{ soft, hard }` ints (`1 ≤ soft ≤ hard`) | no | docker default (1024) |
 | `…services.<name>.replicas` | int (`1`–`20`) | no | one copy |
 | `…services.<name>.cpus` | string (cores, up to two decimals) | no | no cap |
+| `…services.<name>.shm_size` | size string (`256m`, `1g`) | no | docker 64 MB |
 | `…services.<name>.logs.retain` | duration (`72h`, `30d`) | no | server default (48h) |
 | `…services.<name>.logs.max_lines` | int | no | server default (2000) |
 | `…services.<name>.ops_interface` | object (see `spec.ops_interface`) | no | — |

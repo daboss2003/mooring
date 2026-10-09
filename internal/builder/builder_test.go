@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -119,7 +120,7 @@ func TestGenericRequiresBase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(df, "FROM ubuntu:24.04") || !strings.Contains(df, "RUN make deps") {
+	if !strings.Contains(df, "FROM ubuntu:24.04") || !strings.Contains(df, "RUN /bin/sh -c 'make deps' && ") {
 		t.Errorf("generic Dockerfile wrong:\n%s", df)
 	}
 }
@@ -224,5 +225,86 @@ func TestEnvValueNewlineFromDefinition(t *testing.T) {
 	// Simulates a definition that passes schema.validateBuild but should fail at Generate
 	if _, err := Generate(Spec{Language: "node", Env: map[string]string{"MYVAR": "value\nUSER root"}, Start: []string{"node", "x"}}, nil); err == nil {
 		t.Error("a newline in build.env value must be rejected (not validated at definition parse time)")
+	}
+}
+
+// No generated non-root image ends with a `chown -R /app` (it copies every earlier file into a second layer,
+// doubling the image). The source is owned at COPY time and each install/build step owns what it created
+// in its own layer, so /app still ends up entirely owned by the pinned UID.
+func TestNonrootBuildersOwnAppWithoutAChownLayer(t *testing.T) {
+	const owned = " && find /app ! -user 10001 -exec chown -h 10001:10001 {} +"
+	cases := map[string]struct {
+		spec  Spec
+		files map[string]bool
+		want  []string
+	}{
+		"python": {Spec{Language: "python", Start: []string{"python", "app.py"}, Build: "python manage.py collectstatic --noinput", Nonroot: true}, map[string]bool{"requirements.txt": true},
+			[]string{"COPY --chown=10001:10001 . .", "RUN /bin/sh -c 'pip install --no-cache-dir -r requirements.txt'" + owned, "RUN /bin/sh -c 'python manage.py collectstatic --noinput'" + owned}},
+		"ruby": {Spec{Language: "ruby", Start: []string{"bundle", "exec", "puma"}, Nonroot: true}, map[string]bool{"Gemfile": true, "Gemfile.lock": true},
+			[]string{"COPY --chown=10001:10001 . .", owned}},
+		"generic": {Spec{Language: "generic", Base: "debian:12-slim", Install: "make deps", Build: "make", Start: []string{"./bin/server"}, Nonroot: true}, nil,
+			[]string{"COPY --chown=10001:10001 . .", "RUN /bin/sh -c 'make deps'" + owned, "RUN /bin/sh -c 'make'" + owned}},
+		"python, blank install": {Spec{Language: "python", Install: "   ", Start: []string{"python", "app.py"}, Nonroot: true}, map[string]bool{"requirements.txt": true},
+			[]string{"COPY --chown=10001:10001 . .", "RUN chown 10001:10001 /app"}},
+		"generic, no steps": {Spec{Language: "generic", Base: "debian:12-slim", Start: []string{"./bin/server"}, Nonroot: true}, nil,
+			[]string{"COPY --chown=10001:10001 . .", "RUN chown 10001:10001 /app"}},
+		"go": {Spec{Language: "go", Start: []string{"/app/app"}, Nonroot: true}, map[string]bool{"go.mod": true},
+			[]string{"RUN apk add --no-cache ca-certificates && chown 10001:10001 /app", "COPY --from=build --chown=10001:10001 /out/app /app/app"}},
+	}
+	for name, c := range cases {
+		df, err := Generate(c.spec, c.files)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if strings.Contains(df, "chown -R") {
+			t.Errorf("%s: a trailing `chown -R` doubles the image:\n%s", name, df)
+		}
+		for _, w := range c.want {
+			if !strings.Contains(df, w) {
+				t.Errorf("%s: missing %q:\n%s", name, w, df)
+			}
+		}
+		if !RunsAsNonroot(df) {
+			t.Errorf("%s: must still run as the pinned user:\n%s", name, df)
+		}
+	}
+	// A root image is unchanged: no ownership steps at all.
+	df, err := Generate(Spec{Language: "generic", Base: "debian:12-slim", Install: "make deps", Start: []string{"./bin/server"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(df, "10001") || !strings.Contains(df, "RUN make deps") {
+		t.Errorf("a root image must have no ownership steps:\n%s", df)
+	}
+}
+
+// A non-root step runs exactly the operator's command — comments, quotes, arithmetic and all — and the
+// ownership step runs only after it succeeds. Checked with a real /bin/sh, the ownership step swapped for a
+// marker.
+func TestRunOwnedKeepsTheStepIntact(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	const owned = " && find /app ! -user 10001 -exec chown -h 10001:10001 {} +"
+	cases := []struct {
+		cmd  string
+		want string
+		ok   bool
+	}{
+		{"echo hi # fetch deps", "hi\nOWNED\n", true},
+		{`printf '%s\n' "it's" $((1+1))`, "it's\n2\nOWNED\n", true},
+		{"echo a; echo b", "a\nb\nOWNED\n", true},
+		{"false # nothing", "", false},
+		{"echo (", "", false},
+	}
+	for _, c := range cases {
+		line := strings.TrimPrefix(runOwned(true, c.cmd), "RUN ")
+		if !strings.HasSuffix(line, owned) {
+			t.Fatalf("%q: ownership step missing: %s", c.cmd, line)
+		}
+		out, err := exec.Command("sh", "-c", strings.TrimSuffix(line, owned)+" && echo OWNED").Output()
+		if (err == nil) != c.ok || string(out) != c.want {
+			t.Errorf("%q: got %q (err %v), want %q ok=%v", c.cmd, out, err, c.want, c.ok)
+		}
 	}
 }

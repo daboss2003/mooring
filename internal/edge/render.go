@@ -85,6 +85,130 @@ type BaseConfig struct {
 	// LBCookieSecret keys the cookie values of routes with lb: cookie (DeriveLBCookieSecret of the
 	// master key; never from mooring.yaml). Secret: never log it. "" renders those routes as ip_hash.
 	LBCookieSecret string
+	// TrustedProxies is config.yaml edge.trusted_proxies: CIDRs, IP addresses and preset names
+	// (TrustedProxyPreset). A request whose TCP peer is in one of them gets its client address from
+	// ClientIPHeader ("" = DefaultClientIPHeader), which app routes pass on as X-Forwarded-For, and
+	// the edge refuses QUIC 0-RTT. Empty = no peer is trusted and the document renders exactly as it
+	// did before these fields existed. Never from mooring.yaml: trusting a proxy lets it choose the
+	// client address every app sees.
+	TrustedProxies []string
+	ClientIPHeader string
+	// NoHTTP3 renders the edge server with HTTP/1.1 and HTTP/2 only, so Caddy opens no QUIC
+	// listener. Only BootFloor sets it.
+	NoHTTP3 bool
+}
+
+// defaultClientIPHeader is the client IP header when ClientIPHeader is empty and no listed preset
+// names one (DefaultClientIPHeader).
+const defaultClientIPHeader = "X-Forwarded-For"
+
+// BootFloor returns the base the Caddy child boots on (Supervisor.InitialCfg). It leaves out what a
+// Caddy binary may not support, so a missing DNS module or a Caddy too old for trusted proxies fails
+// the first reconcile instead of the boot: the DNS-01 wildcards, and the trusted-proxy fields (the
+// floor has no app routes, so they would change nothing in it).
+func BootFloor(base BaseConfig) BaseConfig {
+	floor := base
+	floor.Wildcards = nil
+	if len(base.TrustedProxies) > 0 {
+		// Intentional: Caddy keeps one QUIC listener across /load and applies allow_0rtt only when
+		// it opens it (Caddy 2.11.7 listeners.go ListenQUIC; reproduced: a reload to allow_0rtt
+		// false still accepted 0-RTT). A floor that served HTTP/3 would keep 0-RTT on for the life
+		// of the child, so it serves none and the first reconcile opens QUIC with 0-RTT refused.
+		floor.NoHTTP3 = true
+	}
+	floor.TrustedProxies, floor.ClientIPHeader = nil, ""
+	return floor
+}
+
+// clientIPHeaderRe is the accepted client-IP header name syntax: letters, digits and '-'.
+var clientIPHeaderRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}$`)
+
+// nonClientIPHeaders are standard request headers that never carry a client address. Forwarded is
+// one of them for Caddy, which reads bare addresses only and can't parse its for= syntax.
+var nonClientIPHeaders = []string{"Host", "Forwarded", "Cookie", "Authorization", "Proxy-Authorization", "Connection", "Content-Length", "Transfer-Encoding", "Upgrade"}
+
+// ValidateClientIPHeader reports whether h may name the header a trusted proxy's client address is
+// read from (config.yaml edge.client_ip_header). The config layer keeps its own copy of this rule.
+func ValidateClientIPHeader(h string) error {
+	if !clientIPHeaderRe.MatchString(h) {
+		return fmt.Errorf("client IP header %q is not a header name (letters, digits and '-', at most 64)", h)
+	}
+	for _, n := range nonClientIPHeaders {
+		if strings.EqualFold(h, n) {
+			return fmt.Errorf("client IP header %q does not carry a client address", h)
+		}
+	}
+	return nil
+}
+
+// ParseTrustedProxy expands one edge.trusted_proxies entry — a CIDR, an IP address or a preset
+// name — into canonical prefixes (masked; IPv4-mapped IPv6 reduced to IPv4, the form Caddy
+// compares peers in). A prefix that contains every address of its family is refused: trusting it
+// would let any client choose its own address. The config layer keeps its own copy of this rule.
+func ParseTrustedProxy(entry string) ([]netip.Prefix, error) {
+	e := strings.TrimSpace(entry)
+	if e == "" {
+		return nil, fmt.Errorf("trusted proxy entry is empty")
+	}
+	if preset, ok := trustedProxyPresets[e]; ok {
+		out := make([]netip.Prefix, 0, len(preset.ranges))
+		for _, r := range preset.ranges {
+			p, err := parseTrustedPrefix(r)
+			if err != nil {
+				return nil, fmt.Errorf("preset %s: %w", e, err)
+			}
+			out = append(out, p)
+		}
+		return out, nil
+	}
+	p, err := parseTrustedPrefix(e)
+	if err != nil {
+		return nil, fmt.Errorf("%w (presets: %s)", err, strings.Join(TrustedProxyPresetNames(), ", "))
+	}
+	return []netip.Prefix{p}, nil
+}
+
+func parseTrustedPrefix(s string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		a, aerr := netip.ParseAddr(s)
+		if aerr != nil || a.Zone() != "" {
+			return netip.Prefix{}, fmt.Errorf("trusted proxy %q is not a CIDR, an IP address or a preset", s)
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	if p.Addr().Is4In6() {
+		bits := p.Bits() - 96
+		if bits < 0 {
+			return netip.Prefix{}, fmt.Errorf("trusted proxy %q is an invalid IPv4-mapped CIDR", s)
+		}
+		p = netip.PrefixFrom(p.Addr().Unmap(), bits)
+	}
+	p = p.Masked()
+	if p.Bits() == 0 {
+		return netip.Prefix{}, fmt.Errorf("trusted proxy %q trusts every address", s)
+	}
+	return p, nil
+}
+
+// trustedProxyRanges expands BaseConfig.TrustedProxies into the canonical CIDR strings the edge
+// server trusts, de-duplicated in first-seen order so an unchanged config renders byte-identically.
+func trustedProxyRanges(entries []string) ([]string, error) {
+	var out []string
+	seen := map[netip.Prefix]bool{}
+	for _, e := range entries {
+		ps, err := ParseTrustedProxy(e)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range ps {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p.String())
+			}
+		}
+	}
+	return out, nil
 }
 
 // lbCookieSecretLabel domain-separates the lb cookie key from every other use of the master key.
@@ -316,6 +440,22 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 	persistOff := false
 	admin := &caddyAdmin{Listen: base.AdminListen, EnforceOrigin: true, Origins: []string{"127.0.0.1", "::1", "localhost"}, Config: &caddyAdminConfig{Persist: &persistOff}}
 
+	trustedRanges, err := trustedProxyRanges(base.TrustedProxies)
+	if err != nil {
+		return nil, fmt.Errorf("edge.trusted_proxies: %w", err)
+	}
+	clientIPHeader := base.ClientIPHeader
+	if clientIPHeader != "" && len(trustedRanges) == 0 {
+		return nil, fmt.Errorf("edge.client_ip_header requires edge.trusted_proxies")
+	}
+	if clientIPHeader == "" {
+		clientIPHeader = DefaultClientIPHeader(base.TrustedProxies)
+	}
+	if err := ValidateClientIPHeader(clientIPHeader); err != nil {
+		return nil, fmt.Errorf("edge.client_ip_header: %w", err)
+	}
+	trusted := len(trustedRanges) > 0
+
 	var httpRoutes []caddyRoute
 	var subjects []string
 	seen := map[string]bool{}
@@ -335,6 +475,10 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			return nil, fmt.Errorf("admin vhost requires the pinned admin upstream")
 		}
 		httpRoutes = append(httpRoutes, caddyRoute{
+			// Intentional: remote_ip and the remote.host X-Forwarded-For are the TCP peer even with
+			// edge.trusted_proxies — never client_ip / {http.vars.client_ip}, which a trusted proxy
+			// fills from a header the client can forge. The dashboard re-checks ip_allowlist against
+			// this X-Forwarded-For, so both gates stay on the real connection.
 			Match: []caddyMatch{{Host: []string{ah}, RemoteIP: &caddyRemoteIP{Ranges: base.AdminAllowlist}}},
 			Handle: []caddyHandler{{
 				Handler:   "reverse_proxy",
@@ -398,7 +542,7 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		rp := caddyHandler{
 			Handler:   "reverse_proxy",
 			Upstreams: ups,
-			Headers:   xffOverwrite(),
+			Headers:   appProxyHeaders(trusted),
 		}
 		// A replica pool (M14): the route's selection policy + passive health checks so a sick
 		// replica is taken out until it recovers. A single upstream needs neither.
@@ -443,6 +587,22 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 	httpRoutes = append(httpRoutes, caddyRoute{Handle: []caddyHandler{{Handler: "static_response", StatusCode: 404}}})
 
 	edgeServer := caddyServer{Listen: []string{":443", ":80"}, Routes: httpRoutes}
+	if trusted {
+		edgeServer.TrustedProxies = &caddyIPSource{Source: "static", Ranges: trustedRanges}
+		edgeServer.ClientIPHeaders = []string{clientIPHeader}
+		// Strict: the header is read right to left and the first address outside the trusted ranges
+		// wins. Non-strict takes the left-most address, which a client writes itself when the proxy
+		// appends to X-Forwarded-For.
+		edgeServer.TrustedProxiesStrict = 1
+		// Intentional: refuse QUIC 0-RTT. In early data Caddy has not verified the source address,
+		// yet still derives {http.vars.client_ip} from it (remote.host is empty there), so a
+		// spoofed trusted source could hand an app any client address. Requires Caddy ≥ 2.11.0.
+		refuse0RTT := false
+		edgeServer.Allow0RTT = &refuse0RTT
+	}
+	if base.NoHTTP3 {
+		edgeServer.Protocols = []string{"h1", "h2"}
+	}
 	cfg := caddyConfig{
 		Admin: admin,
 		Apps: caddyApps{
@@ -576,6 +736,25 @@ func coveredByWildcard(host, base string) bool {
 func xffOverwrite() *caddyProxyHeaders {
 	return &caddyProxyHeaders{Request: &caddyHeaderOps{Set: map[string][]string{
 		"X-Forwarded-For": {"{http.request.remote.host}"},
+	}}}
+}
+
+// appProxyHeaders are the request headers an app route sets. Without trusted proxies that is
+// xffOverwrite. With them, X-Forwarded-For is the client address Caddy derived: the TCP peer, or
+// for a trusted peer the right-most untrusted address of the client IP header. Either way it is
+// overwritten, never appended, so the app gets one address.
+func appProxyHeaders(trusted bool) *caddyProxyHeaders {
+	if !trusted {
+		return xffOverwrite()
+	}
+	return &caddyProxyHeaders{Request: &caddyHeaderOps{Set: map[string][]string{
+		"X-Forwarded-For": {"{http.vars.client_ip}"},
+		// Intentional: with a trusted peer reverse_proxy would keep that peer's X-Forwarded-Proto
+		// and X-Forwarded-Host, and a CDN passes client-supplied values through. Pin both to the
+		// request the edge received (Caddy's own values for an untrusted peer), so trusting a proxy
+		// changes only the client address an app sees.
+		"X-Forwarded-Proto": {"{http.request.scheme}"},
+		"X-Forwarded-Host":  {"{http.request.hostport}"},
 	}}}
 }
 

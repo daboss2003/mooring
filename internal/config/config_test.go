@@ -4,11 +4,13 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/crypto"
+	"github.com/daboss2003/mooring/internal/edge"
 )
 
 // validBase builds a minimal YAML config with a real key + password hash, then
@@ -573,4 +575,100 @@ func TestServiceLogLimits(t *testing.T) {
 	mustReject(t, validYAML(t, "server:\n  service_log_max_lines: -1\n"), "service_log_max_lines")
 	mustReject(t, validYAML(t, "server:\n  service_log_max_disk_mb: 63\n"), "service_log_max_disk_mb")
 	mustReject(t, validYAML(t, "server:\n  service_log_max_disk_mb: 102401\n"), "service_log_max_disk_mb")
+}
+
+// edge.trusted_proxies: CIDRs, IP addresses and preset names; client_ip_header defaults to
+// X-Forwarded-For once a proxy is trusted.
+func TestEdgeTrustedProxies(t *testing.T) {
+	bare, err := Parse([]byte(validYAML(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bare.Edge.TrustedProxies) != 0 || bare.Edge.ClientIPHeader != "" {
+		t.Errorf("unset: trusted_proxies=%v client_ip_header=%q, want none", bare.Edge.TrustedProxies, bare.Edge.ClientIPHeader)
+	}
+
+	cfg, err := Parse([]byte(validYAML(t, "  trusted_proxies: [cloudflare, \"198.51.100.0/24\", \"2001:db8::/32\", \"192.0.2.7\"]\n")))
+	if err != nil {
+		t.Fatalf("valid edge.trusted_proxies rejected: %v", err)
+	}
+	if got := strings.Join(cfg.Edge.TrustedProxies, ","); got != "cloudflare,198.51.100.0/24,2001:db8::/32,192.0.2.7" {
+		t.Errorf("trusted_proxies = %s", got)
+	}
+
+	// client_ip_header: an explicit value wins; otherwise CF-Connecting-IP when the cloudflare
+	// preset is listed, else X-Forwarded-For.
+	for _, c := range []struct{ keys, want string }{
+		{"  trusted_proxies: [cloudflare]\n", "CF-Connecting-IP"},
+		{"  trusted_proxies: [cloudflare, \"198.51.100.0/24\"]\n", "CF-Connecting-IP"},
+		{"  trusted_proxies: [cloudflare]\n  client_ip_header: X-Forwarded-For\n", "X-Forwarded-For"},
+		{"  trusted_proxies: [cloudflare]\n  client_ip_header: True-Client-IP\n", "True-Client-IP"},
+		{"  trusted_proxies: [\"198.51.100.0/24\", \"192.0.2.7\"]\n", "X-Forwarded-For"},
+		{"  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: CF-Connecting-IP\n", "CF-Connecting-IP"},
+	} {
+		got, err := Parse([]byte(validYAML(t, c.keys)))
+		if err != nil {
+			t.Fatalf("%q rejected: %v", c.keys, err)
+		}
+		if got.Edge.ClientIPHeader != c.want {
+			t.Errorf("%q: client_ip_header = %q, want %q", c.keys, got.Edge.ClientIPHeader, c.want)
+		}
+	}
+
+	for _, entry := range []string{`"0.0.0.0/0"`, `"::/0"`, `"::ffff:0.0.0.0/96"`} {
+		mustReject(t, validYAML(t, "  trusted_proxies: ["+entry+"]\n"), "trusts every address")
+	}
+	for _, entry := range []string{"fastly", "Cloudflare", `"10.0.0.0/33"`, `"fe80::1%eth0"`, `""`, `"10.0.0.0/8,10.1.0.0/16"`} {
+		mustReject(t, validYAML(t, "  trusted_proxies: ["+entry+"]\n"), "edge.trusted_proxies[0]")
+	}
+	mustReject(t, validYAML(t, "  client_ip_header: CF-Connecting-IP\n"), "edge.client_ip_header is set but edge.trusted_proxies is empty")
+	for _, h := range []string{"Host", "host", "Forwarded", "Cookie", `"X Forwarded For"`, "X_Forwarded_For", "-Bad", strings.Repeat("A", 65)} {
+		mustReject(t, validYAML(t, "  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: "+h+"\n"), "edge.client_ip_header")
+	}
+
+	// External mode never renders the edge, so the keys are refused there instead of ignored.
+	external := func(edgeKeys string) string {
+		y := strings.Replace(validYAML(t, edgeKeys), `mode: "managed"`, `mode: "external"`, 1)
+		return "trust_proxy: true\ntrusted_proxies: [\"10.9.9.9/32\"]\n" + y
+	}
+	if _, err := Parse([]byte(external(""))); err != nil {
+		t.Fatalf("external base config must parse: %v", err)
+	}
+	mustReject(t, external("  trusted_proxies: [cloudflare]\n"), "edge.mode: managed")
+}
+
+// The config layer and the edge renderer validate trusted-proxy entries and the client IP header
+// separately (the renderer re-checks); they must agree, or a config that loads could fail every
+// render.
+func TestEdgeTrustedProxyRulesMatchRenderer(t *testing.T) {
+	var cfgNames []string
+	for n := range edgeTrustedProxyPresets {
+		cfgNames = append(cfgNames, n)
+	}
+	sort.Strings(cfgNames)
+	if got, want := strings.Join(cfgNames, ","), strings.Join(edge.TrustedProxyPresetNames(), ","); got != want {
+		t.Errorf("config presets %s, renderer presets %s", got, want)
+	}
+	for _, e := range []string{"cloudflare", "Cloudflare", " cloudflare ", "fastly", "", " ", "198.51.100.0/24", "198.51.100.9/24", "192.0.2.7",
+		"::ffff:198.51.100.0/120", "::ffff:198.51.100.7", "::ffff:0.0.0.0/96", "::ffff:0.0.0.0/90", "2001:db8::/32", "2001:db8::1",
+		"0.0.0.0/0", "::/0", "0.0.0.0/1", "10.0.0.0/33", "fe80::1%eth0", "fe80::/10", "10.0.0.0/8,10.1.0.0/16", "not-an-ip"} {
+		_, rerr := edge.ParseTrustedProxy(e)
+		if cerr := validateEdgeTrustedProxy(e); (cerr == nil) != (rerr == nil) {
+			t.Errorf("trusted proxy %q: config err %v, renderer err %v", e, cerr, rerr)
+		}
+	}
+	for _, list := range [][]string{nil, {"cloudflare"}, {" cloudflare "}, {"198.51.100.0/24"}, {"198.51.100.0/24", "cloudflare"},
+		{"Cloudflare"}, {"2001:db8::/32", "192.0.2.7"}} {
+		if got, want := edgeDefaultClientIPHeader(list), edge.DefaultClientIPHeader(list); got != want {
+			t.Errorf("default client IP header for %q: config %q, renderer %q", list, got, want)
+		}
+	}
+	for _, h := range []string{"X-Forwarded-For", "CF-Connecting-IP", "True-Client-IP", "x-real-ip", "Host", "HOST", "Forwarded", "Cookie",
+		"Authorization", "Proxy-Authorization", "Connection", "Content-Length", "Transfer-Encoding", "Upgrade", "X Forwarded", "X_Real_IP",
+		"-X", "", strings.Repeat("A", 64), strings.Repeat("A", 65), "X-Forwarded-For\r\nX-Evil: 1"} {
+		rerr := edge.ValidateClientIPHeader(h)
+		if cerr := validateEdgeClientIPHeader(h); (cerr == nil) != (rerr == nil) {
+			t.Errorf("client IP header %q: config err %v, renderer err %v", h, cerr, rerr)
+		}
+	}
 }

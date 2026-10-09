@@ -93,6 +93,8 @@ edge:
   apply_probe_window: 20s
   l4_enabled: false                   # managed TCP/UDP load balancer (child nginx); needs nginx on host
   l4_nginx_digest: ""                 # optional pinned nginx digest
+  trusted_proxies: []                 # optional: CDN/load balancer in front of the edge (see below)
+  client_ip_header: ""                # optional: header a trusted proxy's client address is read from
 
 # --- Exposing the dashboard through the edge (default: loopback-only) ---
 admin:
@@ -196,6 +198,23 @@ setup:
 caddy_editor: { mode: strict }        # strict | review
 compose_validation: { mode: strict }
 ```
+
+### Edge trusted proxies
+
+| Key | Default | Accepted values |
+|---|---|---|
+| `edge.trusted_proxies` | *(none)* | A list of CIDRs (`198.51.100.0/24`), IP addresses (`192.0.2.7`) and preset names (`cloudflare`: Cloudflare's published IPv4 and IPv6 ranges, shipped with Mooring and refreshed each release). `0.0.0.0/0`, `::/0` and `::ffff:0.0.0.0/96` are refused. `edge.mode: managed` only. |
+| `edge.client_ip_header` | `CF-Connecting-IP` when `trusted_proxies` lists `cloudflare`, else `X-Forwarded-For` | A header name: letters, digits and `-`, at most 64 characters. A value you set always applies. Refused without `trusted_proxies`, and for `Host`, `Forwarded`, `Cookie`, `Authorization`, `Proxy-Authorization`, `Connection`, `Content-Length`, `Transfer-Encoding` and `Upgrade`. |
+
+A request whose TCP peer is in `trusted_proxies` gets its client address from `client_ip_header`,
+read right to left (the last address not in `trusted_proxies`); apps receive it as
+`X-Forwarded-For`. From any other peer, `X-Forwarded-For` is the peer address. The admin vhost's
+`ip_allowlist` check always uses the TCP peer. With `trusted_proxies` set the edge refuses HTTP/3
+0-RTT (early data). Requires Caddy 2.11 or later; restart Mooring after a change. See
+[Behind a CDN or proxy](./edge-and-tls.md#behind-a-cdn-or-proxy).
+
+These are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
+dashboard listener in external-edge mode.
 
 > **Reload vs. restart.** Most of `config.yaml` — the allowlist, `auth`/`users`, alerting tuning, retention — is picked up by `systemctl reload mooring`. A few things are read only at boot and need a full `systemctl restart` (the GitHub credentials, the bind address, the encryption key). See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
 

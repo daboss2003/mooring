@@ -222,9 +222,10 @@ func (p *pacedDeployEnv) runDirCompose(t *testing.T) string {
 	return string(b)
 }
 
-func composeOf(t *testing.T, d *definition.Definition) string {
+// composeOf is the compose a deploy of d at commit generates.
+func composeOf(t *testing.T, d *definition.Definition, commit string) string {
 	t.Helper()
-	b, err := definition.ComposeBytes(d)
+	b, err := definition.ComposeBytesAt(d, commit)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,8 +323,8 @@ func TestReleaseJobFailureKeepsThePreviousRelease(t *testing.T) {
 	prev := p.recordVersion(t, releasePrevYAML, strings.Repeat("cd", 20))
 	// A dashboard edit after that release was never deployed, so it isn't what goes back.
 	edited := p.recordVersion(t, releasePrevYAML+"        config_files:\n          - {template: \"maxmemory 64mb\", mount: /etc/redis/extra.conf}\n", "")
-	want := composeOf(t, prev)
-	if want == composeOf(t, edited) {
+	want := composeOf(t, prev, strings.Repeat("cd", 20))
+	if want == composeOf(t, edited, strings.Repeat("cd", 20)) {
 		t.Fatal("test setup: the dashboard edit must change the compose")
 	}
 	p.plantCompose(t, plantedCompose)
@@ -387,7 +388,7 @@ func TestReleaseJobFailurePutsBackOnlyACheckedCompose(t *testing.T) {
 			p := newReleaseEnv(t, releaseYAML, releaseInitial())
 			var rejected string
 			if tc.deployed != "" {
-				rejected = composeOf(t, p.recordVersion(t, tc.deployed, strings.Repeat("cd", 20)))
+				rejected = composeOf(t, p.recordVersion(t, tc.deployed, strings.Repeat("cd", 20)), strings.Repeat("cd", 20))
 			}
 			p.plantCompose(t, plantedCompose)
 			p.touch(t, "run-fail", "")
@@ -599,7 +600,7 @@ func TestReleaseBuildFailurePutsBackImagesAndCompose(t *testing.T) {
 	if rmi := callIndex(calls, "rmi -- shop-api:mooring-previous"); rmi < restore {
 		t.Errorf("the backup tag must be dropped after the restore:\n%s", all)
 	}
-	if got := p.runDirCompose(t); got != composeOf(t, prev) {
+	if got := p.runDirCompose(t); got != composeOf(t, prev, strings.Repeat("cd", 20)) {
 		t.Errorf("the previous release's compose must be back, got:\n%s", got)
 	}
 	if strings.Contains(all, " run --rm ") || strings.Contains(all, " up ") {
@@ -911,5 +912,53 @@ func TestReleaseRestoreWaitsForTheDockerSlot(t *testing.T) {
 	}
 	if r.prev.keep["api"] {
 		t.Error("a ref that was put back must not keep its backup tag")
+	}
+}
+
+// A git deploy gives every build service the commit it deployed as MOORING_COMMIT; image services don't get it.
+func TestDeployGivesBuildServicesTheCommit(t *testing.T) {
+	p := newReleaseEnv(t, releaseYAML, releaseInitial())
+	if _, err := p.deploy(false); err != nil {
+		t.Fatal(err)
+	}
+	d, err := definition.Parse([]byte(releaseYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.Metadata.Slug = "shop" // the registration slug, which the deploy uses
+	if got, want := p.runDirCompose(t), composeOf(t, d, p.sha); got != want {
+		t.Fatalf("the run dir's compose must be the deploy's, with its commit:\n%s\nwant:\n%s", got, want)
+	}
+	if n := strings.Count(p.runDirCompose(t), "MOORING_COMMIT="+p.sha); n != 2 {
+		t.Fatalf("api and worker (the build services) must each get MOORING_COMMIT, got %d:\n%s", n, p.runDirCompose(t))
+	}
+}
+
+// A deploy without a release job that stops before starting anything puts the deployed release's compose back
+// (with that release's MOORING_COMMIT), so a restart or scale-up doesn't label the old images with the new
+// commit or apply the new config to them. A first deploy has nothing to put back and keeps its file.
+func TestFailedDeployPutsBackTheDeployedCompose(t *testing.T) {
+	noRelease := strings.Replace(releaseYAML, "  release:\n    service: api\n    command: [/app/migrate, --rm, -x]\n", "", 1)
+	if noRelease == releaseYAML {
+		t.Fatal("test setup: the release block must be removed")
+	}
+	p := newReleaseEnv(t, noRelease, releaseInitial())
+	prev := p.recordVersion(t, releasePrevYAML, strings.Repeat("cd", 20))
+	p.touch(t, "build-fail", "worker")
+	if _, err := p.deploy(false); err == nil || !strings.Contains(err.Error(), "docker compose build failed") {
+		t.Fatalf("want the build to fail the deploy, got %v\n%s", err, p.output())
+	}
+	if got, want := p.runDirCompose(t), composeOf(t, prev, strings.Repeat("cd", 20)); got != want {
+		t.Fatalf("the deployed release's compose must be back:\n%s\nwant:\n%s", got, want)
+	}
+
+	// First deploy: no release to go back to, the new file stays.
+	q := newReleaseEnv(t, noRelease, nil)
+	q.touch(t, "build-fail", "worker")
+	if _, err := q.deploy(false); err == nil {
+		t.Fatal("want the build to fail the deploy")
+	}
+	if !strings.Contains(q.runDirCompose(t), "MOORING_COMMIT="+q.sha) {
+		t.Fatalf("a first deploy keeps the compose it wrote:\n%s", q.runDirCompose(t))
 	}
 }

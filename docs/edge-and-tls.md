@@ -27,6 +27,7 @@ when a configuration mistake slips through.
 - [How the edge is owned (process isolation)](#how-the-edge-is-owned-process-isolation)
 - [Automatic HTTPS / ACME](#automatic-https--acme)
 - [Per-app reverse proxy: routes & upstreams](#per-app-reverse-proxy-routes--upstreams)
+- [Behind a CDN or proxy](#behind-a-cdn-or-proxy)
 - [How the edge config is rendered](#how-the-edge-config-is-rendered)
 - [The secure-by-default baseline (SBD-1..8)](#the-secure-by-default-baseline-sbd-18)
 - [Non-HTTP services: cert-only / shared-cert](#non-http-services-cert-only--shared-cert)
@@ -145,8 +146,8 @@ and Mooring's own config/key **out of the edge's mount namespace entirely**, so 
 ## Automatic HTTPS / ACME
 
 In `managed` mode every app vhost automatically gets: an ACME-issued certificate, an HTTP→HTTPS
-redirect, a reverse-proxy with **`X-Forwarded-For` overwritten to the real TCP peer**, and an edge
-header bundle (HSTS is added only *after* a certificate exists). You set a hostname; Mooring does
+redirect, a reverse-proxy with **`X-Forwarded-For` overwritten to the real TCP peer** (or, from a
+[trusted proxy](#behind-a-cdn-or-proxy), the client address it reports), and an edge header bundle (HSTS is added only *after* a certificate exists). You set a hostname; Mooring does
 the rest.
 
 The ACME behavior is deliberately conservative, because each loose default is a real outage or
@@ -313,6 +314,95 @@ what Mooring renders on your behalf:
 // Automatic HTTPS (ACME), HTTP→HTTPS redirect, HSTS-after-cert,
 // and the edge header bundle are all derived for you — not shown here.
 ```
+
+---
+
+## Behind a CDN or proxy
+
+When a CDN (such as Cloudflare) or a load balancer sits in front of the edge, every request reaches
+the edge from that proxy's address. List the proxy's addresses in `edge.trusted_proxies` in
+`config.yaml` and apps receive the client's address instead:
+
+```yaml
+edge:
+  trusted_proxies:
+    - cloudflare                      # preset: Cloudflare's published IPv4 and IPv6 ranges
+    - 198.51.100.0/24                 # a CIDR or a single IP address
+  # client_ip_header: CF-Connecting-IP  # default: CF-Connecting-IP with the cloudflare preset, else X-Forwarded-For
+```
+
+### What the app receives
+
+| Request arrives from | `X-Forwarded-For` sent to the app |
+|---|---|
+| an address in `trusted_proxies` | the client address read from `client_ip_header` |
+| any other address | the TCP peer address; any `X-Forwarded-For` the client sent is replaced |
+
+- `X-Forwarded-For` always holds exactly one address.
+- `X-Forwarded-Proto` and `X-Forwarded-Host` are set from the request the edge received (its scheme and
+  `Host`), whether or not the peer is trusted. Values a trusted proxy sends in them are replaced.
+- Without `trusted_proxies` nothing changes: `X-Forwarded-For` is the TCP peer address.
+
+The header is read right to left: the client address is the last address in it that is not in
+`trusted_proxies`. If the header is missing, or holds only trusted addresses, the client address is
+the TCP peer address.
+
+### Choosing the header
+
+When `client_ip_header` is not set, it is `CF-Connecting-IP` if `cloudflare` is in `trusted_proxies`,
+and `X-Forwarded-For` otherwise. A `client_ip_header` you set always applies.
+
+- **`CF-Connecting-IP`** (default with the `cloudflare` preset): Cloudflare sets it to the connecting
+  address and replaces any value the client sent. With `X-Forwarded-For` instead, a client that itself
+  connects from a Cloudflare address (Cloudflare Workers, WARP) can choose the address the app
+  receives.
+- **`X-Forwarded-For`** (default otherwise): for a proxy that appends the address it received the
+  request from.
+- Any other header must be one the proxy always sets itself, such as `True-Client-IP`. If the proxy
+  passes the header through from the client, clients choose their own address.
+
+### HTTP/3 early data
+
+With `trusted_proxies` set, the edge refuses HTTP/3 0-RTT (early data): a client resuming an HTTP/3
+connection sends its first request after the handshake completes instead of with it. HTTP/3 itself
+stays on. After Mooring starts, the edge serves HTTP/1.1 and HTTP/2 only until it has applied the
+config with the app routes, normally within a few seconds.
+
+### The `cloudflare` preset
+
+`cloudflare` expands to the ranges published at <https://www.cloudflare.com/ips-v4> and
+<https://www.cloudflare.com/ips-v6>. The list ships with Mooring and is refreshed each release. To use a
+newer list before then, list the ranges as CIDRs instead of the preset.
+
+### The admin vhost
+
+The admin hostname's `ip_allowlist` check always uses the TCP peer address, never an address taken
+from a header, and the dashboard receives the TCP peer address as `X-Forwarded-For`. If the admin
+hostname is proxied by the CDN, requests arrive from the CDN's addresses and are refused unless those
+addresses are in `ip_allowlist`. Point the admin hostname at the server with a DNS-only (not proxied)
+record.
+
+### Not affected
+
+- `lb: ip_hash` hashes the TCP peer address.
+- The per-route error log records the TCP peer address.
+
+### Validation and requirements
+
+- Each `trusted_proxies` entry is a CIDR, an IP address or a preset name (`cloudflare`). `0.0.0.0/0`
+  and `::/0` (and `::ffff:0.0.0.0/96`) are refused.
+- `client_ip_header` is letters, digits and `-`, at most 64 characters. It is refused without
+  `trusted_proxies`, and for headers that never carry a client address: `Host`, `Forwarded`, `Cookie`,
+  `Authorization`, `Proxy-Authorization`, `Connection`, `Content-Length`, `Transfer-Encoding`,
+  `Upgrade`.
+- Both keys are valid only with `edge.mode: managed`. They are read at startup: run
+  `systemctl restart mooring` after changing them.
+- Requires Caddy 2.11 or later. An older Caddy refuses the config (`unknown field "allow_0rtt"`, or
+  `unknown field "trusted_proxies_strict"` before 2.8). The edge then stays on its startup config (the
+  admin vhost if configured, no app routes, no HTTP/3) until Caddy is upgraded or the keys are
+  removed. Check the version with `caddy version`.
+- These keys are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
+  dashboard listener in `external` mode.
 
 ---
 
@@ -538,6 +628,8 @@ edge:
   # cas: [...]                  # optional: extra named issuers (private/internal CAs) to opt into
   apply_probe_window: 20s       # how long a deploy waits for the edge to serve its routes (default 20s)
   l4_enabled: false             # managed L4 (TCP/UDP) load balancer via child nginx; needs nginx on host; default off
+  trusted_proxies: []           # optional: CDN/load balancer in front of the edge — CIDRs, IPs, `cloudflare`
+  client_ip_header: ""          # optional: header a trusted proxy's client address is read from
 
 admin:
   # Optional. If unset, the admin UI is reachable only via SSH tunnel / port-forward to 127.0.0.1:9000
@@ -561,5 +653,7 @@ trusted_proxies:
 | `edge.base_domains` | *(none)* | Additional **named** namespaces (e.g. prod + staging on one box); an app opts into one by name. |
 | `edge.cas` | *(none)* | Extra named issuers (private/internal CAs) a route or cert binding can select by name. |
 | `edge.l4_enabled` | `false` | Turns on the managed Layer-4 (TCP/UDP) load balancer — a supervised child **nginx** `stream` proxy. Needs `nginx` on the host; optionally pin it with `edge.l4_nginx_digest`. |
+| `edge.trusted_proxies` | *(none)* | Proxies in front of the edge: CIDRs, IP addresses and the preset `cloudflare`. Requests from them get their client address from `edge.client_ip_header`; HTTP/3 0-RTT is refused. `0.0.0.0/0` and `::/0` are refused. Requires Caddy 2.11 or later. See [Behind a CDN or proxy](#behind-a-cdn-or-proxy). |
+| `edge.client_ip_header` | `CF-Connecting-IP` with the `cloudflare` preset, else `X-Forwarded-For` | Header a trusted proxy's client address is read from (right to left, last untrusted address). Only valid with `edge.trusted_proxies`. |
 | `admin.hostname` | *(unset)* | When unset, no admin vhost is served at all (SBD-1). |
 | `trusted_proxies` | *(none)* | **Required for `external` boot:** a specific edge IP, `≤ /24`, not a bridge CIDR; boot also probes that `:9000` is unreachable from non-loopback. |

@@ -34,6 +34,7 @@ type composeService struct {
 	Ulimits         *composeUlimits `yaml:"ulimits,omitempty"`
 	CPUs            float64         `yaml:"cpus,omitempty"`
 	Scale           int             `yaml:"scale,omitempty"`
+	ShmSize         string          `yaml:"shm_size,omitempty"`
 	// Profiles gates a service out of the default `up` (compose only starts a profiled service
 	// when its profile is enabled or via `compose run`). Mooring uses it for scheduled-only
 	// (cron) services so they exist in the compose but never run as long-lived containers.
@@ -102,6 +103,7 @@ func Generate(spec Spec) ([]byte, error) {
 			cs.CPUs = cpus
 		}
 		cs.Scale = svc.Replicas
+		cs.ShmSize = svc.ShmSize
 		if svc.Ulimits != nil && svc.Ulimits.Nofile != nil {
 			cs.Ulimits = &composeUlimits{Nofile: &composeNofile{Soft: svc.Ulimits.Nofile.Soft, Hard: svc.Ulimits.Nofile.Hard}}
 		}
@@ -147,7 +149,11 @@ func Generate(spec Spec) ([]byte, error) {
 			}
 			cs.Volumes = append(cs.Volumes, entry)
 		}
+		injectCommit := svc.Build != nil && spec.Commit != ""
 		for _, e := range svc.Env {
+			if injectCommit && e.Key == CommitEnvKey {
+				continue // Mooring's value wins (a new definition can't set it: definition.ValidateForSubmit)
+			}
 			if e.Secret != "" {
 				// Secret reference: ${NAME} resolved from the 0600 --env-file at deploy
 				// (the encrypted store), never baked into the YAML. An optional one is ${NAME:-}:
@@ -163,6 +169,11 @@ func Generate(spec Spec) ([]byte, error) {
 				// exactly as written (`a$b` stays `a$b`, `x$$y` stays `x$$y`).
 				cs.Environment = append(cs.Environment, e.Key+"="+strings.ReplaceAll(e.Value, "$", "$$"))
 			}
+		}
+		if injectCommit {
+			// Intentional: only build services, which run this commit's code. A new commit therefore recreates
+			// them even when their image is unchanged; image services (databases, caches) are left alone.
+			cs.Environment = append(cs.Environment, CommitEnvKey+"="+spec.Commit)
 		}
 		if len(svc.Command) > 0 {
 			cs.Command = svc.Command
