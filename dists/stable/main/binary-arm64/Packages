@@ -1,0 +1,19 @@
+Package: mooring
+Priority: optional
+Section: 
+Installed-Size: 16534
+Maintainer: Samson Olawale Oluwafemi <samsonoluwafemi203@gmail.com>
+Architecture: arm64
+Version: 0.24.0
+Recommends: caddy
+Suggests: nginx, libnginx-mod-stream
+Filename: pool/main/m/mooring/mooring_0.24.0_linux_arm64.deb
+Size: 6920440
+MD5sum: f7cee24f85ea10922561f71106ec75a6
+SHA1: fc40e872cae3f27dfd804afc5a708d52c936902b
+SHA256: 4e4086c5749bd7daafd774b241ec49339e76dcc415cd52990096f9fff11badca
+SHA512: 7ada8e96e8a18ca2c883f0379feeb6c22f5cfa07c70efd603715897933b3af285225da71e2eb78d435f868867fe800edf155180819e6f208c2591884cba17e0c
+Description: Security-first self-hosted ops dashboard. Run your apps on your own server
+ with automatic HTTPS, monitoring, and safe deploys — managed from one dashboard.
+Homepage: https://github.com/daboss2003/mooring
+
