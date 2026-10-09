@@ -91,7 +91,7 @@ func TestArchiveExtractsAndConfines(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, "cfg", "a.conf"), []byte("a\n"), 0o644)
 	})
 	dest := t.TempDir()
-	if err := r.ArchiveTo(context.Background(), sha, dest); err != nil {
+	if err := r.ArchiveTo(context.Background(), sha, dest, nil); err != nil {
 		t.Fatalf("archive: %v", err)
 	}
 	if b, err := os.ReadFile(filepath.Join(dest, "cfg", "a.conf")); err != nil || string(b) != "a\n" {
@@ -104,7 +104,7 @@ func TestArchiveRejectsSymlinkEntry(t *testing.T) {
 		os.WriteFile(filepath.Join(dir, "f"), []byte("x\n"), 0o644)
 		os.Symlink("/etc/passwd", filepath.Join(dir, "link"))
 	})
-	if err := r.ArchiveTo(context.Background(), sha, t.TempDir()); err == nil {
+	if err := r.ArchiveTo(context.Background(), sha, t.TempDir(), nil); err == nil {
 		t.Error("archive extraction should reject a symlink entry")
 	}
 }
@@ -284,5 +284,56 @@ func TestClearStaleLocks(t *testing.T) {
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Errorf("a non-lock file must be preserved: %v", err)
+	}
+}
+
+// Entries the caller marks as skipped are never written — including when the extraction then fails on
+// a later entry, which must leave the skipped path exactly as it was.
+func TestArchiveSkipsEntries(t *testing.T) {
+	r, sha := gitFixture(t, func(dir string) {
+		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("services: {evil: {privileged: true}}\n"), 0o644)
+		os.MkdirAll(filepath.Join(dir, ".mooring", "certs"), 0o755)
+		os.WriteFile(filepath.Join(dir, ".mooring", "certs", "tls.key"), []byte("planted\n"), 0o644)
+		os.WriteFile(filepath.Join(dir, "app.js"), []byte("ok\n"), 0o644)
+	})
+	var seen []string
+	skip := func(rel string) bool {
+		seen = append(seen, rel)
+		return rel == "docker-compose.yml" || rel == ".mooring" || strings.HasPrefix(rel, ".mooring/")
+	}
+	dest := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dest, "docker-compose.yml"), []byte("generated\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ArchiveTo(context.Background(), sha, dest, skip); err != nil {
+		t.Fatalf("archive: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "docker-compose.yml")); string(b) != "generated\n" {
+		t.Errorf("a skipped docker-compose.yml was overwritten: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(dest, ".mooring")); !os.IsNotExist(err) {
+		t.Errorf("a skipped .mooring/ was created: %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest, "app.js")); string(b) != "ok\n" {
+		t.Errorf("app.js not extracted: %q", b)
+	}
+	for _, rel := range seen {
+		if strings.HasPrefix(rel, "/") || strings.Contains(rel, "\\") {
+			t.Errorf("skip got a non-relative or non-slash path %q", rel)
+		}
+	}
+
+	// The checkout fails on a symlink AFTER docker-compose.yml: the run dir's compose is untouched.
+	r2, sha2 := gitFixture(t, func(dir string) {
+		os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte("services: {evil: {privileged: true}}\n"), 0o644)
+		os.Symlink("/etc/passwd", filepath.Join(dir, "zz-link"))
+	})
+	dest2 := t.TempDir()
+	os.WriteFile(filepath.Join(dest2, "docker-compose.yml"), []byte("generated\n"), 0o644)
+	if err := r2.ArchiveTo(context.Background(), sha2, dest2, skip); err == nil {
+		t.Fatal("archive with a symlink entry should fail")
+	}
+	if b, _ := os.ReadFile(filepath.Join(dest2, "docker-compose.yml")); string(b) != "generated\n" {
+		t.Errorf("a failed checkout left the repo's docker-compose.yml in place: %q", b)
 	}
 }

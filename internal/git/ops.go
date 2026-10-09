@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -259,8 +260,9 @@ func parseNameStatus(z string, allNew bool, res *DiffResult) {
 
 // ArchiveTo extracts the commit's tree into destDir via `git archive` + an
 // in-process tar reader that REJECTS symlinks/hardlinks/devices and confines
-// every path under destDir (no worktree, no smudge, no hooks).
-func (r *Repo) ArchiveTo(ctx context.Context, sha, destDir string) error {
+// every path under destDir (no worktree, no smudge, no hooks). An entry whose
+// slash-separated path relative to destDir satisfies skip is not written.
+func (r *Repo) ArchiveTo(ctx context.Context, sha, destDir string, skip func(rel string) bool) error {
 	if !isFullSha(sha) {
 		return errors.New("git: archive requires a full commit sha")
 	}
@@ -290,6 +292,9 @@ func (r *Repo) ArchiveTo(ctx context.Context, sha, destDir string) error {
 		target := filepath.Join(dest, filepath.Clean("/"+h.Name))
 		if target != dest && !strings.HasPrefix(target, dest+string(filepath.Separator)) {
 			return fmt.Errorf("git: archive entry %q escapes the checkout dir", h.Name)
+		}
+		if skip != nil && skip(strings.TrimPrefix(path.Clean("/"+h.Name), "/")) {
+			continue
 		}
 		if h.Typeflag == tar.TypeDir {
 			if err := os.MkdirAll(target, 0o750); err != nil {

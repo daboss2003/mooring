@@ -836,3 +836,57 @@ spec:
 		t.Fatalf("want a depends_on cycle rejection, got %v", err)
 	}
 }
+
+// The generated compose and .mooring/ belong to Mooring: never extracted over, never pruned.
+func TestMooringOwnedPath(t *testing.T) {
+	for _, p := range []string{"docker-compose.yml", "./docker-compose.yml", ".mooring", ".mooring/certs/tls.key", "/.mooring/x"} {
+		if !mooringOwnedPath(p) {
+			t.Errorf("mooringOwnedPath(%q) = false", p)
+		}
+	}
+	for _, p := range []string{"sub/docker-compose.yml", "docker-compose.yaml", ".mooringx", "app/.mooring/x", "compose.yml"} {
+		if mooringOwnedPath(p) {
+			t.Errorf("mooringOwnedPath(%q) = true", p)
+		}
+	}
+	rd := t.TempDir()
+	os.WriteFile(filepath.Join(rd, "docker-compose.yml"), []byte("generated\n"), 0o644)
+	os.MkdirAll(filepath.Join(rd, ".mooring"), 0o700)
+	os.WriteFile(filepath.Join(rd, ".mooring", "f"), []byte("managed\n"), 0o600)
+	os.WriteFile(filepath.Join(rd, "old.js"), []byte("x\n"), 0o644)
+	n := removeDeletedTrackedFiles([]string{"docker-compose.yml", ".mooring/f", "old.js"}, nil, rd)
+	if n != 1 {
+		t.Errorf("removed %d files, want 1 (only old.js)", n)
+	}
+	for _, f := range []string{"docker-compose.yml", ".mooring/f"} {
+		if _, err := os.Stat(filepath.Join(rd, f)); err != nil {
+			t.Errorf("%s was pruned: %v", f, err)
+		}
+	}
+}
+
+// A repo shipping its own docker-compose.yml must never become the file Mooring runs: here the checkout
+// fails on a later entry, and the run dir still holds the previously generated compose.
+func TestFailedCheckoutKeepsTheGeneratedCompose(t *testing.T) {
+	p := newPacedServer(t, map[string]string{"api": "nginx:1.27", "cache": "redis:7", "db": "postgres:16", "web": "caddy:2"}, nil)
+	p.sha = gitObjStoreFixtureFiles(t, p.e.srv.gitObjectDir("shop"), map[string]string{
+		"mooring.yaml":       pacedYAML,
+		"docker-compose.yml": "services: {evil: {image: alpine, privileged: true, volumes: ['/:/host']}}\n",
+		"zz":                 "a file where the run dir has a directory\n",
+	})
+	p.cfg = configureRepo(t, p.e, "shop", p.sha)
+	rd := p.e.srv.appRunDir("shop")
+	if err := os.MkdirAll(filepath.Join(rd, "zz", "data"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	const generated = "name: shop\nservices: {}\n"
+	if err := os.WriteFile(filepath.Join(rd, "docker-compose.yml"), []byte(generated), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.deploy(false); err == nil || !strings.Contains(err.Error(), "checkout") {
+		t.Fatalf("deploy should fail at the checkout, got %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(rd, "docker-compose.yml")); string(b) != generated {
+		t.Fatalf("the repo's docker-compose.yml replaced the generated one:\n%s", b)
+	}
+}

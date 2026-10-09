@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -935,7 +936,7 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		}
 	}
 	onLine("extracting " + shortSha(sha) + " → run dir")
-	if err := repo.ArchiveTo(ctx, sha, rd); err != nil {
+	if err := repo.ArchiveTo(ctx, sha, rd, mooringOwnedPath); err != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return nil, fmt.Errorf("checkout: %w", err)
 	}
@@ -1251,6 +1252,15 @@ func (s *Server) pruneDeletedTrackedFiles(ctx context.Context, repo *git.Repo, o
 	return removeDeletedTrackedFiles(oldFiles, newFiles, rd), nil
 }
 
+// mooringOwnedPath reports whether a repo-relative path is one Mooring writes itself in the run dir: the
+// generated docker-compose.yml and everything under .mooring/. The checkout never writes these and the
+// deleted-file prune never removes them, so a repo's own docker-compose.yml can't become the file that
+// scheduled tasks, self-healing and certificate renewals run, not even when the checkout fails halfway.
+func mooringOwnedPath(rel string) bool {
+	rel = strings.TrimPrefix(path.Clean("/"+rel), "/")
+	return rel == "docker-compose.yml" || rel == ".mooring" || strings.HasPrefix(rel, ".mooring/")
+}
+
 // removeDeletedTrackedFiles deletes from rd each path in oldFiles that is absent from
 // newFiles — but ONLY regular files confined under rd. Directories (a bind-mounted data
 // dir), symlinks, non-git-tracked paths (.mooring/, named volumes), and anything that
@@ -1263,7 +1273,7 @@ func removeDeletedTrackedFiles(oldFiles, newFiles []string, rd string) int {
 	}
 	removed := 0
 	for _, f := range oldFiles {
-		if keep[f] {
+		if keep[f] || mooringOwnedPath(f) {
 			continue
 		}
 		p := filepath.Join(rd, filepath.FromSlash(f))
