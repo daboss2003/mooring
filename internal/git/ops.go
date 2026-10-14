@@ -2,7 +2,6 @@ package git
 
 import (
 	"archive/tar"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -258,27 +257,59 @@ func parseNameStatus(z string, allNew bool, res *DiffResult) {
 	}
 }
 
-// ArchiveTo extracts the commit's tree into destDir via `git archive` + an
-// in-process tar reader that REJECTS symlinks/hardlinks/devices and confines
-// every path under destDir (no worktree, no smudge, no hooks). An entry whose
-// slash-separated path relative to destDir satisfies skip is not written.
+// archiveLimit bounds what a checkout reads from `git archive`: a guard for the disk, since the archive is
+// streamed, never held in memory. A var so tests can lower it.
+var archiveLimit int64 = 1 << 30
+
+// ArchiveTo extracts the commit's tree into destDir by streaming `git archive` through an in-process tar
+// reader that REJECTS symlinks/hardlinks/devices and confines every path under destDir (no worktree, no
+// smudge, no hooks). An entry whose slash-separated path relative to destDir satisfies skip is not written.
+// A commit whose archive is larger than archiveLimit fails with an error naming the limit.
 func (r *Repo) ArchiveTo(ctx context.Context, sha, destDir string, skip func(rel string) bool) error {
 	if !isFullSha(sha) {
 		return errors.New("git: archive requires a full commit sha")
 	}
-	out, errb, err := r.run(ctx, nil, "archive", "--format=tar", sha)
+	actx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(actx, r.binary, append(r.hardenedFlags(), "archive", "--format=tar", sha)...)
+	cmd.Env = r.baseEnv()
+	var errb cappedBuffer
+	errb.cap = 64 << 10
+	cmd.Stderr = &errb
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return classifyErr(errb, err)
+		return err
 	}
-	if len(out) > maxArchiveBytes {
-		return errors.New("git: archive exceeds size cap")
+	if err := cmd.Start(); err != nil {
+		return classifyErr(errb.b.Bytes(), err)
 	}
-	dest := filepath.Clean(destDir)
-	tr := tar.NewReader(bytes.NewReader(out))
+	in := &limitedArchive{r: stdout, left: archiveLimit}
+	xerr := extractTar(in, filepath.Clean(destDir), skip)
+	if xerr == nil {
+		// Padding may follow the tar end marker: read to the end (still bounded) so git exits cleanly.
+		_, xerr = io.Copy(io.Discard, in)
+	}
+	if xerr != nil {
+		cancel() // git may be blocked writing to a pipe nobody reads any more
+	}
+	werr := cmd.Wait()
+	switch {
+	case in.tooLarge:
+		return fmt.Errorf("git: the commit's files are larger than %s, the checkout limit", sizeString(archiveLimit))
+	case werr != nil && (xerr == nil || cmd.ProcessState.Exited()):
+		// git failed on its own (a missing object, say): that, not the cut-off stream, is the cause.
+		return classifyErr(errb.b.Bytes(), werr)
+	}
+	return xerr
+}
+
+// extractTar writes the regular files and directories of a tar stream under dest (see ArchiveTo).
+func extractTar(r io.Reader, dest string, skip func(rel string) bool) error {
+	tr := tar.NewReader(r)
 	for {
 		h, e := tr.Next()
 		if e == io.EOF {
-			break
+			return nil
 		}
 		if e != nil {
 			return e
@@ -310,13 +341,50 @@ func (r *Repo) ArchiveTo(ctx context.Context, sha, destDir string, skip func(rel
 		if err != nil {
 			return err
 		}
-		if _, err := io.CopyN(f, tr, maxCatFileBytes*16); err != nil && err != io.EOF {
-			f.Close()
+		// Each file is written whole; the archive as a whole is bounded by limitedArchive.
+		_, err = io.Copy(f, tr)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
 			return err
 		}
-		f.Close()
 	}
-	return nil
+}
+
+// limitedArchive reads at most left bytes; reading past that sets tooLarge and fails.
+type limitedArchive struct {
+	r        io.Reader
+	left     int64
+	tooLarge bool
+}
+
+var errArchiveTooLarge = errors.New("git: archive too large")
+
+func (l *limitedArchive) Read(p []byte) (int, error) {
+	if l.left <= 0 {
+		var one [1]byte
+		n, err := l.r.Read(one[:])
+		if n > 0 {
+			l.tooLarge = true
+			return 0, errArchiveTooLarge
+		}
+		return 0, err
+	}
+	if int64(len(p)) > l.left {
+		p = p[:l.left]
+	}
+	n, err := l.r.Read(p)
+	l.left -= int64(n)
+	return n, err
+}
+
+// sizeString renders a byte count as whole GiB or MiB.
+func sizeString(n int64) string {
+	if n >= 1<<30 && n%(1<<30) == 0 {
+		return fmt.Sprintf("%d GiB", n>>30)
+	}
+	return fmt.Sprintf("%d MiB", n>>20)
 }
 
 func sanitize(s string) string {

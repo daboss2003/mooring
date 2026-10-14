@@ -20,9 +20,8 @@ const (
 )
 
 const (
-	maxCatFileBytes = 1 << 20  // a single config/compose file
-	maxOutputBytes  = 8 << 20  // any git command's stdout
-	maxArchiveBytes = 64 << 20 // a checkout tarball
+	maxCatFileBytes = 1 << 20 // a single config/compose file
+	maxOutputBytes  = 8 << 20 // any git command's stdout
 )
 
 // Repo is a per-app bare object store with hardened git access.

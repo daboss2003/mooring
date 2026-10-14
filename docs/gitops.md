@@ -23,6 +23,8 @@ Either way, **you don't type an app name** — Mooring reads the repo's mooring 
 
 Your repo carries a **`mooring.yaml`** (see [the definition file](./definition-file.md)) describing the app — its services, build, env, edge routes, config files, and cert bindings. **That file is the single source of truth for the app's structure.** Mooring reads it, **generates the `docker-compose.yml` and any Dockerfiles**, and deploys — you never commit a compose file or a Dockerfile. Only `mooring.yaml` and `mooring.<variant>.yaml` files at the repo root are read. If the repo has no mooring file at all, Mooring scaffolds a default from the stack it detects (e.g. a Node or Go project) so the first deploy still works; commit a real `mooring.yaml` when you want full control. A repo whose only mooring file is in a subfolder fails to deploy instead.
 
+A deploy checks out the commit's files into the app's directory. The files of one commit can add up to at most 1 GiB; a larger commit fails with `the commit's files are larger than 1 GiB`. Files marked `export-ignore` in the repo's `.gitattributes` are not checked out.
+
 ### Several apps from one repo
 
 One repo can hold **several mooring files** — the plain `mooring.yaml` plus named variants like `mooring.staging.yaml` and `mooring.prod.yaml` — and **each one becomes its own deployed app**. When you connect a repo with more than one, Mooring shows a **chooser**: the plain `mooring.yaml` is the default, and variants are labelled by the text between `mooring.` and `.yaml` (`staging`, `prod`, …). Pick one to deploy now; connect the repo again to add another.
