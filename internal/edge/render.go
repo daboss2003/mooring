@@ -622,49 +622,44 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		}
 	}
 
-	// Cert-only shadow: a cert_binding host (no proxy route of its own) that sits one label under a
-	// catch-all apex would otherwise be caught by the catch-all over HTTP. Emit an explicit host-level
-	// 404 BEFORE the catch-all so such a name keeps its HTTP 404 — it terminates TLS itself and the
-	// edge must never proxy it. Only when a catch-all exists (byte-identical rendering otherwise).
+	// Claimed-host shadow: every host CLAIMED by anyone that sits one label under a catch-all apex gets
+	// a host-level 404, placed after that host's own routes and before the catch-all. Without it, a
+	// request to any path a claimed host does NOT itself serve would fall through to the catch-all
+	// TENANT — a different app — exposing that host (and the cookies scoped to it) across tenants. A
+	// claimed host is fully owned by its app; the catch-all serves ONLY names no one claims. Three
+	// sources of "claimed": an exact route of ANY app (enabled or not, whatever its path prefix — a
+	// host with only a /v1 route must not leak /other), a cert_binding host (the app terminates TLS
+	// itself), and the admin vhost (whose route also requires the IP allowlist, so a denied-IP request
+	// must 404, never reach a tenant — SBD-1). Only when a catch-all exists (byte-identical otherwise).
 	if len(catchAllRoutes) > 0 {
 		shadowed := map[string]bool{}
+		addShadow := func(host string) {
+			h := strings.ToLower(strings.TrimSpace(host))
+			if h == "" || shadowed[h] {
+				return
+			}
+			for _, apex := range catchAllApexes {
+				if coveredByWildcard(h, apex) {
+					httpRoutes = append(httpRoutes, caddyRoute{
+						Match:    []caddyMatch{{Host: []string{h}}},
+						Handle:   []caddyHandler{{Handler: "static_response", StatusCode: 404}},
+						Terminal: true,
+					})
+					shadowed[h] = true
+					return
+				}
+			}
+		}
+		for _, r := range routes {
+			if !r.CatchAll { // a catch-all's own *.apex is not a claimed single-label host
+				addShadow(r.Hostname)
+			}
+		}
 		for _, ch := range certOnly {
-			ch_h := strings.ToLower(strings.TrimSpace(ch.Hostname))
-			if shadowed[ch_h] {
-				continue
-			}
-			for _, apex := range catchAllApexes {
-				if coveredByWildcard(ch_h, apex) {
-					httpRoutes = append(httpRoutes, caddyRoute{
-						Match:    []caddyMatch{{Host: []string{ch_h}}},
-						Handle:   []caddyHandler{{Handler: "static_response", StatusCode: 404}},
-						Terminal: true,
-					})
-					shadowed[ch_h] = true
-					break
-				}
-			}
+			addShadow(ch.Hostname)
 		}
-		// Admin-vhost shadow: the admin route matches Host AND RemoteIP (the allowlist). A request to
-		// the admin host from a NON-allowlisted IP does not terminate there and would otherwise fall
-		// through to the catch-all tenant — leaking admin-scoped cookies and downgrading SBD-1 from
-		// "refused" to "handed to a tenant". Emit a host-level 404 (after the IP-gated admin route,
-		// before the catch-all) so a denied admin request 404s exactly as it does with no catch-all.
-		if base.AdminHostname != "" {
-			ah := strings.ToLower(strings.TrimSpace(base.AdminHostname))
-			for _, apex := range catchAllApexes {
-				if coveredByWildcard(ah, apex) {
-					httpRoutes = append(httpRoutes, caddyRoute{
-						Match:    []caddyMatch{{Host: []string{ah}}},
-						Handle:   []caddyHandler{{Handler: "static_response", StatusCode: 404}},
-						Terminal: true,
-					})
-					break
-				}
-			}
-		}
-		// Catch-all (*.apex) routes last — after every exact host and cert-only shadow, before the
-		// default 404 — so any more-specific match always wins.
+		addShadow(base.AdminHostname)
+		// Catch-all (*.apex) routes last — after every claimed-host shadow — so any more-specific match wins.
 		httpRoutes = append(httpRoutes, catchAllRoutes...)
 	}
 

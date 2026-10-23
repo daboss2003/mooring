@@ -195,7 +195,12 @@ is refused. Only **one** catch-all is allowed per namespace, server-wide — a s
 deploy, naming both apps. Every claimed name still wins first: the admin vhost, every exact route of
 every app (PR previews included), and every cert-only `cert_binding` hostname are matched before the
 catch-all, and an exact route another app adds later wins immediately, without redeploying the catch-all
-app.
+app. A claimed hostname is owned **in full** — a request to a path it doesn't itself serve (e.g.
+`api.<apex>/other` when `api` only routes `/v1`) returns the edge's 404, never the catch-all tenant.
+
+Revoking consent takes effect on its own: clear `catch_all` (or remove `dns01`) on the namespace and
+the stored catch-all is dropped at the next edge reconcile — its names fall back to the default 404
+without redeploying the app.
 
 - `edge.catch_all: true` — allow a catch-all on the **default** namespace (`edge.base_domain`).
 - `edge.base_domains[].catch_all: true` — allow one on that **named** namespace.

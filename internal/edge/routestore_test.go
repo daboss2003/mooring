@@ -256,3 +256,34 @@ func TestRouteStoreLBMigrationKeepsExistingRows(t *testing.T) {
 	}
 	db.Close()
 }
+
+// keepCatchAlls drops a stored catch-all whose namespace has lost consent/dns01 (so a revoked
+// catch-all stops at the next reconcile, not at the next redeploy), keeps a consented one, and never
+// touches a non-catch-all route. This closes the fail-open consent-drift gap.
+func TestReconcilerKeepCatchAlls(t *testing.T) {
+	routes := []Route{
+		{Hostname: "api.shop.example.com", Upstream: "api:80", Enabled: true},               // normal: always kept
+		{Hostname: "*.shop.example.com", Upstream: "web:80", Enabled: true, CatchAll: true}, // consented apex
+		{Hostname: "*.gone.example.com", Upstream: "web:80", Enabled: true, CatchAll: true}, // consent revoked
+	}
+	r := &Reconciler{catchAllOK: func(apex string) bool { return apex == "shop.example.com" }}
+	kept := r.keepCatchAlls(append([]Route(nil), routes...))
+	gotHosts := map[string]bool{}
+	for _, rt := range kept {
+		gotHosts[rt.Hostname] = true
+	}
+	if !gotHosts["api.shop.example.com"] {
+		t.Error("a non-catch-all route must always be kept")
+	}
+	if !gotHosts["*.shop.example.com"] {
+		t.Error("a catch-all whose namespace still consents must be kept")
+	}
+	if gotHosts["*.gone.example.com"] {
+		t.Error("a catch-all whose namespace lost consent must be dropped")
+	}
+	// With no consent hook wired, every route is kept (no re-check).
+	none := (&Reconciler{}).keepCatchAlls(append([]Route(nil), routes...))
+	if len(none) != len(routes) {
+		t.Errorf("no consent hook must keep all routes, got %d want %d", len(none), len(routes))
+	}
+}

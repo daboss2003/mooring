@@ -334,6 +334,66 @@ func TestRenderCatchAllAdminShadow(t *testing.T) {
 	}
 }
 
+// Cross-tenant regression: a host CLAIMED by a path-scoped exact route (api.apex on /v1) must get a
+// host-level 404 BEFORE the catch-all, so a request to another path (api.apex/other) 404s instead of
+// falling through to the catch-all TENANT. A claimed host is fully owned by its app.
+func TestRenderCatchAllShadowsClaimedHostPaths(t *testing.T) {
+	base := baseCfg()
+	apex := "shop.example.com"
+	base.Wildcards = []WildcardCert{{Domain: apex, DNS01Provider: "cloudflare", DNS01Token: "tok"}}
+	out, err := Render(base, []Route{
+		{Hostname: "api." + apex, PathPrefix: "/v1", Upstream: "api:8080", Pool: []string{"172.18.0.5:8080"}, UpstreamScheme: "http", Enabled: true},
+		{Hostname: "*." + apex, Upstream: "web:8080", Pool: []string{"172.18.0.6:8080"}, UpstreamScheme: "http", Enabled: true, CatchAll: true},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Match []struct {
+							Host []string `json:"host"`
+							Path []string `json:"path"`
+						} `json:"match"`
+						Handle []struct {
+							Handler    string `json:"handler"`
+							StatusCode int    `json:"status_code"`
+						} `json:"handle"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	rts := doc.Apps.HTTP.Servers["edge"].Routes
+	apiPathIdx, apiShadowIdx, catchIdx := -1, -1, -1
+	for i, r := range rts {
+		if len(r.Match) != 1 || len(r.Match[0].Host) != 1 {
+			continue
+		}
+		switch r.Match[0].Host[0] {
+		case "*." + apex:
+			catchIdx = i
+		case "api." + apex:
+			if len(r.Match[0].Path) > 0 { // the /v1 proxy route
+				apiPathIdx = i
+			} else if len(r.Handle) == 1 && r.Handle[0].Handler == "static_response" && r.Handle[0].StatusCode == 404 {
+				apiShadowIdx = i // the host-level 404 covering api.apex's OTHER paths
+			}
+		}
+	}
+	if apiPathIdx < 0 || apiShadowIdx < 0 || catchIdx < 0 {
+		t.Fatalf("missing a route: apiPath=%d apiShadow=%d catch=%d\n%s", apiPathIdx, apiShadowIdx, catchIdx, out)
+	}
+	if !(apiPathIdx < apiShadowIdx && apiShadowIdx < catchIdx) {
+		t.Errorf("order must be api/v1 proxy < api host-404 < catch-all, got %d,%d,%d", apiPathIdx, apiShadowIdx, catchIdx)
+	}
+}
+
 // A catch-all hostname must be exactly *.<apex>; a wildcard without CatchAll, or a malformed
 // catch-all hostname, is still rejected (SBD-4).
 func TestRenderCatchAllValidation(t *testing.T) {

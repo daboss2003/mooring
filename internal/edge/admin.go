@@ -168,6 +168,12 @@ type Reconciler struct {
 	// metric pays nothing). Consulted per reconcile so it reacts to a deploy WITHOUT a restart. nil
 	// = never (the default). See BaseConfig.AccessLog.
 	accessLog func() bool
+	// catchAllOK reports whether a namespace apex STILL has operator consent (+ dns01) for a catch-all
+	// route, right now. Consulted per reconcile so revoking consent (`catch_all: false`) or dropping
+	// dns01 drops a STORED catch-all at the next cycle WITHOUT a redeploy — the gate at apply time only
+	// covers when a route is (re)applied, so without this a stored catch-all would keep serving after
+	// the operator revoked it (fail-open). nil = don't re-check (every catch-all kept).
+	catchAllOK func(apex string) bool
 	// onStatus receives the routes whose served state changed in a committed reconcile. Called after
 	// the lock is released; it must not call back into the Reconciler synchronously.
 	onStatus func([]StatusChange)
@@ -353,6 +359,30 @@ func (r *Reconciler) ReloadAfterRestart(ctx context.Context) {
 // (≤ the refresh cadence) with no restart. nil (the default) means never emit it.
 func (r *Reconciler) SetAccessLog(fn func() bool) { r.accessLog = fn }
 
+// SetCatchAllConsent registers the live operator-consent check for catch-all routes (see catchAllOK):
+// a stored `*.apex` catch-all is dropped at the next reconcile if its namespace no longer consents.
+func (r *Reconciler) SetCatchAllConsent(fn func(apex string) bool) { r.catchAllOK = fn }
+
+// keepCatchAlls drops any stored catch-all route whose namespace has lost operator consent (or dns01),
+// so a revoked catch-all stops serving at the next reconcile rather than lingering until a redeploy.
+// A non-catch-all route is always kept. With no consent hook wired, every route is kept (no re-check).
+func (r *Reconciler) keepCatchAlls(routes []Route) []Route {
+	if r.catchAllOK == nil {
+		return routes
+	}
+	kept := routes[:0]
+	for _, rt := range routes {
+		if rt.CatchAll {
+			apex := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(rt.Hostname)), "*.")
+			if !r.catchAllOK(apex) {
+				continue // consent/dns01 revoked → drop; the names fall back to the default 404
+			}
+		}
+		kept = append(kept, rt)
+	}
+	return kept
+}
+
 // renderBase returns the base config for this reconcile, applying the reactive access-log decision.
 func (r *Reconciler) renderBase() BaseConfig {
 	base := r.base
@@ -410,6 +440,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		r.mu.Unlock()
 		return fmt.Errorf("edge: list routes: %w", err)
 	}
+	// Drop a stored catch-all whose namespace has lost consent/dns01 since it was applied, so a
+	// revoked catch-all stops serving now rather than lingering until the app redeploys (fail-open).
+	routes = r.keepCatchAlls(routes)
 	now := r.clock()
 	lkg, status, changes := r.plan(routes, disc, poolFn != nil, now)
 	cfg, err := Render(r.renderBase(), routes, r.certOnly())

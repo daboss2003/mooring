@@ -604,6 +604,13 @@ func cmdServe(args []string) error {
 			edgeRecon.SetAccessLog(func() bool {
 				return scalingStore.HasEdgeMetric() || cfg.Server.RouteErrorLogOn()
 			})
+			// Re-check catch-all consent every reconcile (reads live config like the access-log hook):
+			// if the operator revokes `catch_all` or drops dns01 on a namespace, its stored catch-all is
+			// dropped at the next cycle instead of serving until the app redeploys.
+			edgeRecon.SetCatchAllConsent(func(apex string) bool {
+				bd, ok := cfg.BaseDomainByApex(apex)
+				return ok && bd.DNS01 != nil && bd.CatchAll
+			})
 			// Keep the host→service attribution index fresh (a deploy/route edit changes it); same
 			// 15s cadence as the edge pool refresh.
 			wg.Add(1)
