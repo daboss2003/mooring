@@ -45,6 +45,41 @@ func TestExpandSubdomains(t *testing.T) {
 	}
 }
 
+// A catch-all subdomain ("*") expands to *.<apex> only when the namespace has BOTH dns01 (the
+// wildcard cert that serves it) AND operator consent (catch_all: true); either missing is a
+// fail-closed deploy error.
+func TestExpandSubdomainsCatchAll(t *testing.T) {
+	dns := &config.EdgeDNS01{Provider: "cloudflare", APIToken: "tok"}
+	withNS := func(bd config.EdgeBaseDomain) *Server {
+		return &Server{cfg: &config.Config{Edge: config.EdgeConfig{BaseDomains: []config.EdgeBaseDomain{bd}}}}
+	}
+	catchAllDef := func() *definition.Definition {
+		d := &definition.Definition{}
+		d.Spec.Edge.BaseDomain = "shop"
+		d.Spec.Edge.Routes = []definition.Route{{Subdomain: "*", Service: "web"}}
+		return d
+	}
+
+	// dns01 + consent → expands.
+	s := withNS(config.EdgeBaseDomain{Name: "shop", Domain: "shop.example.com", DNS01: dns, CatchAll: true})
+	def := catchAllDef()
+	if err := s.expandSubdomains(def); err != nil {
+		t.Fatalf("catch-all with dns01+consent should expand: %v", err)
+	}
+	if got := def.Spec.Edge.Routes[0].Hostname; got != "*.shop.example.com" {
+		t.Errorf(`"*" expanded to %q, want *.shop.example.com`, got)
+	}
+
+	// consent but no dns01 → refused.
+	if err := withNS(config.EdgeBaseDomain{Name: "shop", Domain: "shop.example.com", CatchAll: true}).expandSubdomains(catchAllDef()); err == nil {
+		t.Error("catch-all without dns01 must be refused")
+	}
+	// dns01 but no consent → refused.
+	if err := withNS(config.EdgeBaseDomain{Name: "shop", Domain: "shop.example.com", DNS01: dns}).expandSubdomains(catchAllDef()); err == nil {
+		t.Error("catch-all without operator consent (catch_all) must be refused")
+	}
+}
+
 // TestExpandSubdomainsNamespaces covers named base_domains and the precedence
 // per-item base_domain > spec.edge.base_domain > default scalar base_domain.
 func TestExpandSubdomainsNamespaces(t *testing.T) {

@@ -531,7 +531,7 @@ spec:
 |---|---|---|---|
 | `hostname` | string | required *(or `subdomain`)* | The public vhost (a full FQDN). Subject to the §6.2 conflict gate: it may not shadow a managed hostname, the admin vhost, a cert-only hostname, or an auto-scaled pool. |
 | `base_domain` | string | — | **(with `subdomain` only)** The namespace **name** (from `config.yaml` `edge.base_domains`) to expand this route's subdomain under; overrides `spec.edge.base_domain`. See [namespaces](#specedgebase_domain-namespaces). |
-| `subdomain` | string | — | **Instead of `hostname`** (exactly one of the two): a single DNS label expanded to `<subdomain>.<edge.base_domain>`. Needs `edge.base_domain` set in `config.yaml`. See [Subdomain shorthand](#specedgeroutes) above. |
+| `subdomain` | string | — | **Instead of `hostname`** (exactly one of the two): a single DNS label expanded to `<subdomain>.<edge.base_domain>`. Needs `edge.base_domain` set in `config.yaml`. `"*"` makes this route the namespace **catch-all** — see [Catch-all subdomain routes](#catch-all-subdomain-routes) below. See [Subdomain shorthand](#specedgeroutes) above. |
 | `service` | string | required (proxy routes) | The service **in this app's compose** to route to — resolved against this app's discovered containers, never a literal host:port. Cross-project names are rejected; the pinned-dialer + egress-firewall refuse any resolution to a control-plane port (`9000/2019/2375`), loopback, or metadata. |
 | `port` | int | required (proxy routes) | The service's internal container port to forward to. |
 | `upstream_scheme` | `http` \| `https` | `http` | How the edge dials the upstream (use `https` only if the container itself terminates TLS). |
@@ -543,6 +543,32 @@ spec:
 | `ca` | string | default issuer | Name of a **private CA** to issue this route's cert from, instead of the default `edge.acme_ca`. The CA must be defined in the operator's `config.yaml` under [`edge.cas`](#using-a-private-ca) — referencing an undefined name fails the deploy. Omit it and the route uses the default CA (Let's Encrypt, typically), exactly as before. |
 
 (Need the edge to issue a certificate for a hostname it shouldn't proxy — a broker that terminates its own TLS, say? That's a [`cert_binding`](#speccert_bindings), not a route.)
+
+#### Catch-all subdomain routes
+
+A route may set `subdomain: "*"` instead of a literal label. The route then receives **every single-label name under the namespace that no other route claims** — one app owns "everything else" in the namespace. Accepted on routes only, never on [`cert_bindings`](#speccert_bindings). Every other route field (`service`, `port`, `path_prefix`, `hsts`, `security_headers`, `redirect_http`, `upstream_scheme`, `ca`, `lb`, `base_domain`) behaves exactly as on a normal route.
+
+```yaml
+spec:
+  edge:
+    base_domain: shop
+    routes:
+      - subdomain: admin
+        service: web
+        port: 8080
+      - subdomain: "*"            # every other <label>.shop.<apex> not claimed elsewhere
+        service: web
+        port: 8080
+```
+
+- **One label under the apex.** It matches `<anything>.<apex>` and nothing else — never the apex itself, never `a.b.<apex>`, never a name outside the namespace. (The same one-label rule as a `*.apex` wildcard certificate.)
+- **Needs `dns01` on the namespace.** The namespace must have one wildcard certificate ([`edge.dns01`](./edge-and-tls.md#configuration-reference) in `config.yaml`); without it the deploy is refused. It is served by that existing wildcard cert and never triggers per-name certificate issuance.
+- **Needs operator consent.** The namespace must set `catch_all: true` in `config.yaml` on top of the app's opt-in — [`edge.base_domains[].catch_all`](./edge-and-tls.md#catch-all-routes) for a named namespace, [`edge.catch_all`](./edge-and-tls.md#catch-all-routes) for the default one. Without it the deploy is refused.
+- **One per namespace, server-wide.** A second app's catch-all on the same namespace is refused at deploy, naming both apps.
+- **Every claimed name wins first.** The admin vhost, every exact route of every app (PR previews included), and every `cert_binding` hostname are matched before the catch-all; a cert-only name keeps its HTTP 404. An exact route another app adds later wins immediately, without redeploying the catch-all app.
+- **Proxied like an exact route.** `Host` preserved, `X-Forwarded-For` per the [`trusted_proxies`](./edge-and-tls.md#behind-a-cdn-or-proxy) rules, replica pools and passive health checks as for any route. The edge counts caught requests in its per-request measurements, so [`spec.scaling`](#custom-scaling-signals-metrics) metrics with `source: edge` see them.
+- **The app receives untrusted names** — including names another app will later claim. Treat every caught name as untrusted input and answer names you don't own with your own 404.
+- **Issued from the namespace wildcard.** The catch-all is served by the namespace's DNS-01 wildcard certificate (the default ACME issuer); a per-route `ca:` on a catch-all route is ignored.
 
 #### Using a private CA
 

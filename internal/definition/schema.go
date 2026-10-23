@@ -49,16 +49,32 @@ var (
 // validateHostOrSubdomain enforces that a route/cert_binding declares EXACTLY ONE of a full
 // hostname (an FQDN, no wildcards) or a subdomain label (expanded to
 // <subdomain>.<edge.base_domain> at deploy time, since base_domain lives in the operator's
-// config.yaml, not the app repo). `what` tags the error.
-func validateHostOrSubdomain(what, hostname, subdomain string) error {
+// config.yaml, not the app repo). `what` tags the error. allowCatchAll permits the special
+// subdomain "*" (a namespace catch-all, which expands to *.<apex> at deploy) — only edge ROUTES
+// allow it; a cert_binding passes false (there is no "issue a cert for everything" binding).
+func validateHostOrSubdomain(what, hostname, subdomain string, allowCatchAll bool) error {
 	switch {
 	case hostname == "" && subdomain == "":
 		return fmt.Errorf("%s needs a hostname or a subdomain", what)
 	case hostname != "" && subdomain != "":
 		return fmt.Errorf("%s sets both hostname and subdomain — use exactly one", what)
+	case subdomain == "*":
+		if !allowCatchAll {
+			return fmt.Errorf("%s subdomain %q (catch-all) is only valid on an edge route, not here", what, subdomain)
+		}
+		// Accept: expands to *.<apex> at deploy (needs dns01 + operator consent on the namespace).
 	case subdomain != "":
 		if !subdomainLabelRe.MatchString(subdomain) {
 			return fmt.Errorf("%s subdomain %q must be a single DNS label [a-z0-9-] (it becomes <subdomain>.<edge.base_domain>)", what, subdomain)
+		}
+	case allowCatchAll && strings.HasPrefix(hostname, "*."):
+		// The Mooring-expanded catch-all form: a `subdomain: "*"` route becomes hostname `*.<apex>`
+		// before the canonical is re-validated, so re-validation must accept exactly that shape (one
+		// leading wildcard label over a valid FQDN apex). Routes only — cert_bindings pass
+		// allowCatchAll=false. The dns01 + operator-consent gate is enforced at apply, not here.
+		apex := hostname[len("*."):]
+		if len(hostname) > 253 || !hostnameRe.MatchString(apex) {
+			return fmt.Errorf("%s catch-all hostname %q must be *.<apex> with a valid FQDN apex", what, hostname)
 		}
 	default: // hostname set
 		if len(hostname) > 253 || !hostnameRe.MatchString(hostname) {
@@ -1562,7 +1578,7 @@ func validateBindingSource(svc, key string, b Binding, declaredSecrets, certHost
 }
 
 func validateCertBinding(svc string, cb CertBinding) error {
-	if err := validateHostOrSubdomain(fmt.Sprintf("service %q cert_bindings", svc), cb.Hostname, cb.Subdomain); err != nil {
+	if err := validateHostOrSubdomain(fmt.Sprintf("service %q cert_bindings", svc), cb.Hostname, cb.Subdomain, false); err != nil {
 		return err
 	}
 	if err := validateBaseDomainName(fmt.Sprintf("service %q cert_bindings", svc), cb.BaseDomain); err != nil {
@@ -1638,7 +1654,7 @@ func (s *Spec) validateEdge() error {
 		if id == "" {
 			id = r.Subdomain
 		}
-		if err := validateHostOrSubdomain("edge route "+id, r.Hostname, r.Subdomain); err != nil {
+		if err := validateHostOrSubdomain("edge route "+id, r.Hostname, r.Subdomain, true); err != nil {
 			return err
 		}
 		if err := validateBaseDomainName("edge route "+id, r.BaseDomain); err != nil {

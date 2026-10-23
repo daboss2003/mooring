@@ -42,6 +42,54 @@ func TestRouteStoreRoundTripAndRender(t *testing.T) {
 	}
 }
 
+// A catch-all route round-trips (its CatchAll flag + *.apex hostname persist through migration
+// 0035), and CatchAllOwner enforces one catch-all per namespace server-wide, regardless of path,
+// excluding the owning app itself.
+func TestRouteStoreCatchAll(t *testing.T) {
+	s := newRouteStore(t)
+	ctx := context.Background()
+	if err := s.ReplaceProject(ctx, "shop", []Route{
+		{Hostname: "*.shop.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true, CatchAll: true},
+	}); err != nil {
+		t.Fatalf("store catch-all: %v", err)
+	}
+	routes, err := s.List()
+	if err != nil || len(routes) != 1 || !routes[0].CatchAll || routes[0].Hostname != "*.shop.example.com" {
+		t.Fatalf("catch-all did not round-trip: %+v err=%v", routes, err)
+	}
+	if owner, taken, err := s.CatchAllOwner(ctx, "shop.example.com", "other"); err != nil || !taken || owner != "shop" {
+		t.Errorf("CatchAllOwner(other) = %q,%v,%v want shop,true,nil", owner, taken, err)
+	}
+	if _, taken, err := s.CatchAllOwner(ctx, "shop.example.com", "shop"); err != nil || taken {
+		t.Errorf("CatchAllOwner must exclude the owning app itself (taken=%v)", taken)
+	}
+	if _, taken, err := s.CatchAllOwner(ctx, "unclaimed.example.com", "x"); err != nil || taken {
+		t.Errorf("unexpected catch-all owner for an unclaimed namespace (taken=%v)", taken)
+	}
+}
+
+// One catch-all per namespace, server-wide — enforced INSIDE ReplaceProject's transaction, so a
+// second app claiming the same apex on a DIFFERENT path (which UNIQUE(hostname,path_prefix) does not
+// catch) is still refused, and the original owner survives (Finding 4).
+func TestRouteStoreCatchAllOnePerNamespace(t *testing.T) {
+	s := newRouteStore(t)
+	ctx := context.Background()
+	if err := s.ReplaceProject(ctx, "shop", []Route{
+		{Hostname: "*.shop.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true, CatchAll: true},
+	}); err != nil {
+		t.Fatalf("first catch-all: %v", err)
+	}
+	err := s.ReplaceProject(ctx, "other", []Route{
+		{Hostname: "*.shop.example.com", PathPrefix: "/api", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true, CatchAll: true},
+	})
+	if err == nil {
+		t.Error("a second app's catch-all on the same apex (different path) must be refused")
+	}
+	if owner, taken, _ := s.CatchAllOwner(ctx, "shop.example.com", "x"); !taken || owner != "shop" {
+		t.Errorf("owner after the refused claim = %q,%v want shop,true", owner, taken)
+	}
+}
+
 // The store refuses to persist an unsafe route (control-plane upstream).
 func TestRouteStoreRejectsControlPlaneUpstream(t *testing.T) {
 	s := newRouteStore(t)

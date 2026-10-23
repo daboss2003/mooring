@@ -18,7 +18,7 @@
       <tbody>
         {{range .Routes}}
         <tr>
-          <td class="mono">{{.Hostname}}</td>
+          <td class="mono">{{.Hostname}}{{if .CatchAll}} <span class="muted">(catch-all)</span>{{end}}</td>
           <td class="mono">{{if .PathPrefix}}{{.PathPrefix}}{{else}}/{{end}}</td>
           <td class="mono">{{.UpstreamScheme}}://{{.Upstream}}</td>
           <td class="mono">{{.LB}}</td>

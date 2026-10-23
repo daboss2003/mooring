@@ -163,6 +163,193 @@ func TestRenderRejectsWildcardHost(t *testing.T) {
 	}
 }
 
+// A namespace catch-all (*.apex) renders AFTER every exact host and after a cert-only shadow 404,
+// is the only wildcard Host matcher the edge emits, and adds NO per-name ACME subject — the
+// namespace's DNS-01 wildcard covers it. A cert-only host one label under the apex keeps its HTTP
+// 404 (an explicit route before the catch-all), and the default 404 stays last.
+func TestRenderCatchAll(t *testing.T) {
+	base := baseCfg()
+	apex := "shop.example.com"
+	base.Wildcards = []WildcardCert{{Domain: apex, DNS01Provider: "cloudflare", DNS01Token: "tok"}}
+	routes := []Route{
+		{Hostname: "admin." + apex, Upstream: "web:8080", Pool: []string{"172.18.0.5:8080"}, UpstreamScheme: "http", Enabled: true},
+		{Hostname: "*." + apex, Upstream: "web:8080", Pool: []string{"172.18.0.5:8080"}, UpstreamScheme: "http", Enabled: true, CatchAll: true},
+	}
+	certOnly := []CertHost{{Hostname: "mqtt." + apex}} // cert-only, under the apex → must keep its 404
+
+	out, err := Render(base, routes, certOnly)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	var doc struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Match []struct {
+							Host []string `json:"host"`
+						} `json:"match"`
+						Handle []struct {
+							Handler    string `json:"handler"`
+							StatusCode int    `json:"status_code"`
+						} `json:"handle"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+			TLS struct {
+				Certificates struct {
+					Automate []string `json:"automate"`
+				} `json:"certificates"`
+			} `json:"tls"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	rts := doc.Apps.HTTP.Servers["edge"].Routes
+	idxHost := func(h string) int {
+		for i, r := range rts {
+			if len(r.Match) == 1 && len(r.Match[0].Host) == 1 && r.Match[0].Host[0] == h {
+				return i
+			}
+		}
+		return -1
+	}
+	adminIdx := idxHost("admin." + apex)
+	catchIdx := idxHost("*." + apex)
+	shadowIdx := idxHost("mqtt." + apex)
+	if adminIdx < 0 || catchIdx < 0 || shadowIdx < 0 {
+		t.Fatalf("missing a route: admin=%d catch=%d shadow=%d\n%s", adminIdx, catchIdx, shadowIdx, out)
+	}
+	// Ordering: exact host and the cert-only shadow both precede the catch-all.
+	if !(adminIdx < catchIdx) {
+		t.Errorf("exact host must render before the catch-all (admin=%d catch=%d)", adminIdx, catchIdx)
+	}
+	if !(shadowIdx < catchIdx) {
+		t.Errorf("cert-only shadow 404 must render before the catch-all (shadow=%d catch=%d)", shadowIdx, catchIdx)
+	}
+	// The cert-only shadow is a 404, not a proxy.
+	if h := rts[shadowIdx].Handle; len(h) != 1 || h[0].Handler != "static_response" || h[0].StatusCode != 404 {
+		t.Errorf("cert-only host under a catch-all must be an explicit 404, got %+v", rts[shadowIdx].Handle)
+	}
+	// The catch-all itself is a reverse_proxy (routable — it has a pool).
+	gotProxy := false
+	for _, h := range rts[catchIdx].Handle {
+		if h.Handler == "reverse_proxy" {
+			gotProxy = true
+		}
+	}
+	if !gotProxy {
+		t.Errorf("catch-all route should proxy, got %+v", rts[catchIdx].Handle)
+	}
+	// The last route is the default 404 (no match) and nothing follows the catch-all except it.
+	last := rts[len(rts)-1]
+	if len(last.Match) != 0 || len(last.Handle) != 1 || last.Handle[0].StatusCode != 404 {
+		t.Errorf("last route must be the default 404, got match=%v handle=%+v", last.Match, last.Handle)
+	}
+	if catchIdx >= len(rts)-1 {
+		t.Errorf("the catch-all must come before the default 404 (catch=%d of %d)", catchIdx, len(rts))
+	}
+	// `*.apex` appears in automate ONCE (the DNS-01 wildcard), never as a duplicate per-name subject.
+	n := 0
+	for _, s := range doc.Apps.TLS.Certificates.Automate {
+		if s == "*."+apex {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("*.%s must be automated exactly once (the wildcard), got %d: %v", apex, n, doc.Apps.TLS.Certificates.Automate)
+	}
+
+	// Control: with NO catch-all, the cert-only host gets no explicit route (it relies on the default
+	// 404), so the rendering path is unchanged.
+	out2, err := Render(base, routes[:1], certOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(out2, []byte(`"host":["mqtt.`+apex+`"]`)) {
+		t.Error("without a catch-all, a cert-only host must not get an explicit route")
+	}
+}
+
+// SBD-1 regression: if the admin host sits under a catch-all apex, a request to it from a
+// non-allowlisted IP must NOT fall through to the catch-all tenant. The renderer emits a host-level
+// 404 for the admin host, ordered before the catch-all.
+func TestRenderCatchAllAdminShadow(t *testing.T) {
+	base := baseCfg()
+	apex := "shop.example.com"
+	base.AdminHostname = "admin." + apex
+	base.AdminAllowlist = []string{"10.0.0.0/8"}
+	base.AdminUpstream = "127.0.0.1:9000"
+	base.Wildcards = []WildcardCert{{Domain: apex, DNS01Provider: "cloudflare", DNS01Token: "tok"}}
+	out, err := Render(base, []Route{
+		{Hostname: "*." + apex, Upstream: "web:8080", Pool: []string{"172.18.0.5:8080"}, UpstreamScheme: "http", Enabled: true, CatchAll: true},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Apps struct {
+			HTTP struct {
+				Servers map[string]struct {
+					Routes []struct {
+						Match []struct {
+							Host     []string `json:"host"`
+							RemoteIP *struct {
+								Ranges []string `json:"ranges"`
+							} `json:"remote_ip"`
+						} `json:"match"`
+						Handle []struct {
+							Handler    string `json:"handler"`
+							StatusCode int    `json:"status_code"`
+						} `json:"handle"`
+					} `json:"routes"`
+				} `json:"servers"`
+			} `json:"http"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	rts := doc.Apps.HTTP.Servers["edge"].Routes
+	adminHost := "admin." + apex
+	adminGuardIdx, adminShadowIdx, catchIdx := -1, -1, -1
+	for i, r := range rts {
+		isCatch := len(r.Match) == 1 && len(r.Match[0].Host) == 1 && r.Match[0].Host[0] == "*."+apex
+		isAdmin := len(r.Match) == 1 && len(r.Match[0].Host) == 1 && r.Match[0].Host[0] == adminHost
+		switch {
+		case isCatch:
+			catchIdx = i
+		case isAdmin && r.Match[0].RemoteIP != nil:
+			adminGuardIdx = i // the IP-gated admin proxy
+		case isAdmin && len(r.Handle) == 1 && r.Handle[0].Handler == "static_response" && r.Handle[0].StatusCode == 404:
+			adminShadowIdx = i // the shadow 404 for a denied-IP admin request
+		}
+	}
+	if adminGuardIdx < 0 || adminShadowIdx < 0 || catchIdx < 0 {
+		t.Fatalf("missing a route: adminGuard=%d adminShadow=%d catch=%d\n%s", adminGuardIdx, adminShadowIdx, catchIdx, out)
+	}
+	if !(adminGuardIdx < adminShadowIdx && adminShadowIdx < catchIdx) {
+		t.Errorf("order must be admin-guard < admin-shadow-404 < catch-all, got %d,%d,%d", adminGuardIdx, adminShadowIdx, catchIdx)
+	}
+}
+
+// A catch-all hostname must be exactly *.<apex>; a wildcard without CatchAll, or a malformed
+// catch-all hostname, is still rejected (SBD-4).
+func TestRenderCatchAllValidation(t *testing.T) {
+	// CatchAll set but hostname is not *.<apex>.
+	for _, h := range []string{"app.example.com", "*", "*.", "*.*.example.com", "a.*.example.com"} {
+		if _, err := Render(baseCfg(), []Route{{Hostname: h, Upstream: "web:80", UpstreamScheme: "http", Enabled: true, CatchAll: true}}, nil); err == nil {
+			t.Errorf("CatchAll hostname %q must be rejected", h)
+		}
+	}
+	// A wildcard hostname WITHOUT CatchAll is still rejected (the only wildcard the edge allows is a
+	// marked catch-all).
+	if _, err := Render(baseCfg(), []Route{{Hostname: "*.example.com", Upstream: "web:80", UpstreamScheme: "http", Enabled: true}}, nil); err == nil {
+		t.Error("a *.apex hostname without CatchAll must be rejected")
+	}
+}
+
 // M14: a scaled route renders a least-conn pool with passive health checks, and
 // every pool member is validated (a control-plane member is refused).
 func TestRenderScaledPool(t *testing.T) {

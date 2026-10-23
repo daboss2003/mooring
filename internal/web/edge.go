@@ -22,6 +22,7 @@ type edgeRouteView struct {
 	SecurityHeaders bool
 	Enabled         bool
 	LB              string // replica selection; "least_conn" when the route sets none
+	CatchAll        bool   // a namespace catch-all route (hostname is *.<apex>)
 }
 
 type edgeView struct {
@@ -45,6 +46,7 @@ func (s *Server) handleEdge(w http.ResponseWriter, r *http.Request) {
 				ID: rt.ID(), AppID: rt.AppID, Hostname: rt.Hostname, Upstream: rt.Upstream,
 				UpstreamScheme: rt.UpstreamScheme, PathPrefix: rt.PathPrefix,
 				HSTS: rt.HSTS, SecurityHeaders: rt.SecurityHeaders, Enabled: rt.Enabled, LB: lb,
+				CatchAll: rt.CatchAll,
 			})
 		}
 	}

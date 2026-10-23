@@ -181,6 +181,38 @@ shorthand under its own apex without route collisions. Both namespaces and the p
 (`edge.cas`, for issuing off an internal CA instead of the public one) are declared **only** in the
 root-of-trust `config.yaml` — an app references a name and can never introduce a new apex or issuer.
 
+#### Catch-all routes
+
+An app can opt in, in its own `mooring.yaml`, to receive **every single-label subdomain under its
+namespace that no other route claims** — see [catch-all subdomain routes](./definition-file.md#catch-all-subdomain-routes)
+for the route syntax (`subdomain: "*"`). It matches exactly one label under the apex
+(`<anything>.<apex>`, never the apex itself or `a.b.<apex>`) and is served by the namespace's existing
+DNS-01 wildcard certificate, so it never triggers per-name issuance.
+
+A catch-all needs **operator consent** in `config.yaml` on top of the app's opt-in: the namespace must
+set `catch_all: true`, and it must already have a `dns01` wildcard certificate. Without both the deploy
+is refused. Only **one** catch-all is allowed per namespace, server-wide — a second app's is refused at
+deploy, naming both apps. Every claimed name still wins first: the admin vhost, every exact route of
+every app (PR previews included), and every cert-only `cert_binding` hostname are matched before the
+catch-all, and an exact route another app adds later wins immediately, without redeploying the catch-all
+app.
+
+- `edge.catch_all: true` — allow a catch-all on the **default** namespace (`edge.base_domain`).
+- `edge.base_domains[].catch_all: true` — allow one on that **named** namespace.
+
+```yaml
+# config.yaml  (operator, SSH-only)
+edge:
+  base_domain: example.com
+  catch_all: true                                 # allow a catch-all on the default namespace
+  dns01: { provider: cloudflare, api_token: … }   # required for a catch-all
+  base_domains:
+    - name: shop
+      domain: shop.example.com
+      catch_all: true                             # allow one on the "shop" namespace
+      dns01: { provider: cloudflare, api_token: … }
+```
+
 ---
 
 ## Per-app reverse proxy: routes & upstreams
@@ -463,7 +495,7 @@ test on a fresh install.** These are **release-blocking** on the first edge-owni
 | **SBD-1** | Admin UI never reachable through the public edge by accident | Admin UI binds `127.0.0.1:9000` only. The edge serves **no admin vhost at all** unless you explicitly set `admin.hostname` (default: reach the UI via SSH tunnel / port-forward). If set, the admin vhost renders with the **IP allowlist as the first matcher, injected from typed config** (not operator text) → upstream `127.0.0.1:9000`. The allowlist cannot be omitted. |
 | **SBD-2** | Caddy admin API never public | `admin.listen = unix//run/mooring/caddy-admin.sock` (preferred) or `127.0.0.1:2019`, never routable; `enforce_origin:true`, origins loopback-only. No public vhost may proxy to `:2019`. |
 | **SBD-3** | On-demand TLS off; ACME bounded | Absent from the base; the renderer **force-rewrites any `ask` endpoint** to a fixed loopback validator that answers "yes" only for known route/allowlist hostnames, plus a rate limit. ACME issues only for configured app vhosts. |
-| **SBD-4** | Only configured app vhosts served; control-plane ports unreachable as upstreams | Exactly the route-derived vhost set (+ optional admin vhost); **no catch-all/wildcard proxy**; no upstream targets `9000`/`2019`/`2375` or a loopback/link-local address (validated when stored **and** re-checked at render; only discovered container addresses are dialed, never names); default unmatched-Host = `404`/close, never proxy. |
+| **SBD-4** | Only configured app vhosts served; control-plane ports unreachable as upstreams | Exactly the route-derived vhost set (+ optional admin vhost), **plus at most one catch-all per namespace** that an app opted into *and* whose namespace has operator consent (`catch_all: true`) *and* a wildcard certificate (`dns01`) — see [catch-all routes](#catch-all-routes); a name outside such a namespace still gets the default `404`/close, never a proxy. No upstream targets `9000`/`2019`/`2375` or a loopback/link-local address (validated when stored **and** re-checked at render; only discovered container addresses are dialed, never names). |
 | **SBD-5** | Network isolation of edge from control plane | The structural backstop — container-address-only dials validated at render + unix-socket admin + the optional egress filter (see [the backstops](#the-structural-backstops-that-keep-the-edge-out-of-the-control-plane)). |
 | **SBD-6** | Egress stays controlled by always-on | Outbound calls are **host-pinned in-process** (ops prober, edge upstreams, alert notifiers reject loopback/link-local/metadata). The systemd cgroup egress filter is an **opt-in** deeper backstop (off by default — a strict deny blocks ACME). |
 | **SBD-7** | Config rendering safety | Proxy config is marshalled from typed structs (never string concat), generated from the typed routes in `mooring.yaml` — there is no path by which an operator authors Caddy config. |
@@ -624,6 +656,7 @@ edge:
   dns01:                        # optional: one wildcard cert for the namespace (module auto-installed)
     provider: cloudflare
     api_token: "<dns-provider-token>"
+  # catch_all: false            # optional: allow one app's catch-all route on the default namespace (needs dns01)
   # base_domains: [...]         # optional: additional NAMED namespaces (prod + staging on one box)
   # cas: [...]                  # optional: extra named issuers (private/internal CAs) to opt into
   apply_probe_window: 20s       # how long a deploy waits for the edge to serve its routes (default 20s)
@@ -651,6 +684,8 @@ trusted_proxies:
 | `edge.base_domain` | *(unset)* | Namespace apex for the `subdomain:` shorthand; point `*.<base_domain>` DNS at the box. |
 | `edge.dns01` | *(unset)* | `{provider, api_token}` → one **wildcard** cert for the namespace via DNS-01; the Caddy provider module is auto-installed. |
 | `edge.base_domains` | *(none)* | Additional **named** namespaces (e.g. prod + staging on one box); an app opts into one by name. |
+| `edge.catch_all` | `false` | Operator consent for one app's [catch-all route](#catch-all-routes) (`subdomain: "*"`) on the **default** namespace. Requires `edge.dns01`; one catch-all per namespace, server-wide. |
+| `edge.base_domains[].catch_all` | `false` | Same, per **named** namespace; requires that namespace's `dns01`. |
 | `edge.cas` | *(none)* | Extra named issuers (private/internal CAs) a route or cert binding can select by name. |
 | `edge.l4_enabled` | `false` | Turns on the managed Layer-4 (TCP/UDP) load balancer — a supervised child **nginx** `stream` proxy. Needs `nginx` on the host; optionally pin it with `edge.l4_nginx_digest`. |
 | `edge.trusted_proxies` | *(none)* | Proxies in front of the edge: CIDRs, IP addresses and the preset `cloudflare`. Requests from them get their client address from `edge.client_ip_header`; HTTP/3 0-RTT is refused. `0.0.0.0/0` and `::/0` are refused. Requires Caddy 2.11 or later. See [Behind a CDN or proxy](#behind-a-cdn-or-proxy). |

@@ -50,6 +50,18 @@ func (s *RouteStore) ReplaceProject(ctx context.Context, project string, routes 
 		} else if taken {
 			return fmt.Errorf("hostname %q path %q is already in use by app %q", r.Hostname, displayPrefix(r.PathPrefix), owner)
 		}
+		// One catch-all per namespace, server-wide (any path): UNIQUE(hostname, path_prefix) only
+		// backstops a same-path collision, so this is the transactional backstop for two apps claiming
+		// the same apex on DIFFERENT paths (which the pre-apply check races). Checked in-tx so a
+		// concurrent deploy can't interleave.
+		if r.CatchAll {
+			apex := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(r.Hostname)), "*.")
+			if owner, taken, err := catchAllOwner(ctx, tx, apex, project); err != nil {
+				return err
+			} else if taken {
+				return fmt.Errorf("the catch-all for namespace %q is already owned by app %q", apex, owner)
+			}
+		}
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM app_routes WHERE app_id = ?`, project); err != nil {
 		return err
@@ -57,10 +69,10 @@ func (s *RouteStore) ReplaceProject(ctx context.Context, project string, routes 
 	now := time.Now().Unix()
 	for _, r := range routes {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO app_routes(app_id, hostname, upstream, upstream_scheme, path_prefix, redirect_http, hsts, security_headers, enabled, tls_ca, lb, created_at)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO app_routes(app_id, hostname, upstream, upstream_scheme, path_prefix, redirect_http, hsts, security_headers, enabled, tls_ca, lb, catch_all, created_at)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			r.AppID, r.Hostname, r.Upstream, r.UpstreamScheme, r.PathPrefix,
-			b2i(r.RedirectHTTP), b2i(r.HSTS), b2i(r.SecurityHeaders), b2i(r.Enabled), r.CA, r.LB, now); err != nil {
+			b2i(r.RedirectHTTP), b2i(r.HSTS), b2i(r.SecurityHeaders), b2i(r.Enabled), r.CA, r.LB, b2i(r.CatchAll), now); err != nil {
 			return err
 		}
 	}
@@ -85,16 +97,16 @@ func (s *RouteStore) Save(ctx context.Context, r Route) error {
 	}
 	if r.id == 0 {
 		_, err := s.db.ExecContext(ctx,
-			`INSERT INTO app_routes(app_id, hostname, upstream, upstream_scheme, path_prefix, redirect_http, hsts, security_headers, enabled, tls_ca, lb, created_at)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO app_routes(app_id, hostname, upstream, upstream_scheme, path_prefix, redirect_http, hsts, security_headers, enabled, tls_ca, lb, catch_all, created_at)
+			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			r.AppID, r.Hostname, r.Upstream, r.UpstreamScheme, r.PathPrefix,
-			b2i(r.RedirectHTTP), b2i(r.HSTS), b2i(r.SecurityHeaders), b2i(r.Enabled), r.CA, r.LB, time.Now().Unix())
+			b2i(r.RedirectHTTP), b2i(r.HSTS), b2i(r.SecurityHeaders), b2i(r.Enabled), r.CA, r.LB, b2i(r.CatchAll), time.Now().Unix())
 		return err
 	}
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE app_routes SET app_id=?, hostname=?, upstream=?, upstream_scheme=?, path_prefix=?, redirect_http=?, hsts=?, security_headers=?, enabled=?, tls_ca=?, lb=? WHERE id=?`,
+		`UPDATE app_routes SET app_id=?, hostname=?, upstream=?, upstream_scheme=?, path_prefix=?, redirect_http=?, hsts=?, security_headers=?, enabled=?, tls_ca=?, lb=?, catch_all=? WHERE id=?`,
 		r.AppID, r.Hostname, r.Upstream, r.UpstreamScheme, r.PathPrefix,
-		b2i(r.RedirectHTTP), b2i(r.HSTS), b2i(r.SecurityHeaders), b2i(r.Enabled), r.CA, r.LB, r.id)
+		b2i(r.RedirectHTTP), b2i(r.HSTS), b2i(r.SecurityHeaders), b2i(r.Enabled), r.CA, r.LB, b2i(r.CatchAll), r.id)
 	return err
 }
 
@@ -135,7 +147,7 @@ func displayPrefix(p string) string {
 // List returns all routes (for rendering + the UI).
 func (s *RouteStore) List() ([]Route, error) {
 	rows, err := s.db.Query(
-		`SELECT id, app_id, hostname, upstream, upstream_scheme, path_prefix, redirect_http, hsts, security_headers, enabled, tls_ca, lb FROM app_routes ORDER BY hostname, path_prefix`)
+		`SELECT id, app_id, hostname, upstream, upstream_scheme, path_prefix, redirect_http, hsts, security_headers, enabled, tls_ca, lb, catch_all FROM app_routes ORDER BY hostname, path_prefix`)
 	if err != nil {
 		return nil, err
 	}
@@ -143,14 +155,40 @@ func (s *RouteStore) List() ([]Route, error) {
 	var out []Route
 	for rows.Next() {
 		var r Route
-		var redir, hsts, sec, en int
-		if err := rows.Scan(&r.id, &r.AppID, &r.Hostname, &r.Upstream, &r.UpstreamScheme, &r.PathPrefix, &redir, &hsts, &sec, &en, &r.CA, &r.LB); err != nil {
+		var redir, hsts, sec, en, catchAll int
+		if err := rows.Scan(&r.id, &r.AppID, &r.Hostname, &r.Upstream, &r.UpstreamScheme, &r.PathPrefix, &redir, &hsts, &sec, &en, &r.CA, &r.LB, &catchAll); err != nil {
 			return nil, err
 		}
-		r.RedirectHTTP, r.HSTS, r.SecurityHeaders, r.Enabled = redir == 1, hsts == 1, sec == 1, en == 1
+		r.RedirectHTTP, r.HSTS, r.SecurityHeaders, r.Enabled, r.CatchAll = redir == 1, hsts == 1, sec == 1, en == 1, catchAll == 1
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// CatchAllOwner reports which OTHER app already owns the catch-all for the namespace whose apex is
+// `apex` (the catch-all is stored as hostname `*.<apex>`, catch_all=1), so a deploy can enforce
+// "one catch-all per namespace, server-wide" with a clear message. exceptProject (the app being
+// deployed) is excluded. Unlike HostnameOwner this ignores path_prefix: a namespace has at most one
+// catch-all owner regardless of path.
+func (s *RouteStore) CatchAllOwner(ctx context.Context, apex, exceptProject string) (string, bool, error) {
+	return catchAllOwner(ctx, s.db, apex, exceptProject)
+}
+
+// catchAllOwner is CatchAllOwner over any queryRower (the DB for the pre-apply check, or the open
+// transaction for the in-tx backstop in ReplaceProject).
+func catchAllOwner(ctx context.Context, q queryRower, apex, exceptProject string) (string, bool, error) {
+	host := "*." + strings.ToLower(strings.TrimSpace(apex))
+	var owner string
+	err := q.QueryRowContext(ctx,
+		`SELECT app_id FROM app_routes WHERE hostname = ? AND catch_all = 1 AND app_id <> ? LIMIT 1`,
+		host, exceptProject).Scan(&owner)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return owner, true, nil
 }
 
 // ID returns a route's row id (for the UI).

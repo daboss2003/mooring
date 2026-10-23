@@ -205,6 +205,23 @@ func (s *Server) expandSubdomains(def *definition.Definition) error {
 			}
 			return "", fmt.Errorf("subdomain %q uses base_domain namespace %q, which is not declared in config.yaml edge.base_domains", sub, name)
 		}
+		if sub == "*" {
+			// A namespace catch-all (schema allows "*" only on a route). It is served by the
+			// namespace's DNS-01 wildcard certificate, so the namespace MUST have dns01; and it needs
+			// OPERATOR CONSENT (config.yaml catch_all) on top of this app's opt-in, so one app can't
+			// claim "everything else" in a shared namespace without the root of trust agreeing.
+			nsLabel := name
+			if nsLabel == "" {
+				nsLabel = "default (edge.base_domain " + bd.Domain + ")"
+			}
+			if bd.DNS01 == nil {
+				return "", fmt.Errorf(`edge route subdomain "*" needs dns01 on namespace %s (one wildcard certificate): config.yaml edge`, nsLabel)
+			}
+			if !bd.CatchAll {
+				return "", fmt.Errorf(`edge route subdomain "*" on namespace %s needs operator consent: set catch_all: true on that namespace in config.yaml edge`, nsLabel)
+			}
+			return "*." + bd.Domain, nil
+		}
 		return sub + "." + bd.Domain, nil
 	}
 	for i := range def.Spec.Edge.Routes {
@@ -330,11 +347,37 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 				scheme = "http"
 			}
 			host := r.Hostname // subdomains were already expanded to a full FQDN upstream
+			// A catch-all route was expanded to `*.<apex>` (expandSubdomains already enforced dns01 +
+			// operator consent). Mark it so the store/renderer treat it as the namespace catch-all,
+			// ordered after every exact host and issuing no per-name certificate.
+			catchAll := strings.HasPrefix(host, "*.")
 			// Reject a hostname already claimed by ANOTHER app with a clear message (the
 			// UNIQUE(hostname, path_prefix) constraint is the race-safe backstop; this is
 			// the friendly, specific error the operator sees — "pick a different one").
 			if owner, taken, oerr := s.edgeRoutes.HostnameOwner(ctx, host, r.PathPrefix, project); oerr == nil && taken {
 				return fmt.Errorf("hostname %q is already in use by app %q — pick a different one", host, owner)
+			}
+			// The AUTHORITATIVE catch-all gate. expandSubdomains checks the subdomain-shorthand path
+			// early, but this runs on EVERY ingest path (git deploy, dashboard config/scaling/ops edits
+			// that re-persist the stored canonical, rollback, preview) — all funnel through applyRoutes.
+			// So a catch-all is re-gated on dns01 + operator consent here regardless of how the `*.apex`
+			// hostname arrived, and a later edit after the operator revokes consent is refused.
+			if catchAll {
+				apex := strings.TrimPrefix(host, "*.")
+				bd, ok := s.cfg.BaseDomainByApex(apex)
+				switch {
+				case !ok:
+					return fmt.Errorf("catch-all route %q targets apex %q, which is not a declared namespace in config.yaml edge.base_domains", host, apex)
+				case bd.DNS01 == nil:
+					return fmt.Errorf("catch-all route %q needs dns01 on namespace %q (one wildcard certificate): config.yaml edge", host, apex)
+				case !bd.CatchAll:
+					return fmt.Errorf("catch-all route %q needs operator consent: set catch_all: true on namespace %q in config.yaml edge", host, apex)
+				}
+				// One catch-all per namespace, server-wide (any path): a second app claiming the
+				// namespace's "everything else" is refused, naming both apps.
+				if owner, taken, oerr := s.edgeRoutes.CatchAllOwner(ctx, apex, project); oerr == nil && taken {
+					return fmt.Errorf("the catch-all for namespace %q is already owned by app %q — only one app per namespace may claim it", apex, owner)
+				}
 			}
 			// A route may opt into a private CA by name; it MUST be defined in the
 			// root-of-trust config (an app repo can't introduce a trusted CA).
@@ -352,6 +395,7 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 				Enabled:         true,
 				CA:              r.CA,
 				LB:              r.LB,
+				CatchAll:        catchAll,
 			})
 		}
 		if err := s.edgeRoutes.ReplaceProject(ctx, project, routes); err != nil {

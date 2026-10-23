@@ -236,8 +236,16 @@ func Validate(d *Definition, runDir string, env compose.Env, protectedPaths []st
 		// validateEdge. Validate the route SHAPE with a syntactically-valid placeholder —
 		// the real FQDN <subdomain>.<edge.base_domain> is formed and re-validated at deploy.
 		host := r.Hostname
+		// A catch-all (subdomain "*", or an already-expanded "*.apex" hostname) is validated with the
+		// CatchAll flag set, so edge.ValidateRoute accepts the wildcard shape. The real dns01+consent
+		// gate runs at deploy; this offline §6.2 gate checks SHAPE only (like the subdomain placeholder).
+		catchAll := strings.HasPrefix(host, "*.")
 		if host == "" && r.Subdomain != "" {
-			host = r.Subdomain + ".subdomain.invalid"
+			if r.Subdomain == "*" {
+				host, catchAll = "*.subdomain.invalid", true
+			} else {
+				host = r.Subdomain + ".subdomain.invalid"
+			}
 		}
 		er := edge.Route{
 			Hostname:        host,
@@ -249,6 +257,7 @@ func Validate(d *Definition, runDir string, env compose.Env, protectedPaths []st
 			RedirectHTTP:    r.RedirectHTTP,
 			LB:              r.LB,
 			Enabled:         true,
+			CatchAll:        catchAll,
 		}
 		if err := edge.ValidateRoute(er); err != nil {
 			return fmt.Errorf("§6.2 edge route %q: %w", host, err)

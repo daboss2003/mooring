@@ -111,6 +111,19 @@ func TestEdgeBaseDomainsValidatedAndResolved(t *testing.T) {
 	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"example.com\"\n    - name: b\n      domain: \"sub.example.com\"\n"), "nests")
 	mustReject(t, validYAML(t, "  base_domain: \"example.com\"\n  base_domains:\n    - name: b\n      domain: \"sub.example.com\"\n"), "nests")
 	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"a.example.com\"\n      dns01:\n        provider: cloudflare\n"), "api_token")
+
+	// catch_all (operator consent for a `subdomain: "*"` route) requires dns01 on that namespace —
+	// the catch-all is served by the namespace's wildcard certificate.
+	mustReject(t, validYAML(t, "  base_domains:\n    - name: a\n      domain: \"a.example.com\"\n      catch_all: true\n"), "catch_all requires dns01")
+	mustReject(t, validYAML(t, "  base_domain: \"example.com\"\n  catch_all: true\n"), "edge.catch_all requires edge.dns01")
+	// dns01 + catch_all is valid and the consent flag is carried on resolve.
+	okCA, err := Parse([]byte(validYAML(t, "  base_domains:\n    - name: shop\n      domain: \"shop.example.com\"\n      dns01:\n        provider: cloudflare\n        api_token: \"tok\"\n      catch_all: true\n")))
+	if err != nil {
+		t.Fatalf("dns01 + catch_all should be valid: %v", err)
+	}
+	if bd, ok := okCA.BaseDomainByName("shop"); !ok || !bd.CatchAll {
+		t.Errorf("catch_all not carried on resolve: %+v ok=%v", bd, ok)
+	}
 }
 
 // Hardening from the Phase-1 adversarial review.

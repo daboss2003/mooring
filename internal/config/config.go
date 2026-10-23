@@ -610,6 +610,11 @@ type EdgeConfig struct {
 	// caddy binary with your DNS provider's module compiled in (vanilla Caddy has none —
 	// build one with xcaddy). Optional; leave unset to keep per-subdomain HTTP-01.
 	DNS01 *EdgeDNS01 `yaml:"dns01,omitempty"`
+	// CatchAll is the OPERATOR CONSENT for a catch-all route on the DEFAULT namespace: an app may
+	// declare `subdomain: "*"` on this base_domain only when this is true (and dns01 is set). Off by
+	// default — one app claiming "everything else" in a shared namespace needs the root of trust to
+	// agree, exactly like base_domains whitelists the apexes themselves. See EdgeBaseDomain.CatchAll.
+	CatchAll bool `yaml:"catch_all,omitempty"`
 	// BaseDomains are ADDITIONAL, named subdomain namespaces on top of the default base_domain
 	// above. Colocated apps (e.g. prod + staging on one box) each opt into one BY NAME so both
 	// can keep the `subdomain:` shorthand under their own apex without a route collision. The
@@ -698,6 +703,9 @@ type EdgeBaseDomain struct {
 	Name   string     `yaml:"name"`   // [a-z][a-z0-9-]{0,30}; referenced as `base_domain: <name>`
 	Domain string     `yaml:"domain"` // the apex FQDN, e.g. staging.example.com
 	DNS01  *EdgeDNS01 `yaml:"dns01,omitempty"`
+	// CatchAll is the OPERATOR CONSENT for a catch-all route on this namespace: an app may declare
+	// `subdomain: "*"` under this namespace only when this is true (and DNS01 is set). Off by default.
+	CatchAll bool `yaml:"catch_all,omitempty"`
 }
 
 // EdgeCA is an additional ACME issuer — a private/internal CA (e.g. step-ca). A
@@ -746,7 +754,7 @@ func (c *Config) BaseDomainByName(name string) (EdgeBaseDomain, bool) {
 	// well-formed, case-consistent hostname regardless of how the operator typed the config.
 	if name == "" {
 		if bd := strings.ToLower(strings.TrimSpace(c.Edge.BaseDomain)); bd != "" {
-			return EdgeBaseDomain{Name: "", Domain: bd, DNS01: c.Edge.DNS01}, true
+			return EdgeBaseDomain{Name: "", Domain: bd, DNS01: c.Edge.DNS01, CatchAll: c.Edge.CatchAll}, true
 		}
 		return EdgeBaseDomain{}, false
 	}
@@ -762,6 +770,29 @@ func (c *Config) BaseDomainByName(name string) (EdgeBaseDomain, bool) {
 // HasBaseDomain reports whether a base_domain namespace exists (a named one, or the default
 // when name is "").
 func (c *Config) HasBaseDomain(name string) bool { _, ok := c.BaseDomainByName(name); return ok }
+
+// BaseDomainByApex resolves a namespace by its APEX FQDN (not its name) — the inverse of the usual
+// name lookup. A catch-all route is stored as a literal `*.<apex>` hostname with no namespace name,
+// so the apply layer recovers the namespace (and its DNS01 + CatchAll consent) from the apex to gate
+// the catch-all on EVERY ingest path, not just the subdomain-expansion one. Named namespaces are
+// checked first, then the default scalar base_domain; apexes are validated disjoint, so at most one
+// matches. The returned EdgeBaseDomain is normalized like BaseDomainByName.
+func (c *Config) BaseDomainByApex(apex string) (EdgeBaseDomain, bool) {
+	a := strings.ToLower(strings.TrimSpace(apex))
+	if a == "" {
+		return EdgeBaseDomain{}, false
+	}
+	for _, b := range c.Edge.BaseDomains {
+		if strings.ToLower(strings.TrimSpace(b.Domain)) == a {
+			b.Domain = a
+			return b, true
+		}
+	}
+	if bd := strings.ToLower(strings.TrimSpace(c.Edge.BaseDomain)); bd != "" && bd == a {
+		return EdgeBaseDomain{Name: "", Domain: bd, DNS01: c.Edge.DNS01, CatchAll: c.Edge.CatchAll}, true
+	}
+	return EdgeBaseDomain{}, false
+}
 
 // NamespaceForHost returns the NAME of the declared namespace whose apex `host` is a single-label
 // subdomain of ("" = the default base_domain), and ok=false if host is under no declared apex.
@@ -1328,6 +1359,11 @@ func (c *Config) Validate() error {
 				add("edge.dns01.api_token is required for the DNS-01 wildcard cert")
 			}
 		}
+		// A catch-all route (subdomain: "*") is served by the namespace's wildcard certificate, so
+		// edge.catch_all is meaningless — and unsafe — without dns01 on the default namespace.
+		if c.Edge.CatchAll && c.Edge.DNS01 == nil {
+			add("edge.catch_all requires edge.dns01 (the catch-all is served by the namespace's wildcard certificate)")
+		}
 	case EdgeExternal:
 		// Stronger fail-closed boot for external mode (plan §3.1): must have a
 		// specific edge proxy in trusted_proxies. NOTE: the off-loopback :9000
@@ -1407,6 +1443,9 @@ func (c *Config) Validate() error {
 			if strings.TrimSpace(d.APIToken) == "" {
 				add("edge.base_domains[%d] (%s): dns01.api_token is required for the wildcard cert", i, b.Name)
 			}
+		}
+		if b.CatchAll && b.DNS01 == nil {
+			add("edge.base_domains[%d] (%s): catch_all requires dns01 (the catch-all is served by the namespace's wildcard certificate)", i, b.Name)
 		}
 	}
 

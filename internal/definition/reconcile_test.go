@@ -195,6 +195,35 @@ func TestValidateEdgeUnknownService(t *testing.T) {
 	}
 }
 
+// A catch-all route (subdomain "*") passes the offline §6.2 gate behind `mooring validate` — it
+// checks route SHAPE only; dns01 + operator consent are deploy-time checks. Regression: Finding 2 —
+// the placeholder host "*.subdomain.invalid" with CatchAll unset was rejected by edge.ValidateRoute.
+// The deploy does expandSubdomains → Canonical → Parse (applyDefinition re-validates the canonical
+// before it becomes the truth). A catch-all expands to a literal `*.apex` hostname, so the canonical
+// must re-parse — this is the exact path that failed in Finding 1, and it also proves yaml.v3 quotes
+// the leading-`*` scalar (an unquoted `*.apex` would trip Parse's alias hardening).
+func TestCanonicalParseCatchAllRoundTrip(t *testing.T) {
+	d := base()
+	d.Spec.Edge.Routes[0].Hostname = "*.shop.example.com"
+	d.Spec.Edge.Routes[0].Subdomain = ""
+	canon, err := Canonical(d)
+	if err != nil {
+		t.Fatalf("canonical: %v", err)
+	}
+	if _, err := Parse(canon); err != nil {
+		t.Fatalf("canonical of a catch-all route must re-parse (Finding 1): %v\n%s", err, canon)
+	}
+}
+
+func TestValidateEdgeCatchAll(t *testing.T) {
+	d := base()
+	d.Spec.Edge.Routes[0].Hostname = ""
+	d.Spec.Edge.Routes[0].Subdomain = "*"
+	if err := Validate(d, "/run/app", compose.Env{}, nil); err != nil {
+		t.Errorf("a catch-all route must pass offline validation: %v", err)
+	}
+}
+
 func TestValidateEdgeBaseDomain(t *testing.T) {
 	// Build a full mooring.yaml with a custom edge: block (Parse runs the schema validation
 	// where the base_domain-namespace checks live — the package-level Validate above is the

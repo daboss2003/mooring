@@ -47,6 +47,12 @@ type Route struct {
 	Enabled         bool
 	CA              string // "" = default issuer (BaseConfig.ACMECA); else a BaseConfig.CAs name
 	LB              string // replica selection: "" (= least_conn) | least_conn | round_robin | ip_hash | cookie
+	// CatchAll marks a namespace catch-all route: its Hostname is a `*.<apex>` wildcard that matches
+	// every single-label name under the namespace apex not claimed by a more specific route. It is
+	// ordered AFTER every exact host (so exact routes win) and adds NO ACME subject — the namespace's
+	// DNS-01 wildcard covers it. Persisted (app_routes.catch_all); requires dns01 + operator consent
+	// on the namespace, enforced at deploy.
+	CatchAll bool
 	// Unroutable, set by the Reconciler (never persisted), renders the route as a 503 instead of a
 	// proxy: its (app, service) has no running container to dial. The host matcher, security headers
 	// and ACME subject stay, so the certificate keeps renewing and the host answers 503, not 404.
@@ -309,11 +315,20 @@ func unavailableHandler() caddyHandler {
 }
 
 // ValidateRoute enforces every route-level safety rule (SBD-4). Returns the first
-// violation. A wildcard/catch-all hostname is rejected; an upstream targeting a
-// control-plane port or a loopback/link-local literal IP is rejected.
+// violation. A wildcard hostname is rejected UNLESS the route is a namespace catch-all, whose
+// hostname is exactly `*.<apex>` (one wildcard label over a valid FQDN apex); an upstream
+// targeting a control-plane port or a loopback/link-local literal IP is rejected.
 func ValidateRoute(r Route) error {
 	h := strings.ToLower(strings.TrimSpace(r.Hostname))
-	if len(h) > 253 || !hostnameRe.MatchString(h) {
+	if r.CatchAll {
+		// A catch-all is the ONLY wildcard hostname the edge renders. It must be `*.<apex>` with a
+		// single leading wildcard label over an otherwise valid FQDN — never `*` alone, never a bare
+		// apex, never a deeper `*.a.*`. The apex is Mooring-expanded (never raw operator route text).
+		apex, ok := strings.CutPrefix(h, "*.")
+		if !ok || len(h) > 253 || !hostnameRe.MatchString(apex) {
+			return fmt.Errorf("catch-all hostname %q must be *.<apex> with a valid FQDN apex", r.Hostname)
+		}
+	} else if len(h) > 253 || !hostnameRe.MatchString(h) {
 		return fmt.Errorf("hostname %q is invalid (must be a fully-qualified DNS name, no wildcards)", r.Hostname)
 	}
 	if r.UpstreamScheme != "http" && r.UpstreamScheme != "https" {
@@ -426,6 +441,11 @@ func bySpecificity(routes []Route) []Route {
 	}
 	out := append([]Route(nil), routes...)
 	sort.SliceStable(out, func(i, j int) bool {
+		// A catch-all (*.apex) must be tried AFTER every exact host, so an exact name always wins
+		// over "everything else". This is a hard partition independent of first-appearance order.
+		if out[i].CatchAll != out[j].CatchAll {
+			return !out[i].CatchAll
+		}
 		hi := hostRank[strings.ToLower(strings.TrimSpace(out[i].Hostname))]
 		hj := hostRank[strings.ToLower(strings.TrimSpace(out[j].Hostname))]
 		if hi != hj {
@@ -501,6 +521,11 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			}
 		}
 	}
+	// Catch-all (*.apex) routes are held back and appended AFTER every exact host + cert-only shadow
+	// (bySpecificity already orders them last, but they must also follow the cert-only 404s emitted
+	// below). They add no ACME subject — the namespace's DNS-01 wildcard covers them.
+	var catchAllRoutes []caddyRoute
+	var catchAllApexes []string
 	for _, r := range bySpecificity(routes) {
 		if !r.Enabled {
 			continue
@@ -527,7 +552,13 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		if r.Unroutable || len(dials) == 0 {
 			// No container to dial: answer 503 for this host (and keep its certificate renewing).
 			handlers = append(handlers, unavailableHandler())
-			httpRoutes = append(httpRoutes, caddyRoute{Match: []caddyMatch{match}, Handle: handlers, Terminal: true})
+			rt := caddyRoute{Match: []caddyMatch{match}, Handle: handlers, Terminal: true}
+			if r.CatchAll {
+				catchAllRoutes = append(catchAllRoutes, rt)
+				catchAllApexes = append(catchAllApexes, strings.TrimPrefix(h, "*."))
+				continue
+			}
+			httpRoutes = append(httpRoutes, rt)
 			if !seen[h] {
 				subjects = append(subjects, h)
 				seen[h] = true
@@ -560,7 +591,15 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 			rp.Transport = map[string]any{"protocol": "http", "tls": tls}
 		}
 		handlers = append(handlers, rp)
-		httpRoutes = append(httpRoutes, caddyRoute{Match: []caddyMatch{match}, Handle: handlers, Terminal: true})
+		rt := caddyRoute{Match: []caddyMatch{match}, Handle: handlers, Terminal: true}
+		if r.CatchAll {
+			// No ACME subject: `*.apex` is served by the namespace's DNS-01 wildcard (base.Wildcards),
+			// not a per-name cert. Held back so cert-only shadow 404s render before it.
+			catchAllRoutes = append(catchAllRoutes, rt)
+			catchAllApexes = append(catchAllApexes, strings.TrimPrefix(h, "*."))
+			continue
+		}
+		httpRoutes = append(httpRoutes, rt)
 		if !seen[h] {
 			subjects = append(subjects, h)
 			seen[h] = true
@@ -583,7 +622,54 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		}
 	}
 
-	// SBD-4: default unmatched Host → 404 (never proxy, no catch-all).
+	// Cert-only shadow: a cert_binding host (no proxy route of its own) that sits one label under a
+	// catch-all apex would otherwise be caught by the catch-all over HTTP. Emit an explicit host-level
+	// 404 BEFORE the catch-all so such a name keeps its HTTP 404 — it terminates TLS itself and the
+	// edge must never proxy it. Only when a catch-all exists (byte-identical rendering otherwise).
+	if len(catchAllRoutes) > 0 {
+		shadowed := map[string]bool{}
+		for _, ch := range certOnly {
+			ch_h := strings.ToLower(strings.TrimSpace(ch.Hostname))
+			if shadowed[ch_h] {
+				continue
+			}
+			for _, apex := range catchAllApexes {
+				if coveredByWildcard(ch_h, apex) {
+					httpRoutes = append(httpRoutes, caddyRoute{
+						Match:    []caddyMatch{{Host: []string{ch_h}}},
+						Handle:   []caddyHandler{{Handler: "static_response", StatusCode: 404}},
+						Terminal: true,
+					})
+					shadowed[ch_h] = true
+					break
+				}
+			}
+		}
+		// Admin-vhost shadow: the admin route matches Host AND RemoteIP (the allowlist). A request to
+		// the admin host from a NON-allowlisted IP does not terminate there and would otherwise fall
+		// through to the catch-all tenant — leaking admin-scoped cookies and downgrading SBD-1 from
+		// "refused" to "handed to a tenant". Emit a host-level 404 (after the IP-gated admin route,
+		// before the catch-all) so a denied admin request 404s exactly as it does with no catch-all.
+		if base.AdminHostname != "" {
+			ah := strings.ToLower(strings.TrimSpace(base.AdminHostname))
+			for _, apex := range catchAllApexes {
+				if coveredByWildcard(ah, apex) {
+					httpRoutes = append(httpRoutes, caddyRoute{
+						Match:    []caddyMatch{{Host: []string{ah}}},
+						Handle:   []caddyHandler{{Handler: "static_response", StatusCode: 404}},
+						Terminal: true,
+					})
+					break
+				}
+			}
+		}
+		// Catch-all (*.apex) routes last — after every exact host and cert-only shadow, before the
+		// default 404 — so any more-specific match always wins.
+		httpRoutes = append(httpRoutes, catchAllRoutes...)
+	}
+
+	// SBD-4: default unmatched Host → 404. A name under no namespace catch-all (or outside every
+	// declared namespace) is never proxied — it falls through to this 404.
 	httpRoutes = append(httpRoutes, caddyRoute{Handle: []caddyHandler{{Handler: "static_response", StatusCode: 404}}})
 
 	edgeServer := caddyServer{Listen: []string{":443", ":80"}, Routes: httpRoutes}
