@@ -263,19 +263,19 @@ everything under `base_domain`:
 edge:
   base_domain: mooring.example.com
   dns01:
-    provider: cloudflare            # your DNS provider (cloudflare, route53, digitalocean, …)
+    provider: cloudflare            # your DNS provider (a caddy-dns module name)
     api_token: "<dns-api-token>"    # secret — a token scoped to edit this zone
 ```
 
 **Mooring installs the right Caddy plugin for you** — you don't build anything. DNS-01 needs
-your provider's DNS module compiled into Caddy, so on startup Mooring runs `caddy add-package`
-(Caddy's official mechanism: it downloads a plugin-enabled binary and swaps it in) for the
-`provider` you named. It supports every provider in the [caddy-dns](https://github.com/orgs/caddy-dns/repositories)
-family — Cloudflare, Route 53, DigitalOcean, Google Cloud DNS, Azure, Hetzner, Vultr, Linode,
-Namecheap, and more. (If the auto-install can't run — e.g. the box can't reach `caddyserver.com`
-or the `caddy` binary isn't writable by the service — Mooring logs a clear warning and the edge
-still comes up; the wildcard just won't issue until the plugin is present. Nothing is ever
-mis-issued.)
+your provider's DNS module compiled into Caddy. When the Caddy you installed doesn't have it,
+Mooring downloads a Caddy build with that provider's plugin from `caddyserver.com`, installs it as
+`/var/lib/mooring/bin/caddy` and runs the edge from it. The Caddy package you installed stays as the
+fallback. The install runs in the background and needs outbound HTTPS to `caddyserver.com`; until it
+succeeds the edge serves every route and the wildcard isn't issued. Mooring passes `api_token` to
+the provider's [caddy-dns](https://github.com/orgs/caddy-dns/repositories) module as its `api_token`
+setting, so use a provider whose module takes one (Cloudflare does). See
+[DNS-01 and the Caddy DNS plugin](./edge-and-tls.md#dns-01-and-the-caddy-dns-plugin).
 
 With `dns01` set, subjects at/under `base_domain` are served by the one wildcard; hostnames
 outside it keep their own HTTP-01 cert. The `api_token` is stored only in the root-only

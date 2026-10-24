@@ -141,6 +141,12 @@ challenges for edge hostnames or reach `:2019` — and `ProtectSystem=strict` ke
 and Mooring's own config/key **out of the edge's mount namespace entirely**, so a stray
 `file_server` cannot browse them.
 
+The Mooring-owned Caddy build at `<data_dir>/bin/caddy` (installed when a namespace uses DNS-01) is
+different: the service downloads and writes it itself, so it is owned by the `mooring` user and sits
+in the writable data dir, not on a read-only mount. Each build is checked before it is used: it must
+run, be Caddy 2.x at 2.11 or later, and have every module the config needs. See
+[DNS-01 and the Caddy DNS plugin](#dns-01-and-the-caddy-dns-plugin).
+
 ---
 
 ## Automatic HTTPS / ACME
@@ -166,10 +172,117 @@ abuse class:
 - **Wildcard certificates via DNS-01.** Point one wildcard DNS record (`*.example.com` → this box)
   and set `edge.dns01` with your provider and an API token, and Mooring issues a **single wildcard
   certificate** for the whole namespace — no per-hostname issuance or rate limits, and it works for
-  names that aren't HTTP-reachable. Mooring **installs the matching Caddy DNS-provider module for
-  you** (`caddy add-package`) — you never run `xcaddy` or build a binary. This is what gives every
+  names that aren't HTTP-reachable. Mooring installs a Caddy build with the provider's plugin
+  itself — you never run `xcaddy` or build a binary (see
+  [DNS-01 and the Caddy DNS plugin](#dns-01-and-the-caddy-dns-plugin)). This is what gives every
   app subdomain and every [preview environment](./gitops.md#preview-environments-a-deploy-per-pull-request)
   instant HTTPS. Without `dns01`, each hostname gets its own certificate over HTTP validation.
+
+### DNS-01 and the Caddy DNS plugin
+
+A namespace with `dns01` set (`edge.dns01` for the default namespace, `edge.base_domains[].dns01` for
+a named one) gets one `*.<apex>` certificate over ACME DNS-01. The Caddy that serves the edge needs
+that DNS provider's module compiled in (`dns.providers.<provider>`, e.g. `dns.providers.cloudflare`).
+Mooring installs it:
+
+1. At start, Mooring checks whether the Caddy the edge runs has each configured provider's module.
+2. If one is missing, Mooring downloads a Caddy built with every configured provider's module, plus
+   any non-standard plugins the system `caddy` has, from Caddy's official build server
+   (`https://caddyserver.com/api/download`). If that build fails, it is retried at once with only the
+   DNS provider modules.
+3. It checks the download: the binary runs, it is Caddy 2.x at version 2.11 or later, and it has
+   every needed module. A download that fails a check is deleted and the current binary stays in use.
+4. It installs the download as the Mooring-owned binary `<data_dir>/bin/caddy` (default
+   `/var/lib/mooring/bin/caddy`) with an atomic rename. The previous Mooring-owned build, if any, is
+   kept as `<data_dir>/bin/caddy.bak`.
+5. It restarts the edge on the new binary, which briefly interrupts every app on the server. Once the
+   restarted edge reports the module, the namespace's wildcard certificate is added to the edge config.
+
+Nothing is downloaded when no namespace sets `dns01`, or when every configured provider's module is
+already present. If the binary on disk already has every module when an attempt starts, Mooring only
+restarts the edge onto it.
+
+- **The binary the edge runs** is `<data_dir>/bin/caddy` when it exists, otherwise the system `caddy`
+  on `PATH`. Mooring never modifies the system `caddy` (the distribution's package or Caddy's own); it
+  stays as the fallback. Each time the edge starts on a binary Mooring hasn't checked yet, it reads that
+  binary's modules; until then the namespace's wildcard is left out of the edge config. If a module has
+  disappeared (for example, a package upgrade replaced a system `caddy` that had it), Mooring installs
+  the build again.
+- **The install runs in the background.** Mooring and the edge start at once on the existing binary.
+  A failed attempt is logged with the command's output (up to its last 20 lines) and retried after
+  1 minute, then after twice the previous wait, up to 6 hours between attempts. Restart Mooring to
+  retry at once. Until an install succeeds, that namespace's subdomains get per-name HTTP-01
+  certificates (only names reachable over HTTP) and a [catch-all route](#catch-all-routes) on it has
+  no certificate.
+- **Provider credentials.** Mooring passes the `dns01` token to the provider module as its
+  `api_token` setting. Providers whose module reads `api_token` (Cloudflare, for example) work. A
+  provider whose module needs other credentials (Route 53, for example, takes access keys), or a
+  token in a format the module doesn't accept, is rejected by Caddy when the config is applied.
+  Mooring then serves every route without that namespace's wildcard, lists the namespace under
+  **Wildcards refused by Caddy** on the **Edge & TLS** page, and logs
+  `edge: Caddy rejected the DNS-01 wildcard config …`. Other namespaces keep their wildcards, including
+  ones on the same provider. The refused namespace isn't retried until Mooring restarts. Mooring removes
+  the `dns01` tokens from Caddy's errors and from Caddy's own log output before they are logged or shown.
+- **Running as root.** When Mooring runs as root instead of the `mooring` user, it installs no build
+  and doesn't run `<data_dir>/bin/caddy`; a missing provider is shown as not installable.
+- **Requires outbound HTTPS to `caddyserver.com`.** `caddy add-package` is not used: it is missing
+  from distribution builds such as Ubuntu's `caddy` 2.6.2.
+- **Caddy 2.x only.** The build server serves the latest Caddy release. If it serves a newer major
+  version, Mooring refuses the download and keeps the current binary; the failure is logged and
+  retried like any other.
+- **No `setcap`.** The edge child binds `:80`/`:443` with the `mooring` unit's ambient
+  `CAP_NET_BIND_SERVICE`, so the Mooring-owned build needs no file capabilities.
+- **`noexec` mounts.** If `/var` (or wherever `data_dir` lives) is mounted `noexec`, the downloaded
+  binary can't run, its check fails, and the install is refused. Move `data_dir` to a filesystem
+  mounted without `noexec`, or remount it.
+- **Restart after changing edge settings.** `dns01`, `base_domains`, `catch_all` and the other edge
+  settings in `config.yaml` are read at start: run `sudo systemctl restart mooring` after a change. A
+  reload (`SIGHUP`) does not apply them.
+- **Dashboard.** The **Edge & TLS** page lists each DNS-01 provider's plugin state: installed,
+  installing, install failed (with the error, the number of attempts and the next retry time), or
+  not installable (unknown provider, or Mooring running as root, with the error; not retried), or
+  module check failed (the running binary's modules can't be read; retried). Below
+  it, **Wildcards refused by Caddy** lists each namespace whose wildcard config Caddy refused, with
+  Caddy's error.
+- **`mooring doctor`** checks each configured provider's plugin and the version of the Caddy the edge
+  runs; `sudo mooring setup --yes` can install the build before Mooring starts. See
+  [`mooring doctor` / `setup`](./cli.md#mooring-doctor--setup).
+
+Journal lines (`sudo journalctl -u mooring | grep 'edge'`):
+
+| Line | Meaning |
+|---|---|
+| `edge: Caddy DNS plugin missing — installing a Mooring-owned Caddy build in the background …` | At start: the providers in `providers=` have no module in the current Caddy. |
+| `edge: installing a Caddy build with the DNS plugin(s) for the wildcard certs` | An install attempt started. `missing=` lists the providers, `packages=` the plugins compiled in. |
+| `edge: the Caddy build with the carried plugins failed; retrying with only the DNS providers` | The build with the system `caddy`'s extra plugins failed; a build without them follows. |
+| `edge: Caddy DNS plugin install failed …` | The attempt failed. `err=` holds the cause and the command output. It is retried. |
+| `edge: Caddy DNS plugin(s) installed; restarting the edge on the new binary` | The new build is in place and the edge restarts on it. |
+| `edge child restarted` | The edge is running again; `caddy=` is the binary it runs. |
+| `edge: issuing a *.<apex> wildcard cert via ACME DNS-01` | Logged at each edge start, once the running Caddy's modules are read: the namespace's wildcard certificate is in the edge config. |
+| `edge: can't list the running Caddy's modules; its DNS-01 wildcards stay off until a retry succeeds` | Mooring couldn't run `caddy list-modules` after an edge start. It retries (5 seconds, doubling, up to 2 minutes); meanwhile the providers show the error. |
+| `edge: the Caddy binary changed after the edge started; its modules are read at the next start` | A new build replaced the binary before its modules were read; the restart that follows reads it. |
+| `edge: the running Caddy lacks a DNS plugin it had; reinstalling it` | The binary the edge runs no longer has a provider's module; an install attempt follows. |
+| `edge: Caddy rejected the DNS-01 wildcard config; serving every route without this wildcard` | Caddy refused the namespace in `wildcard=` (see **Provider credentials**). `err=` holds Caddy's error. |
+
+**Updating the build.** `apt upgrade` does not update `<data_dir>/bin/caddy`. `mooring doctor` warns
+when it is more than 180 days old. To replace it with a current build:
+
+```bash
+sudo rm /var/lib/mooring/bin/caddy && sudo mooring setup --yes
+sudo systemctl restart mooring
+```
+
+**Rolling back.** If the edge won't start after an install, put the previous build back (when
+`caddy.bak` exists), or delete the Mooring-owned build to fall back to the system `caddy`, then
+restart Mooring:
+
+```bash
+sudo mv /var/lib/mooring/bin/caddy.bak /var/lib/mooring/bin/caddy   # the previous build
+# or: sudo rm /var/lib/mooring/bin/caddy                            # fall back to the system caddy
+sudo systemctl restart mooring
+```
+
+With `dns01` still configured, a deleted build is installed again at the next start.
 
 ### Subdomain namespaces (colocating apps under one apex)
 
@@ -198,9 +311,25 @@ catch-all, and an exact route another app adds later wins immediately, without r
 app. A claimed hostname is owned **in full** — a request to a path it doesn't itself serve (e.g.
 `api.<apex>/other` when `api` only routes `/v1`) returns the edge's 404, never the catch-all tenant.
 
-Revoking consent takes effect on its own: clear `catch_all` (or remove `dns01`) on the namespace and
-the stored catch-all is dropped at the next edge reconcile — its names fall back to the default 404
-without redeploying the app.
+A deploy that **adds** a catch-all is also refused while the namespace's wildcard certificate is known
+to be off: its [DNS plugin](#dns-01-and-the-caddy-dns-plugin) isn't available (an install attempt has
+failed, or the provider is unknown), or Caddy refused the namespace's DNS-01 config. The refusal gives
+the reason. A deploy of an app that already has that catch-all goes ahead and writes a warning to the
+deploy log.
+
+Every 2 minutes Mooring checks that the edge serves a certificate for each namespace that has a
+catch-all: it opens a TLS connection to the edge for a random name under the apex
+(`mooring-probe-<random>.<apex>`) and requires a certificate that covers that name and hasn't expired.
+The issuer isn't checked, so a staging or private CA passes. The check never causes an issuance;
+on-demand TLS stays off. Mooring raises a critical `edge_catchall_dark` alert naming the namespace and
+the cause when the namespace's wildcard is known to be off (as above), or when the check fails 3 times in a row, about
+4 to 6 minutes after the certificate stops being served (for example, the DNS provider rejects the API
+token and the wildcard is never issued). While the namespace is in this state the **Edge & TLS** page
+shows a banner. The alert resolves when the certificate is served again.
+
+To revoke consent, clear `catch_all` (or remove `dns01`) on the namespace and restart Mooring
+(`sudo systemctl restart mooring`). The stored catch-all is then dropped and its names fall back to
+the default 404, without redeploying the app.
 
 - `edge.catch_all: true` — allow a catch-all on the **default** namespace (`edge.base_domain`).
 - `edge.base_domains[].catch_all: true` — allow one on that **named** namespace.
@@ -437,7 +566,10 @@ record.
 - Requires Caddy 2.11 or later. An older Caddy refuses the config (`unknown field "allow_0rtt"`, or
   `unknown field "trusted_proxies_strict"` before 2.8). The edge then stays on its startup config (the
   admin vhost if configured, no app routes, no HTTP/3) until Caddy is upgraded or the keys are
-  removed. Check the version with `caddy version`.
+  removed. `mooring doctor` fails its `caddy` check when the Caddy the edge runs is older than 2.11
+  and `trusted_proxies` is set; `sudo mooring setup --yes` then installs a current build as
+  `<data_dir>/bin/caddy` (see [DNS-01 and the Caddy DNS plugin](#dns-01-and-the-caddy-dns-plugin)).
+  Restart Mooring afterwards.
 - These keys are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
   dashboard listener in `external` mode.
 
@@ -658,7 +790,7 @@ edge:
   acme_email: ops@example.com   # REQUIRED in managed mode — fail-closed if empty
   acme_ca: https://acme-v02.api.letsencrypt.org/directory   # single pinned issuer, no fallback
   base_domain: example.com      # optional: enables the `subdomain:` shorthand; point *.example.com here
-  dns01:                        # optional: one wildcard cert for the namespace (module auto-installed)
+  dns01:                        # optional: one wildcard cert for the namespace (Mooring installs the Caddy DNS plugin)
     provider: cloudflare
     api_token: "<dns-provider-token>"
   # catch_all: false            # optional: allow one app's catch-all route on the default namespace (needs dns01)
@@ -687,7 +819,7 @@ trusted_proxies:
 | `edge.acme_ca` | *(your CA)* | Single pinned issuer. **No fallback** — a fallback would diverge cert paths and break shared-cert readers. |
 | `edge.apply_probe_window` | `20s` | How long a deploy waits for the edge to serve every route of the app (dialing only that app's containers) before it fails the deploy. |
 | `edge.base_domain` | *(unset)* | Namespace apex for the `subdomain:` shorthand; point `*.<base_domain>` DNS at the box. |
-| `edge.dns01` | *(unset)* | `{provider, api_token}` → one **wildcard** cert for the namespace via DNS-01; the Caddy provider module is auto-installed. |
+| `edge.dns01` | *(unset)* | `{provider, api_token}` → one **wildcard** cert for the namespace via DNS-01. Mooring installs a Caddy build with the provider's plugin as `<data_dir>/bin/caddy`; needs outbound HTTPS to `caddyserver.com`. See [DNS-01 and the Caddy DNS plugin](#dns-01-and-the-caddy-dns-plugin). Restart Mooring after a change. |
 | `edge.base_domains` | *(none)* | Additional **named** namespaces (e.g. prod + staging on one box); an app opts into one by name. |
 | `edge.catch_all` | `false` | Operator consent for one app's [catch-all route](#catch-all-routes) (`subdomain: "*"`) on the **default** namespace. Requires `edge.dns01`; one catch-all per namespace, server-wide. |
 | `edge.base_domains[].catch_all` | `false` | Same, per **named** namespace; requires that namespace's `dns01`. |

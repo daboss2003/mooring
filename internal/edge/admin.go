@@ -3,6 +3,8 @@ package edge
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -90,9 +92,20 @@ func (a *Admin) Load(ctx context.Context, configJSON []byte) error {
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-		return fmt.Errorf("edge: admin rejected config (status %d): %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return &ConfigRejectedError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return nil
+}
+
+// ConfigRejectedError is Caddy refusing a config at /load — as opposed to its admin API being
+// unreachable (a transport error).
+type ConfigRejectedError struct {
+	Status int
+	Body   string
+}
+
+func (e *ConfigRejectedError) Error() string {
+	return fmt.Sprintf("edge: admin rejected config (status %d): %s", e.Status, e.Body)
 }
 
 // Discovery is one container-discovery pass over the route set (see SetPoolDiscoverer).
@@ -174,6 +187,16 @@ type Reconciler struct {
 	// covers when a route is (re)applied, so without this a stored catch-all would keep serving after
 	// the operator revoked it (fail-open). nil = don't re-check (every catch-all kept).
 	catchAllOK func(apex string) bool
+	// wildcards, when set, returns the DNS-01 wildcards to render THIS cycle — only the namespaces
+	// whose DNS plugin is in the running Caddy. Consulted per reconcile so a plugin installed after
+	// Mooring started (a background install + edge restart) brings its wildcard in without restarting
+	// Mooring. A wildcard whose module the binary lacks would make Caddy reject the whole /load, so it
+	// must never be rendered early. nil = base.Wildcards as built at start.
+	wildcards func() []WildcardCert
+	// onWildcardReject, when set, is told about each wildcard Caddy refused (and its error, with every
+	// dns01 token redacted) — see loadWithoutWildcards. Called UNDER r.mu, so the owner's wildcards hook
+	// already leaves the refused one out of the next reconcile; it must not call back into the Reconciler.
+	onWildcardReject func(w WildcardCert, err error)
 	// onStatus receives the routes whose served state changed in a committed reconcile. Called after
 	// the lock is released; it must not call back into the Reconciler synchronously.
 	onStatus func([]StatusChange)
@@ -359,6 +382,15 @@ func (r *Reconciler) ReloadAfterRestart(ctx context.Context) {
 // (≤ the refresh cadence) with no restart. nil (the default) means never emit it.
 func (r *Reconciler) SetAccessLog(fn func() bool) { r.accessLog = fn }
 
+// SetWildcards registers the per-reconcile DNS-01 wildcard set (see wildcards).
+func (r *Reconciler) SetWildcards(fn func() []WildcardCert) { r.wildcards = fn }
+
+// SetWildcardReject registers the hook told about each wildcard Caddy refused (see onWildcardReject).
+// The owner must stop offering it (SetWildcards), or every reconcile would try it again.
+func (r *Reconciler) SetWildcardReject(fn func(w WildcardCert, err error)) {
+	r.onWildcardReject = fn
+}
+
 // SetCatchAllConsent registers the live operator-consent check for catch-all routes (see catchAllOK):
 // a stored `*.apex` catch-all is dropped at the next reconcile if its namespace no longer consents.
 func (r *Reconciler) SetCatchAllConsent(fn func(apex string) bool) { r.catchAllOK = fn }
@@ -388,6 +420,9 @@ func (r *Reconciler) renderBase() BaseConfig {
 	base := r.base
 	if r.accessLog != nil {
 		base.AccessLog = r.accessLog()
+	}
+	if r.wildcards != nil {
+		base.Wildcards = r.wildcards()
 	}
 	return base
 }
@@ -445,27 +480,222 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	routes = r.keepCatchAlls(routes)
 	now := r.clock()
 	lkg, status, changes := r.plan(routes, disc, poolFn != nil, now)
-	cfg, err := Render(r.renderBase(), routes, r.certOnly())
+	base := r.renderBase()
+	cfg, err := Render(base, routes, r.certOnly())
 	if err != nil {
 		r.mu.Unlock()
 		return fmt.Errorf("edge: render: %w", err) // unsafe route → never applied
 	}
 	// Idempotent: a render byte-identical to the last applied one (the common case for the periodic
 	// refresh when nothing moved) skips the /load — Mooring is the sole source of Caddy's config.
+	var rejected []wildcardRejection
 	if !bytes.Equal(cfg, r.lastGood) {
 		if err := r.admin.Load(ctx, cfg); err != nil {
-			r.mu.Unlock()
-			return err
+			applied, rej, lerr := r.loadWithoutWildcards(ctx, base, routes, cfg, err)
+			if lerr != nil {
+				r.mu.Unlock()
+				return redactTokens(lerr, base.Wildcards)
+			}
+			rejected, cfg = rej, applied
 		}
 		r.lastGood = cfg
 	}
 	r.committedGen = gen
 	r.lkg, r.status = lkg, status
+	// The owner records each refusal before the lock is released, so a concurrent reconcile already
+	// leaves the refused wildcard out instead of running the whole isolation again.
+	for i := range rejected {
+		rejected[i].err = redactTokens(rejected[i].err, base.Wildcards)
+		if r.onWildcardReject != nil {
+			r.onWildcardReject(rejected[i].w, rejected[i].err)
+		}
+	}
 	r.mu.Unlock()
+	for _, rj := range rejected {
+		if r.log != nil {
+			r.log.Error("edge: Caddy rejected the DNS-01 wildcard config; serving every route without this wildcard",
+				"wildcard", "*."+rj.w.Domain, "provider", rj.w.DNS01Provider, "err", rj.err)
+		}
+	}
 	if onStatus != nil && len(changes) > 0 {
 		onStatus(changes)
 	}
 	return nil
+}
+
+// wildcardRejection is one wildcard Caddy refused, with Caddy's error (not yet redacted).
+type wildcardRejection struct {
+	w   WildcardCert
+	err error
+}
+
+// loadWithoutWildcards handles a rejected /load of full. A DNS-01 wildcard is the one part of the config
+// whose validity depends on a provider module Mooring doesn't control (its field names, the token's
+// format): if Caddy refuses a render that carries wildcards, the same render WITHOUT them is loaded so
+// every route keeps working, instead of the edge being stuck on its previous (or empty boot) config.
+// To tell a wildcard problem from a transient one (the admin API answering 4xx while a restarted child
+// settles), the full render is tried once more after the bare one loads. If Caddy refuses it again, the
+// wildcards are added back one at a time on top of the ones it accepted, so one namespace's bad config
+// doesn't take another namespace's wildcard down with it; a wildcard is blamed only when Caddy refuses
+// it twice. It returns the config now applied and the wildcards Caddy refused, or the error to give up
+// with. Called under r.mu.
+func (r *Reconciler) loadWithoutWildcards(ctx context.Context, base BaseConfig, routes []Route, full []byte, loadErr error) (applied []byte, rejected []wildcardRejection, err error) {
+	var rej *ConfigRejectedError
+	if len(base.Wildcards) == 0 || !errors.As(loadErr, &rej) {
+		return nil, nil, loadErr
+	}
+	nb := base
+	nb.Wildcards = nil
+	bare, rerr := Render(nb, routes, r.certOnly())
+	if rerr != nil {
+		return nil, nil, loadErr
+	}
+	if lerr := r.admin.Load(ctx, bare); lerr != nil {
+		return nil, nil, loadErr // not the wildcards' fault: the bare config doesn't load either
+	}
+	if lerr := r.admin.Load(ctx, full); lerr == nil {
+		return full, nil, nil // the first rejection was transient
+	} else if !errors.As(lerr, &rej) {
+		// Can't pin it (the admin API went away mid-check). The bare config stays loaded and nothing is
+		// reported; the next reconcile tries the full render again.
+		return bare, nil, nil
+	}
+	applied = bare
+	var accepted []WildcardCert
+	for _, w := range base.Wildcards {
+		nb.Wildcards = append(append([]WildcardCert(nil), accepted...), w)
+		cfg, rerr := Render(nb, routes, r.certOnly())
+		if rerr != nil {
+			rejected = append(rejected, wildcardRejection{w, rerr})
+			continue
+		}
+		lerr := r.admin.Load(ctx, cfg)
+		if errors.As(lerr, &rej) {
+			lerr = r.admin.Load(ctx, cfg)
+		}
+		switch {
+		case lerr == nil:
+			accepted, applied = nb.Wildcards, cfg
+		case errors.As(lerr, &rej):
+			rejected = append(rejected, wildcardRejection{w, lerr})
+		default:
+			// The admin API went away mid-check: keep what is loaded and report only the wildcards already
+			// pinned; the next reconcile tries the rest again.
+			return applied, rejected, nil
+		}
+	}
+	return applied, rejected, nil
+}
+
+// redactTokens removes every dns01 api_token of ws from a Caddy rejection's text. A provider module may
+// echo the token in its error (caddy-dns/cloudflare prints one whose format it doesn't accept), and these
+// errors reach the journal, deploy logs, the dashboard and alert channels. Other errors can't carry the
+// rendered config and are returned unchanged.
+func redactTokens(err error, ws []WildcardCert) error {
+	var rej *ConfigRejectedError
+	if err == nil || !errors.As(err, &rej) {
+		return err
+	}
+	body := rej.Body
+	for _, w := range ws {
+		for _, form := range tokenForms(w.DNS01Token) {
+			body = strings.ReplaceAll(body, form, "[redacted]")
+		}
+	}
+	if body == rej.Body {
+		return err
+	}
+	return &ConfigRejectedError{Status: rej.Status, Body: body}
+}
+
+// NewRedactWriter returns a writer that passes everything to w with each secret (in every tokenForms
+// form) replaced by "[redacted]". Output is held back until the end of a line, so a secret split across
+// two writes is still caught; a line longer than 64 KiB is passed on unredacted at that point. Flush
+// writes out a final partial line. With no non-empty secret it returns w itself.
+func NewRedactWriter(w io.Writer, secrets []string) io.Writer {
+	var forms []string
+	for _, s := range secrets {
+		forms = append(forms, tokenForms(s)...)
+	}
+	if len(forms) == 0 {
+		return w
+	}
+	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+	return &redactWriter{w: w, forms: forms}
+}
+
+type redactWriter struct {
+	mu    sync.Mutex
+	w     io.Writer
+	forms []string
+	buf   []byte
+}
+
+const redactLineMax = 64 << 10
+
+func (r *redactWriter) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	cut := bytes.LastIndexByte(r.buf, '\n') + 1
+	if cut == 0 {
+		if len(r.buf) < redactLineMax {
+			return len(p), nil // wait for the end of the line
+		}
+		cut = len(r.buf)
+	}
+	err := r.emit(r.buf[:cut])
+	r.buf = append(r.buf[:0], r.buf[cut:]...)
+	return len(p), err
+}
+
+// Flush writes out (redacted) whatever partial line is held back.
+func (r *redactWriter) Flush() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.buf) == 0 {
+		return nil
+	}
+	err := r.emit(r.buf)
+	r.buf = r.buf[:0]
+	return err
+}
+
+func (r *redactWriter) emit(b []byte) error {
+	s := string(b)
+	for _, f := range r.forms {
+		s = strings.ReplaceAll(s, f, "[redacted]")
+	}
+	_, err := io.WriteString(r.w, s)
+	return err
+}
+
+// tokenForms is how a token can appear in Caddy's JSON error body: as is, JSON-escaped, and trimmed. A
+// blank token has none (replacing whitespace would mangle every line).
+func tokenForms(tok string) []string {
+	if strings.TrimSpace(tok) == "" {
+		return nil
+	}
+	var out []string
+	add := func(s string) {
+		if s == "" {
+			return
+		}
+		for _, o := range out {
+			if o == s {
+				return
+			}
+		}
+		out = append(out, s)
+	}
+	add(tok)
+	if b, err := json.Marshal(tok); err == nil {
+		add(strings.TrimSuffix(strings.TrimPrefix(string(b), `"`), `"`))
+	}
+	add(strings.TrimSpace(tok))
+	// Longest first, so a form that contains another is replaced whole.
+	sort.Slice(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
 }
 
 // plan decides, for every enabled route, what the edge dials — setting routes[i].Pool or

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/docker"
+	"github.com/daboss2003/mooring/internal/edge"
 )
 
 // cmd_doctor.go is the host-prerequisites helper. Mooring's RUNTIME service is
@@ -35,7 +37,9 @@ import (
 //	mooring setup    — print a fix PLAN (dry run); `--yes` applies it (root, apt).
 //
 // `setup` only performs SAFE, idempotent, well-understood mutations (install Caddy /
-// nginx+stream, cap Docker's logs). It NEVER auto-rewrites host DNS or frees :53 —
+// nginx+stream, install the Mooring-owned Caddy build at <data_dir>/bin/caddy when
+// config.yaml needs one, cap Docker's logs). It never replaces the distro caddy package.
+// It NEVER auto-rewrites host DNS or frees :53 —
 // that broke a box once already — it prints those steps for you to run. The bind
 // capability + runtime/state dirs are provided by the unit + postinstall, not setup.
 const (
@@ -89,6 +93,7 @@ func cmdSetup(args []string) error {
 	yes := fs.Bool("yes", false, "apply the changes (default: print the plan only)")
 	l4 := fs.Bool("l4", false, "also install the L4 prerequisites (nginx + stream module)")
 	restart := fs.Bool("restart", false, "restart the mooring service after applying")
+	configPath := fs.String("config", config.DefaultPath, "config.yaml whose edge settings decide whether a Mooring-owned Caddy build is needed")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -104,12 +109,18 @@ func cmdSetup(args []string) error {
 		return fmt.Errorf("applying changes needs root — run: sudo mooring setup --yes")
 	}
 
+	// setup can run before config.yaml exists, so the config is best-effort: without it no
+	// DNS plugin build or Caddy upgrade is planned.
+	cfg, cfgWarn := loadDoctorConfig(*configPath)
 	// setup runs at onboarding (before config/service start), so skip the runtime-state
 	// checks (run dir / egress / socket-proxy / daemon match) — they need a running service.
-	rep := preflight(*l4, nil, false)
+	rep := preflight(*l4, cfg, false)
+	if cfgWarn != "" {
+		rep.add(result{"config", "warn", cfgWarn, "pass --config so the plan covers the Caddy build that edge.dns01 / edge.trusted_proxies / catch_all need"})
+	}
 	rep.print(os.Stdout)
 
-	steps := plan(*yes, *l4, *restart)
+	steps := plan(*yes, *l4, *restart, cfg)
 	if len(steps) == 0 {
 		fmt.Println("\nNothing to install — all prerequisites are already in place.")
 		printDNSGuidance(*l4)
@@ -125,15 +136,34 @@ func cmdSetup(args []string) error {
 		return nil
 	}
 	fmt.Println("\nApplying:")
-	for i, s := range steps {
-		fmt.Printf("\n  %d. %s\n", i+1, s.desc)
-		if err := s.do(); err != nil {
-			return fmt.Errorf("step %q failed: %w", s.desc, err)
-		}
+	swappedCaddy, err := applySteps(os.Stdout, steps)
+	if err != nil {
+		return err
 	}
 	fmt.Println("\nDone.")
+	if swappedCaddy && !*restart {
+		fmt.Println("Restart Mooring so the edge switches to it: sudo systemctl restart mooring")
+	}
 	printDNSGuidance(*l4)
 	return nil
+}
+
+// applySteps runs steps in order and reports whether a Mooring-owned Caddy build was installed. A step
+// that returns a stepWarning is printed and skipped over; any other error stops setup.
+func applySteps(w io.Writer, steps []step) (swappedCaddy bool, err error) {
+	for i, s := range steps {
+		fmt.Fprintf(w, "\n  %d. %s\n", i+1, s.desc)
+		var warn stepWarning
+		if err := s.do(); errors.As(err, &warn) {
+			fmt.Fprintf(w, "       WARNING: %v\n", warn.err)
+			fmt.Fprintf(w, "       %s\n", warn.hint)
+			continue
+		} else if err != nil {
+			return swappedCaddy, fmt.Errorf("step %q failed: %w", s.desc, err)
+		}
+		swappedCaddy = swappedCaddy || strings.HasPrefix(s.desc, ownedCaddyStepPrefix)
+	}
+	return swappedCaddy, nil
 }
 
 // step is one planned host mutation; do() prints the action and (when apply) runs it.
@@ -142,16 +172,29 @@ type step struct {
 	do   func() error
 }
 
+// stepWarning is a step failure that doesn't stop setup: it is printed with hint and the next step runs.
+type stepWarning struct {
+	err  error
+	hint string
+}
+
+func (w stepWarning) Error() string { return w.err.Error() }
+
 // plan builds the ordered fix steps for whatever is missing. apply=false makes each
-// do() print-only, so the SAME list drives the dry run and the real run.
-func plan(apply, l4, restart bool) []step {
+// do() print-only, so the SAME list drives the dry run and the real run. cfg may be nil
+// (config.yaml not loaded): then no Mooring-owned Caddy build is planned.
+func plan(apply, l4, restart bool, cfg *config.Config) []step {
 	var steps []step
-	if !have("caddy") {
+	caddyBin := edge.ResolveCaddy(doctorDataDir(cfg))
+	if caddyBin == "" {
 		steps = append(steps,
 			step{"add the Caddy apt repo + signing key", func() error { return writeCaddyRepo(apply) }},
 			step{"apt-get update", func() error { return run(apply, "apt-get", "update") }},
 			step{"install caddy", func() error { return run(apply, "apt-get", "install", "-y", "caddy") }},
 		)
+	}
+	if s, ok := ownedCaddyStep(apply, cfg, caddyBin); ok {
+		steps = append(steps, s)
 	}
 	// ALWAYS disable the packaged caddy.service when it exists — Mooring supervises its
 	// OWN Caddy child; the distro unit squats :80/:443 and crash-loops the edge. This is
@@ -191,6 +234,159 @@ func plan(apply, l4, restart bool) []step {
 		steps = append(steps, step{"restart the mooring service", func() error { return run(apply, "systemctl", "restart", "mooring") }})
 	}
 	return steps
+}
+
+// ownedCaddyStepPrefix starts the desc of the step that installs the Mooring-owned Caddy build;
+// cmdSetup reads it to tell the operator to restart Mooring after that step ran.
+const ownedCaddyStepPrefix = "install a Caddy build with "
+
+// ownedCaddyStep plans the Mooring-owned Caddy build (<data_dir>/bin/caddy) when config.yaml needs
+// one: a dns01 provider's module is missing from that build (the owned path itself is checked — a
+// freshly apt-installed caddy has no plugins), or caddyBin is older than edge.MinCaddyVersion while
+// a setting that needs it is configured. The distro caddy is never replaced. ok=false: not needed.
+func ownedCaddyStep(apply bool, cfg *config.Config, caddyBin string) (step, bool) {
+	dataDir := doctorDataDir(cfg)
+	owned := edge.OwnedCaddyPath(dataDir)
+	var pkgs, want []string
+	if cfg != nil && cfg.Edge.Mode == config.EdgeManaged {
+		pkgs, want = dnsPluginPackages(dnsProviders(cfg))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	need := false
+	if len(want) > 0 {
+		// Check the binary the edge will run, as doctor and the runtime installer do: the owned build
+		// when it exists, else the system caddy. With no caddy yet, the apt step planned above brings
+		// a plugin-less official build, so the plugin build is needed.
+		var mods map[string]bool
+		if caddyBin != "" {
+			mods, _ = edge.CaddyModules(ctx, caddyBin) // unreadable → no modules → (re)install
+		}
+		for _, m := range want {
+			need = need || !mods[m]
+		}
+	}
+	if !need && caddyBin != "" && len(caddyMinNeeds(cfg)) > 0 {
+		if v, err := edge.CaddyVersion(ctx, caddyBin); err == nil && !v.AtLeast(edge.MinCaddyVersion) {
+			need = true
+		}
+	}
+	if !need {
+		return step{}, false
+	}
+	mods := "no plugins"
+	if len(want) > 0 {
+		mods = strings.Join(want, ", ")
+	}
+	desc := ownedCaddyStepPrefix + mods + " as " + owned + " (from caddyserver.com; checked before use, the previous build kept as .bak)"
+	return step{desc, func() error { return installOwnedCaddy(apply, dataDir, pkgs, want) }}, true
+}
+
+// installOwnedCaddy downloads a Caddy with dnsPkgs (plus any plugins the current caddy already
+// carries) from the build server and installs it as the Mooring-owned build, owned by the mooring
+// service user. apply=false prints what it would do.
+func installOwnedCaddy(apply bool, dataDir string, dnsPkgs, want []string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	pkgs := dnsPkgs
+	// Carry plugins over only from the root-owned system caddy (looked up now: an apt step may have just
+	// installed it) — never from the Mooring-owned build, which the service user can rewrite.
+	if bin, lerr := exec.LookPath("caddy"); lerr == nil {
+		extras, err := edge.CaddyExtraPackages(ctx, bin)
+		if err != nil {
+			fmt.Printf("       note: can't read the plugins built into %s (%v) — the new build has only the DNS providers\n", bin, err)
+		}
+		pkgs = mergePackages(dnsPkgs, extras)
+	}
+	src, err := edge.BuildServerURL("", runtime.GOOS, runtime.GOARCH, pkgs)
+	if err != nil {
+		return err
+	}
+	owned := edge.OwnedCaddyPath(dataDir)
+	check := "has " + strings.Join(want, ", ")
+	if len(want) == 0 {
+		check = "lists its modules"
+	}
+	fmt.Printf("       download %s\n", src)
+	fmt.Printf("       check it runs, is at least %s and %s; keep the current build as %s.bak\n", edge.MinCaddyVersion, check, owned)
+	fmt.Printf("       install it as %s, owned by the mooring user\n", owned)
+	if !apply {
+		return nil
+	}
+	if fi, err := os.Stat(dataDir); err != nil || !fi.IsDir() {
+		return fmt.Errorf("data_dir %s doesn't exist — install the mooring package first", dataDir)
+	}
+	owner, err := serviceUserOwner()
+	if err != nil {
+		return err
+	}
+	path, err := edge.InstallPluginBuild(ctx, edge.InstallOptions{DataDir: dataDir, Packages: pkgs, WantModules: want, Owner: owner})
+	if err != nil {
+		// Intentional: not fatal. Mooring retries the install itself at startup, and failing here would
+		// abort the setup steps after this one (disabling the distro caddy.service, enabling mooring).
+		return stepWarning{fmt.Errorf("the Caddy build wasn't installed: %w", err),
+			"Mooring retries it at startup; `sudo mooring doctor` shows the plugin's state."}
+	}
+	fmt.Printf("       installed %s\n", path)
+	return nil
+}
+
+// serviceUserOwner is the mooring service user as an install owner (setup runs as root; the edge runs
+// the binary as mooring). The user is looked up before anything is downloaded.
+func serviceUserOwner() (*edge.Owner, error) {
+	u, err := user.Lookup("mooring")
+	if err != nil {
+		return nil, errors.New("the mooring service user doesn't exist — install the mooring package first")
+	}
+	uid, uerr := strconv.Atoi(u.Uid)
+	gid, gerr := strconv.Atoi(u.Gid)
+	if uerr != nil || gerr != nil {
+		return nil, fmt.Errorf("the mooring service user has a non-numeric uid/gid (%s/%s)", u.Uid, u.Gid)
+	}
+	return &edge.Owner{Uid: uid, Gid: gid}, nil
+}
+
+// dnsProviders returns the distinct dns01 providers (lowercased) of the configured namespaces, in
+// config order.
+func dnsProviders(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, w := range edgeWildcards(cfg) {
+		if p := strings.ToLower(strings.TrimSpace(w.DNS01Provider)); p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// dnsPluginPackages maps the known providers to their Go module paths and Caddy module IDs; an
+// unknown provider is skipped (doctor reports it).
+func dnsPluginPackages(providers []string) (pkgs, moduleIDs []string) {
+	for _, p := range providers {
+		if mod, ok := edge.DNSProviderModule(p); ok {
+			pkgs = append(pkgs, mod)
+			moduleIDs = append(moduleIDs, edge.DNSModuleID(p))
+		}
+	}
+	return pkgs, moduleIDs
+}
+
+// mergePackages returns the distinct packages of a and b, sorted.
+func mergePackages(a, b []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, p := range append(append([]string(nil), a...), b...) {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // --- checks ---
@@ -245,9 +441,14 @@ func (r report) print(w io.Writer) {
 func preflight(l4 bool, cfg *config.Config, runtimeChecks bool) report {
 	managed := cfg == nil || cfg.Edge.Mode == config.EdgeManaged // default mode is managed
 	var r report
-	r.add(checkBinary("caddy", "managed HTTPS edge (:80/:443 + ACME)", "sudo mooring setup --yes"))
+	r.add(checkCaddy(cfg))
 	if managed {
 		r.add(checkDistroService("caddy", ":80/:443 (edge)"))
+	}
+	if cfg != nil && cfg.Edge.Mode == config.EdgeManaged {
+		for _, x := range checkDNSPlugins(cfg) {
+			r.add(x)
+		}
 	}
 	r.add(checkBinary("docker", "container read/write plane", "install Docker + the compose plugin"))
 	r.add(checkDockerDaemons())
@@ -316,6 +517,159 @@ func checkBinary(bin, what, fix string) result {
 		return result{bin, "ok", "found at " + p + " — " + what, ""}
 	}
 	return result{bin, "fail", "MISSING — " + what, fix}
+}
+
+// ownedCaddyMaxAge is when doctor suggests refreshing the Mooring-owned Caddy build, which no
+// package manager updates.
+const ownedCaddyMaxAge = 180 * 24 * time.Hour
+
+// caddyMinSettings names the settings that need edge.MinCaddyVersion (see caddyMinNeeds).
+const caddyMinSettings = "edge.trusted_proxies, dns01 and catch_all"
+
+// caddyMinNeeds lists the configured settings that need Caddy >= edge.MinCaddyVersion; empty when
+// none is set or cfg is nil.
+func caddyMinNeeds(cfg *config.Config) []string {
+	if cfg == nil || cfg.Edge.Mode == config.EdgeExternal {
+		return nil // external mode: Mooring runs no Caddy, so nothing needs its version
+	}
+	var why []string
+	if len(cfg.Edge.TrustedProxies) > 0 {
+		why = append(why, "edge.trusted_proxies")
+	}
+	if len(edgeWildcards(cfg)) > 0 {
+		why = append(why, "dns01")
+	}
+	catchAll := cfg.Edge.CatchAll
+	for _, b := range cfg.Edge.BaseDomains {
+		catchAll = catchAll || b.CatchAll
+	}
+	if catchAll {
+		why = append(why, "catch_all")
+	}
+	return why
+}
+
+// checkCaddy reports the Caddy the edge runs (edge.ResolveCaddy: the Mooring-owned build when
+// present, else the system caddy) and its version. Below edge.MinCaddyVersion it fails only when a
+// setting that needs it is configured.
+func checkCaddy(cfg *config.Config) result {
+	dataDir := doctorDataDir(cfg)
+	bin := edge.ResolveCaddy(dataDir)
+	if bin == "" {
+		return result{"caddy", "fail", "MISSING — managed HTTPS edge (:80/:443 + ACME)", "sudo mooring setup --yes"}
+	}
+	owned := edge.OwnedCaddyPath(dataDir)
+	where := bin
+	if bin == owned {
+		where += " (Mooring-owned build)"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	v, err := edge.CaddyVersion(ctx, bin)
+	if err != nil {
+		return result{"caddy", "warn", "found at " + where + " but could not read its version (" + err.Error() + ")",
+			"check that it runs: " + bin + " version"}
+	}
+	if !v.AtLeast(edge.MinCaddyVersion) {
+		detail := fmt.Sprintf("v%s at %s is older than %s", v, where, edge.MinCaddyVersion)
+		if needs := caddyMinNeeds(cfg); len(needs) > 0 {
+			return result{"caddy", "fail", detail + " — needed by the configured " + strings.Join(needs, ", "),
+				"sudo mooring setup --yes (installs a current Caddy as " + owned + ")"}
+		}
+		why := "nothing configured needs it"
+		if cfg == nil {
+			why = "config.yaml unreadable, so not known whether anything needs it"
+		}
+		return result{"caddy", "warn", detail + " — " + why + " (" + caddyMinSettings + " need " + edge.MinCaddyVersion.String() + "+)",
+			"if config.yaml sets one of those: sudo mooring setup --yes (installs a current Caddy as " + owned + ")"}
+	}
+	if bin == owned {
+		if fi, err := os.Stat(bin); err == nil {
+			if age := time.Since(fi.ModTime()); age > ownedCaddyMaxAge {
+				return result{"caddy", "warn", fmt.Sprintf("found at %s — v%s, installed %d days ago (no package manager updates it)", where, v, int(age.Hours()/24)),
+					"refresh it: sudo rm " + bin + " && sudo mooring setup --yes"}
+			}
+		}
+	}
+	return result{"caddy", "ok", "found at " + where + " — v" + v.String() + ", managed HTTPS edge (:80/:443 + ACME)", ""}
+}
+
+// caddyBuildServerAddr is edge.DefaultBuildServer's host, where plugin builds are downloaded from.
+const caddyBuildServerAddr = "caddyserver.com:443"
+
+// buildServerReachable reports whether a TLS connection to Caddy's build server succeeds. A var so
+// tests can stub it.
+var buildServerReachable = func() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// Intentional: a TLS dial, never a GET — requesting the download endpoint starts a build.
+	conn, err := (&tls.Dialer{}).DialContext(ctx, "tcp", caddyBuildServerAddr)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// checkDNSPlugins reports, per distinct dns01 provider, whether its Caddy module is in the binary the
+// edge runs. A missing one is a warn when caddyserver.com is reachable (Mooring installs a plugin
+// build at startup) and a fail when it isn't. caddyserver.com is dialed at most once.
+func checkDNSPlugins(cfg *config.Config) []result {
+	providers := dnsProviders(cfg)
+	if len(providers) == 0 {
+		return nil
+	}
+	dataDir := doctorDataDir(cfg)
+	owned := edge.OwnedCaddyPath(dataDir)
+	bin := edge.ResolveCaddy(dataDir)
+	var mods map[string]bool
+	var modErr error
+	if bin != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		mods, modErr = edge.CaddyModules(ctx, bin)
+		cancel()
+	}
+	reachable, probed := false, false
+	var out []result
+	for _, p := range providers {
+		name := "dns plugin " + p
+		if _, ok := edge.DNSProviderModule(p); !ok {
+			out = append(out, result{name, "fail", "unknown DNS provider " + strconv.Quote(p) + " — supported: " + strings.Join(edge.KnownDNSProviders(), ", "),
+				"set dns01.provider in config.yaml to a supported provider"})
+			continue
+		}
+		id := edge.DNSModuleID(p)
+		if mods[id] {
+			out = append(out, result{name, "ok", id + " is in " + bin, ""})
+			continue
+		}
+		if !probed {
+			reachable, probed = buildServerReachable(), true
+		}
+		where := "not in " + bin
+		switch {
+		case bin == "":
+			where = "no caddy is installed"
+		case modErr != nil:
+			where = "could not list the modules of " + bin + ": " + modErr.Error()
+		}
+		switch {
+		case !reachable:
+			fix := "allow outbound HTTPS to caddyserver.com, then restart mooring"
+			if bin == "" {
+				fix = "allow outbound HTTPS to caddyserver.com, then sudo mooring setup --yes"
+			}
+			out = append(out, result{name, "fail", id + " missing (" + where + "), and " + caddyBuildServerAddr + " is unreachable (the plugin build is downloaded from there)", fix})
+		case bin == "":
+			// The edge (and its plugin installer) doesn't start without a caddy, so setup installs both.
+			out = append(out, result{name, "warn", id + " missing (" + where + ")",
+				"sudo mooring setup --yes (installs Caddy, then a build with this plugin as " + owned + ")"})
+		default:
+			out = append(out, result{name, "warn", id + " missing (" + where + ") — Mooring installs it at startup as " + owned,
+				"or install it now: sudo mooring setup --yes"})
+		}
+	}
+	return out
 }
 
 // checkDistroService flags a packaged caddy/nginx unit that is active or enabled — it

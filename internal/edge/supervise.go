@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -58,7 +60,11 @@ func VerifyDigest(caddyPath, want string) error {
 // Supervisor launches + supervises the child Caddy. It is fail-closed: if the
 // host can't own the edge, Run logs and returns without starting anything.
 type Supervisor struct {
-	CaddyBin    string
+	CaddyBin string
+	// BinFn, when set, picks the binary at EACH launch (the Mooring-owned plugin build once it exists,
+	// else the system caddy), so a swapped binary takes effect on the next (re)launch. A "" result
+	// falls back to CaddyBin.
+	BinFn       func() string
 	AdminListen string
 	InitialCfg  []byte // the typed base render (Layer 0) — the recovery floor
 	Log         *slog.Logger
@@ -69,28 +75,81 @@ type Supervisor struct {
 	// stdout on os.Stdout as before. Caddy's own logs + errors always stay on STDERR (→ journald),
 	// so nothing here affects error visibility.
 	AccessLine func(line []byte)
+	// Stderr receives Caddy's own logs and errors (nil = os.Stderr → journald). Serve passes a
+	// NewRedactWriter so the dns01 tokens Caddy echoes when it refuses a provider config never reach the
+	// journal. A writer with a Flush() error method is flushed when the child exits.
+	Stderr io.Writer
 	// OnLaunch, when set, runs (in its own goroutine) each time a Caddy child has been started. A
 	// (re)launched child boots on InitialCfg — the route-less base — so the owner must push the full
 	// config again (see Reconciler.ReloadAfterRestart); otherwise every app host answers 404 until the
 	// render next changes.
 	OnLaunch func()
+
+	mu         sync.Mutex
+	cur        *os.Process // the running child, nil between launches
+	restarting bool        // the current child is being stopped by Restart
+}
+
+// bin is the binary for the next launch.
+func (s *Supervisor) bin() string {
+	if s.BinFn != nil {
+		if b := s.BinFn(); b != "" {
+			return b
+		}
+	}
+	if s.CaddyBin != "" {
+		return s.CaddyBin
+	}
+	return "caddy"
+}
+
+// Restart stops the running child so Run relaunches it at once — no backoff, on whatever binary is
+// current (used after the Mooring-owned Caddy is swapped for a build with a new DNS plugin). SIGTERM
+// first so Caddy shuts down gracefully, SIGKILL if it's still running 5s later. A no-op when no
+// child is running.
+func (s *Supervisor) Restart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur == nil {
+		return
+	}
+	s.restarting = true
+	p := s.cur
+	_ = p.Signal(syscall.SIGTERM)
+	// Safe after the process is reaped: os.Process.Kill then returns os.ErrProcessDone.
+	time.AfterFunc(5*time.Second, func() { _ = p.Kill() })
 }
 
 // Run supervises the child with capped backoff until ctx is cancelled. NOTE: the
 // actual process launch + its systemd slice/user/caps/egress-firewall are the OS
 // deployment layer (plan §6); this owns the lifecycle. Not exercised off-Linux.
 func (s *Supervisor) Run(ctx context.Context) {
-	if ok, why := Available(s.CaddyBin); !ok {
+	if ok, why := Available(s.bin()); !ok {
 		s.Log.Warn("managed edge not started", "reason", why)
 		return
 	}
+	s.supervise(ctx)
+}
+
+// supervise is Run's launch loop, without the host check.
+func (s *Supervisor) supervise(ctx context.Context) {
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		start := time.Now()
-		if err := s.launch(ctx); err != nil && ctx.Err() == nil {
+		err := s.launch(ctx)
+		s.mu.Lock()
+		restarted := s.restarting
+		s.restarting = false
+		s.mu.Unlock()
+		if restarted && ctx.Err() == nil {
+			s.Log.Info("edge child restarted", "caddy", s.bin())
+			backoff = time.Second
+			continue // relaunch immediately on the current binary
+		}
+		if err != nil && ctx.Err() == nil {
 			s.Log.Error("edge child exited", "err", err)
 		}
 		if ctx.Err() != nil {
@@ -113,25 +172,17 @@ func (s *Supervisor) Run(ctx context.Context) {
 // launch runs `caddy run` with the resource set the OS layer pins. The admin API
 // is the only control surface; the initial config is the safe base (SBD-8 floor).
 func (s *Supervisor) launch(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, s.CaddyBin, "run", "--config", "-", "--adapter", "")
-	cmd.Stdin = bytes.NewReader(s.InitialCfg)
-	// Pin all of Caddy's storage under the writable /var/lib/caddy: HOME +
-	// XDG_DATA_HOME (certs) + XDG_CONFIG_HOME (autosave config) — otherwise autosave
-	// falls back to $HOME/.config and is fragile under the sandbox.
-	cmd.Env = []string{"HOME=/var/lib/caddy", "XDG_DATA_HOME=/var/lib/caddy", "XDG_CONFIG_HOME=/var/lib/caddy"}
-	cmd.Stderr = os.Stderr // Caddy's own logs + errors always surface in journald (not /dev/null)
-	cmd.WaitDelay = 5 * time.Second
-
 	// STDOUT: normally straight to journald. When an access-log sink is set (edge-measured
 	// autoscaling), pipe stdout into a drain goroutine that hands each line to AccessLine instead.
 	// The access log flows to STDOUT (BaseConfig.AccessLog); errors stay on STDERR, so capturing
 	// stdout never hides an error.
+	var stdout io.Writer = os.Stdout
 	var pw *os.File
 	drained := make(chan struct{})
 	if s.AccessLine != nil {
 		if pr, w, err := os.Pipe(); err == nil {
 			pw = w
-			cmd.Stdout = pw
+			stdout = pw
 			go func() {
 				defer close(drained)
 				s.drainAccess(pr)
@@ -144,20 +195,45 @@ func (s *Supervisor) launch(ctx context.Context) error {
 			// DISCARD stdout rather than routing it to os.Stdout. The signal is disabled this run;
 			// the next launch retries the pipe.
 			s.Log.Warn("edge: access-log capture unavailable; latency signal disabled this run", "err", err.Error())
-			cmd.Stdout = io.Discard
+			stdout = io.Discard
 			close(drained)
 		}
 	} else {
-		cmd.Stdout = os.Stdout
 		close(drained)
 	}
 
+	// Resolve the binary, start it and record it under ONE lock: a Restart() racing this launch then
+	// lands either before (this launch already runs the swapped binary) or after (it stops this child)
+	// — never in between, where it would miss the child and leave the old binary running.
+	s.mu.Lock()
+	cmd := exec.CommandContext(ctx, s.bin(), "run", "--config", "-", "--adapter", "")
+	cmd.Stdin = bytes.NewReader(s.InitialCfg)
+	// Pin all of Caddy's storage under the writable /var/lib/caddy: HOME +
+	// XDG_DATA_HOME (certs) + XDG_CONFIG_HOME (autosave config) — otherwise autosave
+	// falls back to $HOME/.config and is fragile under the sandbox.
+	cmd.Env = []string{"HOME=/var/lib/caddy", "XDG_DATA_HOME=/var/lib/caddy", "XDG_CONFIG_HOME=/var/lib/caddy"}
+	cmd.Stderr = os.Stderr // Caddy's own logs + errors always surface in journald (not /dev/null)
+	if s.Stderr != nil {
+		cmd.Stderr = s.Stderr
+	}
+	cmd.Stdout = stdout
+	cmd.WaitDelay = 5 * time.Second
 	err := cmd.Start()
+	if err == nil {
+		s.cur = cmd.Process
+	}
+	s.mu.Unlock()
 	if err == nil {
 		if s.OnLaunch != nil {
 			go s.OnLaunch()
 		}
 		err = cmd.Wait()
+		s.mu.Lock()
+		s.cur = nil
+		s.mu.Unlock()
+		if f, ok := s.Stderr.(interface{ Flush() error }); ok {
+			_ = f.Flush() // Wait has copied all of the child's stderr; write out a final partial line
+		}
 	}
 	if pw != nil {
 		pw.Close() // close our write end so the drain goroutine sees EOF and exits

@@ -882,6 +882,16 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return nil, err
 	}
+	// A catch-all needs its namespace's DNS plugin for its wildcard certificate: refuse ADDING one while
+	// the plugin is known missing, before anything is built (applyRoutes re-checks on every ingest path).
+	catchAllWarns, cerr := s.catchAllWildcardCheck(slug, def)
+	if cerr != nil {
+		s.gitStore.SetState(bg, slug, "update_blocked")
+		return nil, cerr
+	}
+	for _, w := range catchAllWarns {
+		onLine(w)
+	}
 	composeBytes, gerr := definition.ComposeBytesAt(def, sha)
 	if gerr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")

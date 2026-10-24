@@ -133,6 +133,10 @@ type Deps struct {
 	APITokens    *apitoken.Store             // scoped read/deploy API tokens (M19; may be nil → /api/v1 disabled)
 	Backups      *backupstore.Store          // encrypted Mooring-state backups (may be nil)
 	CronStore    *cronstore.Store            // scheduled-task last-run bookkeeping (may be nil → cron disabled)
+
+	// EdgeDNSPlugins is the per-provider Caddy DNS plugin state (nil when no namespace uses dns01 or the
+	// edge isn't owned). The catch-all deploy gate, the catch-all watch and the Edge page read it.
+	EdgeDNSPlugins *edge.DNSPlugins
 }
 
 // Server holds everything the request pipeline needs. Construct with New.
@@ -163,6 +167,11 @@ type Server struct {
 	cronStore      *cronstore.Store                       // scheduled-task last-run bookkeeping (may be nil)
 	edgeRoutes     *edge.RouteStore                       // managed-edge routes (may be nil)
 	edgeRecon      *edge.Reconciler                       // edge config reconciler (nil when edge unowned)
+	edgeDNSPlugins *edge.DNSPlugins                       // per-provider Caddy DNS plugin state (may be nil)
+	catchAllProbe  func(context.Context, string) error    // test seam: replaces the local-edge wildcard probe (catchall_watch.go)
+	catchAllMu     sync.Mutex                             // guards catchAllFails/catchAllDark
+	catchAllFails  map[string]int                         // apex → consecutive failed wildcard probes
+	catchAllDark   map[string]string                      // apex → why its catch-all serves no certificate
 	edgeAlertMu    sync.Mutex                             // guards edgeAlerted
 	edgeAlerted    map[string]bool                        // route key → an "unroutable" alert is open (edge_status.go)
 	daemonMu       sync.Mutex                             // guards daemonMismatch/daemonDetail (daemon_check.go)
@@ -275,6 +284,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		deployQueue:   newDeployQueue(),
 		logStreams:    make(chan struct{}, maxConcurrentLogStreams),
 	}
+	s.edgeDNSPlugins = d.EdgeDNSPlugins
 	s.sweepDiscoveryScratch() // clear any orphaned multi-file-connect scratch dirs from a prior run
 	sec, err := buildSecState(cfg)
 	if err != nil {

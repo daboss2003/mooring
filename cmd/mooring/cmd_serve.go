@@ -509,6 +509,7 @@ func cmdServe(args []string) error {
 		}
 	}
 	var edgeRecon *edge.Reconciler
+	var dnsPlugins *edge.DNSPlugins     // per-provider Caddy DNS plugin state (nil without dns01 or an owned edge)
 	var edgeAgg *edgemetrics.Aggregator // edge-measured latency/req-rate for source:edge autoscaling (nil unless the edge is owned)
 	edgeReason := ""
 	if cfg.Edge.Mode == config.EdgeManaged {
@@ -527,29 +528,72 @@ func cmdServe(args []string) error {
 		if dk, derr := config.DecodeKey(cfg.EncryptionKey); derr == nil {
 			base.LBCookieSecret = edge.DeriveLBCookieSecret(dk)
 		}
-		// Per-namespace DNS-01 wildcards. Install each DISTINCT provider's Caddy plugin (add-package
-		// accumulates modules into the binary), and include a namespace's wildcard in the rendered
-		// config ONLY if its provider module is actually present. This ISOLATES failures: one
-		// namespace's missing/failed DNS plugin can never make Caddy reject the whole /load and deny
-		// routes to every OTHER namespace (including pure HTTP-01 apps with no dns01 at all). A
-		// namespace whose module is unavailable falls back to per-name HTTP-01 for its subdomains
-		// (issued only if HTTP-reachable), logged loudly.
-		providerOK := map[string]bool{}
-		for _, w := range edgeWildcards(cfg) {
-			if _, done := providerOK[w.DNS01Provider]; !done {
-				ierr := edge.EnsureDNSProvider(ctx, "caddy", w.DNS01Provider, log)
-				providerOK[w.DNS01Provider] = ierr == nil
-				if ierr != nil {
-					log.Warn("edge: Caddy DNS plugin unavailable — wildcards using it fall back to per-name HTTP-01 until it's installed",
-						"provider", w.DNS01Provider, "err", ierr.Error())
-				}
-			}
-			if providerOK[w.DNS01Provider] {
-				log.Info("edge: issuing a *."+w.Domain+" wildcard cert via ACME DNS-01", "provider", w.DNS01Provider)
-				base.Wildcards = append(base.Wildcards, w)
+		// Per-namespace DNS-01 wildcards. A namespace's wildcard is rendered ONLY while its provider's
+		// Caddy module is in the RUNNING binary: a wildcard whose module is missing makes Caddy reject
+		// the whole /load, which would deny routes to every OTHER namespace (and to pure HTTP-01 apps)
+		// too. A missing plugin is installed in the background as the Mooring-owned Caddy build
+		// (<data_dir>/bin/caddy — a packaged caddy is read-only under the unit's ProtectSystem=strict):
+		// the edge starts now on the binary it has, and restarts on the new one once the install lands,
+		// with failures retried on a backoff (edge.DNSPluginInstaller). Until then that namespace's
+		// subdomains fall back to per-name HTTP-01 and a catch-all on it has no certificate.
+		wildcards := edgeWildcards(cfg)
+		var dnsInstaller *edge.DNSPluginInstaller
+		var providers []string
+		seenProvider := map[string]bool{}
+		for _, w := range wildcards {
+			if p := strings.ToLower(strings.TrimSpace(w.DNS01Provider)); p != "" && !seenProvider[p] {
+				seenProvider[p] = true
+				providers = append(providers, p)
 			}
 		}
-		if ok, why := edge.Available(""); ok {
+		// Intentional: when Mooring itself runs as root (unsupported — the shipped unit runs it as
+		// `mooring`), the Mooring-owned Caddy build is OFF everywhere (resolve, check, install): it lives
+		// in data_dir, which a non-root account may control, so launching it as root would hand root to
+		// that account. The edge runs only the system caddy, and a plugin it lacks is reported as
+		// unavailable (deploy gate, catch-all alert, Edge page) instead of being installed.
+		asRoot := os.Geteuid() == 0
+		ownedDir := cfg.DataDir
+		if asRoot {
+			ownedDir = "" // ResolveCaddy("") never picks the owned build
+		}
+		var missing []string
+		if len(providers) > 0 {
+			dnsPlugins = edge.NewDNSPlugins(providers)
+			// The installer always exists when a namespace uses dns01: even when it can't install (as root),
+			// its Sync sets the plugin state from each launched binary.
+			dnsInstaller = &edge.DNSPluginInstaller{DataDir: ownedDir, Providers: providers, State: dnsPlugins, Log: log}
+			missing = dnsInstaller.Check(ctx)
+			if len(missing) > 0 && asRoot {
+				for _, p := range missing {
+					dnsPlugins.MarkUnavailable(p, "Mooring is running as root, so it installs no Caddy DNS plugin — run it as the mooring user (the shipped systemd unit), or use a caddy that has this provider's module")
+				}
+				log.Warn("edge: Caddy DNS plugin missing and Mooring runs as root — not installing; those wildcards stay off",
+					"providers", strings.Join(missing, ","))
+				missing = nil
+			}
+		}
+		activeWildcards := func() []edge.WildcardCert {
+			var out []edge.WildcardCert
+			for _, w := range wildcards {
+				if dnsPlugins.Active(w.DNS01Provider, w.Domain) {
+					out = append(out, w)
+				}
+			}
+			return out
+		}
+		base.Wildcards = activeWildcards()
+		caddyBin := func() string { return edge.ResolveCaddy(ownedDir) }
+		ok, why := edge.Available(caddyBin())
+		if !ok {
+			// No edge here: nothing will install or serve these plugins. Say so instead of "installing".
+			for _, p := range missing {
+				dnsPlugins.MarkUnavailable(p, "the managed edge isn't running on this host: "+why)
+			}
+		} else if len(missing) > 0 {
+			log.Warn("edge: Caddy DNS plugin missing — installing a Mooring-owned Caddy build in the background; its wildcards stay off until it lands",
+				"providers", strings.Join(missing, ","), "path", edge.OwnedCaddyPath(cfg.DataDir))
+		}
+		if ok {
 			admin := edge.NewAdmin(base.AdminListen)
 			edgeRecon = edge.NewReconciler(edgeRoutes, admin, base, log)
 			// cert_bindings: the edge issues a cert-only ACME subject per hostname, from
@@ -562,10 +606,57 @@ func cmdServe(args []string) error {
 				}
 				return out
 			})
-			sup := &edge.Supervisor{CaddyBin: "caddy", AdminListen: base.AdminListen, Log: log}
-			// A (re)launched Caddy boots on the route-less base config: push the full config again at
-			// once (an unchanged render would otherwise be skipped as already applied → 404 everywhere).
-			sup.OnLaunch = func() { edgeRecon.ReloadAfterRestart(ctx) }
+			// Re-read each cycle: a wildcard joins the render once its plugin is in the running binary.
+			edgeRecon.SetWildcards(activeWildcards)
+			// A wildcard Caddy refuses (e.g. a provider whose module takes credentials other than
+			// `api_token`, or a malformed token) is dropped for its namespace only, so it isn't offered
+			// again; every other route and namespace keeps working. err has the tokens redacted.
+			edgeRecon.SetWildcardReject(func(w edge.WildcardCert, err error) {
+				dnsPlugins.RejectNamespace(w.Domain, err.Error())
+			})
+			// BinFn re-resolves at every launch, so the Mooring-owned build takes over on the restart
+			// that follows a plugin install.
+			sup := &edge.Supervisor{CaddyBin: "caddy", BinFn: caddyBin, AdminListen: base.AdminListen, Log: log}
+			// Caddy logs the error of a refused /load, which can carry a dns01 token (a provider module
+			// echoes one it finds malformed): keep the tokens out of the journal.
+			var tokens []string
+			for _, w := range wildcards {
+				tokens = append(tokens, w.DNS01Token)
+			}
+			sup.Stderr = edge.NewRedactWriter(os.Stderr, tokens)
+			// A (re)launched Caddy boots on the route-less base config: push the full config again at once
+			// (an unchanged render would otherwise be skipped as already applied → 404 everywhere). On the
+			// same binary as before, that push already carries the wildcards. On a new one they wait until
+			// Sync has read which DNS plugins IT has — reading them runs the binary, which mustn't hold the
+			// routes back on a busy host — and a second push adds them.
+			sup.OnLaunch = func() {
+				var gen uint64
+				if dnsInstaller != nil {
+					gen = dnsInstaller.Launched()
+				}
+				edgeRecon.ReloadAfterRestart(ctx)
+				if dnsInstaller == nil {
+					return
+				}
+				if read, enabled := dnsInstaller.Sync(ctx, gen); read {
+					for _, w := range activeWildcards() {
+						log.Info("edge: issuing a *."+w.Domain+" wildcard cert via ACME DNS-01", "provider", w.DNS01Provider)
+					}
+					if enabled {
+						edgeRecon.ReloadAfterRestart(ctx)
+					}
+				}
+			}
+			if dnsInstaller != nil {
+				// Set even when nothing is missing now: Sync restarts the install loop if a module later
+				// disappears from the binary (e.g. a package upgrade replaced the system caddy).
+				dnsInstaller.OnSwap = sup.Restart
+				if len(missing) > 0 {
+					dnsInstaller.Start(ctx)
+				}
+				wg.Add(1)
+				go func() { defer wg.Done(); <-ctx.Done(); dnsInstaller.Wait() }()
+			}
 
 			// Edge-measured autoscaling signals (source:edge). The edge emits a per-request access
 			// log to STDOUT (only while some enabled policy uses a source:edge metric — the reactive
@@ -760,6 +851,9 @@ func cmdServe(args []string) error {
 		CronStore:    cronStore,
 		APITokens:    apiTokenStore,
 		Backups:      backupStore,
+
+		// The catch-all deploy gate, catch-all watch and Edge page read the DNS plugin state.
+		EdgeDNSPlugins: dnsPlugins,
 	})
 	if err != nil {
 		return err
@@ -841,6 +935,9 @@ func cmdServe(args []string) error {
 		edgeRecon.SetPoolDiscoverer(srv.DiscoverEdgePools)
 		edgeRecon.SetStatusHook(srv.OnEdgeRouteStatus)
 		edgePool = edgeRecon
+		// Alerts (and flags on the Edge page) while a stored catch-all serves no certificate.
+		wg.Add(1)
+		go func() { defer wg.Done(); srv.RunCatchAllWatch(ctx) }()
 	}
 
 	// Self-healing supervisor (M13, plan §8.5): a bounded watcher at the poll cadence

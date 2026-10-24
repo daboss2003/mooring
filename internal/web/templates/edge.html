@@ -9,6 +9,7 @@
     never reach the control plane (control-plane ports are refused).</p>
   <div class="notice">Read-only — edit routes in your app's <code>mooring.yaml</code> (<code>spec.edge.routes</code>) and deploy. This page shows the routes from the last deploy.</div>
   {{if .Reason}}<div class="error" role="alert">Edge not owned on this host: {{.Reason}}. Routes apply once the edge is up.</div>{{end}}
+  {{range .Dark}}<div class="error" role="alert">Catch-all <code>*.{{.Apex}}</code> serves no certificate — every name it catches fails TLS: {{.Cause}}</div>{{end}}
 
   <section class="panel">
     <h2>Routes</h2>
@@ -30,6 +31,48 @@
     </table></div>
     {{else}}<p class="muted">No routes deployed yet — declare them under <code>spec.edge.routes</code> in your app's <code>mooring.yaml</code> and deploy.</p>{{end}}
   </section>
+
+  {{if .Plugins}}
+  <section class="panel">
+    <h2>DNS-01 plugins</h2>
+    <p class="muted">A namespace with <code>dns01</code> issues its wildcard certificate through its DNS provider's Caddy plugin.
+      A missing plugin is installed in the background and retried on failure; until it is installed, that namespace's
+      subdomains use per-name certificates and a catch-all on it has no certificate.</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Provider</th><th>State</th><th>Last error</th></tr></thead>
+      <tbody>
+        {{range .Plugins}}
+        <tr>
+          <td class="mono">{{.Provider}}</td>
+          <td>{{if eq .State "failed"}}install failed{{if .NextRetry}} — next retry {{template "ts" .NextRetry}}{{end}}, {{.Attempts}} attempt(s)
+            {{- else if eq .State "permanent"}}not installable (no retry)
+            {{- else if eq .State "unreadable"}}module check failed (retrying)
+            {{- else if eq .State "installing"}}installing{{if .Attempts}} (retry after {{.Attempts}} failed attempt(s)){{end}}
+            {{- else}}{{.State}}{{end}}</td>
+          <td class="mono">{{if .Err}}{{.Err}}{{else}}—{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{if .Refused}}
+    <h3>Wildcards refused by Caddy</h3>
+    <p class="muted">Caddy refused these namespaces' DNS-01 config, so they are served without their wildcard certificate until
+      Mooring restarts. Mooring passes the <code>dns01</code> token to the provider as <code>api_token</code>: a provider that
+      needs other credentials, or a token in the wrong format, is refused.</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Namespace</th><th>Caddy's error</th></tr></thead>
+      <tbody>
+        {{range .Refused}}
+        <tr>
+          <td class="mono">*.{{.Apex}}</td>
+          <td class="mono">{{.Reason}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{end}}
+  </section>
+  {{end}}
 {{end}}
 </main>
 {{template "bottom" .}}

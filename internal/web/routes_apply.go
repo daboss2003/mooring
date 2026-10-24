@@ -337,6 +337,7 @@ func (s *Server) adviseSubdomainDNS(ctx context.Context, def *definition.Definit
 func (s *Server) applyRoutes(ctx context.Context, project string, def *definition.Definition) error {
 	if s.edgeRoutes != nil {
 		routes := make([]edge.Route, 0, len(def.Spec.Edge.Routes))
+		var storedCatchAlls map[string]bool // this app's catch-alls as stored BEFORE ReplaceProject (read once, when needed)
 		for _, r := range def.Spec.Edge.Routes {
 			port := r.Port
 			if port == 0 {
@@ -377,6 +378,17 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 				// namespace's "everything else" is refused, naming both apps.
 				if owner, taken, oerr := s.edgeRoutes.CatchAllOwner(ctx, apex, project); oerr == nil && taken {
 					return fmt.Errorf("the catch-all for namespace %q is already owned by app %q — only one app per namespace may claim it", apex, owner)
+				}
+				// Its wildcard certificate needs the namespace's DNS plugin: a NEW catch-all is refused while
+				// that plugin is known missing; one this app already has is kept (catchall_watch.go). Like the
+				// gates above, this covers every ingest path.
+				if s.edgeDNSPlugins != nil && !s.edgeDNSPlugins.Active(bd.DNS01.Provider, apex) {
+					if storedCatchAlls == nil {
+						storedCatchAlls = s.storedCatchAllHosts(project)
+					}
+					if _, err := s.catchAllPluginGate(apex, bd.DNS01.Provider, storedCatchAlls[strings.ToLower(strings.TrimSpace(host))]); err != nil {
+						return err
+					}
 				}
 			}
 			// A route may opt into a private CA by name; it MUST be defined in the

@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/docker"
+	"github.com/daboss2003/mooring/internal/edge"
 )
 
 func TestCheckBinary(t *testing.T) {
@@ -507,5 +511,419 @@ func TestEvalDaemonMatch(t *testing.T) {
 	both := evalDaemonMatch(docker.Info{}, errors.New("proxy down"), "", errors.New("cli down"))
 	if !strings.Contains(both.detail, "proxy down") || !strings.Contains(both.detail, "cli down") {
 		t.Errorf("both sides failing should report both reasons: %q", both.detail)
+	}
+}
+
+// fakeCaddy writes a #!/bin/sh stand-in for caddy at path: `version` prints ver, and `list-modules`
+// prints mods one per line, then a blank line and a summary, like the real command.
+func fakeCaddy(t *testing.T, path, ver string, mods ...string) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\ncase \"$1\" in\nversion) echo '" + ver + "' ;;\nlist-modules)\n")
+	for _, m := range mods {
+		b.WriteString("  echo '" + m + "'\n")
+	}
+	b.WriteString("  echo ''\n  echo '  Standard modules: 1'\n  ;;\n*) exit 1 ;;\nesac\n")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// caddyHost isolates a test from the host's caddy and data dir: PATH is an empty temp dir (put a
+// system caddy at filepath.Join(pathDir, "caddy")) and cfg.DataDir is another temp dir.
+func caddyHost(t *testing.T) (pathDir string, cfg *config.Config) {
+	t.Helper()
+	pathDir = t.TempDir()
+	t.Setenv("PATH", pathDir)
+	return pathDir, &config.Config{DataDir: t.TempDir(), Edge: config.EdgeConfig{Mode: config.EdgeManaged}}
+}
+
+// withDNS01 configures the default namespace with providers[0] and a named namespace for each other
+// provider.
+func withDNS01(cfg *config.Config, providers ...string) {
+	cfg.Edge.BaseDomain = "example.com"
+	cfg.Edge.DNS01 = &config.EdgeDNS01{Provider: providers[0], APIToken: "token"}
+	for i, p := range providers[1:] {
+		name := string(rune('a' + i))
+		cfg.Edge.BaseDomains = append(cfg.Edge.BaseDomains, config.EdgeBaseDomain{
+			Name: "ns" + name, Domain: "ns" + name + ".example.net", DNS01: &config.EdgeDNS01{Provider: p, APIToken: "token"},
+		})
+	}
+}
+
+// stubBuildServer replaces the caddyserver.com dial for the test and returns its call count.
+func stubBuildServer(t *testing.T, reachable bool) *int {
+	t.Helper()
+	calls := 0
+	orig := buildServerReachable
+	buildServerReachable = func() bool { calls++; return reachable }
+	t.Cleanup(func() { buildServerReachable = orig })
+	return &calls
+}
+
+func TestCheckCaddy(t *testing.T) {
+	t.Run("missing", func(t *testing.T) {
+		_, cfg := caddyHost(t)
+		r := checkCaddy(cfg)
+		if r.name != "caddy" || r.state != "fail" || !strings.Contains(r.detail, "MISSING") || r.fix != "sudo mooring setup --yes" {
+			t.Errorf("no caddy = %+v, want a MISSING fail with the setup fix", r)
+		}
+	})
+
+	t.Run("current system caddy", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x")
+		r := checkCaddy(cfg)
+		if r.state != "ok" || !strings.Contains(r.detail, "v2.11.2") || !strings.Contains(r.detail, filepath.Join(dir, "caddy")) {
+			t.Errorf("2.11.2 = %+v, want ok naming the version and path", r)
+		}
+	})
+
+	t.Run("old caddy fails only when a setting needs 2.11", func(t *testing.T) {
+		cases := []struct {
+			name string
+			set  func(*config.Config)
+			want string
+		}{
+			{"nothing needs it", func(*config.Config) {}, "warn"},
+			{"trusted_proxies", func(c *config.Config) { c.Edge.TrustedProxies = []string{"cloudflare"} }, "fail"},
+			{"default dns01", func(c *config.Config) { withDNS01(c, "cloudflare") }, "fail"},
+			{"named namespace dns01", func(c *config.Config) {
+				c.Edge.BaseDomains = []config.EdgeBaseDomain{{Name: "staging", Domain: "staging.example.com", DNS01: &config.EdgeDNS01{Provider: "cloudflare", APIToken: "token"}}}
+			}, "fail"},
+			{"edge.catch_all", func(c *config.Config) { c.Edge.CatchAll = true }, "fail"},
+			{"base_domains catch_all", func(c *config.Config) {
+				c.Edge.BaseDomains = []config.EdgeBaseDomain{{Name: "staging", Domain: "staging.example.com", CatchAll: true}}
+			}, "fail"},
+		}
+		for _, c := range cases {
+			dir, cfg := caddyHost(t)
+			fakeCaddy(t, filepath.Join(dir, "caddy"), "2.6.2")
+			c.set(cfg)
+			r := checkCaddy(cfg)
+			if r.state != c.want {
+				t.Errorf("%s: 2.6.2 = %q (%s), want %q", c.name, r.state, r.detail, c.want)
+			}
+			if !strings.Contains(r.detail, "2.6.2") || !strings.Contains(r.detail, filepath.Join(dir, "caddy")) || !strings.Contains(r.fix, edge.OwnedCaddyPath(cfg.DataDir)) {
+				t.Errorf("%s: %+v must name the version, the path and the owned build in the fix", c.name, r)
+			}
+		}
+	})
+
+	t.Run("owned build is preferred", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "2.6.2")
+		owned := edge.OwnedCaddyPath(cfg.DataDir)
+		fakeCaddy(t, owned, "v2.11.2 h1:x")
+		cfg.Edge.TrustedProxies = []string{"cloudflare"}
+		r := checkCaddy(cfg)
+		if r.state != "ok" || !strings.Contains(r.detail, owned+" (Mooring-owned build)") {
+			t.Errorf("owned build = %+v, want ok naming the Mooring-owned build", r)
+		}
+	})
+
+	t.Run("stale owned build", func(t *testing.T) {
+		_, cfg := caddyHost(t)
+		owned := edge.OwnedCaddyPath(cfg.DataDir)
+		fakeCaddy(t, owned, "v2.11.2 h1:x")
+		old := time.Now().Add(-200 * 24 * time.Hour)
+		if err := os.Chtimes(owned, old, old); err != nil {
+			t.Fatal(err)
+		}
+		r := checkCaddy(cfg)
+		if r.state != "warn" || !strings.Contains(r.detail, "Mooring-owned build") || r.fix != "refresh it: sudo rm "+owned+" && sudo mooring setup --yes" {
+			t.Errorf("200-day-old owned build = %+v, want a refresh warn", r)
+		}
+	})
+
+	t.Run("unreadable version", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "(devel)")
+		if r := checkCaddy(cfg); r.state != "warn" || !strings.Contains(r.detail, "could not read its version") {
+			t.Errorf("(devel) build = %+v, want a warn", r)
+		}
+	})
+}
+
+func TestCaddyMinNeeds(t *testing.T) {
+	if got := caddyMinNeeds(nil); len(got) != 0 {
+		t.Errorf("nil config needs %v, want nothing (doctor warns)", got)
+	}
+	cfg := &config.Config{}
+	if got := caddyMinNeeds(cfg); len(got) != 0 {
+		t.Errorf("empty config needs %v", got)
+	}
+	cfg.Edge.TrustedProxies = []string{"192.0.2.0/24"}
+	withDNS01(cfg, "cloudflare")
+	cfg.Edge.CatchAll = true
+	if got, want := caddyMinNeeds(cfg), []string{"edge.trusted_proxies", "dns01", "catch_all"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("caddyMinNeeds = %v, want %v", got, want)
+	}
+}
+
+func TestCheckDNSPlugins(t *testing.T) {
+	t.Run("no dns01", func(t *testing.T) {
+		_, cfg := caddyHost(t)
+		calls := stubBuildServer(t, true)
+		if got := checkDNSPlugins(cfg); len(got) != 0 || *calls != 0 {
+			t.Errorf("no dns01 = %+v (dials %d), want no results and no dial", got, *calls)
+		}
+	})
+
+	t.Run("present", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x", "http", "dns.providers.cloudflare")
+		withDNS01(cfg, "cloudflare")
+		calls := stubBuildServer(t, false)
+		got := checkDNSPlugins(cfg)
+		if len(got) != 1 || got[0].name != "dns plugin cloudflare" || got[0].state != "ok" {
+			t.Fatalf("present = %+v, want one ok", got)
+		}
+		if *calls != 0 {
+			t.Errorf("caddyserver.com dialed %d times with every plugin present", *calls)
+		}
+	})
+
+	t.Run("present in the owned build", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "2.6.2")
+		owned := edge.OwnedCaddyPath(cfg.DataDir)
+		fakeCaddy(t, owned, "v2.11.2 h1:x", "dns.providers.cloudflare")
+		withDNS01(cfg, "cloudflare")
+		stubBuildServer(t, false)
+		if got := checkDNSPlugins(cfg); len(got) != 1 || got[0].state != "ok" || !strings.Contains(got[0].detail, owned) {
+			t.Errorf("owned build with the module = %+v, want ok naming %s", got, owned)
+		}
+	})
+
+	t.Run("missing, build server reachable", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x", "http")
+		withDNS01(cfg, "cloudflare")
+		stubBuildServer(t, true)
+		got := checkDNSPlugins(cfg)
+		if len(got) != 1 || got[0].state != "warn" {
+			t.Fatalf("missing+reachable = %+v, want one warn", got)
+		}
+		if want := "Mooring installs it at startup as " + edge.OwnedCaddyPath(cfg.DataDir); !strings.Contains(got[0].detail, want) {
+			t.Errorf("detail %q, want it to contain %q", got[0].detail, want)
+		}
+		if got[0].fix != "or install it now: sudo mooring setup --yes" {
+			t.Errorf("fix = %q", got[0].fix)
+		}
+	})
+
+	t.Run("missing, build server unreachable, dialed once", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x", "http")
+		withDNS01(cfg, "cloudflare", "route53")
+		calls := stubBuildServer(t, false)
+		got := checkDNSPlugins(cfg)
+		if len(got) != 2 || got[0].name != "dns plugin cloudflare" || got[1].name != "dns plugin route53" {
+			t.Fatalf("got %+v, want one result per provider", got)
+		}
+		for _, r := range got {
+			if r.state != "fail" || !strings.Contains(r.detail, "caddyserver.com:443 is unreachable") || r.fix != "allow outbound HTTPS to caddyserver.com, then restart mooring" {
+				t.Errorf("missing+unreachable = %+v, want a fail naming caddyserver.com", r)
+			}
+		}
+		if *calls != 1 {
+			t.Errorf("caddyserver.com dialed %d times, want once per preflight", *calls)
+		}
+	})
+
+	t.Run("no caddy at all", func(t *testing.T) {
+		_, cfg := caddyHost(t)
+		withDNS01(cfg, "cloudflare")
+		stubBuildServer(t, true)
+		if got := checkDNSPlugins(cfg); len(got) != 1 || got[0].state != "warn" || !strings.Contains(got[0].fix, "sudo mooring setup --yes") {
+			t.Errorf("no caddy = %+v, want a warn pointing at setup", got)
+		}
+	})
+
+	t.Run("unknown provider", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x")
+		withDNS01(cfg, "nosuchdns")
+		calls := stubBuildServer(t, true)
+		got := checkDNSPlugins(cfg)
+		if len(got) != 1 || got[0].name != "dns plugin nosuchdns" || got[0].state != "fail" || !strings.Contains(got[0].detail, "cloudflare") {
+			t.Errorf("unknown provider = %+v, want a fail listing the supported providers", got)
+		}
+		if *calls != 0 {
+			t.Errorf("an unknown provider must not dial the build server (%d dials)", *calls)
+		}
+	})
+
+	t.Run("providers are deduplicated case-insensitively", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x", "dns.providers.cloudflare")
+		withDNS01(cfg, "Cloudflare", "cloudflare")
+		stubBuildServer(t, true)
+		if got := checkDNSPlugins(cfg); len(got) != 1 || got[0].name != "dns plugin cloudflare" || got[0].state != "ok" {
+			t.Errorf("got %+v, want one ok for cloudflare", got)
+		}
+	})
+}
+
+// ownedStep returns the plan's Mooring-owned Caddy build step and its index (-1 when absent).
+func ownedStep(steps []step) (step, int) {
+	for i, s := range steps {
+		if strings.HasPrefix(s.desc, ownedCaddyStepPrefix) {
+			return s, i
+		}
+	}
+	return step{}, -1
+}
+
+func stepIndex(steps []step, desc string) int {
+	for i, s := range steps {
+		if s.desc == desc {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestPlanOwnedCaddyBuild(t *testing.T) {
+	t.Run("system caddy already has the module", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		// The edge runs this caddy (no owned build) and it has both modules: nothing to download,
+		// matching doctor and the runtime installer.
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x", "dns.providers.cloudflare", "dns.providers.route53")
+		withDNS01(cfg, "cloudflare", "route53")
+		if _, i := ownedStep(plan(false, false, false, cfg)); i >= 0 {
+			t.Error("the caddy the edge runs has the modules: no owned build expected")
+		}
+	})
+
+	t.Run("dns01 module missing from the caddy the edge runs", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x", "dns.providers.route53")
+		withDNS01(cfg, "cloudflare", "route53")
+		steps := plan(false, false, false, cfg)
+		s, i := ownedStep(steps)
+		if i < 0 {
+			t.Fatalf("no owned-build step in %v", steps)
+		}
+		owned := edge.OwnedCaddyPath(cfg.DataDir)
+		want := "install a Caddy build with dns.providers.cloudflare, dns.providers.route53 as " + owned + " (from caddyserver.com; checked before use, the previous build kept as .bak)"
+		if s.desc != want {
+			t.Errorf("desc:\n got %q\nwant %q", s.desc, want)
+		}
+		if stepIndex(steps, "install caddy") >= 0 {
+			t.Error("a caddy is installed: the apt steps must not be planned")
+		}
+		// The dry run prints only: nothing is downloaded or written.
+		if err := s.do(); err != nil {
+			t.Fatalf("dry-run do() = %v", err)
+		}
+		if _, err := os.Stat(filepath.Dir(owned)); !os.IsNotExist(err) {
+			t.Errorf("the dry run created %s (err=%v)", filepath.Dir(owned), err)
+		}
+	})
+
+	t.Run("owned build already has the module", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "2.6.2")
+		fakeCaddy(t, edge.OwnedCaddyPath(cfg.DataDir), "v2.11.2 h1:x", "dns.providers.cloudflare")
+		withDNS01(cfg, "cloudflare")
+		if _, i := ownedStep(plan(false, false, false, cfg)); i >= 0 {
+			t.Error("owned build has the module and a current version: no step expected")
+		}
+	})
+
+	t.Run("no caddy at all: apt first, then the plugin build", func(t *testing.T) {
+		_, cfg := caddyHost(t)
+		withDNS01(cfg, "cloudflare")
+		steps := plan(false, false, false, cfg)
+		apt := stepIndex(steps, "install caddy")
+		_, i := ownedStep(steps)
+		if apt < 0 || i < 0 || i != apt+1 {
+			t.Errorf("want the owned-build step right after the apt install, got apt=%d owned=%d", apt, i)
+		}
+	})
+
+	t.Run("old caddy and a setting that needs 2.11", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "2.6.2")
+		cfg.Edge.TrustedProxies = []string{"cloudflare"}
+		s, i := ownedStep(plan(false, false, false, cfg))
+		if i < 0 || !strings.HasPrefix(s.desc, ownedCaddyStepPrefix+"no plugins as ") {
+			t.Errorf("2.6.2 + trusted_proxies: want a plain owned build, got %q", s.desc)
+		}
+	})
+
+	t.Run("old caddy, nothing needs 2.11", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "2.6.2")
+		if _, i := ownedStep(plan(false, false, false, cfg)); i >= 0 {
+			t.Error("the distro caddy is enough here: no owned build expected")
+		}
+	})
+
+	t.Run("no dns01 and a current caddy", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x")
+		steps := plan(false, false, false, cfg)
+		if _, i := ownedStep(steps); i >= 0 || stepIndex(steps, "install caddy") >= 0 {
+			t.Errorf("nothing caddy-related to do, got %v", steps)
+		}
+	})
+
+	t.Run("external edge mode never plans a plugin build", func(t *testing.T) {
+		dir, cfg := caddyHost(t)
+		fakeCaddy(t, filepath.Join(dir, "caddy"), "v2.11.2 h1:x")
+		cfg.Edge.Mode = config.EdgeExternal
+		withDNS01(cfg, "cloudflare")
+		if _, i := ownedStep(plan(false, false, false, cfg)); i >= 0 {
+			t.Error("Mooring runs no Caddy in external mode: no plugin build expected")
+		}
+	})
+}
+
+// The reachability probe dials the build server InstallPluginBuild downloads from.
+func TestCaddyBuildServerAddr(t *testing.T) {
+	host := strings.TrimSuffix(caddyBuildServerAddr, ":443")
+	if !strings.HasPrefix(edge.DefaultBuildServer, "https://"+host+"/") {
+		t.Errorf("probe dials %s but builds come from %s", caddyBuildServerAddr, edge.DefaultBuildServer)
+	}
+}
+
+// A failed Caddy build is a warning (the next steps still run) and is not counted as installed, so
+// setup doesn't tell the operator to restart onto a build that isn't there. Any other step error stops
+// setup.
+func TestApplyStepsWarningIsNotAnInstall(t *testing.T) {
+	var ran []string
+	mark := func(name string, err error) func() error {
+		return func() error { ran = append(ran, name); return err }
+	}
+	failedBuild := stepWarning{errors.New("download: dial tcp: no route to host"), "Mooring retries it at startup."}
+	var out bytes.Buffer
+	swapped, err := applySteps(&out, []step{
+		{ownedCaddyStepPrefix + "dns.providers.cloudflare as /x", mark("build", failedBuild)},
+		{"enable the mooring service (start on boot)", mark("enable", nil)},
+	})
+	if err != nil || swapped {
+		t.Errorf("swapped=%v err=%v; want a warning, not an install", swapped, err)
+	}
+	if strings.Join(ran, ",") != "build,enable" {
+		t.Errorf("ran %v; the step after a warning must still run", ran)
+	}
+	if !strings.Contains(out.String(), "WARNING: download: dial tcp: no route to host") || !strings.Contains(out.String(), "Mooring retries it at startup.") {
+		t.Errorf("output = %q", out.String())
+	}
+
+	swapped, err = applySteps(io.Discard, []step{{ownedCaddyStepPrefix + "dns.providers.cloudflare as /x", mark("build", nil)}})
+	if err != nil || !swapped {
+		t.Errorf("a build that installed must count: swapped=%v err=%v", swapped, err)
+	}
+
+	ran = nil
+	if _, err := applySteps(io.Discard, []step{{"apt-get update", mark("apt", errors.New("exit 100"))}, {"later", mark("later", nil)}}); err == nil || len(ran) != 1 {
+		t.Errorf("a real failure must stop setup: err=%v ran=%v", err, ran)
 	}
 }

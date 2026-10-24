@@ -87,7 +87,7 @@ edge:
   acme_email: "ops@example.com"       # REQUIRED in managed mode
   acme_ca: "https://acme-v02.api.letsencrypt.org/directory"
   base_domain: "example.com"          # optional: enables the `subdomain:` shorthand
-  dns01: { provider: cloudflare, api_token: "..." }   # optional: one wildcard cert; module auto-installed
+  dns01: { provider: cloudflare, api_token: "..." }   # optional: one wildcard cert; Mooring installs the Caddy DNS plugin (edge-and-tls.md)
   base_domains: []                    # optional: additional NAMED namespaces (prod + staging on one box)
   cas: []                             # optional: private/internal ACME issuers to opt into by name
   apply_probe_window: 20s
@@ -216,7 +216,7 @@ read right to left (the last address not in `trusted_proxies`); apps receive it 
 These are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
 dashboard listener in external-edge mode.
 
-> **Reload vs. restart.** Most of `config.yaml` — the allowlist, `auth`/`users`, alerting tuning, retention — is picked up by `systemctl reload mooring`. A few things are read only at boot and need a full `systemctl restart` (the GitHub credentials, the bind address, the encryption key). See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
+> **Reload vs. restart.** Most of `config.yaml` — the allowlist, `auth`/`users`, alerting tuning, retention — is picked up by `systemctl reload mooring`. A few things are read only at boot and need a full `systemctl restart` (the GitHub credentials, the bind address, the encryption key, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`). See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
 
 ## Acknowledging changes
 

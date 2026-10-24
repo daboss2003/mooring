@@ -31,6 +31,7 @@ Everything else is managed in the dashboard — no files or config to hand-edit.
 - **Your servers** — CPU, memory, and disk.
 - **Your apps** — containers going down, becoming unhealthy, or restart-looping; a dependency an app reports as down.
 - **The platform** — crashed or out-of-memory containers, a restart storm, low memory headroom, a full disk.
+- **The edge** — a namespace with a [catch-all route](./edge-and-tls.md#catch-all-routes) whose wildcard certificate isn't served raises a critical `edge_catchall_dark` alert naming the namespace and the cause; it resolves when the certificate is served again.
 
 ## How it decides what to send
 

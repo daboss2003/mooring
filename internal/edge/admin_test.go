@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -511,5 +512,253 @@ func TestAvailableFailClosedOffLinux(t *testing.T) {
 	}
 	if why == "" {
 		t.Error("unavailable must carry a reason")
+	}
+}
+
+// fakeCaddyAdmin answers /load: reject(body, n) decides (n = 1-based call count) whether to refuse a
+// config with 400, answering errBody(body) (a fixed module error when nil). It records the last ACCEPTED
+// body.
+type fakeCaddyAdmin struct {
+	mu       sync.Mutex
+	calls    int
+	accepted []byte
+	reject   func(body []byte, n int) bool
+	errBody  func(body []byte) string
+}
+
+func (f *fakeCaddyAdmin) server(t *testing.T) *httptest.Server {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.calls++
+		if f.reject(body, f.calls) {
+			msg := `loading tls app module: decoding module config: dns.providers.route53: json: unknown field "api_token"`
+			if f.errBody != nil {
+				msg = f.errBody(body)
+			}
+			http.Error(w, msg, http.StatusBadRequest)
+			return
+		}
+		f.accepted = body
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+type wildcardReport struct {
+	w   WildcardCert
+	err error
+}
+
+var shopWildcard = WildcardCert{Domain: "shop.example.com", DNS01Provider: "cloudflare", DNS01Token: "tok-shop-0123456789"}
+
+func wildcardReconciler(t *testing.T, admin *fakeCaddyAdmin, ws ...WildcardCert) (*Reconciler, *[]wildcardReport) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	rs := NewRouteStore(db)
+	if err := rs.Save(context.Background(), Route{Hostname: "app.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	ts := admin.server(t)
+	rec := NewReconciler(rs, NewAdmin(ts.Listener.Addr().String()), baseCfg(), quietLog())
+	rec.SetPoolDiscoverer(func(_ context.Context, routes []Route, _ map[string]bool) Discovery {
+		return Discovery{OK: true, Evaluated: map[string]bool{PoolKey(routes[0]): true},
+			Pools: map[string][]string{PoolKey(routes[0]): {"172.18.0.5:8080"}}}
+	})
+	if len(ws) == 0 {
+		ws = []WildcardCert{shopWildcard}
+	}
+	rec.SetWildcards(func() []WildcardCert { return ws })
+	var reports []wildcardReport
+	rec.SetWildcardReject(func(w WildcardCert, err error) { reports = append(reports, wildcardReport{w, err}) })
+	return rec, &reports
+}
+
+// A wildcard config Caddy refuses must never take the whole edge down: the same render without the
+// wildcards is applied (every route keeps working) and the rejection is reported once.
+func TestReconcileRejectedWildcardFallsBack(t *testing.T) {
+	admin := &fakeCaddyAdmin{reject: func(body []byte, _ int) bool { return strings.Contains(string(body), `"challenges"`) }}
+	rec, reports := wildcardReconciler(t, admin)
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("a rejected wildcard must not fail the reconcile: %v", err)
+	}
+	if got := string(admin.accepted); !strings.Contains(got, "app.example.com") || strings.Contains(got, "*.shop.example.com") {
+		t.Errorf("the applied config must keep the routes and drop the wildcard:\n%s", got)
+	}
+	if len(*reports) != 1 || (*reports)[0].w.Domain != "shop.example.com" {
+		t.Errorf("reports = %v; want the rejected wildcard reported once", *reports)
+	}
+}
+
+// One namespace's bad wildcard config must not switch off another's: Caddy refuses any config carrying
+// the route53 namespace, so only that one is dropped and reported, and the cloudflare namespace's
+// wildcard stays in the applied config.
+func TestReconcileIsolatesTheRejectedWildcard(t *testing.T) {
+	staging := WildcardCert{Domain: "staging.example.com", DNS01Provider: "route53", DNS01Token: "tok-staging-0123456789"}
+	admin := &fakeCaddyAdmin{reject: func(body []byte, _ int) bool { return strings.Contains(string(body), `"route53"`) }}
+	rec, reports := wildcardReconciler(t, admin, staging, shopWildcard)
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	got := string(admin.accepted)
+	if !strings.Contains(got, "*.shop.example.com") || strings.Contains(got, "*.staging.example.com") {
+		t.Errorf("the applied config must keep the accepted wildcard and drop the refused one:\n%s", got)
+	}
+	if len(*reports) != 1 || (*reports)[0].w.Domain != "staging.example.com" {
+		t.Errorf("reports = %v; want only the staging wildcard", *reports)
+	}
+
+	// Once the owner stops offering the refused wildcard, the render equals what is loaded: no /load.
+	rec.SetWildcards(func() []WildcardCert { return []WildcardCert{shopWildcard} })
+	admin.mu.Lock()
+	before := admin.calls
+	admin.mu.Unlock()
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if admin.calls != before {
+		t.Errorf("an unchanged render must not be loaded again (%d extra /load calls)", admin.calls-before)
+	}
+}
+
+// A provider module can echo the dns01 token in its error. Neither the report nor the log may carry it,
+// raw or JSON-escaped, and the same holds for an error the reconcile returns.
+func TestReconcileRedactsTokensFromRejections(t *testing.T) {
+	odd := WildcardCert{Domain: "shop.example.com", DNS01Provider: "cloudflare", DNS01Token: `tok"quoted-0123456789 `}
+	echo := func([]byte) string {
+		return `{"error":"loading tls app module: provision dns.providers.cloudflare: API token 'tok\"quoted-0123456789 ' appears invalid"}`
+	}
+	var logBuf bytes.Buffer
+	admin := &fakeCaddyAdmin{reject: func(body []byte, _ int) bool { return strings.Contains(string(body), `"challenges"`) }, errBody: echo}
+	rec, reports := wildcardReconciler(t, admin, odd)
+	rec.log = slog.New(slog.NewTextHandler(&logBuf, nil))
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(*reports) != 1 {
+		t.Fatalf("reports = %v; want one", *reports)
+	}
+	msg := (*reports)[0].err.Error()
+	for _, leak := range []string{`tok"quoted`, `tok\"quoted`, "quoted-0123456789"} {
+		if strings.Contains(msg, leak) || strings.Contains(logBuf.String(), leak) {
+			t.Errorf("token fragment %q leaked:\nreport: %s\nlog: %s", leak, msg, logBuf.String())
+		}
+	}
+	if !strings.Contains(msg, "[redacted]") || !strings.Contains(msg, "appears invalid") {
+		t.Errorf("the redacted error must keep Caddy's message: %s", msg)
+	}
+
+	all := &fakeCaddyAdmin{reject: func([]byte, int) bool { return true }, errBody: echo}
+	rec2, _ := wildcardReconciler(t, all, odd)
+	if err := rec2.Reconcile(context.Background()); err == nil || strings.Contains(err.Error(), "quoted-0123456789") {
+		t.Errorf("a returned reconcile error must not carry the token: %v", err)
+	}
+}
+
+// A one-off rejection (the admin API answering 400 while a restarted child settles) is not pinned on
+// the wildcards: the full config is applied and nothing is reported.
+func TestReconcileTransientRejectionKeepsWildcards(t *testing.T) {
+	admin := &fakeCaddyAdmin{reject: func(_ []byte, n int) bool { return n == 1 }}
+	rec, reports := wildcardReconciler(t, admin)
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if !strings.Contains(string(admin.accepted), "*.shop.example.com") {
+		t.Errorf("after a transient rejection the full config (with the wildcard) must be applied:\n%s", admin.accepted)
+	}
+	if len(*reports) != 0 {
+		t.Errorf("a transient rejection must not be reported, got %v", *reports)
+	}
+}
+
+// When even the config without wildcards is refused, the wildcards aren't to blame: the reconcile
+// fails and nothing is reported.
+func TestReconcileRejectedWithoutWildcardsIsNotBlamed(t *testing.T) {
+	admin := &fakeCaddyAdmin{reject: func([]byte, int) bool { return true }}
+	rec, reports := wildcardReconciler(t, admin)
+	if err := rec.Reconcile(context.Background()); err == nil {
+		t.Error("a config Caddy refuses even without wildcards must fail the reconcile")
+	}
+	if len(*reports) != 0 {
+		t.Errorf("nothing may be reported when the wildcards aren't the cause, got %v", *reports)
+	}
+}
+
+// A wildcard is blamed only when Caddy refuses it twice during isolation: a one-off refusal of the
+// wildcard on its own (a restarted child settling) leaves it in, and nothing is reported.
+func TestReconcileIsolationRetriesBeforeBlaming(t *testing.T) {
+	staging := WildcardCert{Domain: "staging.example.com", DNS01Provider: "route53", DNS01Token: "tok-staging-0123456789"}
+	var seen int
+	admin := &fakeCaddyAdmin{reject: func(body []byte, _ int) bool {
+		if !strings.Contains(string(body), `"route53"`) {
+			return false
+		}
+		seen++
+		return seen <= 3 // the full render twice, then the first try of staging on its own
+	}}
+	rec, reports := wildcardReconciler(t, admin, staging, shopWildcard)
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := string(admin.accepted); !strings.Contains(got, "*.staging.example.com") || !strings.Contains(got, "*.shop.example.com") {
+		t.Errorf("a wildcard refused only once must stay in the applied config:\n%s", got)
+	}
+	if len(*reports) != 0 {
+		t.Errorf("a wildcard refused only once must not be reported, got %v", *reports)
+	}
+}
+
+// The refusal hook runs under the reconciler lock, so a concurrent reconcile already sees the refused
+// wildcard as gone instead of running the isolation again.
+func TestReconcileRecordsRefusalUnderTheLock(t *testing.T) {
+	admin := &fakeCaddyAdmin{reject: func(body []byte, _ int) bool { return strings.Contains(string(body), `"challenges"`) }}
+	rec, _ := wildcardReconciler(t, admin)
+	called := false
+	rec.SetWildcardReject(func(WildcardCert, error) {
+		called = true
+		if rec.mu.TryLock() {
+			rec.mu.Unlock()
+			t.Error("the refusal hook must run with the reconciler lock held")
+		}
+	})
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("the refusal hook was not called")
+	}
+}
+
+// NewRedactWriter removes every secret form, also when a secret is split across two writes, and holds a
+// partial line back until its end (or Flush).
+func TestRedactWriter(t *testing.T) {
+	var out bytes.Buffer
+	w := NewRedactWriter(&out, []string{`tok"en-0123456789`, ""})
+	for _, chunk := range []string{`{"msg":"loading: API token 'tok\"en-0`, "123456789' appears invalid\"}\n", "raw tok\"en-0123456789 here\n", "tail tok"} {
+		if n, err := w.Write([]byte(chunk)); err != nil || n != len(chunk) {
+			t.Fatalf("Write(%q) = %d, %v", chunk, n, err)
+		}
+	}
+	if strings.Contains(out.String(), "tail") {
+		t.Errorf("a partial line must wait for its end: %q", out.String())
+	}
+	if err := w.(interface{ Flush() error }).Flush(); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if strings.Contains(got, "0123456789") {
+		t.Errorf("secret leaked: %q", got)
+	}
+	want := "{\"msg\":\"loading: API token '[redacted]' appears invalid\"}\nraw [redacted] here\ntail tok"
+	if got != want {
+		t.Errorf("got  %q\nwant %q", got, want)
+	}
+	if NewRedactWriter(&out, []string{"", " "}) != io.Writer(&out) {
+		t.Error("no secret: the writer itself must be returned")
 	}
 }
