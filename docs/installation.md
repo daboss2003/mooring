@@ -2,40 +2,70 @@
 
 > **Getting started, 2 of 3** · [← Introduction](./introduction.md) · Next: [Deploy your first app →](./first-steps.md)
 
-This is the one part you do over SSH. It takes about five minutes: put the program on your server, create your login, and start it. After this, everything happens in the dashboard.
+This guide takes a fresh Linux server to a running Mooring you can sign in to. Do the steps in
+order: each one ends with a **Check**, so you know it worked before you move on. It's all over SSH
+and takes about 15 minutes. After this, you work in the dashboard.
 
-## What you need
+The commands are for **Ubuntu 22.04 / 24.04 and Debian 12**. On another distribution, follow the
+same steps and use [the raw binary](#other-linux-install-the-raw-binary) in Step 3.
 
-- A **Linux server** with `systemd` (any cheap VPS works).
-- **Docker** installed, with the Compose plugin (`docker compose`) — [how to install it is just below](#install-docker-first).
-- **Caddy** — the managed HTTPS edge supervises a child Caddy for `:80`/`:443` + automatic certificates. It isn't bundled (it's third-party, like Docker); `mooring setup` installs it for you (below), or the `.deb`/`.rpm` pulls it in if you've added Caddy's apt repo.
-- **SSH access** to the server.
-- **1 GB of RAM or more** if you want to deploy and build apps on the box. Monitoring and HTTPS run fine on a smaller server.
+## Before you start
 
-> **Why doesn't Mooring just install these itself at runtime?** Because the running service is deliberately **unprivileged** — it can't install packages, edit host DNS, or grant capabilities. That's the security model: a compromised dashboard must not be able to either. So prerequisites are a one-time, admin-run, root job — which `mooring setup` makes a single command (it runs as *you* over SSH, not as the service).
+You need:
 
-### Install Docker first
+| | |
+|---|---|
+| A Linux server with `systemd` | any VPS; **1 GB of RAM or more** if apps are built on the box |
+| SSH access with `sudo` | every command below runs over SSH |
+| A domain whose DNS you control | for the dashboard (optional) and for your apps |
+| Your own public IP address | only if you'll put the dashboard on a hostname (`curl -s https://ifconfig.me`) |
 
-`mooring setup` installs Caddy for you, but **Docker is deliberately left to you.** It's your host's container runtime and root-equivalent trust base, and installing it — choosing storage/cgroup drivers, daemon config, group membership — redefines the box in ways a control plane shouldn't decide on your behalf. So set it up once, up front. (`mooring doctor` will report Docker as **missing** until you do.)
+> **Why can't Mooring install all of this itself?** The running service is deliberately
+> **unprivileged**: it can't install packages, edit host DNS or grant capabilities, so a
+> compromised dashboard can't either. Everything that needs root is a one-time step you run here.
 
-If both of these already print a version, you're set — skip ahead:
+## Step 1. Open ports 80 and 443
+
+Mooring's edge serves HTTPS on **443** and needs **80** to get certificates from Let's Encrypt.
+
+- **Cloud firewall** (AWS security group, Lightsail networking, Hetzner/DigitalOcean firewall):
+  allow inbound **TCP 22, 80 and 443**.
+- **`ufw` on the server** (only if you use it; allow SSH first, or you lock yourself out):
+
+  ```bash
+  sudo ufw allow OpenSSH
+  sudo ufw allow 80/tcp
+  sudo ufw allow 443/tcp
+  sudo ufw enable
+  ```
+
+**Check:** `sudo ufw status` lists 22, 80 and 443 (or your cloud console shows the three rules).
+
+## Step 2. Install Docker
+
+Install Docker **before** Mooring: the Mooring package adds its service user to the `docker` group,
+and it can only do that if the group already exists.
+
+If these already print versions (Compose `v2.x`), skip to Step 3:
 
 ```bash
 docker --version
-docker compose version    # note the space — the v2 "Compose plugin", not the old docker-compose
+docker compose version     # note the space: the v2 Compose plugin, not docker-compose
+docker buildx version
 ```
 
-If not, install the **engine plus the Compose and Buildx plugins** (Mooring needs all three — it builds images with BuildKit). On **Ubuntu**, using Docker's official apt repo:
+Otherwise install the engine with the Compose and Buildx plugins from Docker's own repository
+(Mooring needs all three: it builds images with BuildKit):
 
 ```bash
-# 1. Add Docker's official GPG key
+# 1. Docker's signing key
 sudo apt update
 sudo apt install -y ca-certificates curl
 sudo install -m 0755 -d /etc/apt/keyrings
 sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
 
-# 2. Add Docker's apt repo
+# 2. Docker's repository
 sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
@@ -46,302 +76,435 @@ Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 sudo apt update
 
-# 3. Install the engine + plugins
+# 3. The engine and the two plugins
 sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 ```
 
-> **On Debian**, replace both `ubuntu` occurrences above with `debian`. **Fedora / RHEL / other distros:** follow <https://docs.docker.com/engine/install/>. In a hurry on Debian/Ubuntu and don't need the newest engine? The distro's own packages work too: `sudo apt install docker.io docker-compose-v2 docker-buildx`.
+On **Debian**, replace both `ubuntu` above with `debian`. Other distributions:
+<https://docs.docker.com/engine/install/>.
 
-Then confirm the Compose plugin is live — `docker compose version` should print `v2.x`. That's all the Docker you touch — from here, Mooring drives it for you over a locked-down, read-only connection.
+**Check:** the three commands at the top of this step print versions, and `docker compose
+version` says `v2.x`.
 
-## 1. Install the program
+## Step 3. Install Mooring
 
-> `apt install mooring` with nothing else only works for packages that ship in Debian/Ubuntu's own repositories (that's why `apt install python` just works). Mooring is third-party, so `apt` needs to be told where to find it once — exactly like installing Docker, Chrome, or Tailscale. Pick one:
-
-**Quickest — install the `.deb` directly.** Download the `.deb` for your architecture from the [latest release](https://github.com/daboss2003/mooring/releases/latest), then:
-
-```bash
-sudo apt install ./mooring_<version>_linux_amd64.deb
-```
-
-`apt` pulls in any dependencies, creates the `mooring` service user, and installs the systemd unit — so you can **skip Step 4**. To update later, download the newer `.deb` and run the same command. (Updates never disable boot-start — the package keeps the service enabled and running across upgrades.)
-
-> **Download into a Mooring-cleanable folder so old `.deb`s don't pile up.** Each update leaves the previous `.deb` behind. Put them in a Mooring-owned cache dir and the **Server tab** can list + delete the superseded ones for you (behind password + TOTP). One-time, after your first install:
->
-> ```bash
-> sudo install -d -o mooring -g mooring -m 0755 /var/lib/mooring/deb-cache
-> ```
-> Add `server.deb_cache_dir: /var/lib/mooring/deb-cache` to `/etc/mooring/config.yaml`, then download + install updates from there:
->
-> ```bash
-> ARCH=$(dpkg --print-architecture)
-> TAG=$(curl -fsSL https://api.github.com/repos/daboss2003/mooring/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
-> sudo curl -fsSL -o "/var/lib/mooring/deb-cache/mooring_${TAG#v}_linux_${ARCH}.deb" \
->   "https://github.com/daboss2003/mooring/releases/download/${TAG}/mooring_${TAG#v}_linux_${ARCH}.deb"
-> sudo dpkg -i "/var/lib/mooring/deb-cache/mooring_${TAG#v}_linux_${ARCH}.deb"
-> sudo systemctl daemon-reload && sudo systemctl restart mooring
-> ```
-> It must live **under `/var/lib/mooring`** — a path that's both writable by the `mooring` service and inside the unit's `ReadWritePaths`, so the Server-tab cleanup can delete there. A home-directory path (`~/…`) can't be cleaned up: the service user can't reach it. Delete any old `.deb`s already sitting in your home dir with `rm -f ~/mooring_*.deb`.
-
-> **Seeing `N: Download is performed unsandboxed as root … couldn't be accessed by user '_apt' … Permission denied`?** That's a harmless *note*, not a failure. `apt`'s unprivileged sandbox user can't read files in your home directory (it's mode `0750`), so `apt` copies the `.deb` as root and the install completes anyway — confirm with `dpkg -l mooring`. To avoid the note, install from a path `_apt` can read (download into `/tmp`), or skip the sandbox with `dpkg`:
->
-> ```bash
-> sudo dpkg -i mooring_<version>_linux_amd64.deb && sudo apt-get install -f
-> ```
-
-**Best for updates — add the signed APT repo (once).** Then `sudo apt upgrade` keeps Mooring current automatically, and every download is signature-checked:
+Add Mooring's signed APT repository once, then install. `sudo apt upgrade` then keeps Mooring up to
+date, and every download is signature-checked:
 
 ```bash
 curl -fsSL https://daboss2003.github.io/mooring/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/mooring.gpg
 echo "deb [signed-by=/usr/share/keyrings/mooring.gpg] https://daboss2003.github.io/mooring stable main" | sudo tee /etc/apt/sources.list.d/mooring.list
-sudo apt update && sudo apt install mooring
+sudo apt update && sudo apt install -y mooring
 ```
 
-(Fedora/RHEL: a matching `.rpm` is on each release — `sudo dnf install ./mooring_<version>_linux_amd64.rpm` (or `_linux_arm64.rpm`).)
-
-**Any other Linux — the raw binary.** Grab the binary for your architecture from the [releases page](https://github.com/daboss2003/mooring/releases) and put it in place (update by replacing the file). With this option you also do Step 4 to create the service:
+<details>
+<summary>Or install the <code>.deb</code> file directly (no repository)</summary>
 
 ```bash
-install -m0755 mooring /usr/local/bin/mooring
-mooring version
+cd /tmp       # a folder apt's sandbox can read (a home dir gives a harmless "unsandboxed" note)
+ARCH=$(dpkg --print-architecture)
+TAG=$(curl -fsSL https://api.github.com/repos/daboss2003/mooring/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
+curl -fsSLO "https://github.com/daboss2003/mooring/releases/download/${TAG}/mooring_${TAG#v}_linux_${ARCH}.deb"
+sudo apt install -y "./mooring_${TAG#v}_linux_${ARCH}.deb"
 ```
 
-### Host prerequisites — what's automatic, and the few things you do once
+Fedora / RHEL: the same release has `mooring_<version>_linux_<arch>.rpm`
+(`sudo dnf install ./mooring_<version>_linux_amd64.rpm`).
+</details>
 
-**Most host prep is automatic.** The package's systemd unit + postinstall already create the
-runtime dir (`/run/mooring`) and the writable state dirs, grant the one capability the edge needs
-(`CAP_NET_BIND_SERVICE`, so Caddy/nginx bind `:80`/`:443`/`:53` non-root), set a writable `HOME`
-and a sane `MemoryMax`, and leave the egress filter off by default. You don't apply drop-ins or
-tune the unit.
+The package creates the `mooring` service user, its folders (`/etc/mooring`, `/var/lib/mooring`,
+`/var/lib/mooring-apps`, `/var/lib/caddy`), a config template, and the systemd service. It does
+**not** start the service: that happens in Step 8, once the config exists.
 
-There are only a **few one-time steps you do by hand** — `mooring doctor` tells you if any are
-missing (it's read-only; run it any time to verify the box):
+**Check:** `mooring version` prints a version, and `systemctl list-unit-files mooring.service`
+shows the service (disabled for now).
+
+## Step 4. Install Caddy, the HTTPS edge
+
+Mooring runs its own copy of [Caddy](https://caddyserver.com) for ports 80/443 and certificates. It
+must be **Caddy's official build, version 2.11 or later**. Ubuntu's and Debian's own `caddy`
+package is too old (Ubuntu ships 2.6.2) and can't take the DNS plugins wildcard certificates need,
+so don't use `apt install caddy` on its own.
+
+1. See whether a Caddy is already there:
+
+   ```bash
+   caddy version 2>/dev/null || echo "no caddy"
+   ```
+
+   | It prints | Do this |
+   |---|---|
+   | `no caddy` | go on to 2 |
+   | `v2.11…` or later (official builds start with `v`) | go on to 2 |
+   | `2.6.2`, anything without a leading `v`, or below `v2.11` | remove it first: `sudo apt-get remove -y caddy` |
+
+2. Let Mooring install the official Caddy and prepare the host. Without `--yes` it only prints what
+   it would do; read it, then apply:
+
+   ```bash
+   sudo mooring setup          # the plan
+   sudo mooring setup --yes    # apply it
+   ```
+
+   This installs Caddy from Caddy's official repository, turns off the separate `caddy` service
+   that package brings (Mooring supervises its own Caddy, and the packaged service would take
+   ports 80/443), and caps Docker's container logs so they can't fill the disk. Capping the logs
+   restarts Docker, which is why you do this before deploying any app.
+
+**Check:**
 
 ```bash
-mooring doctor              # read-only: reports anything off + the exact fix
-sudo mooring setup --yes    # installs the Caddy binary — the managed edge needs it
+caddy version              # v2.11 or later
+systemctl is-enabled caddy # disabled (or "not-found")
 ```
 
-> **Mooring runs its OWN supervised Caddy (and nginx for L4).** The packaged
-> `caddy.service`/`nginx.service` would squat `:80`/`:443` and crash-loop Mooring's
-> edge (you'd see a green `doctor` of old but a cert failure at deploy: *"the edge has
-> not issued the TLS cert yet"*). `mooring setup` now **disables those distro units**
-> whenever they're present — even if you installed Caddy/nginx yourself beforehand. If
-> you ever add them later, run `sudo mooring setup --yes` again (or
-> `sudo systemctl disable --now caddy nginx`). `mooring doctor` flags an active/enabled
-> distro `caddy`/`nginx` as a **conflict** with the one-line fix.
+When `edge.dns01` is set for a namespace, Mooring installs a Caddy build with that DNS provider's
+plugin as `/var/lib/mooring/bin/caddy` and runs the edge from it. The Caddy package you installed
+stays as the fallback. This needs outbound HTTPS to `caddyserver.com`. See
+[DNS-01 and the Caddy DNS plugin](./edge-and-tls.md#dns-01-and-the-caddy-dns-plugin).
 
-That's everything for a normal HTTPS app. Two extras apply **only in specific cases**:
+## Step 5. Create your master key and password
 
-- **A non-HTTP service on a privileged port (a DNS resolver on `:53`, MQTT, …)?** Install the L4
-  load balancer's nginx + stream module, and — only if you bind `:53` — free it from
-  `systemd-resolved` (Mooring never rewrites host DNS for you, because getting it wrong takes the
-  box's own DNS down):
-  ```bash
-  sudo mooring setup --l4 --yes      # nginx + the stream module
-  # then, ONLY for a :53 resolver, free the port from systemd-resolved:
-  printf '[Resolve]\nDNSStubListener=no\n' | sudo tee /etc/systemd/resolved.conf.d/no-stub.conf
-  sudo systemctl restart systemd-resolved
-  sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf   # the real upstreams — NOT stub-resolv.conf
-  getent hosts github.com             # confirm host DNS still resolves
-  ```
-
-- **(Recommended) Cap Docker's container logs.** Mooring *streams* logs (it never buffers them in
-  memory or its DB), but Docker's default `json-file` driver keeps every container's stdout on disk
-  **forever** — on a small VPS that fills the disk. `mooring setup` caps it for you (merges a
-  `max-size` into `/etc/docker/daemon.json`, preserving your other settings, then restarts Docker).
-  That restart **bounces running containers**, so it's a reviewable step in the plan — run `setup`
-  *before* you deploy apps and it's a no-op disruption. The equivalent by hand:
-  ```json
-  { "log-driver": "json-file", "log-opts": { "max-size": "10m", "max-file": "3" } }
-  ```
-  then `sudo systemctl restart docker` (or use the self-rotating `local`/`journald` driver).
-
-When `mooring doctor` is all-green, the host is ready — there's nothing else to tune.
-
-## 2. Create your login and encryption key
-
-These commands create the secrets Mooring needs. You run them over SSH — never in a browser — so your master key and password never travel anywhere they shouldn't. They print what to paste into your config in the next step.
+Run these and keep the output for Step 6. Run them over SSH only, never in a browser.
 
 ```bash
-# A master key that encrypts your stored secrets. Back this up somewhere safe.
-mooring gen-key
-
-# Your dashboard password (you'll be prompted to type it; it's never shown or logged).
-mooring hash-password
-
-# Optional: turn on two-factor sign-in. Prints a QR code to scan with your
-# authenticator app, plus the secret to paste into your config below.
-mooring gen-totp
+mooring gen-key            # the master key that encrypts your stored secrets
+mooring hash-password      # asks for your dashboard password, prints its hash
+mooring gen-totp           # optional, recommended: two-factor sign-in (shows a QR code to scan)
 ```
 
-> **Keep your master key safe.** It's what unlocks your stored secrets. Save a copy somewhere separate from the server. If you lose it, the encrypted data can't be recovered.
+> **Back up the master key now**, somewhere off this server. It's what decrypts your stored
+> secrets: lose it and they can't be recovered.
 
-## 3. Write your config file
+## Step 6. Write the config file
 
-`/etc/mooring/config.yaml` is the only file you edit by hand. It holds the essentials: your key, your login, who's allowed to reach the dashboard, and your email for HTTPS certificates. There's no command that generates it for you — it contains your master key and login, so you write it over SSH.
-
-If you installed the `.deb`/`.rpm`/`apt` package, the directory already exists and a template is on disk — copy it and edit:
+`/etc/mooring/config.yaml` is the only file you edit by hand. Start from the template:
 
 ```bash
 sudo cp /usr/share/mooring/config.example.yaml /etc/mooring/config.yaml
-sudo nano /etc/mooring/config.yaml      # or: sudo vi /etc/mooring/config.yaml
+sudo nano /etc/mooring/config.yaml
 ```
 
-Fill in the essentials (below), then lock the file down — Mooring refuses to boot if it's group/world-writable or unreadable by the service:
-
-```bash
-sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml
-```
-
-The file:
+Make it look like this, pasting in your values from Step 5:
 
 ```yaml
 # /etc/mooring/config.yaml
-bind_addr: "127.0.0.1:9000"        # the dashboard is private — only reachable as below
+bind_addr: "127.0.0.1:9000"          # the dashboard listens on this server only
 
-encryption_key: "<paste from gen-key>"
+encryption_key: "<from mooring gen-key>"
 
-ip_allowlist:                       # who may reach the dashboard (your IP / VPN)
-  - "203.0.113.10/32"
+ip_allowlist:                         # who may open the dashboard
+  - "127.0.0.1/32"                    # needed for the SSH tunnel (Step 9)
+  - "::1/128"
+  # - "203.0.113.10/32"               # your own IP, only if you add admin.hostname below
 
 auth:
   username: "operator"
-  password_hash: "<paste from hash-password>"
-  # totp_secret: "<paste from gen-totp>"   # optional two-factor
-
-# Optional: additional operators with roles (leave out for a single-user setup).
-# users:
-#   - username: "alice"
-#     password_hash: "<paste from hash-password>"
-#     totp_secret: "<paste from gen-totp>"   # optional
-#     role: deployer                         # owner | deployer | viewer
+  password_hash: "<from mooring hash-password>"
+  # totp_secret: "<from mooring gen-totp>"
 
 edge:
-  mode: "managed"                   # Mooring runs the web server + HTTPS for you
-  acme_email: "you@example.com"     # used by Let's Encrypt for your certificates
+  mode: "managed"                     # Mooring runs the HTTPS edge for you
+  acme_email: "you@example.com"       # Let's Encrypt's contact for your certificates
+  acme_ca: "https://acme-v02.api.letsencrypt.org/directory"
 
-admin:
-  hostname: "admin.example.com"     # the dashboard's address; point its DNS at this server
-
-data_dir: "/var/lib/mooring"       # where Mooring keeps its data
+data_dir: "/var/lib/mooring"
 ```
 
-Set `admin.hostname` to the address you want the dashboard on, and point that hostname's DNS at your server — Mooring serves it over HTTPS, behind your IP allowlist. If you use the [subdomain shorthand](./definition-file.md#specedgeroutes) (`edge.base_domain`), you can instead set just `admin.subdomain: admin` and it becomes `admin.<base_domain>` — covered by the same wildcard DNS record as your apps:
+| Setting | What to put | Required |
+|---|---|---|
+| `bind_addr` | keep `127.0.0.1:9000`. It must be loopback: the edge, or your SSH tunnel, is the only way in | yes |
+| `encryption_key` | the output of `mooring gen-key` | yes |
+| `ip_allowlist` | keep both loopback lines: requests through an SSH tunnel come from `127.0.0.1`, and anything not listed gets a plain 404, even the tunnel. Add your own IP only if you put the dashboard on a hostname | yes, at least one entry |
+| `auth.username` / `auth.password_hash` | your login, the hash from `mooring hash-password` | yes |
+| `auth.totp_secret` | the secret from `mooring gen-totp` | no, but strongly recommended |
+| `edge.mode` | `managed` | yes |
+| `edge.acme_email` | an email address you read | yes |
+| `edge.acme_ca` | Let's Encrypt's directory, exactly as above. (Testing? `https://acme-staging-v02.api.letsencrypt.org/directory` issues untrusted test certificates without Let's Encrypt's rate limits) | yes, Mooring won't start without it |
+| `data_dir` | keep `/var/lib/mooring` | yes |
 
-```yaml
-edge:
-  base_domain: mooring.example.com
-admin:
-  subdomain: admin                  # → admin.mooring.example.com (or use admin.hostname for a full name)
-```
+Want the dashboard on its own address instead of the SSH tunnel? Add `admin.hostname` now or
+later: see [Put the dashboard on its own hostname](#optional-put-the-dashboard-on-its-own-hostname).
 
-(Prefer not to expose it at all? Leave both out and reach the dashboard over an SSH tunnel instead — see the next guide.)
-
-### Team members and roles
-
-The `auth:` block is your primary operator — always an **owner**. To let others in, add a `users:` list; each entry is minted the same way (`mooring hash-password`, and optionally `mooring gen-totp`) and given a **role**:
-
-| Role | Can |
-|---|---|
-| **owner** | Everything — deploy, plus all admin actions: delete apps, reveal secrets, run setup scripts, manage backups, connect repos/GitHub, rotate tokens, reclaim disk. |
-| **deployer** | Deploy, roll back, start/stop/restart, and edit an app's env, config files, and scaling. **Not** the admin actions above. |
-| **viewer** | Read-only — see apps, logs, metrics, events, and status. No changes. |
-
-Roles are enforced on the server for every action (a viewer who tries a deploy gets a clear "forbidden"), and each user has their own password and 2FA. Changing, adding, or removing any user logs everyone out (they log back in) — so a removed operator's sessions end immediately. There's no self-service UI: like every other secret, users live in the root-owned config file, and a `systemctl reload mooring` picks up a change.
-
-> **When you expose the admin dashboard, it becomes internet-reachable** — gated by your `ip_allowlist` (enforced at the edge *and* re-checked against the real client), then your password + **TOTP**. Keep `ip_allowlist` tight (never a catch-all), and enable TOTP. Mooring fronts the dashboard through the managed edge to a **dedicated internal listener** (`admin.edge_listen`, default `127.0.0.1:9001`) so your SSH-tunnel access on `bind_addr` keeps working unchanged. Exposing/unexposing needs a **restart** (listeners are fixed at boot). If you use GitHub connect, re-register your OAuth App's callback as `https://<admin hostname>/github/callback`.
-
-#### Optional: one wildcard certificate for all subdomains (ACME DNS-01)
-
-By default each declared subdomain gets its own certificate via HTTP-01. If you run many
-subdomains (or want a name that isn't HTTP-reachable), you can instead issue **one
-`*.<base_domain>` wildcard** via ACME **DNS-01** — no per-name rate limits, one cert for
-everything under `base_domain`:
-
-```yaml
-edge:
-  base_domain: mooring.example.com
-  dns01:
-    provider: cloudflare            # your DNS provider (a caddy-dns module name)
-    api_token: "<dns-api-token>"    # secret — a token scoped to edit this zone
-```
-
-**Mooring installs the right Caddy plugin for you** — you don't build anything. DNS-01 needs
-your provider's DNS module compiled into Caddy. When the Caddy you installed doesn't have it,
-Mooring downloads a Caddy build with that provider's plugin from `caddyserver.com`, installs it as
-`/var/lib/mooring/bin/caddy` and runs the edge from it. The Caddy package you installed stays as the
-fallback. The install runs in the background and needs outbound HTTPS to `caddyserver.com`; until it
-succeeds the edge serves every route and the wildcard isn't issued. Mooring passes `api_token` to
-the provider's [caddy-dns](https://github.com/orgs/caddy-dns/repositories) module as its `api_token`
-setting, so use a provider whose module takes one (Cloudflare does). See
-[DNS-01 and the Caddy DNS plugin](./edge-and-tls.md#dns-01-and-the-caddy-dns-plugin).
-
-With `dns01` set, subjects at/under `base_domain` are served by the one wildcard; hostnames
-outside it keep their own HTTP-01 cert. The `api_token` is stored only in the root-only
-`config.yaml` (never logged or shown in the dashboard) and passed solely to the supervised Caddy.
-
-> **More than one app on this box?** Add **named** `edge.base_domains` (each with its own
-> optional `dns01`) so colocated apps — prod, staging, … — each keep the `subdomain:` shorthand
-> under their own apex without colliding. See [namespaces](./definition-file.md#specedgebase_domain-namespaces).
-
-Mooring validates this file at startup. If a required value is missing or the file permissions are too open, it stops with a clear message explaining what to fix.
-
-> Everything *else* about your apps lives in the dashboard (or an optional per-app file). This config is just the foundation.
-
-## 4. Start it
-
-> ### Installed via `.deb` / `.rpm` / `apt`? Almost everyone — do this and skip the rest of this section.
->
-> The package's postinstall **already** created the `mooring` service user, the data directories (`/var/lib/mooring`, `/var/lib/mooring-apps`, `/var/lib/caddy`), `/etc/mooring`, and the systemd unit. **Do _not_ run the manual commands below** — they're for the raw-binary install only, and running them produces harmless-but-confusing errors like `user 'mooring' already exists` and `cannot stat 'config.yaml'`. Once your config from Step 3 is in place, just start it:
->
-> ```bash
-> sudo systemctl enable --now mooring
-> sudo systemctl status mooring     # → "active (running)"
-> ```
->
-> Then jump to the verification at the end. (Run everything with `sudo` — a plain `systemctl enable` will hang on a polkit password prompt.)
-
-**Only if you installed the raw binary** (Step 1's last option — no package, so nothing was set up for you) do you create the service account, directories, and unit by hand. Run these with `sudo`, from a checkout of the repo so `deploy/systemd/mooring.service` exists:
+Then lock the file down. Mooring refuses to start if anyone but root can write it, or if it's
+readable by anyone outside the `mooring` group:
 
 ```bash
-sudo groupadd --system mooring
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin --gid mooring mooring
-sudo usermod -aG docker mooring
-sudo install -d -o root    -g mooring -m0750 /etc/mooring
-sudo install -d -o mooring -g mooring -m0700 /var/lib/mooring
-sudo install -d -o mooring -g mooring -m0700 /var/lib/mooring-apps   # per-app run dirs
-sudo install -d -o mooring -g mooring -m0700 /var/lib/caddy          # edge data/cert store
-sudo install -m0644 deploy/systemd/mooring.service /etc/systemd/system/mooring.service
-# (write /etc/mooring/config.yaml per Step 3, then:)
-sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml
-sudo systemctl daemon-reload && sudo systemctl enable --now mooring
-sudo systemctl status mooring
+sudo chown root:mooring /etc/mooring/config.yaml
+sudo chmod 0640 /etc/mooring/config.yaml
 ```
 
-That's it. **You won't run any Docker commands** — Mooring sets up everything it needs to talk to Docker (a locked-down, read-only connection) and runs your HTTPS edge itself. From here on, it's all in the dashboard.
+**Check:** `sudo ls -l /etc/mooring/config.yaml` shows `-rw-r----- 1 root mooring`.
 
-### Editing the config file (reload vs restart)
+## Step 7. Point DNS at the server
 
-`/etc/mooring/config.yaml` is read at **startup**. After you hand-edit it, Mooring won't notice the change on its own — you have to tell it to pick it up, and **how depends on what you changed**:
+Skip this for now if you'll use the SSH tunnel and have no app yet: come back when you give an app
+a domain.
 
-| You changed… | Apply with |
-|---|---|
-| Who can reach the dashboard (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), your login (`auth.username`, `auth.password_hash`, `auth.totp_secret`), or log retention (`retention.*`) | **`sudo systemctl reload mooring`** — hot-applied, no downtime |
-| **Anything else** — the master `encryption_key`, `bind_addr`, `edge.*` (incl. `base_domain`, `dns01`, `l4_enabled`), `admin.*` (incl. `subdomain`, `edge_listen`), `github.*`, `alerting.*`, `session.*`, `cookie.*`, `docker.*`, `protected_projects`, … | **`sudo systemctl restart mooring`** |
+At your DNS provider, add an **A** record (and **AAAA** if the server has IPv6) pointing at the
+server's public IP for:
 
-The rule of thumb: only the **allowlist + login + retention** are hot-reloadable; **everything else is read once at boot and needs a restart**. A reload that touches a restart-only setting will *silently do nothing* — so when in doubt, `restart` (it briefly drops the dashboard connection; your apps keep running).
+- the dashboard's hostname, if you set `admin.hostname` (e.g. `admin.example.com`);
+- each app hostname, or one wildcard record `*.<base_domain>` if you use
+  [`edge.base_domain`](./edge-and-tls.md#subdomain-namespaces-colocating-apps-under-one-apex).
 
-> **Reload is safe:** it validates the new file first and **keeps the old config if the edit is invalid**. One side effect to know: enabling/rotating two-factor (`auth.totp_secret`) on reload **logs you out**, so you re-authenticate with the new factor.
+**Using Cloudflare?** Set every record to **DNS only** (the grey cloud), not proxied. Mooring issues
+and serves its own certificates, and Cloudflare's free certificate doesn't cover names two levels
+deep, such as `shop.app.example.com`.
 
-(Most *app* settings — env, routes, scaling, self-healing, ops — aren't in this file at all; you manage them in the dashboard, which applies them live. This file is just the bootstrap essentials.)
+**Check:** `dig +short admin.example.com` prints the server's IP. Mooring requests a hostname's
+certificate only once the name resolves to this server.
 
-## 5. You're ready
+## Step 8. Start Mooring
 
-Mooring is now running and serving HTTPS. Nothing is published yet — that happens when you add an app and give it a domain.
+```bash
+sudo systemctl enable --now mooring
+sudo systemctl status mooring --no-pager     # → active (running)
+sudo -u mooring mooring verify-key           # → verify-key: OK — key matches the DB
+sudo mooring doctor                          # every line reads ok
+```
 
-> **Next: [Deploy your first app →](./first-steps.md)**
+Run `verify-key` as the `mooring` user: on a fresh install it creates the database, which must
+belong to the service. Use `sudo` for `systemctl`: without it, `systemctl enable` waits on a
+password prompt you never see.
+
+**Check:** `status` says `active (running)` and `doctor` has no `fail` lines. If Mooring doesn't
+start, the reason is in its log: `sudo journalctl -u mooring -n 50 --no-pager` (config mistakes
+name the exact key; see [Troubleshooting](#troubleshooting)).
+
+## Step 9. Open the dashboard
+
+**Through an SSH tunnel** (works right away). On your own computer:
+
+```bash
+ssh -L 9000:127.0.0.1:9000 <you>@<server>
+```
+
+then open <http://127.0.0.1:9000> and sign in with the username and password from Step 5.
+
+**On its own hostname**, if you set it up: open `https://admin.example.com`.
+
+You're done. **Next: [Deploy your first app →](./first-steps.md)**
 
 ---
 
-*Want the security and hardening details of the service file (memory caps, sandboxing, network egress lock-down)? See [How it works & why it's safe](./architecture.md). Running your own Docker connection instead of the built-in one? Set `docker.external_proxy: true` — see [the CLI reference](./cli.md).*
+## Optional: one wildcard certificate for all subdomains (DNS-01)
+
+By default every hostname gets its own certificate over HTTP. Switch a domain to **one
+`*.<base_domain>` wildcard certificate** when you run many subdomains, when a name isn't reachable
+over HTTP, or when an app uses a [catch-all route](./edge-and-tls.md#catch-all-routes) (which
+requires one). This example uses **Cloudflare**. Mooring passes the token to the provider's
+[caddy-dns](https://github.com/orgs/caddy-dns/repositories) module as `api_token`, so a provider whose
+module takes other credentials (Route 53, for example) is refused; see
+[DNS-01 and the Caddy DNS plugin](./edge-and-tls.md#dns-01-and-the-caddy-dns-plugin).
+
+1. **Create a Cloudflare API token** (never the Global API Key):
+   1. Cloudflare dashboard → your profile (top right) → **API Tokens** → **Create Token** → the
+      **Edit zone DNS** template → **Use template**.
+   2. **Permissions:** keep **Zone / DNS / Edit** and add **Zone / Zone / Read**.
+   3. **Zone Resources:** **Include / Specific zone /** your domain (the registered domain, e.g.
+      `example.com`, even when the wildcard is for `app.example.com`).
+   4. Optional: **Client IP Address Filtering → Is in →** this server's public IP.
+   5. **Continue to summary → Create Token**, and copy it: it's shown once. Don't set an expiry:
+      Mooring renews the certificate with it.
+2. **Check the token** from the server, without leaving it in your shell history:
+
+   ```bash
+   read -rs CF_TOKEN    # paste, then Enter
+   curl -s -H "Authorization: Bearer $CF_TOKEN" https://api.cloudflare.com/client/v4/user/tokens/verify
+   unset CF_TOKEN
+   ```
+
+   It answers `"status": "active"`.
+3. **Add it to the config** (it lives only in this root-owned file):
+
+   ```yaml
+   edge:
+     base_domain: app.example.com
+     dns01:
+       provider: cloudflare
+       api_token: "<the token>"
+   ```
+
+4. **DNS:** a wildcard record `*.app.example.com` → the server (DNS only on Cloudflare), plus a
+   record for `app.example.com` itself if the base name serves a site (a wildcard never covers it).
+5. **Restart:** `sudo systemctl restart mooring`. On startup Mooring installs a Caddy build with the
+   Cloudflare plugin as `/var/lib/mooring/bin/caddy` (in the background; the edge stays up), restarts
+   the edge on it, and requests the wildcard. This takes a minute or two.
+
+**Check:**
+
+```bash
+sudo -u mooring /var/lib/mooring/bin/caddy list-modules | grep dns.providers.cloudflare
+sudo journalctl -u mooring --since "5 min ago" | grep -i wildcard
+# → edge: issuing a *.app.example.com wildcard cert via ACME DNS-01
+```
+
+If the log says `edge: Caddy DNS plugin install failed` instead, the line carries the reason; the
+usual one is that the server can't reach `caddyserver.com` (allow outbound HTTPS to it). Mooring
+retries on its own, and `sudo mooring doctor` shows the plugin's state.
+
+## Optional: several domains on one server (namespaces)
+
+Running more than one domain on one server, say production and staging? Declare **named
+namespaces** under `edge.base_domains`, each with its own optional `dns01`, and apps pick one by
+name. A namespace can also allow one app a [catch-all route](./edge-and-tls.md#catch-all-routes)
+with `catch_all: true` (it needs `dns01`):
+
+```yaml
+edge:
+  base_domains:
+    - name: prod
+      domain: app.example.com
+      dns01: { provider: cloudflare, api_token: "<token>" }
+      catch_all: true
+```
+
+Namespaces must not overlap (no domain inside another). See
+[namespaces](./definition-file.md#specedgebase_domain-namespaces).
+
+## Optional: put the dashboard on its own hostname
+
+Instead of the SSH tunnel, Mooring can serve the dashboard over HTTPS at its own address:
+
+1. In the config, add your own public IP to `ip_allowlist` (never a catch-all such as `0.0.0.0/0`:
+   Mooring refuses that) and set either:
+
+   ```yaml
+   admin:
+     hostname: "admin.example.com"     # a full name, or…
+   #  subdomain: admin                  # …admin.<edge.base_domain>, covered by your wildcard
+   ```
+
+2. Turn on two-factor sign-in (`auth.totp_secret`): the login is now on the internet, behind your
+   allow-list.
+3. Point the name's DNS at the server ([Step 7](#step-7-point-dns-at-the-server)), then
+   `sudo systemctl restart mooring` (a reload isn't enough for this).
+
+The dashboard must be a subdomain, never the base domain itself. The SSH tunnel keeps working
+alongside it. Using **Connect with GitHub**? Set your OAuth App's callback to
+`https://<admin hostname>/github/callback`.
+
+## Optional: team members and roles
+
+The `auth:` block is your primary operator, always an **owner**. To let others in, add a `users:`
+list. Mint each entry the same way (`mooring hash-password`, optionally `mooring gen-totp`) and give
+it a **role**:
+
+```yaml
+users:
+  - username: "alice"
+    password_hash: "<from mooring hash-password>"
+    totp_secret: "<from mooring gen-totp>"   # optional
+    role: deployer                           # owner | deployer | viewer
+```
+
+| Role | Can |
+|---|---|
+| **owner** | Everything: deploy, plus every admin action (delete apps, reveal secrets, run setup scripts, manage backups, connect repos/GitHub, rotate tokens, reclaim disk). |
+| **deployer** | Deploy, roll back, start/stop/restart, and edit an app's env, config files and scaling. **Not** the admin actions above. |
+| **viewer** | Read-only: apps, logs, metrics, events, status. |
+
+Roles are enforced on the server for every action. Users live in this root-owned file (there's no
+sign-up page); `sudo systemctl reload mooring` applies a change and signs everyone out once, so a
+removed user's sessions end at once.
+
+## Optional: non-HTTP services (DNS, MQTT) and the L4 load balancer
+
+For a service on a privileged non-HTTP port, install nginx with the stream module, and set
+`edge.l4_enabled: true` in the config:
+
+```bash
+sudo mooring setup --l4 --yes
+```
+
+Only for a DNS resolver on `:53`, free the port from `systemd-resolved` (Mooring never rewrites
+host DNS for you):
+
+```bash
+printf '[Resolve]\nDNSStubListener=no\n' | sudo tee /etc/systemd/resolved.conf.d/no-stub.conf
+sudo systemctl restart systemd-resolved
+sudo ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf   # the real upstreams, NOT stub-resolv.conf
+getent hosts github.com     # host DNS must still resolve
+```
+
+**Check:** `sudo mooring doctor --l4` has no `fail` lines.
+
+## Editing the config file (reload vs restart)
+
+`/etc/mooring/config.yaml` is read at **startup**. After you edit it, tell Mooring, and how depends
+on what you changed:
+
+| You changed… | Apply with |
+|---|---|
+| Who can reach the dashboard (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), your login (`auth.username`, `auth.password_hash`, `auth.totp_secret`), `users`, or log retention (`retention.*`) | **`sudo systemctl reload mooring`**: applied live, no downtime |
+| **Anything else**: the `encryption_key`, `bind_addr`, `edge.*` (incl. `base_domain`, `base_domains`, `dns01`, `l4_enabled`), `admin.*`, `github.*`, `alerting.*`, `session.*`, `cookie.*`, `docker.*`, `protected_projects`, … | **`sudo systemctl restart mooring`** |
+
+When in doubt, restart: a reload that touches a restart-only setting silently does nothing. A
+restart briefly drops the dashboard; your apps keep running. A reload checks the new file first and
+keeps the old config if the edit is invalid. Turning on or changing two-factor on reload signs you
+out, so you sign in again with the new factor.
+
+## Keep Mooring up to date
+
+- **APT repository (Step 3):** `sudo apt update && sudo apt upgrade`. The package keeps the service
+  enabled and restarts it on the new version.
+- **`.deb` file:** download the newer release the same way and `sudo apt install` it. To let the
+  dashboard's **Server tab** clean up old `.deb` files, download them into
+  `/var/lib/mooring/deb-cache` (create it with
+  `sudo install -d -o mooring -g mooring -m 0755 /var/lib/mooring/deb-cache`) and set
+  `server.deb_cache_dir: /var/lib/mooring/deb-cache` in the config.
+
+## Other Linux: install the raw binary
+
+No `.deb` or `.rpm`? Use the release tarball (it holds the binary and the systemd unit), then set
+up the service account and folders yourself (the package does this for you):
+
+```bash
+ARCH=amd64     # or arm64
+TAG=$(curl -fsSL https://api.github.com/repos/daboss2003/mooring/releases/latest | grep -oP '"tag_name":\s*"\K[^"]+')
+cd /tmp
+curl -fsSLO "https://github.com/daboss2003/mooring/releases/download/${TAG}/mooring_${TAG#v}_linux_${ARCH}.tar.gz"
+tar -xzf "mooring_${TAG#v}_linux_${ARCH}.tar.gz" mooring deploy/systemd/mooring.service
+curl -fsSLO "https://raw.githubusercontent.com/daboss2003/mooring/${TAG}/deploy/nfpm/config.example.yaml"
+sudo install -m 0755 mooring /usr/local/bin/mooring     # the path the unit runs
+
+sudo groupadd --system mooring
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --gid mooring mooring
+sudo usermod -aG docker mooring
+sudo install -d -o root    -g mooring -m 0750 /etc/mooring
+sudo install -d -o mooring -g mooring -m 0700 /var/lib/mooring
+sudo install -d -o mooring -g mooring -m 0700 /var/lib/mooring-apps
+sudo install -d -o mooring -g mooring -m 0700 /var/lib/caddy
+sudo install -m 0644 deploy/systemd/mooring.service /etc/systemd/system/mooring.service
+sudo install -m 0644 config.example.yaml /etc/mooring/config.example.yaml
+sudo systemctl daemon-reload
+```
+
+Then continue at [Step 4](#step-4-install-caddy-the-https-edge) (install Caddy from
+<https://caddyserver.com/docs/install> on a non-Debian system: the official build, 2.11 or later),
+and copy the template from `/etc/mooring/config.example.yaml` in Step 6.
+
+## Troubleshooting
+
+| You see | Why | Fix |
+|---|---|---|
+| `edge.acme_ca: required in managed mode` | the config has no ACME issuer | add `edge.acme_ca` exactly as in [Step 6](#step-6-write-the-config-file), restart |
+| `ip_allowlist: empty …` | the allow-list has no entry | add `127.0.0.1/32` and `::1/128` |
+| A plain **404** at <http://127.0.0.1:9000> through the tunnel | the tunnel arrives from loopback, which isn't in `ip_allowlist` | add `127.0.0.1/32` and `::1/128`, then `sudo systemctl reload mooring` |
+| `bind_addr: must bind loopback only` | `bind_addr` is a public address | set `bind_addr: "127.0.0.1:9000"` |
+| `config: … must not be world-accessible` / `… group-writable` / `… owned by root` | the file's owner or mode is wrong | `sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml` |
+| `sudo systemctl enable` seems to hang | it's waiting on a password prompt you can't see | press Ctrl-C and run it with `sudo` |
+| `N: Download is performed unsandboxed as root …` during `apt install ./mooring….deb` | apt's sandbox user can't read your home folder | harmless (`dpkg -l mooring` confirms the install); download into `/tmp` to avoid it |
+| `caddy version` prints `2.6.2` (no leading `v`) | the distribution's old Caddy | [Step 4](#step-4-install-caddy-the-https-edge): `sudo apt-get remove -y caddy`, then `sudo mooring setup --yes` |
+| Log: `edge: Caddy DNS plugin install failed`; wildcard names fail with `ERR_SSL_PROTOCOL_ERROR` | the server can't download the plugin build from `caddyserver.com` (the log line has the reason) | allow outbound HTTPS to `caddyserver.com`; Mooring retries on its own. `sudo mooring doctor` shows the plugin's state |
+| Log: `edge child exited: address already in use` | a packaged `caddy` or `nginx` service holds port 80/443 | `sudo mooring setup --yes` (it turns them off), or `sudo systemctl disable --now caddy nginx` |
+| Deploy: *the edge has not issued the TLS cert yet* | the hostname doesn't resolve to this server yet, or port 80 is closed | check [Step 7](#step-7-point-dns-at-the-server) (`dig +short <name>`) and [Step 1](#step-1-open-ports-80-and-443) |
+| `doctor`: `docker` **MISSING** | Docker isn't installed | [Step 2](#step-2-install-docker) |
+| Deploys fail to reach Docker after installing it | Docker was installed after Mooring, so `mooring` isn't in the `docker` group | `sudo usermod -aG docker mooring && sudo systemctl restart mooring` |
+
+---
+
+*The service's hardening (memory caps, sandboxing, network egress lock-down) is in [How it works &
+why it's safe](./architecture.md). Running your own Docker connection instead of the built-in one?
+Set `docker.external_proxy: true`; see [the CLI reference](./cli.md).*

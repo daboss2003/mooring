@@ -64,7 +64,7 @@ Mooring is third-party, so (like Docker or Tailscale) `apt` needs to know where 
 **Quickest** — grab the `.deb` from the [latest release](https://github.com/daboss2003/mooring/releases/latest) and install it directly:
 
 ```bash
-sudo apt install ./mooring_<version>_amd64.deb
+sudo apt install ./mooring_<version>_linux_amd64.deb    # or _linux_arm64.deb
 ```
 
 **For automatic `apt upgrade` updates** — add the signed APT repo once, then install:

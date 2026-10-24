@@ -9,8 +9,10 @@ bind_addr: "127.0.0.1:9000"          # the dashboard binds loopback; the edge fr
 
 encryption_key: "<from gen-key>"
 
-ip_allowlist:                         # who may reach the dashboard (your IP / VPN)
-  - "203.0.113.10/32"
+ip_allowlist:                         # who may reach the dashboard
+  - "127.0.0.1/32"                    # the SSH tunnel arrives from loopback: keep these two
+  - "::1/128"
+  # - "203.0.113.10/32"               # your IP / VPN, only with admin.hostname below
 
 auth:
   username: "operator"
@@ -20,6 +22,7 @@ auth:
 edge:
   mode: "managed"                     # Mooring runs the web server + HTTPS for you
   acme_email: "you@example.com"
+  acme_ca: "https://acme-v02.api.letsencrypt.org/directory"   # required in managed mode
   # Optional: own a managed L4 (TCP/UDP) load balancer for non-HTTP stream services
   # (DNS 53, DoT 853, MQTTS 8883) so they can run as an auto-scaled internal replica
   # pool. Requires nginx installed on the host + the privileged-ports systemd drop-in
@@ -27,9 +30,9 @@ edge:
   # l4_enabled: true
   # l4_nginx_digest: ""               # optional SHA-256 pin of the nginx binary
 
-admin:
-  hostname: "admin.example.com"       # Mooring serves the dashboard here over HTTPS,
-                                      # behind ip_allowlist. Omit to use an SSH tunnel.
+# admin:
+#   hostname: "admin.example.com"     # Mooring serves the dashboard here over HTTPS, behind
+#                                     # ip_allowlist (add your IP above). Omit to use an SSH tunnel.
 
 data_dir: "/var/lib/mooring"
 
