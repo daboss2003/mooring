@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,6 +49,27 @@ func fakeCaddy(version string, modules []string, pkgs map[string]string) []byte 
 		"    fi ;;\n" +
 		"  *) echo 'Error: unknown command' >&2; echo \"Run 'caddy --help' for usage.\" >&2; exit 1 ;;\n" +
 		"esac\n")
+}
+
+// configCaddy is fakeCaddy (no packages) that also answers `validate --config - --adapter ""`: it reads
+// the config on stdin (shell builtins only: the edge's environment has no PATH) and accepts it, or with
+// refuse fails the way Caddy refuses a config, with an error-level JSON log line — a release (or DNS
+// plugin) that rejects a field the edge renders.
+func configCaddy(version string, modules []string, refuse bool) []byte {
+	validate := "  validate) " + readStdin + " > /dev/null; echo 'Valid configuration' ;;\n"
+	if refuse {
+		validate = "  validate) " + readStdin + " > /dev/null\n" +
+			`    echo '{"level":"error","msg":"loading http app module: provision http: json: unknown field \"bogus\""}' >&2; exit 1 ;;` + "\n"
+	}
+	return []byte(strings.Replace(string(fakeCaddy(version, modules, nil)), "  *) ", validate+"  *) ", 1))
+}
+
+// servedConfig stands in for the config the edge serves, which a build check validates.
+var servedConfig = []byte(`{"apps":{"http":{"servers":{}}}}`)
+
+// validateServed is the check serve wires up: `caddy validate` of the served config on the download.
+func validateServed(ctx context.Context, bin string) error {
+	return ValidateConfig(ctx, bin, servedConfig, nil)
 }
 
 // leftoverDownloads lists any caddy.new* files in <dataDir>/bin.
@@ -219,6 +242,81 @@ func TestInstallPluginBuildRefusesBadDownloads(t *testing.T) {
 				t.Error(".bak must not exist after a refused download")
 			}
 		})
+	}
+}
+
+// opt.Check runs on the download once it passed the version and module checks, before anything is
+// swapped: a download that refuses the config the edge serves (a new release or DNS plugin rejecting a
+// field the edge renders, which would crash-loop the edge on its restart) is deleted, the current binary
+// stays, no .bak is made, and the error says why (ErrBuildCheckFailed, the download's version and the
+// check's cause). The check runs the download itself, at its bin/caddy.new.* path.
+func TestInstallPluginBuildCheckRefusesTheDownload(t *testing.T) {
+	skipNoShell(t)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	mods := []string{"dns.providers.cloudflare"}
+	current := configCaddy("v2.11.2 h1:current", mods, false)
+	writeExec(t, OwnedCaddyPath(dataDir), current)
+	srv, hits := buildServer(t, http.StatusOK, configCaddy("v2.12.0 h1:new", mods, true))
+	var checked []string
+	_, err := InstallPluginBuild(ctx, InstallOptions{DataDir: dataDir, Packages: []string{"github.com/caddy-dns/cloudflare"},
+		WantModules: mods, BuildServer: srv.URL, Client: srv.Client(), GOOS: "linux", GOARCH: "amd64",
+		Check: func(ctx context.Context, bin string) error {
+			checked = append(checked, bin)
+			if got, _ := os.ReadFile(OwnedCaddyPath(dataDir)); !bytes.Equal(got, current) {
+				t.Error("the check must run before the swap")
+			}
+			return validateServed(ctx, bin)
+		}})
+	if !errors.Is(err, ErrBuildCheckFailed) || !strings.Contains(err.Error(), `unknown field "bogus"`) ||
+		!strings.Contains(err.Error(), "2.12.0") || !strings.Contains(err.Error(), "keeping the current") {
+		t.Fatalf("err = %v; want ErrBuildCheckFailed naming the download's version and Caddy's error", err)
+	}
+	if len(checked) != 1 || filepath.Dir(checked[0]) != filepath.Join(dataDir, "bin") || !strings.HasPrefix(filepath.Base(checked[0]), "caddy.new.") {
+		t.Errorf("checked %v; want the download, once", checked)
+	}
+	if got, _ := os.ReadFile(OwnedCaddyPath(dataDir)); !bytes.Equal(got, current) {
+		t.Error("a download that fails the check must leave the current binary in place")
+	}
+	if left := leftoverDownloads(t, dataDir); len(left) != 0 {
+		t.Errorf("a download that fails the check must be deleted: %v", left)
+	}
+	if _, err := os.Stat(OwnedCaddyPath(dataDir) + ".bak"); !errors.Is(err, os.ErrNotExist) {
+		t.Error(".bak must not exist after a refused download")
+	}
+	if hits.Load() != 1 {
+		t.Errorf("build server hits = %d", hits.Load())
+	}
+}
+
+// A download that passes opt.Check is installed as before; with SkipIfSame an unchanged download is
+// dropped without running the check.
+func TestInstallPluginBuildCheckPassesThenSwaps(t *testing.T) {
+	skipNoShell(t)
+	fakeBuildInfo(t)
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	mods := []string{"dns.providers.cloudflare"}
+	current := withBuild(configCaddy("v2.11.2 h1:current", mods, false), "go1.25.6 caddy@v2.11.2")
+	writeExec(t, OwnedCaddyPath(dataDir), current)
+	offered := withBuild(configCaddy("v2.12.1 h1:new", mods, false), "go1.25.7 caddy@v2.12.1")
+	srv, _ := buildServer(t, http.StatusOK, offered)
+	checks := 0
+	opt := InstallOptions{DataDir: dataDir, Packages: []string{"github.com/caddy-dns/cloudflare"}, WantModules: mods,
+		BuildServer: srv.URL, Client: srv.Client(), GOOS: "linux", GOARCH: "amd64", SkipIfSame: true,
+		Check: func(ctx context.Context, bin string) error { checks++; return validateServed(ctx, bin) }}
+	path, err := InstallPluginBuild(ctx, opt)
+	if err != nil || path != OwnedCaddyPath(dataDir) || checks != 1 {
+		t.Fatalf("path=%q err=%v checks=%d; want the build installed after one check", path, err, checks)
+	}
+	if got, _ := os.ReadFile(path); !bytes.Equal(got, offered) {
+		t.Error("the download must be at the owned path")
+	}
+	if bak, _ := os.ReadFile(path + ".bak"); !bytes.Equal(bak, current) {
+		t.Error("caddy.bak must hold the previous build")
+	}
+	if _, err := InstallPluginBuild(ctx, opt); !errors.Is(err, ErrBuildUnchanged) || checks != 1 {
+		t.Errorf("an unchanged download: err=%v checks=%d; want ErrBuildUnchanged without a check", err, checks)
 	}
 }
 
@@ -1000,5 +1098,221 @@ func TestRunCaddyRefusesBinaryOthersCanWrite(t *testing.T) {
 	}
 	if _, err := CaddyVersion(context.Background(), bin); err != nil {
 		t.Errorf("our own 0700 caddy must run: %v", err)
+	}
+}
+
+// fakeBuildInfo stands in for debug/buildinfo on the fake (shell script) caddies: a "# build <id>" line
+// is the binary's build info; a script without one has none (like a binary that isn't Go).
+func fakeBuildInfo(t *testing.T) {
+	t.Helper()
+	old := readBuildInfo
+	readBuildInfo = func(r io.ReaderAt) (*debug.BuildInfo, error) {
+		b, _ := io.ReadAll(io.NewSectionReader(r, 0, 1<<20))
+		for _, l := range strings.Split(string(b), "\n") {
+			if id, ok := strings.CutPrefix(l, "# build "); ok {
+				return &debug.BuildInfo{GoVersion: id}, nil
+			}
+		}
+		return nil, errors.New("not a Go binary")
+	}
+	t.Cleanup(func() { readBuildInfo = old })
+}
+
+func withBuild(script []byte, id string) []byte { return append(script, []byte("# build "+id+"\n")...) }
+
+// SkipIfSame: a download whose Go build info equals the installed build's is dropped and nothing is
+// swapped; any difference (or build info that can't be read on either side) installs it as usual.
+func TestInstallPluginBuildSkipIfSame(t *testing.T) {
+	skipNoShell(t)
+	fakeBuildInfo(t)
+	ctx := context.Background()
+	mods := []string{"dns.providers.cloudflare"}
+	cases := []struct {
+		name               string
+		installed, offered []byte // nil installed = no owned build yet
+		skip, wantSwap     bool
+	}{
+		{"same build", withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), true, false},
+		{"new go version", withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.6 caddy@v2.11.2"), withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), true, true},
+		{"installed has no build info", fakeCaddy("v2.11.2 h1:x", mods, nil), withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), true, true},
+		{"download has no build info", withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), fakeCaddy("v2.11.2 h1:x", mods, nil), true, true},
+		{"no owned build yet", nil, withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), true, true},
+		{"SkipIfSame off", withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), withBuild(fakeCaddy("v2.11.2 h1:x", mods, nil), "go1.25.7 caddy@v2.11.2"), false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dataDir := t.TempDir()
+			owned := OwnedCaddyPath(dataDir)
+			if c.installed != nil {
+				// Different bytes from the download (a trailing comment), the same build info.
+				writeExec(t, owned, append(append([]byte{}, c.installed...), []byte("# installed\n")...))
+			}
+			before, _ := os.ReadFile(owned)
+			srv, hits := buildServer(t, http.StatusOK, c.offered)
+			path, err := InstallPluginBuild(ctx, InstallOptions{DataDir: dataDir, Packages: []string{"github.com/caddy-dns/cloudflare"},
+				WantModules: mods, BuildServer: srv.URL, Client: srv.Client(), GOOS: "linux", GOARCH: "amd64", SkipIfSame: c.skip})
+			if hits.Load() != 1 {
+				t.Errorf("build server hits = %d", hits.Load())
+			}
+			if left := leftoverDownloads(t, dataDir); len(left) != 0 {
+				t.Errorf("downloads left behind: %v", left)
+			}
+			now, _ := os.ReadFile(owned)
+			if !c.wantSwap {
+				if !errors.Is(err, ErrBuildUnchanged) || path != "" {
+					t.Fatalf("path=%q err=%v; want ErrBuildUnchanged", path, err)
+				}
+				if !bytes.Equal(now, before) {
+					t.Error("an unchanged build must leave the installed binary in place")
+				}
+				if _, err := os.Stat(owned + ".bak"); !errors.Is(err, os.ErrNotExist) {
+					t.Error("an unchanged build must not touch caddy.bak")
+				}
+				return
+			}
+			if err != nil || path != owned {
+				t.Fatalf("path=%q err=%v; want the build installed", path, err)
+			}
+			if !bytes.Equal(now, c.offered) {
+				t.Error("the download must be at the owned path")
+			}
+			if c.installed != nil {
+				if bak, _ := os.ReadFile(owned + ".bak"); !bytes.Equal(bak, before) {
+					t.Error("caddy.bak must hold the previous build")
+				}
+			}
+		})
+	}
+}
+
+// The real reader: a Go binary's build info is read and compared field by field.
+func TestBuildFingerprint(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(filepath.Dir(exe))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	fp, ok := buildFingerprintOf(root, filepath.Base(exe))
+	if !ok || !strings.Contains(fp, runtime.Version()) {
+		t.Fatalf("this test binary's build info: ok=%v %q", ok, fp)
+	}
+	if !sameBuild(root, filepath.Base(exe), filepath.Base(exe)) {
+		t.Error("a binary is the same build as itself")
+	}
+	script := filepath.Join(t.TempDir(), "caddy")
+	writeExec(t, script, []byte("#!/bin/sh\n"))
+	sroot, err := os.OpenRoot(filepath.Dir(script))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sroot.Close()
+	if sameBuild(sroot, "caddy", "caddy") {
+		t.Error("a file without Go build info is never the same build, not even as itself")
+	}
+
+	base := func() *debug.BuildInfo {
+		return &debug.BuildInfo{GoVersion: "go1.25.7", Main: debug.Module{Path: "caddy", Version: "(devel)"}, Deps: []*debug.Module{
+			{Path: "github.com/caddyserver/caddy/v2", Version: "v2.11.2"},
+			{Path: "github.com/caddy-dns/cloudflare", Version: "v0.2.1"},
+		}}
+	}
+	b := base()
+	b.Deps[0], b.Deps[1] = b.Deps[1], b.Deps[0]
+	if buildFingerprint(base()) != buildFingerprint(b) {
+		t.Error("dependency order must not matter")
+	}
+	for name, mutate := range map[string]func(*debug.BuildInfo){
+		"go version":  func(b *debug.BuildInfo) { b.GoVersion = "go1.25.8" },
+		"main":        func(b *debug.BuildInfo) { b.Main.Version = "v1.0.0" },
+		"dep version": func(b *debug.BuildInfo) { b.Deps[0].Version = "v2.11.3" },
+		"replace": func(b *debug.BuildInfo) {
+			b.Deps[1].Replace = &debug.Module{Path: "github.com/fork/cloudflare", Version: "v0.2.1"}
+		},
+		"extra dep": func(b *debug.BuildInfo) {
+			b.Deps = append(b.Deps, &debug.Module{Path: "golang.org/x/net", Version: "v0.40.0"})
+		},
+	} {
+		b := base()
+		mutate(b)
+		if buildFingerprint(base()) == buildFingerprint(b) {
+			t.Errorf("%s: a different build must have a different fingerprint", name)
+		}
+	}
+}
+
+// An owned build installed before builds were made 0755 is made readable (the host vulnerability scan
+// reads it without CAP_DAC_OVERRIDE); anything that isn't a plain file is left alone.
+func TestEnsureOwnedCaddyReadable(t *testing.T) {
+	skipNoShell(t)
+	mode := func(p string) os.FileMode {
+		t.Helper()
+		fi, err := os.Lstat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+	for _, c := range []struct {
+		before, after os.FileMode
+	}{{0o700, 0o755}, {0o750, 0o755}, {0o755, 0o755}, {0o775, 0o775}} {
+		dataDir := t.TempDir()
+		owned := OwnedCaddyPath(dataDir)
+		writeExec(t, owned, []byte("#!/bin/sh\n"))
+		if err := os.Chmod(owned, c.before); err != nil {
+			t.Fatal(err)
+		}
+		if err := EnsureOwnedCaddyReadable(dataDir); err != nil {
+			t.Fatalf("%o: %v", c.before, err)
+		}
+		if got := mode(owned); got != c.after {
+			t.Errorf("mode %o → %o; want %o", c.before, got, c.after)
+		}
+		if got := mode(filepath.Dir(owned)); got != 0o700 {
+			t.Errorf("the bin dir must stay 0700, got %o", got)
+		}
+	}
+
+	if err := EnsureOwnedCaddyReadable(""); err != nil {
+		t.Errorf("no data dir: %v", err)
+	}
+	if err := EnsureOwnedCaddyReadable(t.TempDir()); err != nil {
+		t.Errorf("no owned build: %v", err)
+	}
+	if err := EnsureOwnedCaddyReadable(filepath.Join(t.TempDir(), "missing")); err != nil {
+		t.Errorf("no data dir on disk: %v", err)
+	}
+
+	dataDir := t.TempDir()
+	target := filepath.Join(dataDir, "elsewhere")
+	writeExec(t, target, []byte("#!/bin/sh\n"))
+	if err := os.MkdirAll(filepath.Join(dataDir, "bin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Relative links that stay inside data_dir: os.Root itself refuses absolute ones and ones that leave it.
+	if err := os.Symlink("../elsewhere", OwnedCaddyPath(dataDir)); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureOwnedCaddyReadable(dataDir); err == nil {
+		t.Error("a symlinked owned build must be refused")
+	}
+	if got := mode(target); got != 0o700 {
+		t.Errorf("the symlink's target must not be changed: %o", got)
+	}
+
+	dataDir = t.TempDir()
+	realBin := filepath.Join(dataDir, "realbin")
+	writeExec(t, filepath.Join(realBin, "caddy"), []byte("#!/bin/sh\n"))
+	if err := os.Symlink("realbin", filepath.Join(dataDir, "bin")); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureOwnedCaddyReadable(dataDir); err == nil {
+		t.Error("a symlinked bin dir must be refused")
+	}
+	if got := mode(filepath.Join(realBin, "caddy")); got != 0o700 {
+		t.Errorf("a file behind a symlinked bin dir must not be changed: %o", got)
 	}
 }

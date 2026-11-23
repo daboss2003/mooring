@@ -237,10 +237,11 @@ type scaleFailure struct {
 
 // Watcher is the auto-scaling controller loop (plan §8A).
 type Watcher struct {
-	cfg     Config
-	states  map[Key]State
-	refused map[Key]bool // services with an open scale_refused_no_capacity alert
-	lastAt  time.Time    // the last snapshot acted on (each is acted on once)
+	cfg           Config
+	states        map[Key]State
+	refused       map[string]bool // dedupe keys of the open scale_refused_no_capacity alerts
+	refusedSeeded bool            // refused holds the alerts open before this process started
+	lastAt        time.Time       // the last snapshot acted on (each is acted on once)
 
 	// Copy additions (tick goroutine only).
 	shBusy map[Key]bool            // this tick's SelfHealBusy
@@ -300,7 +301,7 @@ func New(cfg Config) *Watcher {
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	return &Watcher{cfg: cfg, states: map[Key]State{}, refused: map[Key]bool{}, waits: map[Key]*startgate.Wait{},
+	return &Watcher{cfg: cfg, states: map[Key]State{}, refused: map[string]bool{}, waits: map[Key]*startgate.Wait{},
 		failed: map[Key]scaleFailure{}}
 }
 
@@ -909,9 +910,15 @@ func (w *Watcher) save(ctx context.Context, k Key, st State, now int64) {
 	_ = w.cfg.Store.SaveState(ctx, k, st, now)
 }
 
-// emitRefused raises scale_refused_no_capacity (plan §8.4) — never a silent hold.
+// emitRefused raises scale_refused_no_capacity (plan §8.4) — never a silent hold. It pages once per
+// refusal episode: a refusal that persists re-enters here every tick, and resolveRefused ends the episode.
 func (w *Watcher) emitRefused(ctx context.Context, k Key, nearOOM bool, reason string) {
 	target := sanitizeName(k.App) + "/" + sanitizeName(k.Service)
+	key := "scale:" + target
+	w.seedRefused(ctx)
+	if w.refused[key] {
+		return
+	}
 	msg := "Service " + target + " wanted to scale up but the host has no capacity"
 	if nearOOM {
 		msg = "Service " + target + " wanted to scale up but the host is near OOM (scaling is a no-op until memory frees up)"
@@ -925,30 +932,50 @@ func (w *Watcher) emitRefused(ctx context.Context, k Key, nearOOM bool, reason s
 		// missing channel caused the refusal).
 		w.cfg.Log.Warn("scale: up refused — the host has no capacity for another replica (add an alert channel to be notified of this)",
 			"target", target, "reason", reason, "near_oom", nearOOM)
+		w.refused[key] = true
 		return
 	}
-	w.refused[k] = true
-	_ = w.cfg.Alerts.EnqueueInfra(ctx, alert.Outbox{
+	if err := w.cfg.Alerts.EnqueueInfra(ctx, alert.Outbox{
 		RuleID: 0, Target: target, Kind: "scale_refused_no_capacity", Level: alert.LevelWarning,
-		Transition: "firing", Summary: msg, DedupeKey: "scale:" + target,
-	})
+		Transition: "firing", Summary: msg, DedupeKey: key,
+	}); err == nil {
+		w.refused[key] = true
+	}
 }
 
 // resolveRefused clears an open scale_refused_no_capacity alert once the service can
 // scale again (capacity returned) or no longer wants to (load dropped).
 func (w *Watcher) resolveRefused(ctx context.Context, k Key) {
-	if !w.refused[k] {
+	target := sanitizeName(k.App) + "/" + sanitizeName(k.Service)
+	key := "scale:" + target
+	w.seedRefused(ctx)
+	if !w.refused[key] {
 		return
 	}
-	delete(w.refused, k)
+	delete(w.refused, key)
 	if w.cfg.Alerts == nil {
 		return
 	}
-	target := sanitizeName(k.App) + "/" + sanitizeName(k.Service)
 	_ = w.cfg.Alerts.EnqueueInfra(ctx, alert.Outbox{
 		RuleID: 0, Target: target, Kind: "scale_refused_no_capacity", Level: alert.LevelWarning,
-		Transition: "resolved", Summary: "Service " + target + " no longer needs more capacity (resolved).", DedupeKey: "scale:" + target,
+		Transition: "resolved", Summary: "Service " + target + " no longer needs more capacity (resolved).", DedupeKey: key,
 	})
+}
+
+// seedRefused re-adopts, once, the refusal alerts left open before this process started, so a refusal
+// that still holds isn't paged again and one that ended is resolved.
+func (w *Watcher) seedRefused(ctx context.Context) {
+	if w.refusedSeeded || w.cfg.Alerts == nil {
+		return
+	}
+	open, err := w.cfg.Alerts.OpenInfraAlerts(ctx, "scale_refused_no_capacity")
+	if err != nil {
+		return // retried on the next call
+	}
+	w.refusedSeeded = true
+	for key := range open {
+		w.refused[key] = true
+	}
 }
 
 func hostFree(snap *monitor.Snapshot) uint64 {

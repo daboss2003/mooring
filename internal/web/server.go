@@ -105,6 +105,7 @@ type Deps struct {
 	Version      string               // the running Mooring build version (for the Server tab's .deb cleanup)
 	UpdateCheck  *updatecheck.Checker // self-update / security-advisory posture (nil when disabled)
 	ImageScans   *imagescan.Store     // per-app Trivy scan results (surface on the Server tab)
+	HostScans    *imagescan.HostStore // the host's own Trivy scan (Server tab; may be nil)
 	ImageUpdates *imageupdate.Store   // per-service pull-image update state (surface on the Server tab; may be nil)
 	ServiceLogs  *servicelog.Store    // retained per-service container logs for search (on by default; nil when off)
 	EventLog     *eventlog.Store      // deduped operational events for the Activity tab (may be nil)
@@ -216,6 +217,7 @@ type Server struct {
 	footprintC     *footprintCache              // cached on-disk footprint (off-request refresh)
 	updateCheck    *updatecheck.Checker         // self-update / security-advisory posture (may be nil)
 	imageScans     *imagescan.Store             // per-app Trivy scan results (may be nil)
+	hostScans      *imagescan.HostStore         // the host's own Trivy scan (may be nil)
 	imageUpdates   *imageupdate.Store           // per-service pull-image update state (may be nil)
 	serviceLogs    *servicelog.Store            // retained per-service logs for search (on by default; nil when off)
 	eventLog       *eventlog.Store              // deduped operational events for the Activity tab (may be nil)
@@ -239,6 +241,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		version:       d.Version,
 		updateCheck:   d.UpdateCheck,
 		imageScans:    d.ImageScans,
+		hostScans:     d.HostScans,
 		imageUpdates:  d.ImageUpdates,
 		serviceLogs:   d.ServiceLogs,
 		eventLog:      d.EventLog,

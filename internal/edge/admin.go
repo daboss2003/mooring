@@ -200,7 +200,10 @@ type Reconciler struct {
 	// onStatus receives the routes whose served state changed in a committed reconcile. Called after
 	// the lock is released; it must not call back into the Reconciler synchronously.
 	onStatus func([]StatusChange)
-	now      func() time.Time // test clock; nil = time.Now
+	// onRefusalCleared is called when a reconcile ends a refusal LoadRefused reported (see
+	// SetRefusalCleared). Called after the lock is released.
+	onRefusalCleared func()
+	now              func() time.Time // test clock; nil = time.Now
 
 	// hooksMu guards poolFn and onStatus: they are wired after the Caddy supervisor has started, and a
 	// Caddy launch reconciles from its own goroutine.
@@ -208,8 +211,16 @@ type Reconciler struct {
 
 	gen atomic.Uint64 // discovery generation, taken before each discovery starts
 
-	mu           sync.Mutex // serializes the render→Load→lastGood commit (atomic, last-wins)
-	lastGood     []byte
+	mu       sync.Mutex // serializes the render→Load→lastGood commit (atomic, last-wins)
+	lastGood []byte
+	// applied is the config Caddy last accepted. Unlike lastGood, a Caddy restart doesn't clear it
+	// (ReloadAfterRestart clears lastGood only to force the next /load).
+	applied []byte
+	// refused is Caddy's error (tokens redacted) for the latest render it refused — not one namespace's
+	// wildcard, which is left out instead — while no render has been accepted since; "" otherwise.
+	// refusedCfg is that render, byte for byte (nil when refused is "").
+	refused      string
+	refusedCfg   []byte
 	committedGen uint64                 // generation of the discovery behind the committed render
 	lkg          map[string]lkgPool     // PoolKey → last confirmed endpoints
 	status       map[string]RouteStatus // routeKey → served state
@@ -345,6 +356,34 @@ func (r *Reconciler) drainingSet() map[string]bool {
 	return out
 }
 
+// LastApplied returns a copy of the config Caddy last accepted from this Reconciler (nil before the
+// first accepted /load). It carries the dns01 tokens of the wildcards it renders.
+func (r *Reconciler) LastApplied() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.applied == nil {
+		return nil
+	}
+	return append([]byte(nil), r.applied...)
+}
+
+// LoadRefused reports whether Caddy refused the current render at /load — for a reason other than one
+// namespace's wildcard, which is left out and the rest loaded — with Caddy's error, every rendered dns01
+// token redacted, and a copy of the render it refused (it carries the dns01 tokens of the wildcards it
+// renders). The edge keeps serving the config it accepted before (LastApplied), but a restarted Caddy
+// boots on the startup config and is fed the current render again: unless the new binary accepts it,
+// every app answers 404 until the render is fixed. It is cleared when a reconcile's render is accepted,
+// or is the config Caddy already serves. A /load that didn't reach Caddy, a render error and
+// RevertToLastGood leave it as it is.
+func (r *Reconciler) LoadRefused() (refused bool, reason string, render []byte) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.refused == "" {
+		return false, "", nil
+	}
+	return true, r.refused, append([]byte(nil), r.refusedCfg...)
+}
+
 // ReloadAfterRestart re-feeds a freshly (re)launched Caddy. A relaunched child boots on the route-less
 // base config while lastGood still holds the full document, so an unchanged render would be skipped as
 // already applied and every app host would answer 404 until something changed. Clearing lastGood forces
@@ -390,6 +429,12 @@ func (r *Reconciler) SetWildcards(fn func() []WildcardCert) { r.wildcards = fn }
 func (r *Reconciler) SetWildcardReject(fn func(w WildcardCert, err error)) {
 	r.onWildcardReject = fn
 }
+
+// SetRefusalCleared registers fn, called each time a reconcile ends a refusal LoadRefused reported: a
+// render was accepted, or the render is back to the config Caddy serves. fn runs after the reconcile lock
+// is released, on the reconciling goroutine: it must return quickly and must not call back into the
+// Reconciler synchronously. Set it before the edge starts.
+func (r *Reconciler) SetRefusalCleared(fn func()) { r.onRefusalCleared = fn }
 
 // SetCatchAllConsent registers the live operator-consent check for catch-all routes (see catchAllOK):
 // a stored `*.apex` catch-all is dropped at the next reconcile if its namespace no longer consents.
@@ -493,13 +538,20 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		if err := r.admin.Load(ctx, cfg); err != nil {
 			applied, rej, lerr := r.loadWithoutWildcards(ctx, base, routes, cfg, err)
 			if lerr != nil {
+				lerr = redactTokens(lerr, base.Wildcards)
+				if errors.As(lerr, new(*ConfigRejectedError)) {
+					r.refused, r.refusedCfg = lerr.Error(), cfg
+				}
 				r.mu.Unlock()
-				return redactTokens(lerr, base.Wildcards)
+				return lerr
 			}
 			rejected, cfg = rej, applied
 		}
-		r.lastGood = cfg
+		r.lastGood, r.applied = cfg, cfg
 	}
+	// Accepted now, or the same render as the config Caddy serves.
+	refusalCleared := r.refused != ""
+	r.refused, r.refusedCfg = "", nil
 	r.committedGen = gen
 	r.lkg, r.status = lkg, status
 	// The owner records each refusal before the lock is released, so a concurrent reconcile already
@@ -511,6 +563,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 	}
 	r.mu.Unlock()
+	if refusalCleared && r.onRefusalCleared != nil {
+		r.onRefusalCleared()
+	}
 	for _, rj := range rejected {
 		if r.log != nil {
 			r.log.Error("edge: Caddy rejected the DNS-01 wildcard config; serving every route without this wildcard",
@@ -613,15 +668,30 @@ func redactTokens(err error, ws []WildcardCert) error {
 // two writes is still caught; a line longer than 64 KiB is passed on unredacted at that point. Flush
 // writes out a final partial line. With no non-empty secret it returns w itself.
 func NewRedactWriter(w io.Writer, secrets []string) io.Writer {
+	forms := secretForms(secrets)
+	if len(forms) == 0 {
+		return w
+	}
+	return &redactWriter{w: w, forms: forms}
+}
+
+// secretForms is every tokenForms form of each secret, longest first (so a form containing another is
+// replaced whole).
+func secretForms(secrets []string) []string {
 	var forms []string
 	for _, s := range secrets {
 		forms = append(forms, tokenForms(s)...)
 	}
-	if len(forms) == 0 {
-		return w
-	}
 	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
-	return &redactWriter{w: w, forms: forms}
+	return forms
+}
+
+// redactSecrets returns s with every form of each secret replaced by "[redacted]".
+func redactSecrets(s string, secrets []string) string {
+	for _, f := range secretForms(secrets) {
+		s = strings.ReplaceAll(s, f, "[redacted]")
+	}
+	return s
 }
 
 type redactWriter struct {
@@ -781,5 +851,9 @@ func (r *Reconciler) RevertToLastGood(ctx context.Context) error {
 			return err
 		}
 	}
-	return r.admin.Load(ctx, cfg)
+	if err := r.admin.Load(ctx, cfg); err != nil {
+		return err
+	}
+	r.applied = cfg
+	return nil
 }

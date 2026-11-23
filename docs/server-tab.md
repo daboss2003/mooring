@@ -20,6 +20,9 @@ read-only except one narrow, re-authenticated action (deleting an old `.deb`).
   separately — Mooring reclaims those for you (see **Reclaiming disk** below).
 - **Mooring downloads (`.deb`)** — lists the Mooring release packages you've
   downloaded so you can delete the old ones (see below).
+- **Vulnerabilities** — known CVEs in each deployed app's images and dependencies (see below).
+- **Host vulnerabilities** — known CVEs in the host's OS packages and in the binaries Mooring
+  runs, plus a notice when the host needs a reboot (see below).
 - **Files (read-only)** — an opt-in, allow-listed file viewer (see below).
 
 ## Reclaiming disk
@@ -157,10 +160,12 @@ finding, update the flagged package (bump a dependency, or update the base image
 
 The scanner runs the pinned Trivy image with no Docker socket, dropped capabilities, and
 `no-new-privileges`; its vulnerability database is cached in a persistent volume so it isn't
-re-downloaded every scan.
+re-downloaded every scan. Trivy's usage telemetry and update check are turned off
+(`--disable-telemetry --skip-version-check`), so a scan contacts only the image registry and the
+vulnerability database mirrors (`mirror.gcr.io`, then `ghcr.io`).
 
-One heads-up: scanning is a bit heavy. The first run downloads a vulnerability database (a few
-hundred MB) and each scan uses some CPU and memory. On a small server you might prefer to turn
+One heads-up: scanning is a bit heavy. The first run downloads a vulnerability database (about
+150 MB, about 2 GB once unpacked in the cache volume) and each scan uses some CPU and memory. On a small server you might prefer to turn
 it off:
 
 ```yaml
@@ -171,6 +176,115 @@ server:
 (There's one thing it can't see: the exact operating-system packages inside an image you build
 yourself. Getting at those would mean handing the scanner the Docker socket, which would undo
 Mooring's security model — so it doesn't.)
+
+## Host vulnerabilities
+
+The **Host vulnerabilities** section lists known CVEs in the host itself. The scan covers:
+
+- **OS packages** — every package in the host's package database: `/var/lib/dpkg/status` on
+  Debian and Ubuntu, the rpm database (`/var/lib/rpm` or `/usr/lib/sysimage/rpm`) on RHEL-family
+  and Amazon Linux hosts. The OS is detected from `/etc/os-release` and the distribution's release
+  file (`/etc/lsb-release`, `/etc/debian_version`, `/etc/<distro>-release` or, on Amazon Linux,
+  `/etc/system-release`).
+- **Binaries** — the Go binaries Mooring runs, each listed separately: `caddy (system)` (the
+  `caddy` on `PATH`), `caddy (Mooring-owned build)` (`<data_dir>/bin/caddy`, when present; not
+  scanned when Mooring runs as root, which never uses that build, or with `edge.mode: external`),
+  `docker`, `dockerd`, `containerd`, `containerd-shim-runc-v2`, `runc`, `docker-proxy` (on `PATH`, else
+  `/usr/libexec/docker/docker-proxy` or `/usr/lib/docker/docker-proxy`), `docker compose` and
+  `docker buildx` (the CLI plugins, from `/usr/libexec/docker/cli-plugins`,
+  `/usr/lib/docker/cli-plugins` or `/usr/local/lib/docker/cli-plugins`) and `mooring`. A binary that
+  isn't installed is left out. Binaries under `/snap/` are not scanned.
+
+For each target the section shows the Critical / High / Medium / Low counts with how many of each
+have a fixed version, and the worst 25 findings with their fixed version (or "no fix yet"). A
+target that could not be scanned shows the reason instead of counts: for example a binary that is
+not world-readable, or a host without a dpkg or rpm database.
+
+When Trivy reports the OS release as end of life (no longer supported by the distribution), the
+section shows the notice "This OS release is end of life: it gets no more security fixes, so a
+clean result doesn't mean it's safe." The scan only finds vulnerabilities that the distribution
+has published, so an end-of-life release shows few or no findings. No alert is sent for it.
+
+How it runs:
+
+- One `docker run` of the pinned Trivy image per scan (`trivy rootfs`). The release files, the
+  package database and each binary are bind-mounted read-only under `/host`, each at `/host`
+  followed by its path with symlinks resolved (on Amazon Linux 2023, `/etc/system-release` is
+  mounted as `/host/usr/lib/system-release`); nothing else on the host is visible to the scanner,
+  and nothing on the host is changed.
+- No Docker socket, all capabilities dropped, `no-new-privileges`. The vulnerability database is
+  shared with the app scan (the `mooring-trivy-cache` volume).
+- It runs on the app scan's schedule (`server.image_scan_interval`, default 24h; the first run is
+  about 2 minutes after Mooring starts), before the app scans, one Trivy container at a time. It
+  runs even when `server.image_scan_enabled` is `false`.
+- A failed scan keeps the previous results on the page and shows the error; the cause is in the
+  Mooring log (`journalctl -u mooring`).
+
+Alerts (see [Alerts](./alerting.md#host-and-edge-maintenance-alerts)):
+
+- `host_vulnerabilities` — a scan finds a High or Critical finding with a fixed version that no
+  earlier `host_vulnerabilities` alert included since Mooring started. A finding is identified by
+  its CVE ID, package and target. Level `critical` when one of the new findings is Critical,
+  otherwise `warning`. The alert counts the new findings, gives the totals, names up to three of
+  the new ones and says how to fix every High or Critical finding with a fixed version in the scan
+  (see below). A scan with only findings that were already alerted, or with fewer findings, sends
+  nothing. After a Mooring restart, findings that remain are alerted once more. Findings without a
+  fixed version are listed but never alert.
+- `host_reboot_required` — see **Pending reboot** below.
+
+To clear findings, upgrade only the affected packages:
+
+- Debian and Ubuntu: `sudo apt-get update && sudo apt-get install --only-upgrade <package>…`
+- RHEL family, Fedora and Amazon Linux 2023: `sudo dnf upgrade <package>…` (`sudo yum upgrade
+  <package>…` on Amazon Linux 2 and on RHEL, CentOS or Oracle Linux 7)
+
+A full `sudo apt-get upgrade` or `sudo dnf upgrade` also upgrades Docker (`docker-ce`,
+`containerd.io`, …) when an update for it is available. Upgrading Docker or the container runtime
+restarts Docker and every container on the host.
+
+The `host_vulnerabilities` alert gives this command with the names of the OS packages that have a
+High or Critical finding with a fixed version in the scan, sorted, up to 20 (the rest are counted,
+with "see the Server tab"). Only names made of `A-Z`, `a-z`, `0-9` and `.+_:-` that start with a letter
+or digit and don't end with `-` are printed. When one of them is a Docker or container-runtime package (`docker-ce`,
+`docker-ce-cli`, `docker-ce-rootless-extras`, `containerd.io`, `docker-buildx-plugin`,
+`docker-compose-plugin`, `docker.io`, `containerd`, `runc`, `moby-*`), or one of Docker's binaries has
+such a finding, the alert says that upgrading restarts Docker and every container on the host.
+
+Binaries are updated by the packages that installed them, once those ship a rebuilt version;
+`mooring` is updated by a Mooring release. The alert names the affected binaries.
+
+The Mooring-owned Caddy build is refreshed by Mooring, never by a package upgrade, and only when Mooring runs the managed edge
+(`edge.mode: managed`). When a host scan finds a finding with a fixed version in that build,
+Mooring downloads a current build (at most one download every 20 hours, counted from the last
+attempt; the time is kept in `<data_dir>/bin/caddy.refresh-attempt`, so a Mooring restart doesn't
+reset it):
+
+- The download differs from the installed build: Mooring swaps it in, keeps the previous build as
+  `<data_dir>/bin/caddy.bak`, restarts the edge and sends `caddy_build_refreshed`.
+- The download is the same build as the installed one (same Go build info): nothing changes and no
+  alert is sent; Mooring logs it.
+- The download or its check fails: the download is deleted, the installed build keeps running and
+  Mooring sends `caddy_build_refresh_failed`. The check includes `caddy validate` of the config the
+  edge serves.
+- Caddy still refuses the edge config that held the last downloaded build back: nothing is
+  downloaded, no attempt is recorded, and Mooring sends `caddy_build_refresh_failed` (`waiting for
+  Caddy to accept the edge config`).
+
+With `edge.mode: external` the owned build is neither scanned nor refreshed.
+
+### Pending reboot
+
+On Debian and Ubuntu, an update that needs a reboot creates `/run/reboot-required` and lists the
+packages that asked for it in `/run/reboot-required.pkgs`. While the file exists, the section shows
+a notice with those packages (up to 20), and after each host scan Mooring sends a
+`host_reboot_required` alert (level `warning`), again when the package list changes.
+
+To disable the host scan:
+
+```yaml
+server:
+  host_scan_enabled: false
+```
 
 ## Image updates
 
@@ -214,7 +328,10 @@ server:
 
   # App vulnerability scanning — ON by default; set false on a small server if it's too heavy.
   image_scan_enabled: false
-  image_scan_interval: 24h         # how often to re-scan (default 24h)
+  image_scan_interval: 24h         # how often to re-scan (default 24h); the host scan uses it too
+
+  # Host vulnerability scanning (OS packages + the binaries Mooring runs) — ON by default.
+  host_scan_enabled: false
 
   # Image-update detection for pull-image services — ON by default; set false to disable.
   image_update_check_enabled: false

@@ -9,6 +9,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/alert"
@@ -16,10 +18,29 @@ import (
 	"github.com/daboss2003/mooring/internal/store"
 )
 
+// Outbox retention. Quiet hours hold a row less than a day and a critical is retried for a day, so no row
+// they keep reaches the unsent limit.
+const (
+	outboxSentRetention = 7 * 24 * time.Hour // delivered and closed rows (OpenInfraAlerts reads them)
+	outboxUnsentMaxAge  = 48 * time.Hour     // rows never sent: alerting disabled, or no channel worked
+	outboxPruneEvery    = 10 * time.Minute   // how often EnqueueInfra prunes
+)
+
+// Delivery retries (owner decision): a message that isn't critical is tried warningAttempts times in all,
+// each on the next drain; a critical message is retried with a backoff from criticalBackoff, doubling, at
+// most criticalBackoffMax apart, until its rows are criticalRetryFor old. Then the rows are given up.
+const (
+	warningAttempts    = 3
+	criticalBackoff    = 15   // seconds
+	criticalBackoffMax = 3600 // seconds
+	criticalRetryFor   = 24 * time.Hour
+)
+
 // Store persists alerting state.
 type Store struct {
-	db     *store.DB
-	cipher *secret.Cipher
+	db        *store.DB
+	cipher    *secret.Cipher
+	nextPrune atomic.Int64 // unix sec before which EnqueueInfra doesn't prune again
 }
 
 // New builds a Store.
@@ -141,10 +162,17 @@ func (s *Store) channel(id int64) (alert.Channel, error) {
 // ChannelByID builds a single channel (for the "send test" button).
 func (s *Store) ChannelByID(id int64) (alert.Channel, error) { return s.channel(id) }
 
+// BuiltChannel is an enabled channel ready to send, with its id (the notifier retries only the channels
+// that failed).
+type BuiltChannel struct {
+	ID int64
+	alert.Channel
+}
+
 // AllChannels builds every enabled channel. Used for Mooring-originated infra
 // alerts (plan §8.4), which are never deferred and route to all channels. A channel
 // that fails to build is skipped (a broken channel can't block the others).
-func (s *Store) AllChannels() ([]alert.Channel, error) {
+func (s *Store) AllChannels() ([]BuiltChannel, error) {
 	rows, err := s.db.Query(`SELECT id FROM alert_channels WHERE enabled=1 ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -161,34 +189,140 @@ func (s *Store) AllChannels() ([]alert.Channel, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	var out []alert.Channel
+	var out []BuiltChannel
 	for _, id := range ids {
 		if ch, err := s.channel(id); err == nil {
-			out = append(out, ch)
+			out = append(out, BuiltChannel{ID: id, Channel: ch})
 		}
 	}
 	return out, nil
 }
 
 // EnqueueInfra appends a Mooring-originated infra notification (rule_id=0 sentinel,
-// never deferred). It is deduped against pending rows so a re-paged condition each
-// tick can't pile up — at most one un-sent row per (dedupe_key, transition).
+// never deferred). A condition re-raised each tick can't pile up: the row is skipped when
+// the NEWEST row for its dedupe key — sent or not — is unsent with the same transition, level,
+// kind and summary. Only the newest row counts: quiet hours hold warnings unsent for hours, so a
+// re-fire queued behind a held or already-sent "resolved" must still be recorded, and a held
+// warning must never swallow a critical raised under the same key (self-heal and disk GC use one
+// key for both). A new summary or kind is a new state (a task that failed again, for another
+// reason): it is recorded, so the message that combines the held rows reports the newest and
+// counts every one.
+//
+// It also prunes the outbox (at most every outboxPruneEvery): producers enqueue whether or not
+// alerting is enabled, and with alerting disabled nothing else would drop the rows.
 func (s *Store) EnqueueInfra(ctx context.Context, o alert.Outbox) error {
+	s.maybePrune(ctx)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO alert_outbox(rule_id, target, kind, level, transition, summary, dedupe_key, created_at)
 		 SELECT 0, ?, ?, ?, ?, ?, ?, ?
-		 WHERE NOT EXISTS (SELECT 1 FROM alert_outbox WHERE dedupe_key=? AND transition=? AND sent_at=0)`,
+		 WHERE NOT EXISTS (
+		   SELECT 1 FROM (SELECT transition, level, kind, summary, sent_at FROM alert_outbox
+		                   WHERE rule_id=0 AND dedupe_key=? ORDER BY id DESC LIMIT 1) AS newest
+		    WHERE newest.sent_at=0 AND newest.transition=? AND newest.level=? AND newest.kind=? AND newest.summary=?)`,
 		o.Target, o.Kind, o.Level, o.Transition, o.Summary, o.DedupeKey, time.Now().Unix(),
-		o.DedupeKey, o.Transition)
+		o.DedupeKey, o.Transition, o.Level, o.Kind, o.Summary)
 	return err
 }
 
-// ChannelsForRule returns the channels a rule routes to (its channel_id, or all
-// enabled channels when channel_id is NULL/0).
+// CloseInfraAlert ends the infra alert open under o.DedupeKey without notifying anyone: the operator
+// cleared it, or what it is about went away (a removed app). It records o — a "resolved" row — already
+// closed, so the key's next episode starts after it (InfraResolveLevel, OpenInfraAlerts, the rows a
+// message combines), and closes the key's unsent rows undelivered. It does nothing when the key's newest
+// row isn't a "firing" one: no alert is open.
+func (s *Store) CloseInfraAlert(ctx context.Context, o alert.Outbox) error {
+	if o.DedupeKey == "" {
+		return errors.New("alertstore: CloseInfraAlert needs a dedupe key")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var transition string
+	err = tx.QueryRowContext(ctx, `SELECT transition FROM alert_outbox WHERE rule_id=0 AND dedupe_key=? ORDER BY id DESC LIMIT 1`,
+		o.DedupeKey).Scan(&transition)
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && transition != "firing") {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	if _, err := tx.ExecContext(ctx, `UPDATE alert_outbox SET sent_at=? WHERE rule_id=0 AND dedupe_key=? AND sent_at=0`,
+		now, o.DedupeKey); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO alert_outbox(rule_id, target, kind, level, transition, summary, dedupe_key, created_at, sent_at)
+		 VALUES(0, ?, ?, ?, 'resolved', ?, ?, ?, ?)`,
+		o.Target, o.Kind, o.Level, o.Summary, o.DedupeKey, now, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) maybePrune(ctx context.Context) {
+	now := time.Now()
+	next := s.nextPrune.Load()
+	if now.Unix() < next || !s.nextPrune.CompareAndSwap(next, now.Add(outboxPruneEvery).Unix()) {
+		return
+	}
+	s.PruneOutbox(ctx, now)
+}
+
+// InfraResolveLevel returns the level a "resolved" row for the infra alert under dedupeKey should carry:
+// the highest level among the key's "firing" rows, delivered or not, since its last "resolved" row (a
+// CloseInfraAlert row too). ok is false when no such firing row is recorded (never raised, or pruned).
+func (s *Store) InfraResolveLevel(ctx context.Context, dedupeKey string) (level string, ok bool) {
+	var n, crit int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MAX(level='critical'),0) FROM alert_outbox
+		  WHERE rule_id=0 AND dedupe_key=? AND transition='firing'
+		    AND id > COALESCE((SELECT MAX(id) FROM alert_outbox
+		                        WHERE rule_id=0 AND dedupe_key=? AND transition='resolved'), 0)`,
+		dedupeKey, dedupeKey).Scan(&n, &crit)
+	if err != nil || n == 0 {
+		return "", false
+	}
+	if crit == 1 {
+		return alert.LevelCritical, true
+	}
+	return alert.LevelWarning, true
+}
+
+// InfraFiringRecorded reports whether a "firing" row of the infra alert under dedupeKey may be recorded in
+// the key's current episode: since its last "resolved" row (a CloseInfraAlert row too). since is when the
+// caller knows the episode began at the earliest (unix sec, wall clock; 0 = unknown). false is a positive
+// answer: no such row is recorded and none can have been pruned, because the episode began inside the
+// outbox retention — after since, or after the last "resolved" row was recorded, whichever is later. A read
+// error is returned with true.
+func (s *Store) InfraFiringRecorded(ctx context.Context, dedupeKey string, since int64) (bool, error) {
+	var n int
+	var resolvedAt int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT (SELECT COUNT(*) FROM alert_outbox
+		          WHERE rule_id=0 AND dedupe_key=? AND transition='firing'
+		            AND id > COALESCE((SELECT MAX(id) FROM alert_outbox
+		                                WHERE rule_id=0 AND dedupe_key=? AND transition='resolved'), 0)),
+		        COALESCE((SELECT created_at FROM alert_outbox WHERE rule_id=0 AND dedupe_key=? AND transition='resolved'
+		                   ORDER BY id DESC LIMIT 1), 0)`,
+		dedupeKey, dedupeKey, dedupeKey).Scan(&n, &resolvedAt)
+	if err != nil {
+		return true, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	// A row of the episode was raised after since and after the last resolve, so it was closed after them
+	// too; the prune deletes only rows closed before the retention.
+	return max(since, resolvedAt) < time.Now().Add(-outboxSentRetention).Unix(), nil
+}
+
 // OpenInfraAlerts returns, for every dedupe key of the given infra alert kind whose most recent outbox
-// row is a "firing" transition, that row's target. A restarted process uses it to re-adopt the alerts it
-// raised before the restart, so their "resolved" is still sent. (Rows past the outbox retention are
-// gone, and with them any memory of the alert.)
+// row of that kind, delivered or not, is a "firing" transition, that row's target. A restarted process
+// uses it to re-adopt the alerts it raised before the restart, so their "resolved" is still sent. (Rows
+// past the outbox retention are gone, and with them any memory of the alert. A row left unsent for 48
+// hours is closed, not deleted, so it outlives the rows raised before it.)
 func (s *Store) OpenInfraAlerts(ctx context.Context, kind string) (map[string]string, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT dedupe_key, target, transition FROM alert_outbox WHERE rule_id=0 AND kind=? AND dedupe_key<>'' ORDER BY id`, kind)
@@ -219,13 +353,15 @@ func (s *Store) OpenInfraAlerts(ctx context.Context, kind string) (map[string]st
 	return out, nil
 }
 
-func (s *Store) ChannelsForRule(channelID int64) ([]alert.Channel, error) {
+// ChannelsForRule returns the channels a rule routes to (its channel_id, or all
+// enabled channels when channel_id is NULL/0).
+func (s *Store) ChannelsForRule(channelID int64) ([]BuiltChannel, error) {
 	if channelID != 0 {
 		c, err := s.channel(channelID)
 		if err != nil {
 			return nil, err
 		}
-		return []alert.Channel{c}, nil
+		return []BuiltChannel{{ID: channelID, Channel: c}}, nil
 	}
 	rows, err := s.db.Query(`SELECT id FROM alert_channels WHERE enabled=1`)
 	if err != nil {
@@ -240,10 +376,13 @@ func (s *Store) ChannelsForRule(channelID int64) ([]alert.Channel, error) {
 		}
 		ids = append(ids, id)
 	}
-	var out []alert.Channel
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []BuiltChannel
 	for _, id := range ids {
 		if c, err := s.channel(id); err == nil {
-			out = append(out, c)
+			out = append(out, BuiltChannel{ID: id, Channel: c})
 		}
 	}
 	return out, nil
@@ -375,16 +514,32 @@ func (s *Store) LoadStates() ([]alert.State, error) {
 	return out, rows.Err()
 }
 
-// SaveStates upserts the state set and prunes ok rows to keep the table bounded.
+// SaveStates upserts the state set and prunes ok rows to keep the table bounded. The states come from a
+// LoadStates done before evaluating, so an existing row keeps what the operator set since: its silence
+// (only Silence changes it) and, within the same phase, its ack. A new phase takes the state's ack, which
+// the evaluator clears when an episode ends. An ok row whose silence hasn't ended is kept, at ok with no
+// ack, so a firing inside the silence is still silenced (EnqueueOutbox); the first save after the silence
+// ends deletes it. An ok state never creates a row.
 func (s *Store) SaveStates(ctx context.Context, states []alert.State) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	now := time.Now().Unix()
 	for _, st := range states {
 		if st.Phase == alert.PhaseOK {
-			_, _ = tx.ExecContext(ctx, `DELETE FROM alert_state WHERE rule_id=? AND target=?`, st.RuleID, st.Target)
+			// The row's own silenced_until decides, not the state's: a silence set or lifted since the load counts.
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE alert_state SET phase=?, since=?, level=?, detail=?, acked=0, updated_at=?
+				  WHERE rule_id=? AND target=? AND silenced_until>?`,
+				string(st.Phase), st.Since, st.Level, st.Detail, now, st.RuleID, st.Target, now); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM alert_state WHERE rule_id=? AND target=? AND silenced_until<=?`,
+				st.RuleID, st.Target, now); err != nil {
+				return err
+			}
 			continue
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -392,7 +547,9 @@ func (s *Store) SaveStates(ctx context.Context, states []alert.State) error {
 			 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(rule_id, target) DO UPDATE SET
 			   phase=excluded.phase, since=excluded.since, level=excluded.level, detail=excluded.detail,
-			   acked=excluded.acked, silenced_until=excluded.silenced_until, updated_at=excluded.updated_at`,
+			   acked=CASE WHEN alert_state.phase=excluded.phase AND alert_state.since=excluded.since
+			              THEN MAX(alert_state.acked, excluded.acked) ELSE excluded.acked END,
+			   updated_at=excluded.updated_at`,
 			st.RuleID, st.Target, string(st.Phase), st.Since, st.Level, st.Detail, b2i(st.Acked), st.SilencedUntil, time.Now().Unix()); err != nil {
 			return err
 		}
@@ -420,9 +577,27 @@ func (s *Store) Ack(ctx context.Context, ruleID int64, target string) error {
 	return err
 }
 
+// Silence silences a rule's alert on one target until the unix time until. It also closes the alert's
+// unsent outbox rows undelivered (quiet hours may be holding them), and EnqueueOutbox records any row the
+// alert raises while silenced already closed: the silence is applied when a row is raised, not when it
+// would be sent, by which time the state that holds silenced_until may be gone. Mooring's own alerts
+// (rule 0) have no silence.
 func (s *Store) Silence(ctx context.Context, ruleID int64, target string, until int64) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE alert_state SET silenced_until=? WHERE rule_id=? AND target=?`, until, ruleID, target)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE alert_state SET silenced_until=? WHERE rule_id=? AND target=?`, until, ruleID, target); err != nil {
+		return err
+	}
+	if now := time.Now().Unix(); ruleID > 0 && until > now {
+		if _, err := tx.ExecContext(ctx, `UPDATE alert_outbox SET sent_at=? WHERE rule_id=? AND target=? AND sent_at=0`,
+			now, ruleID, target); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // IsSilenced reports whether a (rule,target) is silenced at now.
@@ -445,9 +620,36 @@ type OutboxRow struct {
 	Summary    string
 	DedupeKey  string
 	Attempts   int
+	CreatedAt  int64 // unix sec
 }
 
-// EnqueueOutbox appends notifications the evaluator produced (it never sends).
+// AlertKey names the alert the row belongs to (see alertWhere): rows with the same key are one alert.
+func (r OutboxRow) AlertKey() string {
+	switch {
+	case r.RuleID != 0:
+		return fmt.Sprintf("rule:%d:%s", r.RuleID, r.Target)
+	case r.DedupeKey != "":
+		return "infra:" + r.DedupeKey
+	}
+	return fmt.Sprintf("row:%d", r.ID)
+}
+
+// alertWhere returns the SQL predicate, and its args, selecting every row of r's alert. A rule's alert is
+// one (rule, target) — the key of its alert_state row; its dedupe key also names the rule's kind, which an
+// edit can change mid-alert. A Mooring infra alert (rule_id 0) is one dedupe key. An infra row without a
+// dedupe key is an alert of its own (no producer sends one today).
+func alertWhere(r OutboxRow) (string, []any) {
+	switch {
+	case r.RuleID != 0:
+		return "rule_id=? AND target=?", []any{r.RuleID, r.Target}
+	case r.DedupeKey != "":
+		return "rule_id=0 AND dedupe_key=?", []any{r.DedupeKey}
+	}
+	return "id=?", []any{r.ID}
+}
+
+// EnqueueOutbox appends notifications the evaluator produced (it never sends). A row raised while its
+// (rule, target) state is silenced is recorded already closed (see Silence).
 func (s *Store) EnqueueOutbox(ctx context.Context, items []alert.Outbox) error {
 	if len(items) == 0 {
 		return nil
@@ -460,20 +662,49 @@ func (s *Store) EnqueueOutbox(ctx context.Context, items []alert.Outbox) error {
 	now := time.Now().Unix()
 	for _, o := range items {
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO alert_outbox(rule_id, target, kind, level, transition, summary, dedupe_key, created_at)
-			 VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
-			o.RuleID, o.Target, o.Kind, o.Level, o.Transition, o.Summary, o.DedupeKey, now); err != nil {
+			`INSERT INTO alert_outbox(rule_id, target, kind, level, transition, summary, dedupe_key, created_at, sent_at)
+			 SELECT ?, ?, ?, ?, ?, ?, ?, ?,
+			        CASE WHEN EXISTS (SELECT 1 FROM alert_state WHERE rule_id=? AND target=? AND silenced_until>?) THEN ? ELSE 0 END`,
+			o.RuleID, o.Target, o.Kind, o.Level, o.Transition, o.Summary, o.DedupeKey, now,
+			o.RuleID, o.Target, now, now); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
+const outboxColumns = `id, rule_id, target, kind, level, transition, summary, dedupe_key, attempts, created_at`
+
 // PendingOutbox returns unsent rows, oldest first.
 func (s *Store) PendingOutbox(limit int) ([]OutboxRow, error) {
-	rows, err := s.db.Query(
-		`SELECT id, rule_id, target, kind, level, transition, summary, dedupe_key, attempts
-		 FROM alert_outbox WHERE sent_at=0 ORDER BY id LIMIT ?`, limit)
+	return s.queryOutbox(`SELECT `+outboxColumns+` FROM alert_outbox WHERE sent_at=0 ORDER BY id LIMIT ?`, limit)
+}
+
+// PendingAlerts returns, for each alert with unsent rows due at now, its oldest such row, oldest first: the
+// notifier's batch, one entry per alert however many rows it has. A row is due unless a failed delivery
+// set it to back off (next_try_at). criticalOnly limits it to alerts with an unsent, due critical row
+// (their oldest one): the quiet-hours batch, during which every other alert is held. The level is filtered
+// before the LIMIT, so any number of held rows can't keep a critical alert out of the batch. The grouping
+// is alertWhere's alert identity.
+//
+// Intentional: criticalOnly looks at unsent rows only. An alert whose message is critical only because of
+// a given-up critical row (PendingAlert combines it) is held through quiet hours like a warning (owner
+// decision): a critical that already failed for 24 hours doesn't page again at night.
+func (s *Store) PendingAlerts(limit int, criticalOnly bool, now time.Time) ([]OutboxRow, error) {
+	level := ""
+	if criticalOnly {
+		level = alert.LevelCritical
+	}
+	return s.queryOutbox(`SELECT `+outboxColumns+` FROM alert_outbox WHERE id IN (
+		  SELECT MIN(id) FROM alert_outbox WHERE sent_at=0 AND next_try_at<=? AND (?='' OR level=?)
+		   GROUP BY rule_id, CASE WHEN rule_id<>0 THEN 't:'||target
+		                          WHEN dedupe_key<>'' THEN 'k:'||dedupe_key
+		                          ELSE 'i:'||id END)
+		ORDER BY id LIMIT ?`, now.Unix(), level, level, limit)
+}
+
+func (s *Store) queryOutbox(query string, args ...any) ([]OutboxRow, error) {
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -481,7 +712,7 @@ func (s *Store) PendingOutbox(limit int) ([]OutboxRow, error) {
 	var out []OutboxRow
 	for rows.Next() {
 		var o OutboxRow
-		if err := rows.Scan(&o.ID, &o.RuleID, &o.Target, &o.Kind, &o.Level, &o.Transition, &o.Summary, &o.DedupeKey, &o.Attempts); err != nil {
+		if err := rows.Scan(&o.ID, &o.RuleID, &o.Target, &o.Kind, &o.Level, &o.Transition, &o.Summary, &o.DedupeKey, &o.Attempts, &o.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -489,21 +720,121 @@ func (s *Store) PendingOutbox(limit int) ([]OutboxRow, error) {
 	return out, rows.Err()
 }
 
-// MarkSent finalizes an outbox row: ok → sent; otherwise bump attempts, and after
-// maxAttempts mark sent anyway so a permanently-failing channel can't wedge the
-// queue (a separate infra alert would surface a broken channel).
-func (s *Store) MarkSent(ctx context.Context, id int64, ok bool, maxAttempts int) {
-	if ok {
-		_, _ = s.db.ExecContext(ctx, `UPDATE alert_outbox SET sent_at=? WHERE id=?`, time.Now().Unix(), id)
-		return
-	}
-	_, _ = s.db.ExecContext(ctx, `UPDATE alert_outbox SET attempts=attempts+1 WHERE id=?`, id)
-	_, _ = s.db.ExecContext(ctx, `UPDATE alert_outbox SET sent_at=? WHERE id=? AND attempts>=?`, time.Now().Unix(), id, maxAttempts)
+// PendingAlert is what the notifier sends for one alert: every undelivered row of the alert combined
+// into one message. The rule, in full:
+//   - The rows combined are the alert's unsent rows plus the rows given up (closed after their
+//     deliveries kept failing) since the alert's last row closed otherwise — delivered, or dropped on
+//     purpose (silenced, the alert closed by CloseInfraAlert, 48 hours unsent) — before its oldest
+//     unsent row. A given-up critical is reported with the next message, and nothing the operator
+//     already got or chose not to get is reported again.
+//   - The message reports the newest of them, at critical level when any of them is critical.
+//   - A delivered message closes every unsent row it combined, never a row raised after it was read.
+//   - A failed delivery counts an attempt against every unsent row the message combined (in the
+//     quiet-hours pass only against its critical rows: held warnings keep theirs). A message that isn't
+//     critical is tried warningAttempts times; a critical one backs off and is retried until its rows
+//     are criticalRetryFor old. Then the rows are given up: closed, and reported again by the alert's
+//     next message.
+type PendingAlert struct {
+	Latest   OutboxRow // the newest combined row: the state the message reports
+	Level    string    // critical when any combined row is critical, else Latest's level
+	Count    int       // rows combined
+	Fired    int       // of them "firing"
+	Resolved int       // of them "resolved"
+	Since    int64     // created_at of the oldest combined row (unix sec)
+	First    string    // transition of the oldest combined row
+
+	newestUnsent int64 // the newest unsent row combined: a delivery closes the unsent rows up to it
+	criticalOnly bool  // read for the quiet-hours pass
 }
 
-// PruneOutbox drops sent rows older than the cutoff (bounded growth).
-func (s *Store) PruneOutbox(ctx context.Context, olderThan int64) {
-	_, _ = s.db.ExecContext(ctx, `DELETE FROM alert_outbox WHERE sent_at>0 AND sent_at<?`, olderThan)
+// PendingAlert returns the combination of every undelivered row of row's alert (see PendingAlert and
+// alertWhere). criticalOnly: it is read for the quiet-hours pass, in which a failure counts only against
+// the critical rows. ok is false when the alert has no unsent row any more.
+func (s *Store) PendingAlert(row OutboxRow, criticalOnly bool) (PendingAlert, bool, error) {
+	where, args := alertWhere(row)
+	qargs := append(append(append([]any{}, args...), args...), args...)
+	p := PendingAlert{criticalOnly: criticalOnly}
+	var latestID, firstID int64
+	var crit int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*), COALESCE(MIN(created_at),0), COALESCE(MAX(id),0), COALESCE(MIN(id),0),
+		        COALESCE(MAX(CASE WHEN sent_at=0 THEN id END),0),
+		        COALESCE(SUM(transition='firing'),0), COALESCE(SUM(transition='resolved'),0),
+		        COALESCE(MAX(level='critical'),0)
+		   FROM alert_outbox
+		  WHERE `+where+` AND (sent_at=0 OR given_up=1)
+		    AND id > COALESCE((SELECT MAX(id) FROM alert_outbox WHERE `+where+` AND sent_at>0 AND given_up=0
+		                         AND id < (SELECT MIN(id) FROM alert_outbox WHERE `+where+` AND sent_at=0)), 0)`, qargs...).
+		Scan(&p.Count, &p.Since, &latestID, &firstID, &p.newestUnsent, &p.Fired, &p.Resolved, &crit)
+	if err != nil {
+		return PendingAlert{}, false, err
+	}
+	if p.newestUnsent == 0 {
+		return PendingAlert{}, false, nil
+	}
+	ends, err := s.queryOutbox(`SELECT `+outboxColumns+` FROM alert_outbox WHERE id IN (?, ?) ORDER BY id`, firstID, latestID)
+	if err != nil {
+		return PendingAlert{}, false, err
+	}
+	if len(ends) == 0 || ends[len(ends)-1].ID != latestID { // pruned in between
+		return PendingAlert{}, false, nil
+	}
+	p.First = ends[0].Transition
+	p.Latest, p.Level = ends[len(ends)-1], ends[len(ends)-1].Level
+	if crit == 1 {
+		p.Level = alert.LevelCritical
+	}
+	return p, true, nil
+}
+
+// FinishAlert records the outcome of one delivery of p at now. delivered (or dropped on purpose: silenced,
+// rule deleted) closes every unsent row p combined. Otherwise one failed attempt is counted against them
+// (see PendingAlert): a critical message's rows back off 15 seconds, doubling, at most an hour, and are
+// given up once criticalRetryFor old; any other message's rows are tried again by the next drain and
+// given up after warningAttempts attempts. Giving up means a permanently failing channel can't wedge the
+// queue. It returns the write's error; the rows are then left as they were (unsent, and due again).
+func (s *Store) FinishAlert(ctx context.Context, p PendingAlert, delivered bool, now time.Time) error {
+	where, args := alertWhere(p.Latest)
+	ts := now.Unix()
+	if delivered {
+		_, err := s.db.ExecContext(ctx, `UPDATE alert_outbox SET sent_at=? WHERE sent_at=0 AND id<=? AND `+where,
+			append([]any{ts, p.newestUnsent}, args...)...)
+		return err
+	}
+	only := ""
+	if p.criticalOnly {
+		only = " AND level='critical'"
+	}
+	crit := b2i(p.Level == alert.LevelCritical)
+	// Every SET expression reads the row's values from before the update (attempts is the count before
+	// this failure).
+	giveUp := `((?=0 AND attempts+1>=?) OR (?=1 AND created_at<=?))`
+	giveUpArgs := []any{crit, warningAttempts, crit, now.Add(-criticalRetryFor).Unix()}
+	q := `UPDATE alert_outbox SET attempts=attempts+1,
+	        next_try_at=CASE WHEN ?=1 THEN ? + MIN(?, ? << MIN(attempts, 20)) ELSE 0 END,
+	        given_up=CASE WHEN ` + giveUp + ` THEN 1 ELSE 0 END,
+	        sent_at=CASE WHEN ` + giveUp + ` THEN ? ELSE 0 END
+	      WHERE sent_at=0 AND id<=? AND ` + where + only
+	qargs := []any{crit, ts, criticalBackoffMax, criticalBackoff}
+	qargs = append(qargs, giveUpArgs...)
+	qargs = append(qargs, giveUpArgs...)
+	qargs = append(qargs, ts, p.newestUnsent)
+	_, err := s.db.ExecContext(ctx, q, append(qargs, args...)...)
+	return err
+}
+
+// PruneOutbox bounds the outbox: rows closed more than 7 days ago are deleted, and rows still unsent 48
+// hours after they were raised are closed. The notifier calls it each cycle and EnqueueInfra every 10
+// minutes, so it also runs with alerting disabled.
+func (s *Store) PruneOutbox(ctx context.Context, now time.Time) {
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM alert_outbox WHERE sent_at>0 AND sent_at<?`, now.Add(-outboxSentRetention).Unix())
+	// Intentional: closed unsent, not given up. A row this old was raised while alerting was disabled or no
+	// channel worked (quiet hours hold a row less than a day, a critical is retried for a day), and
+	// replaying it when alerting comes back would report long-gone states. Closed rather than deleted, so
+	// it outlives the rows raised before it: deleting a never-sent "resolved" while the sent "firing"
+	// before it is kept would make the alert look open again (OpenInfraAlerts, InfraResolveLevel).
+	_, _ = s.db.ExecContext(ctx, `UPDATE alert_outbox SET sent_at=? WHERE sent_at=0 AND created_at<?`,
+		now.Unix(), now.Add(-outboxUnsentMaxAge).Unix())
 }
 
 func b2i(b bool) int {

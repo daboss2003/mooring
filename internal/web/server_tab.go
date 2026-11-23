@@ -17,6 +17,9 @@ import (
 	"github.com/daboss2003/mooring/internal/serverinfo"
 )
 
+// rebootRequired reads the host's pending-reboot flag (a test seam).
+var rebootRequired = serverinfo.RebootRequired
+
 // procTopN bounds the process list so a busy host can't produce an unbounded
 // table (and so the per-request /proc scan stays cheap).
 const procTopN = 25
@@ -50,9 +53,16 @@ type serverView struct {
 	FileEnabled bool
 	FileRoots   []serverinfo.Root
 
-	// image vulnerability scans (opt-in): per-app Trivy results, worst-first.
+	// image vulnerability scans (on by default): per-app Trivy results, worst-first.
 	ScanEnabled bool
 	Scans       []imagescan.AppScan
+
+	// host vulnerability scan (on by default): OS packages + the Go binaries Mooring runs.
+	HostScanEnabled bool
+	HostScanReady   bool // a scan row exists
+	HostScan        imagescan.HostScan
+	RebootRequired  bool   // /run/reboot-required exists (read live)
+	RebootPkgs      string // the packages that asked for it, comma-separated
 
 	// image-update detection (on by default): per pull-image service, updates-available first.
 	ImageUpdateEnabled bool
@@ -201,6 +211,15 @@ func (s *Server) handleServer(w http.ResponseWriter, r *http.Request) {
 		if scans, err := s.imageScans.List(r.Context()); err == nil {
 			v.Scans = scans
 		}
+	}
+	v.HostScanEnabled = s.cfg.Server.HostScanOn()
+	if s.hostScans != nil {
+		if h, ok, err := s.hostScans.Get(r.Context()); err == nil && ok {
+			v.HostScan, v.HostScanReady = h, true
+		}
+	}
+	if req, pkgs := rebootRequired(); req {
+		v.RebootRequired, v.RebootPkgs = true, strings.Join(pkgs, ", ")
 	}
 	v.ImageUpdateEnabled = s.cfg.Server.ImageUpdateCheckOn()
 	if s.imageUpdates != nil {

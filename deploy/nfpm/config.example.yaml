@@ -36,8 +36,9 @@ edge:
 
 data_dir: "/var/lib/mooring"
 
-# The Server tab watches for updates and scans your apps for known vulnerabilities.
-# Both are ON by default — uncomment to turn one off. See docs/server-tab.md.
+# The Server tab watches for updates and scans your apps and this server for known
+# vulnerabilities. All are ON by default — uncomment to turn one off. See docs/server-tab.md.
 # server:
 #   version_check_enabled: false      # stop checking GitHub for Mooring updates + advisories
-#   image_scan_enabled: false         # stop the Trivy vulnerability scan (it's a bit heavy)
+#   image_scan_enabled: false         # stop the Trivy scan of your apps' images (it's a bit heavy)
+#   host_scan_enabled: false          # stop the Trivy scan of this server's packages and binaries

@@ -45,6 +45,7 @@ cat <<'EOF'
 Mooring installed. Next steps (over SSH):
   1. Install Caddy:      sudo mooring setup --yes
                          (the managed edge supervises a child Caddy; this installs
+                          Caddy's official release, or upgrades an older Caddy to
                           it. The unit already grants the bind capability + creates
                           its runtime dirs, so nothing else is needed.)
   2. Generate secrets:   mooring gen-key ; mooring hash-password

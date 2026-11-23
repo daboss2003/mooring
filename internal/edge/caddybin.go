@@ -1,12 +1,16 @@
 package edge
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"debug/buildinfo"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
@@ -14,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,10 +39,10 @@ const DefaultBuildServer = "https://caddyserver.com/api/download"
 // refuses QUIC 0-RTT through `allow_0rtt`, which Caddy added in 2.11.
 var MinCaddyVersion = Version{Major: 2, Minor: 11}
 
-// supportedCaddyMajor is the Caddy major version the rendered config is written for. The build server
+// SupportedCaddyMajor is the Caddy major version the rendered config is written for. The build server
 // serves the latest release, so a downloaded build of a future major (which may reject the boot
 // config and crash-loop every app's edge) is refused and the current binary kept.
-const supportedCaddyMajor = 2
+const SupportedCaddyMajor = 2
 
 // maxCaddyDownload caps a build-server download: a plugin build is ~50 MB, and anything far larger is
 // not a Caddy binary. A variable only so a test can lower it.
@@ -221,7 +226,25 @@ type InstallOptions struct {
 	// Owner, when set, receives the bin dir and the new binary (lchown) before the check runs: `mooring
 	// setup` runs as root and hands them to the service user; the service itself leaves it nil.
 	Owner *Owner
+	// SkipIfSame: after the download passes its check, compare its Go build info (Go version, main
+	// module and every dependency, with replacements) with the current owned binary's; when they are
+	// equal, delete the download and return ErrBuildUnchanged without swapping. Build info that can't
+	// be read on either side counts as different.
+	SkipIfSame bool
+	// Check, when set, runs on the download after it passed the version and module checks (and, with
+	// SkipIfSame, only when it differs from the installed build), before the previous build is kept as
+	// .bak and the download renamed into place. bin is the download's path, <DataDir>/bin/caddy.new.<random>
+	// (mode 0755, owned by Owner when set). An error deletes the download, keeps the current binary and is
+	// returned wrapped in ErrBuildCheckFailed. The service passes `caddy validate` of the config the edge
+	// serves (DNSPluginInstaller.CheckBuild).
+	Check func(ctx context.Context, bin string) error
 }
+
+// ErrBuildUnchanged: with SkipIfSame, the download is the same build as the installed one.
+var ErrBuildUnchanged = errors.New("edge: the downloaded Caddy build is the same as the installed one")
+
+// ErrBuildCheckFailed: the download failed InstallOptions.Check; the current binary was kept.
+var ErrBuildCheckFailed = errors.New("edge: the downloaded Caddy build failed its check")
 
 // Owner is a file owner for InstallOptions.Owner.
 type Owner struct{ Uid, Gid int }
@@ -233,11 +256,11 @@ const staleDownloadAge = time.Hour
 // InstallPluginBuild downloads a Caddy with opt.Packages compiled in from the build server and makes
 // it the Mooring-owned binary. The swap is safe: the download goes to a uniquely named
 // bin/caddy.new.<random> (size-capped, https only, redirects included), is verified (its `version`
-// runs and is >= MinCaddyVersion, and `list-modules` has every WantModule), the current owned binary
-// (if any) is kept as bin/caddy.bak, and the new one is renamed into place, so there is never a moment
-// with no binary at bin/caddy. On any failure the current binary is left untouched. No file
-// capabilities are needed: the edge child gets CAP_NET_BIND_SERVICE as an ambient capability from the
-// mooring unit.
+// runs and is >= MinCaddyVersion, and `list-modules` has every WantModule) and passes opt.Check when
+// set, the current owned binary (if any) is kept as bin/caddy.bak, and the new one is renamed into
+// place, so there is never a moment with no binary at bin/caddy. On any failure the current binary is
+// left untouched. No file capabilities are needed: the edge child gets CAP_NET_BIND_SERVICE as an
+// ambient capability from the mooring unit.
 //
 // Every file operation goes through an os.Root on data_dir: data_dir belongs to the service user, and a
 // root caller (setup) must never follow a symlink planted there (a `bin` pointing at /usr/local/bin,
@@ -288,6 +311,14 @@ func InstallPluginBuild(ctx context.Context, opt InstallOptions) (string, error)
 		return "", fmt.Errorf("edge: write the Caddy download: %w", err)
 	}
 	derr := download(ctx, opt.Client, src, f)
+	if derr == nil {
+		// Intentional: 0755, not the 0700 OpenFile asks for (the umask strips those bits anyway). The host
+		// vulnerability scan reads the build through a bind mount as a root with no CAP_DAC_OVERRIDE; the
+		// 0700 bin dir and data_dir still keep other host users out.
+		if err := f.Chmod(ownedCaddyMode); err != nil {
+			derr = fmt.Errorf("edge: chmod the Caddy download: %w", err)
+		}
+	}
 	if cerr := f.Close(); derr == nil && cerr != nil {
 		derr = fmt.Errorf("edge: write the Caddy download: %w", cerr)
 	}
@@ -303,9 +334,22 @@ func InstallPluginBuild(ctx context.Context, opt InstallOptions) (string, error)
 			return "", fmt.Errorf("edge: chown the Caddy download: %w", err)
 		}
 	}
-	if err := verifyCaddy(ctx, filepath.Join(opt.DataDir, tmp), opt.WantModules); err != nil {
+	v, err := verifyCaddy(ctx, filepath.Join(opt.DataDir, tmp), opt.WantModules)
+	if err != nil {
 		_ = root.Remove(tmp)
 		return "", err
+	}
+	if opt.SkipIfSame {
+		if fi, err := root.Lstat(dst); err == nil && fi.Mode().IsRegular() && sameBuild(root, tmp, dst) {
+			_ = root.Remove(tmp)
+			return "", ErrBuildUnchanged
+		}
+	}
+	if opt.Check != nil {
+		if err := opt.Check(ctx, filepath.Join(opt.DataDir, tmp)); err != nil {
+			_ = root.Remove(tmp)
+			return "", fmt.Errorf("%w (Caddy v%s), keeping the current binary: %w", ErrBuildCheckFailed, v, err)
+		}
 	}
 	if fi, err := root.Lstat(dst); err == nil && fi.Mode().IsRegular() {
 		// Keep the previous build. A hard link leaves dst in place, so the rename below replaces it
@@ -321,6 +365,102 @@ func InstallPluginBuild(ctx context.Context, opt InstallOptions) (string, error)
 		return "", fmt.Errorf("edge: install %s: %w", OwnedCaddyPath(opt.DataDir), err)
 	}
 	return OwnedCaddyPath(opt.DataDir), nil
+}
+
+// ownedCaddyMode is the Mooring-owned build's mode: readable by the host vulnerability scan, which
+// runs as a root without CAP_DAC_OVERRIDE. The 0700 bin dir and data_dir keep other users out.
+const ownedCaddyMode os.FileMode = 0o755
+
+// EnsureOwnedCaddyReadable makes an owned build installed as 0700 (before builds were made 0755)
+// readable by the host vulnerability scan: a regular <dataDir>/bin/caddy whose mode lacks group/other
+// read+execute is set to 0755. No owned build, or dataDir "", is a no-op; a symlinked bin dir or binary
+// is refused and left alone. Every path is resolved through an os.Root on dataDir.
+func EnsureOwnedCaddyReadable(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+	root, err := os.OpenRoot(dataDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("edge: open %s: %w", dataDir, err)
+	}
+	defer root.Close()
+	const binDir = "bin"
+	if fi, err := root.Lstat(binDir); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	} else if !fi.IsDir() {
+		return fmt.Errorf("edge: %s/bin is not a directory (a symlink is refused)", dataDir)
+	}
+	fi, err := root.Lstat(ownedCaddyRel)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("edge: %s is not a regular file (a symlink is refused)", OwnedCaddyPath(dataDir))
+	}
+	if fi.Mode().Perm()&0o055 == 0o055 {
+		return nil
+	}
+	return root.Chmod(ownedCaddyRel, ownedCaddyMode)
+}
+
+// readBuildInfo reads a Go binary's embedded build info. A variable only so a test can read it from a
+// fake (shell script) caddy.
+var readBuildInfo = func(r io.ReaderAt) (*debug.BuildInfo, error) { return buildinfo.Read(r) }
+
+// sameBuild reports whether the files a and b in root carry the same Go build info. Either one unreadable
+// (not a regular file, not a Go binary) is never the same.
+func sameBuild(root *os.Root, a, b string) bool {
+	fa, ok := buildFingerprintOf(root, a)
+	if !ok {
+		return false
+	}
+	fb, ok := buildFingerprintOf(root, b)
+	return ok && fa == fb
+}
+
+// buildFingerprintOf opens name through root (never out of data_dir) and fingerprints its build info.
+func buildFingerprintOf(root *os.Root, name string) (string, bool) {
+	f, err := root.Open(name)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
+		return "", false
+	}
+	bi, err := readBuildInfo(f)
+	if err != nil || bi == nil {
+		return "", false
+	}
+	return buildFingerprint(bi), true
+}
+
+// buildFingerprint is the Go version, the main module and every dependency (path@version, with its
+// replacement), dependencies sorted.
+func buildFingerprint(bi *debug.BuildInfo) string {
+	mod := func(m *debug.Module) string {
+		s := m.Path + "@" + m.Version
+		if m.Replace != nil {
+			s += " => " + m.Replace.Path + "@" + m.Replace.Version
+		}
+		return s
+	}
+	deps := make([]string, 0, len(bi.Deps))
+	for _, d := range bi.Deps {
+		if d != nil {
+			deps = append(deps, mod(d))
+		}
+	}
+	sort.Strings(deps)
+	return bi.GoVersion + "\n" + mod(&bi.Main) + "\n" + strings.Join(deps, "\n")
 }
 
 // removeStaleDownloads deletes `caddy.new*` files in dir older than staleDownloadAge — what an
@@ -396,21 +536,21 @@ func httpsOnlyRedirects(req *http.Request, via []*http.Request) error {
 }
 
 // verifyCaddy checks a downloaded binary before it can go live: it runs, its version is at least
-// MinCaddyVersion, and it has every wanted module.
-func verifyCaddy(ctx context.Context, bin string, want []string) error {
+// MinCaddyVersion, and it has every wanted module. It returns the version.
+func verifyCaddy(ctx context.Context, bin string, want []string) (Version, error) {
 	v, err := CaddyVersion(ctx, bin)
 	if err != nil {
-		return fmt.Errorf("edge: the downloaded Caddy does not run: %w", err)
+		return Version{}, fmt.Errorf("edge: the downloaded Caddy does not run: %w", err)
 	}
 	if !v.AtLeast(MinCaddyVersion) {
-		return fmt.Errorf("edge: the downloaded Caddy is %s, older than %s", v, MinCaddyVersion)
+		return v, fmt.Errorf("edge: the downloaded Caddy is %s, older than %s", v, MinCaddyVersion)
 	}
-	if v.Major != supportedCaddyMajor {
-		return fmt.Errorf("edge: the downloaded Caddy is %s; this Mooring supports Caddy %d.x — keeping the current binary", v, supportedCaddyMajor)
+	if v.Major != SupportedCaddyMajor {
+		return v, fmt.Errorf("edge: the downloaded Caddy is %s; this Mooring supports Caddy %d.x — keeping the current binary", v, SupportedCaddyMajor)
 	}
 	mods, err := CaddyModules(ctx, bin)
 	if err != nil {
-		return fmt.Errorf("edge: the downloaded Caddy can't list its modules: %w", err)
+		return v, fmt.Errorf("edge: the downloaded Caddy can't list its modules: %w", err)
 	}
 	var missing []string
 	for _, m := range want {
@@ -419,9 +559,9 @@ func verifyCaddy(ctx context.Context, bin string, want []string) error {
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("edge: the downloaded Caddy lacks %s", strings.Join(missing, ", "))
+		return v, fmt.Errorf("edge: the downloaded Caddy lacks %s", strings.Join(missing, ", "))
 	}
-	return nil
+	return v, nil
 }
 
 // runCaddy runs a short, daemon-less caddy command (version, list-modules) with a timeout and an
@@ -444,6 +584,88 @@ func runCaddy(ctx context.Context, bin string, args ...string) ([]byte, error) {
 		return out, fmt.Errorf("`%s %s` failed (%v): %s", filepath.Base(bin), strings.Join(args, " "), err, tailLines(out, errTailLines))
 	}
 	return out, nil
+}
+
+// ValidateConfig reports whether Caddy at bin accepts cfg: `<bin> validate --config - --adapter ""`
+// with cfg on stdin, the way the edge's `caddy run` reads its config. Caddy then loads and provisions
+// every module (a missing DNS module, a token the provider refuses) without starting the config: no
+// listener, admin endpoint or certificate management (checked against Caddy 2.11). It runs in the edge's
+// environment, so it reads the edge's certificate storage, hardened and bounded like the other short
+// caddy commands. Every form of each string in redact (the dns01 tokens in cfg: a DNS provider module
+// echoes a malformed token in its error) is removed from the error before its output is cut to a
+// bounded tail. Run it as the service user: as root it runs as an account that can't write that storage.
+// An error where Caddy itself refused the config matches ErrValidateRefused.
+func ValidateConfig(ctx context.Context, bin string, cfg []byte, redact []string) error {
+	if bin == "" {
+		return errors.New("no caddy binary")
+	}
+	if len(bytes.TrimSpace(cfg)) == 0 {
+		return errors.New("edge: no config to validate")
+	}
+	cctx, cancel := context.WithTimeout(ctx, caddyCmdTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, bin, "validate", "--config", "-", "--adapter", "")
+	cmd.Stdin = bytes.NewReader(cfg)
+	cmd.Env = caddyEnv()
+	cmd.Dir = "/" // traversable by the dropped-to account, whatever the caller's cwd
+	if err := hardenCaddyCmd(cmd); err != nil {
+		return err
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		// Redact the whole output first: the bound on the reported text can cut a token in half.
+		msg := fmt.Sprintf("`%s validate` refused the edge config (%v): %s", filepath.Base(bin), err,
+			validateFailure(redactSecrets(string(out), redact), redact))
+		// A refusal only when Caddy ran to its own exit: a signal, the deadline or an exec failure says
+		// nothing about the config.
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.Exited() && cctx.Err() == nil {
+			return &validateRefusal{msg}
+		}
+		return errors.New(msg)
+	}
+	return nil
+}
+
+// ErrValidateRefused matches (errors.Is) a ValidateConfig error where Caddy ran and refused the config
+// (it exited with a non-zero status), as opposed to a check that couldn't run it: no binary, an exec or
+// hardening failure, a signal, the deadline.
+var ErrValidateRefused = errors.New("edge: caddy validate refused the config")
+
+// validateRefusal is ValidateConfig's error when Caddy refused the config; its text is the report alone.
+type validateRefusal struct{ msg string }
+
+func (e *validateRefusal) Error() string        { return e.msg }
+func (e *validateRefusal) Is(target error) bool { return target == ErrValidateRefused }
+
+// validateFailure is the cause in the (redacted) output of a failed `caddy validate`: the messages of
+// its error-level JSON log lines — Caddy logs the refusal as one, after info lines a quoted alert would
+// otherwise show instead — else the output's bounded tail. The decoded messages are redacted again:
+// decoding can turn an escaped form the raw pass didn't match (`\/`) back into the secret.
+func validateFailure(out string, redact []string) string {
+	var msgs []string
+	for _, line := range strings.Split(out, "\n") {
+		var e struct{ Level, Msg, Error string }
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &e) != nil {
+			continue
+		}
+		switch e.Level {
+		case "error", "dpanic", "panic", "fatal":
+		default:
+			continue
+		}
+		m := e.Msg
+		if e.Error != "" {
+			m += ": " + e.Error
+		}
+		if m != "" {
+			msgs = append(msgs, m)
+		}
+	}
+	if len(msgs) == 0 {
+		return tailLines([]byte(out), errTailLines)
+	}
+	return tailLines([]byte(redactSecrets(strings.Join(msgs, "\n"), redact)), errTailLines)
 }
 
 // tailLines returns the last n non-empty lines of b joined with " | " (bounded to 4 KiB), so a failed

@@ -131,6 +131,65 @@ on-disk config file the proxy auto-loads — **the admin API is the single sourc
 - Mooring talks to the child over loopback `:2019` (or, preferably, a unix socket) **only**.
 - A liveness poll plus crash-loop detection raises a `level=security` audit event.
 
+### Package upgrades of Caddy and nginx
+
+The edge Caddy and the [L4](#layer-4-tcpudp-load-balancing-opt-in-default-off) nginx are children of
+the `mooring` service. A package upgrade (`apt upgrade`, unattended-upgrades) restarts `caddy.service`
+and `nginx.service`, not these children. Mooring checks its children every minute:
+
+- When a child's binary, or a file it loaded from `/usr`, `/lib`, `/lib32`, `/lib64`, `/bin`, `/sbin`,
+  `/opt` or `/var/lib` (a library such as `libssl`, an nginx module), has been replaced on disk,
+  Mooring waits until the set of replaced files has not changed for 2 minutes. It then checks the
+  updated files. For Caddy, the binary the edge starts next must be Caddy 2.x (2.11 or later when a
+  setting needs it, unless it is no older than the running one) and accept the edge's startup config
+  and the config the edge serves now (`caddy validate`, which loads the config without starting it).
+  While Caddy refuses the current edge config (the config it accepted before keeps serving), the new
+  Caddy must also accept that config, and the running Caddy must refuse it in `caddy validate`: the
+  refusal is then the running binary's, and the restart fixes it (for example Ubuntu's Caddy 2.6.2,
+  which refuses `edge.trusted_proxies`, upgraded to 2.11). Otherwise Caddy is not restarted, since the
+  restarted edge would serve only its startup config and every app would answer 404. If Caddy has
+  refused every config since Mooring started, the edge already serves only the startup config, and
+  the refusal doesn't hold a restart back. For nginx, `nginx -t` on the live L4 config.
+- A child's binary deleted with nothing in its place doesn't count until a new file is at its path.
+  After `sudo rm /var/lib/mooring/bin/caddy && sudo mooring setup --yes`, the edge keeps running
+  until setup has installed the new build, then restarts on it. A deleted library counts at once: an
+  upgrade can install a library under a new file name (for example a new `libpcre2-8.so.0.*`) and
+  leave nothing at the old one.
+- With `edge.l4_nginx_digest` set, the SHA-256 of the `nginx` on `PATH` is compared with the pin
+  before every `nginx -t` (the check above, and the test of every L4 config change) and every launch
+  of the L4 child, including a relaunch after the process exits. A binary that doesn't match is never
+  run. L4 config changes are not applied (the live config stays), and the L4 child is not started:
+  the journal shows `l4: not starting nginx: the binary fails the edge.l4_nginx_digest check; …`
+  (`err=` holds the binary's SHA-256), and while the launch is refused the L4 listeners are down.
+  The launch is retried with backoff, so the child starts again if the pinned binary is put back. To
+  run the upgraded nginx, check it, set `edge.l4_nginx_digest` to its SHA-256 and run
+  `sudo systemctl restart mooring`: the pin is read only when Mooring starts (`SIGHUP` doesn't
+  reload `edge.*`).
+- If the check passes, Mooring restarts that child on the updated files and sends an
+  `edge_child_restarted` alert (level `warning`). The restart briefly interrupts what the child
+  serves: every app for Caddy, the L4 listeners for nginx.
+- If the check fails, the old process keeps running and Mooring sends an `edge_child_stale` alert
+  (level `warning`) with the check's error. When the updated files fail, a restart would fail the same
+  way, so fix what the check reports (for an interrupted upgrade, `sudo dpkg --configure -a`) and run
+  `sudo mooring doctor`. An error that starts with `Caddy refuses the current edge config` means the
+  restart is held back by the refused config (see above): fix what Caddy reports. The check runs again
+  every minute, and the child is restarted once it passes.
+- Each child is restarted this way at most once per 30 minutes. A child that runs replaced files
+  again within 30 minutes of its last restart, and whose updated files pass the check, gets an
+  `edge_child_stale` alert and is restarted once the 30 minutes have passed;
+  `sudo systemctl restart mooring` restarts it now.
+- A process gets at most one `edge_child_stale` alert for each reason (failed check, 30-minute limit).
+- `sudo systemctl restart mooring` restarts both children at once.
+
+Journal lines (`sudo journalctl -u mooring | grep hostproc`):
+
+| Line | Meaning |
+|---|---|
+| `hostproc: <child> runs files a package upgrade replaced; restarting it once they have settled` | Replaced files were found; `files=` lists them. |
+| `hostproc: <child> runs files a package upgrade replaced; restarting it on the updated files` | The check passed and the child is restarted. |
+| `hostproc: <child> runs files a package upgrade replaced; not restarting it` | `reason=` is the failed check or the 30-minute limit. Logged once per process and reason. |
+| `hostproc: can't read which files the <child> process runs; …` | Mooring can't read the child's `/proc` entries; that child isn't restarted after upgrades. |
+
 ### Supply-chain hardening of the child binary
 
 The child proxy binary is **root-owned, mode `0755`, on a read-only mount, digest-pinned, and
@@ -143,8 +202,10 @@ and Mooring's own config/key **out of the edge's mount namespace entirely**, so 
 
 The Mooring-owned Caddy build at `<data_dir>/bin/caddy` (installed when a namespace uses DNS-01) is
 different: the service downloads and writes it itself, so it is owned by the `mooring` user and sits
-in the writable data dir, not on a read-only mount. Each build is checked before it is used: it must
-run, be Caddy 2.x at 2.11 or later, and have every module the config needs. See
+in the writable data dir, not on a read-only mount. The file is mode `0755`; `<data_dir>/bin` and
+`data_dir` are `0700`. Each build is checked before it is used: it must
+run, be Caddy 2.x at 2.11 or later, have every module the config needs, and accept the edge config
+(`caddy validate`). See
 [DNS-01 and the Caddy DNS plugin](#dns-01-and-the-caddy-dns-plugin).
 
 ---
@@ -190,8 +251,12 @@ Mooring installs it:
    any non-standard plugins the system `caddy` has, from Caddy's official build server
    (`https://caddyserver.com/api/download`). If that build fails, it is retried at once with only the
    DNS provider modules.
-3. It checks the download: the binary runs, it is Caddy 2.x at version 2.11 or later, and it has
-   every needed module. A download that fails a check is deleted and the current binary stays in use.
+3. It checks the download: the binary runs, it is Caddy 2.x at version 2.11 or later, it has every
+   needed module, and it accepts the edge's startup config and the config the edge serves
+   (`caddy validate`, which loads the config without starting it). While Caddy refuses the current
+   edge config, the download must also accept that config where the running Caddy refuses it (see
+   [Package upgrades of Caddy and nginx](#package-upgrades-of-caddy-and-nginx)). A download that fails
+   a check is deleted and the current binary stays in use.
 4. It installs the download as the Mooring-owned binary `<data_dir>/bin/caddy` (default
    `/var/lib/mooring/bin/caddy`) with an atomic rename. The previous Mooring-owned build, if any, is
    kept as `<data_dir>/bin/caddy.bak`.
@@ -199,12 +264,28 @@ Mooring installs it:
    restarted edge reports the module, the namespace's wildcard certificate is added to the edge config.
 
 Nothing is downloaded when no namespace sets `dns01`, or when every configured provider's module is
-already present. If the binary on disk already has every module when an attempt starts, Mooring only
-restarts the edge onto it.
+already present. If the binary on disk already has every module when an attempt starts (for example
+a build `sudo mooring setup --yes` installed), Mooring checks it with `caddy validate` like a download
+(step 3) and only restarts the edge onto it. If it fails that check, the edge isn't restarted, the
+attempt fails with the check's error and is retried like a failed install, and the next attempt
+downloads a new build instead of checking the same file again.
+
+While Caddy refuses the current edge config, a download can fail step 3 because of that config: the
+download refuses it too, or the running Caddy accepts it in `caddy validate` too. Mooring then
+downloads no further build while Caddy refuses that same config, for up to 6 hours after that check.
+Each attempt fails at once with `edge: waiting for Caddy to accept the edge config: …`, Caddy's error
+and the time the wait ends, shown as the install error on the **Edge & TLS** page, and is retried on
+the backoff below. When Caddy accepts an edge config, the next attempt starts at once. If that attempt
+is held back again, the one after it starts after the backoff, even if Caddy accepts a config
+meanwhile. When Caddy refuses a different config instead, or the 6 hours have passed, the next attempt
+downloads again, after the backoff. A binary on disk that failed its check because of the refused
+config is checked again once Caddy accepts a config or refuses a different one.
 
 - **The binary the edge runs** is `<data_dir>/bin/caddy` when it exists, otherwise the system `caddy`
-  on `PATH`. Mooring never modifies the system `caddy` (the distribution's package or Caddy's own); it
-  stays as the fallback. Each time the edge starts on a binary Mooring hasn't checked yet, it reads that
+  on `PATH`. The running service never modifies the system `caddy`; it stays as the fallback.
+  `sudo mooring setup --yes` installs it from Caddy's apt repository when there is none, and upgrades
+  one older than 2.11 (such as the distribution's 2.6.2) to Caddy's official release from that
+  repository. Each time the edge starts on a binary Mooring hasn't checked yet, it reads that
   binary's modules; until then the namespace's wildcard is left out of the edge config. If a module has
   disappeared (for example, a package upgrade replaced a system `caddy` that had it), Mooring installs
   the build again.
@@ -255,7 +336,7 @@ Journal lines (`sudo journalctl -u mooring | grep 'edge'`):
 | `edge: Caddy DNS plugin missing — installing a Mooring-owned Caddy build in the background …` | At start: the providers in `providers=` have no module in the current Caddy. |
 | `edge: installing a Caddy build with the DNS plugin(s) for the wildcard certs` | An install attempt started. `missing=` lists the providers, `packages=` the plugins compiled in. |
 | `edge: the Caddy build with the carried plugins failed; retrying with only the DNS providers` | The build with the system `caddy`'s extra plugins failed; a build without them follows. |
-| `edge: Caddy DNS plugin install failed …` | The attempt failed. `err=` holds the cause and the command output. It is retried. |
+| `edge: Caddy DNS plugin install failed …` | The attempt failed. `err=` holds the cause and the command output (`the Caddy on disk … fails its check` for a binary on disk that failed `caddy validate`; `edge: waiting for Caddy to accept the edge config: …` when nothing was downloaded because Caddy refuses the edge config). It is retried. |
 | `edge: Caddy DNS plugin(s) installed; restarting the edge on the new binary` | The new build is in place and the edge restarts on it. |
 | `edge child restarted` | The edge is running again; `caddy=` is the binary it runs. |
 | `edge: issuing a *.<apex> wildcard cert via ACME DNS-01` | Logged at each edge start, once the running Caddy's modules are read: the namespace's wildcard certificate is in the edge config. |
@@ -263,9 +344,36 @@ Journal lines (`sudo journalctl -u mooring | grep 'edge'`):
 | `edge: the Caddy binary changed after the edge started; its modules are read at the next start` | A new build replaced the binary before its modules were read; the restart that follows reads it. |
 | `edge: the running Caddy lacks a DNS plugin it had; reinstalling it` | The binary the edge runs no longer has a provider's module; an install attempt follows. |
 | `edge: Caddy rejected the DNS-01 wildcard config; serving every route without this wildcard` | Caddy refused the namespace in `wildcard=` (see **Provider credentials**). `err=` holds Caddy's error. |
+| `edge: refreshing the Mooring-owned Caddy build` | A refresh download started (see **Updating the build**). `packages=` lists the plugins compiled in. |
+| `edge: the downloaded Caddy build is the same as the installed one; kept` | The refresh downloaded the same build; nothing was swapped. |
+| `edge: Caddy build refresh failed; keeping the current build` | The refresh failed. `err=` holds the cause. |
+| `edge: Caddy build refresh waits for Caddy to accept the edge config; keeping the current build` | Nothing was downloaded: Caddy still refuses the edge config that held the last downloaded build back. `err=` holds Caddy's error. |
+| `edge: refreshed the Mooring-owned Caddy build; restarting the edge on it` | The new build is in place and the edge restarts on it. |
+| `edge: can't record the Caddy build refresh attempt; …` | Mooring couldn't write `<data_dir>/bin/caddy.refresh-attempt`. The refresh still runs; after a Mooring restart the next one isn't held to the 20 hours. `err=` holds the cause. |
+| `edge: can't read the last Caddy build refresh attempt; not limiting this refresh` | `<data_dir>/bin/caddy.refresh-attempt` isn't a regular file holding a timestamp (a symlink is not followed). The refresh runs and replaces it. |
+| `edge: the last Caddy build refresh attempt is recorded in the future (the clock changed); not limiting this refresh` | The recorded time is later than the current time. The refresh runs and records the current time. |
 
-**Updating the build.** `apt upgrade` does not update `<data_dir>/bin/caddy`. `mooring doctor` warns
-when it is more than 180 days old. To replace it with a current build:
+**Updating the build.** `apt upgrade` does not update `<data_dir>/bin/caddy`. When the server's
+vulnerability scan finds a vulnerability with a fixed version in the Mooring-owned build, Mooring
+downloads a current build with the same plugins after that scan, at most once every 20 hours (with
+the default 24-hour `server.image_scan_interval`, once per scan). The download is checked like an
+install. If its Go version and module versions are the same as the installed build's, it is deleted
+and nothing changes. Otherwise the installed build is kept as `<data_dir>/bin/caddy.bak`, the new one
+takes its place, and the edge restarts on it. If every DNS provider on the **Edge & TLS** page shows
+as installed when the new build is swapped in, the namespace wildcards stay in the edge config across
+that restart. Otherwise the config applied right after the restart has no namespace wildcards; they
+are added once Mooring has read the new build's modules (`caddy list-modules`), and until then those
+namespaces' subdomains can start per-name HTTP-01 certificate orders and a catch-all route has no
+certificate. No refresh runs while an install is in progress. The 20 hours count from
+the start of the last download attempt, failed or not. Mooring records that time in
+`<data_dir>/bin/caddy.refresh-attempt`, so a Mooring restart does not reset the limit; a missing or
+unreadable file, or a time later than the current time, sets no limit. To allow a download sooner,
+delete that file and restart Mooring: the download follows the first host scan after the start.
+While Caddy refuses the edge config that held the last downloaded build back (see above), a refresh
+downloads nothing, records no attempt and sends `caddy_build_refresh_failed` with
+`waiting for Caddy to accept the edge config`.
+`mooring doctor` warns when the build is more than 180 days old. To replace it with a current build
+now:
 
 ```bash
 sudo rm /var/lib/mooring/bin/caddy && sudo mooring setup --yes
@@ -567,9 +675,11 @@ record.
   `unknown field "trusted_proxies_strict"` before 2.8). The edge then stays on its startup config (the
   admin vhost if configured, no app routes, no HTTP/3) until Caddy is upgraded or the keys are
   removed. `mooring doctor` fails its `caddy` check when the Caddy the edge runs is older than 2.11
-  and `trusted_proxies` is set; `sudo mooring setup --yes` then installs a current build as
-  `<data_dir>/bin/caddy` (see [DNS-01 and the Caddy DNS plugin](#dns-01-and-the-caddy-dns-plugin)).
-  Restart Mooring afterwards.
+  and `trusted_proxies` is set. `sudo mooring setup --yes` then upgrades the system `caddy` from
+  Caddy's apt repository. If the system `caddy` is still older than 2.11 when that upgrade has run
+  (setup checks the version at that step), setup installs a current build as `<data_dir>/bin/caddy`
+  (see [DNS-01 and the Caddy DNS plugin](#dns-01-and-the-caddy-dns-plugin)). A Mooring-owned build
+  older than 2.11 is replaced with a current one. Restart Mooring afterwards.
 - These keys are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
   dashboard listener in `external` mode.
 

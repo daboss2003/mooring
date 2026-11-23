@@ -55,6 +55,10 @@ const (
 // plain strings here (the file itself is 0600 root:root) but are never echoed:
 // String() is overridden to redact them.
 type Config struct {
+	// LoadWarnings are problems in config.yaml that were corrected instead of refusing to boot; serve logs
+	// them at startup. Never read from YAML.
+	LoadWarnings []string `yaml:"-"`
+
 	BindAddr string `yaml:"bind_addr"`
 
 	EncryptionKey         string `yaml:"encryption_key"`
@@ -130,6 +134,15 @@ type ServerConfig struct {
 	// ImageScanInterval is how often to re-scan (default 24h; clamped to a 1h floor).
 	// Re-scanning unchanged images matters — new CVEs are disclosed daily.
 	ImageScanInterval Duration `yaml:"image_scan_interval"`
+
+	// HostScanEnabled controls periodic vulnerability scanning of the HOST itself with Trivy: every
+	// installed OS package (the dpkg/rpm database) plus the Go binaries Mooring runs (caddy, docker,
+	// dockerd, containerd, runc, docker-proxy, the compose and buildx plugins, mooring). A NEW fixable
+	// High/Critical → an alert; results on the Server tab. ON by default (a *bool: unset = on; set false to disable). It runs on
+	// the image_scan_interval schedule in the same runner (one Trivy at a time) and is HEAVY like the
+	// image scan. The scanner never gets the Docker socket: only those files are bind-mounted,
+	// read-only, and nothing on the host is changed.
+	HostScanEnabled *bool `yaml:"host_scan_enabled"`
 
 	// ImageUpdateCheckEnabled controls periodic image-update detection for PULL-IMAGE app services
 	// (a service that runs `image: postgres:16` rather than a git build). Mooring compares the
@@ -305,6 +318,11 @@ func (s ServerConfig) VersionCheckOn() bool {
 // ImageScanOn reports whether app vulnerability scanning is enabled (default on).
 func (s ServerConfig) ImageScanOn() bool {
 	return s.ImageScanEnabled == nil || *s.ImageScanEnabled
+}
+
+// HostScanOn reports whether the host vulnerability scan is enabled (default on).
+func (s ServerConfig) HostScanOn() bool {
+	return s.HostScanEnabled == nil || *s.HostScanEnabled
 }
 
 // RouteErrorLogOn reports whether the per-route edge error log is enabled (default on).
@@ -978,7 +996,7 @@ type AlertingConfig struct {
 	Enabled           bool     `yaml:"enabled"`
 	EvalInterval      Duration `yaml:"eval_interval"`       // evaluator tick
 	NotifyMinInterval Duration `yaml:"notify_min_interval"` // global rate limit between sends
-	QuietStartHour    int      `yaml:"quiet_start_hour"`    // [0..23], -1 disables (suppresses WARNING; CRITICAL always pages)
+	QuietStartHour    int      `yaml:"quiet_start_hour"`    // [0..23], -1 disables (holds WARNING until quiet hours end; CRITICAL always pages); other values turn quiet hours off (LoadWarnings)
 	QuietEndHour      int      `yaml:"quiet_end_hour"`
 	DeadMansURL       string   `yaml:"dead_mans_url"` // outbound heartbeat to an external cron-monitor
 	DeadMansInterval  Duration `yaml:"dead_mans_interval"`
@@ -1115,6 +1133,20 @@ func applyDefaults(c *Config) {
 	}
 	if c.Alerting.QuietStartHour == 0 && c.Alerting.QuietEndHour == 0 {
 		c.Alerting.QuietStartHour, c.Alerting.QuietEndHour = -1, -1 // disabled
+	}
+	// Intentional: an out-of-range quiet hour (e.g. quiet_end_hour: 24) turns quiet hours OFF with a
+	// warning instead of refusing to boot: older releases accepted such values, and refusing would take
+	// the edge and every app down on upgrade. (Every hour quiet would hold warnings forever.)
+	if outOfRange := func(h int) bool { return h < -1 || h > 23 }; outOfRange(c.Alerting.QuietStartHour) || outOfRange(c.Alerting.QuietEndHour) {
+		c.LoadWarnings = append(c.LoadWarnings, fmt.Sprintf(
+			"alerting.quiet_start_hour / quiet_end_hour must be hours from 0 to 23 (0 is midnight), or -1 to disable; got %d and %d, so quiet hours are off",
+			c.Alerting.QuietStartHour, c.Alerting.QuietEndHour))
+		c.Alerting.QuietStartHour, c.Alerting.QuietEndHour = -1, -1
+	}
+	// A valid pair that still means "never quiet" — say so instead of leaving it silent. (-1 in either
+	// one is the documented way to turn quiet hours off, so it isn't warned about.)
+	if s, e := c.Alerting.QuietStartHour, c.Alerting.QuietEndHour; s >= 0 && s == e {
+		c.LoadWarnings = append(c.LoadWarnings, fmt.Sprintf("alerting.quiet_start_hour and quiet_end_hour are both %d, so there are no quiet hours", s))
 	}
 	if c.Alerting.DeadMansInterval == 0 {
 		c.Alerting.DeadMansInterval = Duration(5 * time.Minute)

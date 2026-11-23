@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -52,10 +53,22 @@ func VerifyDigest(nginxPath, want string) error {
 	if _, err := io.Copy(h, f); err != nil {
 		return err
 	}
-	if hex.EncodeToString(h.Sum(nil)) != want {
-		return fmt.Errorf("l4: nginx binary digest mismatch (refusing to launch)")
+	if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		return fmt.Errorf("l4: nginx binary digest mismatch (refusing to run it): %s doesn't match edge.l4_nginx_digest; its SHA-256 is %s", nginxPath, got)
 	}
 	return nil
+}
+
+// verifyNginxOnPath checks the nginx a command named "nginx" runs now against the pin (none: nil).
+func (s *Supervisor) verifyNginxOnPath() error {
+	if s.Digest == "" {
+		return nil
+	}
+	path, err := exec.LookPath(nginxBin)
+	if err != nil {
+		return fmt.Errorf("l4: %w", err)
+	}
+	return VerifyDigest(path, s.Digest)
 }
 
 // Supervisor owns the child nginx that serves the L4 stream proxy. Config lives in a
@@ -69,17 +82,57 @@ type Supervisor struct {
 	Digest     string // pinned SHA-256 of the nginx binary (optional)
 	Log        *slog.Logger
 
-	mu   sync.Mutex
-	proc *os.Process // running master, for a SIGHUP reload (nil when not running)
+	mu         sync.Mutex
+	proc       *os.Process // running master, for a SIGHUP reload (nil when not running)
+	restarting bool        // the current master is being stopped by Restart
 
-	// Seams (nil → real implementation): testConf runs `nginx -t`; sighup signals reload.
+	// Seams (nil → real implementation): testConf runs `nginx -t`; sighup signals reload; command builds
+	// the master's command.
 	testConf func(ctx context.Context, configPath string) error
 	sighup   func(p *os.Process) error
+	command  func(ctx context.Context) *exec.Cmd
+}
+
+// PID is the running master's pid, 0 when none is running.
+func (s *Supervisor) PID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.proc == nil {
+		return 0
+	}
+	return s.proc.Pid
+}
+
+// Restart stops the running master so Run relaunches it at once — no backoff, on the nginx binary and
+// libraries now on disk (used after a package upgrade replaced them). SIGTERM first (nginx's fast
+// shutdown), SIGKILL if it's still running 5s later. A no-op when no master is running.
+func (s *Supervisor) Restart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.proc == nil {
+		return
+	}
+	s.restarting = true
+	p := s.proc
+	_ = p.Signal(syscall.SIGTERM)
+	// Safe after the process is reaped: os.Process.Kill then returns os.ErrProcessDone.
+	time.AfterFunc(5*time.Second, func() { _ = p.Kill() })
+}
+
+// Validate reports whether a relaunch would come up on the nginx now on disk: `nginx -t` on the live
+// config, which with a Digest first checks that nginx against it (runTest: a binary that fails the pin
+// is never run). The test holds the lock Reconcile holds, so it never tests a config while a Reconcile
+// swaps it.
+func (s *Supervisor) Validate(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runTest(ctx, s.ConfigPath)
 }
 
 // Reconcile renders the routes, validates the rendered config, and atomically swaps
-// it in + reloads. It is fail-closed and serialized: a render error or an `nginx -t`
-// rejection leaves the live config untouched (last-good keeps serving).
+// it in + reloads. It is fail-closed and serialized: a render error, an nginx that fails
+// the Digest pin or an `nginx -t` rejection leaves the live config untouched (last-good
+// keeps serving).
 func (s *Supervisor) Reconcile(ctx context.Context, routes []Route) error {
 	cfg, err := Render(routes) // bad routes → nothing changes
 	if err != nil {
@@ -96,6 +149,9 @@ func (s *Supervisor) Reconcile(ctx context.Context, routes []Route) error {
 	}
 	if err := s.runTest(ctx, tmp); err != nil {
 		os.Remove(tmp)
+		if errors.As(err, new(pinRefusedError)) {
+			return fmt.Errorf("l4: rendered config not tested or applied (keeping last-good): %w", err)
+		}
 		return fmt.Errorf("l4: rendered config rejected by nginx -t (keeping last-good): %w", err)
 	}
 	if err := os.Rename(tmp, s.ConfigPath); err != nil { // atomic swap
@@ -110,11 +166,20 @@ func (s *Supervisor) Reconcile(ctx context.Context, routes []Route) error {
 	return nil
 }
 
+// runTest runs `nginx -t` on configPath. With a Digest, the nginx the command resolved to is checked
+// first, as at every launch: serve reconciles before Run's own check and every few seconds after, also
+// once Run has refused to start the binary, so without it a package upgrade's unpinned nginx would run.
 func (s *Supervisor) runTest(ctx context.Context, configPath string) error {
+	cmd := exec.CommandContext(ctx, "nginx", "-t", "-c", configPath, "-p", s.Prefix) // literal: SEC-1 requires it
+	// cmd.Err (no nginx on PATH) fails the run below.
+	if s.Digest != "" && cmd.Err == nil {
+		if err := VerifyDigest(cmd.Path, s.Digest); err != nil {
+			return pinRefusedError{err}
+		}
+	}
 	if s.testConf != nil {
 		return s.testConf(ctx, configPath)
 	}
-	cmd := exec.CommandContext(ctx, "nginx", "-t", "-c", configPath, "-p", s.Prefix) // literal: SEC-1 requires it
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%w: %s", err, out)
@@ -184,16 +249,9 @@ func (s *Supervisor) Run(ctx context.Context) {
 		s.Log.Warn("managed L4 LB not started", "reason", why)
 		return
 	}
-	if s.Digest != "" {
-		path, err := exec.LookPath(nginxBin)
-		if err != nil {
-			s.Log.Error("managed L4 LB not started", "err", err)
-			return
-		}
-		if err := VerifyDigest(path, s.Digest); err != nil {
-			s.Log.Error("managed L4 LB not started", "err", err)
-			return
-		}
+	if err := s.verifyNginxOnPath(); err != nil {
+		s.Log.Error("managed L4 LB not started", "err", err)
+		return
 	}
 	// Make the prefix-relative `load_module modules/…` (from /etc/nginx/modules-enabled
 	// on Debian/Ubuntu) resolve, since we run nginx with `-p <Prefix>`.
@@ -206,13 +264,33 @@ func (s *Supervisor) Run(ctx context.Context) {
 			return
 		}
 	}
+	s.supervise(ctx)
+}
+
+// supervise is Run's launch loop, without the host checks.
+func (s *Supervisor) supervise(ctx context.Context) {
 	backoff := time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		start := time.Now()
-		if err := s.launch(ctx); err != nil && ctx.Err() == nil {
+		err := s.launch(ctx)
+		s.mu.Lock()
+		restarted := s.restarting
+		s.restarting = false
+		s.mu.Unlock()
+		if restarted && ctx.Err() == nil {
+			s.Log.Info("l4 child restarted")
+			backoff = time.Second
+			continue // relaunch immediately on the nginx now on disk
+		}
+		switch {
+		case err == nil || ctx.Err() != nil:
+		case errors.As(err, new(pinRefusedError)):
+			// The pin is read only at startup (SIGHUP doesn't reload edge.*), so a new pin needs a restart.
+			s.Log.Error("l4: not starting nginx: the binary fails the edge.l4_nginx_digest check; retrying with backoff, so it starts if the pinned binary is put back. To run this binary, set edge.l4_nginx_digest to its SHA-256 (in err) and run `sudo systemctl restart mooring`", "err", err.Error())
+		default:
 			s.Log.Error("l4 child exited", "err", err)
 		}
 		if ctx.Err() != nil {
@@ -231,21 +309,50 @@ func (s *Supervisor) Run(ctx context.Context) {
 	}
 }
 
+// ErrPinRefused matches (errors.Is) every error Reconcile, Validate and a launch return because the nginx
+// on PATH fails the Digest pin. Retrying soon doesn't help: it stays refused until the pinned binary is
+// put back, or the pin is changed and Mooring restarted.
+var ErrPinRefused = errors.New("l4: the nginx binary fails the edge.l4_nginx_digest pin")
+
+// pinRefusedError: a binary that fails the Digest check was refused (err is VerifyDigest's).
+type pinRefusedError struct{ err error }
+
+func (e pinRefusedError) Error() string        { return e.err.Error() }
+func (e pinRefusedError) Unwrap() error        { return e.err }
+func (e pinRefusedError) Is(target error) bool { return target == ErrPinRefused }
+
 // launch runs nginx in the foreground (daemon off) so this supervisor owns its
 // lifecycle and can SIGHUP it for a graceful reload. The resource set / slice / caps
-// are pinned by the OS layer.
+// are pinned by the OS layer. With a Digest, the binary the command resolved to is
+// checked first at every launch, not only at Run's start: a package upgrade can replace
+// nginx while Mooring runs, and a relaunch (Restart, a crash) would start it unchecked.
 func (s *Supervisor) launch(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "nginx", "-c", s.ConfigPath, "-p", s.Prefix, "-g", "daemon off;") // literal: SEC-1 requires it
-	cmd.Env = []string{"HOME=" + s.Prefix}
+	var cmd *exec.Cmd
+	if s.command != nil {
+		cmd = s.command(ctx)
+	} else {
+		cmd = exec.CommandContext(ctx, "nginx", "-c", s.ConfigPath, "-p", s.Prefix, "-g", "daemon off;") // literal: SEC-1 requires it
+		cmd.Env = []string{"HOME=" + s.Prefix}
+	}
+	if s.Digest != "" && cmd.Err == nil { // cmd.Err (no nginx on PATH) fails Start below
+		if err := VerifyDigest(cmd.Path, s.Digest); err != nil {
+			return pinRefusedError{err}
+		}
+	}
 	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr // surface nginx errors in journald (not /dev/null)
 	cmd.WaitDelay = 5 * time.Second
-	if err := cmd.Start(); err != nil {
+	// Start and record the master under ONE lock: a Restart racing this launch then stops this master
+	// or lands before it, never in between where it would find no master and leave the old one running.
+	s.mu.Lock()
+	err := cmd.Start()
+	if err == nil {
+		s.proc = cmd.Process
+	}
+	s.mu.Unlock()
+	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.proc = cmd.Process
-	s.mu.Unlock()
-	err := cmd.Wait()
+	err = cmd.Wait()
 	s.mu.Lock()
 	s.proc = nil
 	s.mu.Unlock()

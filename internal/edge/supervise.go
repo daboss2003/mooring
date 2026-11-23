@@ -120,6 +120,16 @@ func (s *Supervisor) Restart() {
 	time.AfterFunc(5*time.Second, func() { _ = p.Kill() })
 }
 
+// PID is the running child's pid, 0 when none is running.
+func (s *Supervisor) PID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur == nil {
+		return 0
+	}
+	return s.cur.Pid
+}
+
 // Run supervises the child with capped backoff until ctx is cancelled. NOTE: the
 // actual process launch + its systemd slice/user/caps/egress-firewall are the OS
 // deployment layer (plan §6); this owns the lifecycle. Not exercised off-Linux.
@@ -208,10 +218,7 @@ func (s *Supervisor) launch(ctx context.Context) error {
 	s.mu.Lock()
 	cmd := exec.CommandContext(ctx, s.bin(), "run", "--config", "-", "--adapter", "")
 	cmd.Stdin = bytes.NewReader(s.InitialCfg)
-	// Pin all of Caddy's storage under the writable /var/lib/caddy: HOME +
-	// XDG_DATA_HOME (certs) + XDG_CONFIG_HOME (autosave config) — otherwise autosave
-	// falls back to $HOME/.config and is fragile under the sandbox.
-	cmd.Env = []string{"HOME=/var/lib/caddy", "XDG_DATA_HOME=/var/lib/caddy", "XDG_CONFIG_HOME=/var/lib/caddy"}
+	cmd.Env = caddyEnv()
 	cmd.Stderr = os.Stderr // Caddy's own logs + errors always surface in journald (not /dev/null)
 	if s.Stderr != nil {
 		cmd.Stderr = s.Stderr
@@ -240,6 +247,14 @@ func (s *Supervisor) launch(ctx context.Context) error {
 		<-drained  // and finish draining before we loop/backoff (bounded: pipe EOF)
 	}
 	return err
+}
+
+// caddyEnv is the whole environment of the edge's Caddy (and of ValidateConfig, which must read the
+// same storage). It pins all of Caddy's storage under the writable /var/lib/caddy: HOME +
+// XDG_DATA_HOME (certs) + XDG_CONFIG_HOME (autosave config) — otherwise autosave falls back to
+// $HOME/.config and is fragile under the sandbox.
+func caddyEnv() []string {
+	return []string{"HOME=/var/lib/caddy", "XDG_DATA_HOME=/var/lib/caddy", "XDG_CONFIG_HOME=/var/lib/caddy"}
 }
 
 // drainAccessBuf bounds the per-line buffer. A normal access entry is well under 2 KiB; 1 MiB is

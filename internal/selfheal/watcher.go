@@ -99,10 +99,22 @@ type Watcher struct {
 	cfg  Config
 	fsms map[Key]FSM // in-memory FSM cache, recovered from the store on boot
 
-	lastAt  time.Time               // the last snapshot stepped (each is stepped once)
-	stable  map[Key]int64           // unix sec each service became fully healthy (tick goroutine only)
-	waits   map[Key]*startgate.Wait // per-service start-gate deferral of the pending remediation
-	settleW map[Key]bool            // a long settle deferral was already logged
+	lastAt    time.Time               // the last snapshot stepped (each is stepped once)
+	stable    map[Key]int64           // unix sec each service became fully healthy (tick goroutine only)
+	waits     map[Key]*startgate.Wait // per-service start-gate deferral of the pending remediation
+	settleW   map[Key]bool            // a long settle deferral was already logged
+	lowPaged  map[Key]bool            // low_headroom was paged in the service's current failing episode
+	lowWarned map[Key]bool            // a low_headroom page of the current episode failed to enqueue and was logged
+	// pendingInfra: each service's newest infra alert that couldn't be enqueued, retried every tick
+	// (raiseInfra). Apart from fsms, so a service_gone resolve outlives the pruned FSM.
+	pendingInfra map[Key]alert.Outbox
+	infraOpen    map[Key]bool // a firing was enqueued for the service in this process, and no resolve after it
+	// episodeAt: when the service's alert episode began, if it began in this process (noteEpisode; wall
+	// clock unix sec). Absent = unknown. It bounds the outbox rows the episode can have (neverRaised).
+	episodeAt map[Key]int64
+	// pendingClose: each service's close (closeInfra) that couldn't be recorded, retried every tick before
+	// any other alert of the service (retryInfra, raiseInfra).
+	pendingClose map[Key]alert.Outbox
 
 	mu           sync.Mutex   // guards pendingClear only (NOT held during tick I/O)
 	pendingClear map[Key]bool // operator clear-circuit requests, drained at tick start
@@ -117,7 +129,8 @@ func New(cfg Config) *Watcher {
 		cfg.Log = slog.Default()
 	}
 	return &Watcher{cfg: cfg, fsms: map[Key]FSM{}, pendingClear: map[Key]bool{},
-		stable: map[Key]int64{}, waits: map[Key]*startgate.Wait{}, settleW: map[Key]bool{}}
+		stable: map[Key]int64{}, waits: map[Key]*startgate.Wait{}, settleW: map[Key]bool{}, lowPaged: map[Key]bool{}, lowWarned: map[Key]bool{},
+		pendingInfra: map[Key]alert.Outbox{}, infraOpen: map[Key]bool{}, episodeAt: map[Key]int64{}, pendingClose: map[Key]alert.Outbox{}}
 }
 
 // ClearCircuit requests that a latched CIRCUIT_OPEN service be reset to HEALTHY (the
@@ -131,14 +144,19 @@ func (w *Watcher) ClearCircuit(k Key) {
 	w.mu.Unlock()
 }
 
-// drainClears applies any pending operator clear-circuit requests.
+// drainClears applies any pending operator clear-circuit requests. The service's open alert is closed
+// without a message: the clear is no recovery, and the service starts over from HEALTHY, so no resolve
+// would ever close it and its level would carry into the next episode's resolve.
 func (w *Watcher) drainClears(ctx context.Context, now int64) {
 	w.mu.Lock()
 	pending := w.pendingClear
 	w.pendingClear = map[Key]bool{}
 	w.mu.Unlock()
 	for k := range pending {
+		w.closeInfra(ctx, k, "circuit_cleared")
 		w.fsms[k] = FSM{Phase: Healthy}
+		delete(w.lowPaged, k)
+		delete(w.lowWarned, k)
 		_ = w.cfg.Store.Save(ctx, k, w.fsms[k], now)
 	}
 }
@@ -172,6 +190,11 @@ func (w *Watcher) Run(ctx context.Context) {
 
 // Tick runs one supervision pass over the latest snapshot. Exported for tests.
 func (w *Watcher) Tick(ctx context.Context) {
+	now := w.cfg.Now()
+	// Before the snapshot checks: an operator's clear and an alert waiting for the outbox act on no
+	// observation, so they don't wait for Docker to be listed again.
+	w.drainClears(ctx, now)
+	w.retryInfra(ctx) // after the clears: a cleared service's pending alert is dropped, never sent
 	snap := w.cfg.Snap()
 	if snap == nil || !snap.DockerOK || snap.ListFailed {
 		return // never act on stale/absent data (a failed list shows no containers, not that none run)
@@ -185,8 +208,6 @@ func (w *Watcher) Tick(ctx context.Context) {
 	if w.cfg.Observe != nil {
 		w.cfg.Observe(snap)
 	}
-	now := w.cfg.Now()
-	w.drainClears(ctx, now)
 	leases, _ := w.cfg.Store.ActiveExpectedDown(now)
 	held, _ := w.cfg.Store.ActiveHeld() // operator-held services: suspend remediation (never restart)
 
@@ -472,6 +493,10 @@ func (w *Watcher) stepService(ctx context.Context, app monitor.App, service stri
 		delete(w.waits, key) // nothing pending: the next remediation starts a fresh start-gate wait
 		delete(w.settleW, key)
 	}
+	if d.Next.Phase == Healthy {
+		delete(w.lowPaged, key) // the failing episode is over
+		delete(w.lowWarned, key)
+	}
 
 	switch d.Act {
 	case ActNone:
@@ -567,10 +592,17 @@ func (w *Watcher) remediate(ctx context.Context, app monitor.App, service string
 			w.cfg.Log.Warn("selfheal: remediation still waiting for other containers to finish starting", "app", app.Project, "service", service, "reason", reason)
 		}
 	case GatePage:
-		// Headroom too low to safely restart: page instead of acting (plan §8.5).
+		// Headroom too low to safely restart: page instead of acting (plan §8.5) — once per failing
+		// episode, not on every tick it is still low. The open alert is resolved with the recovery. Only an
+		// enqueued page counts: after a failed enqueue the next tick still below the floor pages again.
+		// Intentional: so a failed page isn't kept as the pending alert — it opened no alert, and enqueued
+		// after the headroom came back it would stay open, with no resolve to close it.
 		next := d.Next
 		next.Phase = Degraded
-		w.emitInfra(ctx, app, service, "low_headroom", "firing")
+		if !w.lowPaged[key] && w.raiseInfra(ctx, app, service, "low_headroom", "firing", false) == nil {
+			w.lowPaged[key] = true
+			next.Open = true
+		}
 		w.commit(ctx, key, next, now)
 	case GateSkip:
 		// Edge/control plane is never a remediation target — leave it untouched.
@@ -598,20 +630,34 @@ func shortIDs(ids []string) []string {
 // mid-deploy under a lease), so the table doesn't grow unbounded. A dropped service of an app still
 // listed whose alert is open gets it resolved, so the alert isn't left open forever. Intentional: not
 // for an app gone from the list — a deleted app's alerts are erased with it, and a resolution sent
-// after the delete would only be noise.
+// after the delete (or after the whole app was taken down) would only be noise. Its alert is closed
+// without a message instead, so a later episode under the same name starts clean.
 func (w *Watcher) prune(ctx context.Context, seen map[Key]bool, leases, listed map[string]bool) {
 	for key, f := range w.fsms {
 		if seen[key] || leases[key.App] {
 			continue
 		}
-		if f.Open && listed[key.App] {
+		switch {
+		case !listed[key.App]:
+			w.closeInfra(ctx, key, "service_gone")
+		case f.Open:
 			w.emitInfra(ctx, monitor.App{Project: key.App}, key.Service, "service_gone", "resolved")
 		}
+		if _, waiting := w.pendingInfra[key]; !waiting {
+			delete(w.episodeAt, key) // nothing of the episode left to raise
+		}
+		delete(w.lowPaged, key)
+		delete(w.lowWarned, key)
 		delete(w.fsms, key)
 		delete(w.stable, key)
 		delete(w.waits, key)
 		delete(w.settleW, key)
 		_ = w.cfg.Store.Delete(ctx, key)
+	}
+	for key := range w.pendingInfra {
+		if !listed[key.App] && !leases[key.App] {
+			w.closeInfra(ctx, key, "service_gone") // its service was pruned before the whole app went
+		}
 	}
 }
 
@@ -620,9 +666,9 @@ func (w *Watcher) commit(ctx context.Context, key Key, f FSM, now int64) {
 	_ = w.cfg.Store.Save(ctx, key, f, now)
 }
 
-// kindLevel maps a can't-fix taxonomy kind to its alert level. low_headroom, a long dependency
-// wait and a reported (notify) failing healthcheck are WARNINGs (quiet-hours-suppressible); the
-// give-up kinds are CRITICAL (always page).
+// kindLevel maps a can't-fix taxonomy kind to its "firing" alert level. low_headroom, a long dependency
+// wait and a reported (notify) failing healthcheck are WARNINGs (held during quiet hours); the
+// give-up kinds are CRITICAL (always page). A resolve takes the level of the alert it closes (emitInfra).
 func kindLevel(kind string) string {
 	switch kind {
 	case "low_headroom", "dependency_wait", "unhealthy_reported":
@@ -631,36 +677,201 @@ func kindLevel(kind string) string {
 	return alert.LevelCritical
 }
 
-// emitInfra enqueues a Mooring-originated infra alert (origin=mooring_infra,
+// emitInfra raises the service's infra alert; one that can't be enqueued is retried every tick (raiseInfra).
+func (w *Watcher) emitInfra(ctx context.Context, app monitor.App, service, kind, transition string) error {
+	return w.raiseInfra(ctx, app, service, kind, transition, true)
+}
+
+// raiseInfra enqueues a Mooring-originated infra alert (origin=mooring_infra,
 // rule_id=0, never deferred). Names are CR/LF/NUL-stripped before they reach any
 // channel (the email channel also builds MIME-safe, never placing a name in a
 // header). A nil alert store (alerting disabled) logs the page instead.
-func (w *Watcher) emitInfra(ctx context.Context, app monitor.App, service, kind, transition string) {
+//
+// The caller commits the FSM's next state whether or not the enqueue succeeded, and only after this call
+// (w.fsms still holds the state the decision started from), so with retry an alert that can't be enqueued
+// (a full disk) becomes the service's pending alert, enqueued by a later tick (retryInfra) as built now; a
+// newer alert for the service replaces it. A resolve that would replace a pending firing when no firing of
+// the episode reached the outbox drops both: the alert was never raised. The service's pending close
+// (closeInfra) is recorded first; while it still fails, an alert waits behind it, and a resolve is dropped
+// (nothing raised since the close can have reached the outbox). It returns the enqueue's error (already
+// logged); nil when the alert was enqueued, logged or dropped.
+func (w *Watcher) raiseInfra(ctx context.Context, app monitor.App, service, kind, transition string, retry bool) error {
 	target := sanitizeName(app.Project) + "/" + sanitizeName(service)
 	if w.cfg.Alerts == nil {
 		w.cfg.Log.Warn("selfheal: infra alert (no channels configured)", "kind", kind, "target", target, "transition", transition)
+		return nil
+	}
+	key := Key{App: app.Project, Service: service}
+	if transition == "firing" && retry {
+		w.noteEpisode(key)
+	}
+	closeErr := w.flushClose(ctx, key)
+	if transition == "resolved" && (closeErr != nil || w.neverRaised(ctx, key)) {
+		w.cfg.Log.Info("selfheal: infra alert dropped: resolved before it could be enqueued", "kind", w.pendingInfra[key].Kind, "target", target)
+		delete(w.pendingInfra, key)
+		delete(w.episodeAt, key)
+		return nil
+	}
+	row := w.infraOutbox(ctx, target, kind, transition)
+	err := closeErr
+	if err == nil {
+		err = w.enqueueInfra(ctx, key, row)
+	}
+	if err != nil {
+		// Without retry (low_headroom, raised again by every tick of its episode) only the first failure of
+		// the episode is a warning.
+		if retry || !w.lowWarned[key] {
+			w.cfg.Log.Warn("selfheal: enqueue infra alert failed", "kind", kind, "target", target, "transition", transition, "retry", retry, "err", err)
+		} else {
+			w.cfg.Log.Debug("selfheal: infra alert still not enqueued", "kind", kind, "target", target, "err", err)
+		}
+		if retry {
+			w.pendingInfra[key] = row
+		} else {
+			w.lowWarned[key] = true
+		}
+		return err
+	}
+	if !retry && w.lowWarned[key] {
+		delete(w.lowWarned, key)
+		w.cfg.Log.Info("selfheal: infra alert enqueued on retry", "kind", kind, "target", target, "transition", transition)
+	}
+	return nil
+}
+
+// noteEpisode records that the service's alert episode begins now: a firing is raised while no alert of the
+// service is open — its FSM has none, none was enqueued in this process, and no resolve is waiting to be
+// enqueued (until it is, the alert before stays open in the outbox). An episode that was open when Mooring
+// started stays unknown.
+func (w *Watcher) noteEpisode(key Key) {
+	if _, known := w.episodeAt[key]; known || w.fsms[key].Open || w.infraOpen[key] || w.pendingInfra[key].Transition == "resolved" {
 		return
 	}
-	summary := infraSummary(kind, transition, target)
-	o := alert.Outbox{
+	// Intentional: the wall clock, not cfg.Now — it is compared with the outbox's timestamps.
+	w.episodeAt[key] = time.Now().Unix()
+}
+
+// neverRaised reports that the service's pending alert is a firing and no firing of its episode reached the
+// outbox: none was enqueued in this process (infraOpen), and the outbox positively records none, with no
+// row of the episode old enough to have been pruned (alertstore.InfraFiringRecorded, bounded by episodeAt).
+// Intentional: an outbox that can't be read counts as raised — the resolve is sent. An unneeded recovery
+// beats an alert left open forever.
+func (w *Watcher) neverRaised(ctx context.Context, key Key) bool {
+	p, ok := w.pendingInfra[key]
+	if !ok || p.Transition != "firing" || w.infraOpen[key] {
+		return false
+	}
+	recorded, err := w.cfg.Alerts.InfraFiringRecorded(ctx, p.DedupeKey, w.episodeAt[key])
+	if err != nil {
+		w.cfg.Log.Warn("selfheal: can't read whether the infra alert was raised; its resolve is sent", "target", p.Target, "err", err)
+		return false
+	}
+	return !recorded
+}
+
+// enqueueInfra enqueues row, the service's newest infra alert, which replaces its pending one.
+func (w *Watcher) enqueueInfra(ctx context.Context, key Key, row alert.Outbox) error {
+	if err := w.cfg.Alerts.EnqueueInfra(ctx, row); err != nil {
+		return err
+	}
+	delete(w.pendingInfra, key)
+	if row.Transition == "firing" {
+		w.infraOpen[key] = true
+	} else {
+		delete(w.infraOpen, key)
+		delete(w.episodeAt, key)
+	}
+	return nil
+}
+
+// flushClose records the service's pending close, if any. It returns the close's error while it still fails.
+func (w *Watcher) flushClose(ctx context.Context, key Key) error {
+	row, ok := w.pendingClose[key]
+	if !ok {
+		return nil
+	}
+	if err := w.cfg.Alerts.CloseInfraAlert(ctx, row); err != nil {
+		return err
+	}
+	delete(w.pendingClose, key)
+	w.cfg.Log.Info("selfheal: infra alert closed on retry", "target", row.Target)
+	return nil
+}
+
+// retryInfra records the pending closes, then enqueues the pending infra alerts (raiseInfra); an alert behind
+// a close that still fails waits. A failure was logged when it first happened, so a retry that fails again
+// is logged at debug only. Intentional: in memory only — a database that can't take the outbox row usually
+// can't take the FSM save either, so after a restart the service is decided again from its last saved state
+// and pages again.
+func (w *Watcher) retryInfra(ctx context.Context) {
+	for key, row := range w.pendingClose {
+		if err := w.flushClose(ctx, key); err != nil {
+			w.cfg.Log.Debug("selfheal: infra alert still not closed", "target", row.Target, "err", err)
+		}
+	}
+	for key, row := range w.pendingInfra {
+		if _, closing := w.pendingClose[key]; closing {
+			continue
+		}
+		if err := w.enqueueInfra(ctx, key, row); err != nil {
+			w.cfg.Log.Debug("selfheal: infra alert still not enqueued", "kind", row.Kind, "target", row.Target, "err", err)
+			continue
+		}
+		w.cfg.Log.Info("selfheal: infra alert enqueued on retry", "kind", row.Kind, "target", row.Target, "transition", row.Transition)
+	}
+}
+
+// infraOutbox builds the self-heal alert row for target ("app/service", sanitized).
+func (w *Watcher) infraOutbox(ctx context.Context, target, kind, transition string) alert.Outbox {
+	key := "selfheal:" + target // one open supervisor alert per service
+	level := kindLevel(kind)
+	if transition == "resolved" {
+		// The resolve ("recovered", "service_gone") carries the level the alert reached: a warning held
+		// through quiet hours must not have its resolve page at night. Nothing recorded (pruned) → warning.
+		level = alert.LevelWarning
+		if l, ok := w.cfg.Alerts.InfraResolveLevel(ctx, key); ok {
+			level = l
+		}
+	}
+	return alert.Outbox{
 		RuleID:     0, // infra sentinel
 		Target:     target,
 		Kind:       kind,
-		Level:      kindLevel(kind),
+		Level:      level,
 		Transition: transition,
-		Summary:    summary,
-		DedupeKey:  "selfheal:" + target, // one open supervisor alert per service
+		Summary:    infraSummary(kind, transition, target),
+		DedupeKey:  key,
 	}
-	if err := w.cfg.Alerts.EnqueueInfra(ctx, o); err != nil {
-		w.cfg.Log.Warn("selfheal: enqueue infra alert failed", "err", err)
+}
+
+// closeInfra closes the service's open self-heal alert without sending anything (alertstore.CloseInfraAlert),
+// its pending alert included. A close that can't be recorded becomes the service's pending close, retried
+// every tick and before any later alert of the service (retryInfra, raiseInfra): recorded after a later
+// alert, it would end that alert's episode. A newer close replaces it.
+func (w *Watcher) closeInfra(ctx context.Context, k Key, kind string) {
+	if w.cfg.Alerts == nil {
+		return
+	}
+	delete(w.pendingInfra, k)
+	delete(w.infraOpen, k)
+	delete(w.episodeAt, k)
+	delete(w.pendingClose, k)
+	target := sanitizeName(k.App) + "/" + sanitizeName(k.Service)
+	row := w.infraOutbox(ctx, target, kind, "resolved")
+	if err := w.cfg.Alerts.CloseInfraAlert(ctx, row); err != nil {
+		w.cfg.Log.Warn("selfheal: closing the infra alert failed; retrying on every check", "target", target, "err", err)
+		w.pendingClose[k] = row
 	}
 }
 
 // infraSummary builds the bounded, fixed-section body (plan §8.4) — no log dump.
 func infraSummary(kind, transition, target string) string {
 	if transition == "resolved" {
-		if kind == "service_gone" {
+		switch kind {
+		case "service_gone":
 			return "Service " + target + " has no containers any more and is no longer supervised; this alert is closed."
+		case "circuit_cleared":
+			return "The operator cleared the circuit of service " + target + "; Mooring supervises it again from a clean state and this alert is closed."
 		}
 		return "Service " + target + " recovered and is healthy again."
 	}

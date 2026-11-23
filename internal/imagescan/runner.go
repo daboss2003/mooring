@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/daboss2003/mooring/internal/alert"
+	"github.com/daboss2003/mooring/internal/serverinfo"
 )
 
 // Target is one thing to scan: an image ref (Kind "image", scanned from the
@@ -34,23 +35,46 @@ type alertSink interface {
 type scanIface interface {
 	ScanImage(ctx context.Context, ref string) (Report, error)
 	ScanFS(ctx context.Context, hostDir, label string) (Report, error)
+	ScanHost(ctx context.Context, plan HostPlan) (HostScan, error)
 }
 
-// Runner periodically scans every app's targets and stores + alerts on the results.
+// Runner periodically scans the host (when WithHost is set) and every app's targets, and stores +
+// alerts on the results.
 type Runner struct {
 	scanner  scanIface
 	store    *Store
 	alerts   alertSink                          // may be nil (alerting disabled)
-	targets  func(ctx context.Context) []Target // enumerates all apps' targets (injected)
+	targets  func(ctx context.Context) []Target // enumerates all apps' targets (injected; nil = no app scans)
 	interval time.Duration
 	log      *slog.Logger
 
 	alerted map[string]string // project → last-alerted "crit/high" signature (avoid re-paging)
+
+	// Host scan (WithHost).
+	hostPlan            func(ctx context.Context) HostPlan
+	hostStore           *HostStore
+	onOwnedCaddyFixable func(ctx context.Context)
+	reboot              func() (bool, []string) // serverinfo.RebootRequired (injected in tests)
+	hostAlerted         map[string]bool         // "ID|Package|ReportTarget" of every finding a host_vulnerabilities alert included this process
+	rebootAlerted       map[string]bool         // host_reboot_required signatures paged this process
 }
 
 // NewRunner builds a Runner. interval floors at 1h in Run.
 func NewRunner(scanner scanIface, store *Store, alerts alertSink, targets func(context.Context) []Target, interval time.Duration, log *slog.Logger) *Runner {
-	return &Runner{scanner: scanner, store: store, alerts: alerts, targets: targets, interval: interval, log: log, alerted: map[string]string{}}
+	return &Runner{
+		scanner: scanner, store: store, alerts: alerts, targets: targets, interval: interval, log: log,
+		alerted: map[string]string{}, reboot: serverinfo.RebootRequired,
+		hostAlerted: map[string]bool{}, rebootAlerted: map[string]bool{},
+	}
+}
+
+// WithHost turns on the host scan. ScanAll then scans the host FIRST, then the apps (the targets func
+// may return nil — image scanning off). onOwnedCaddyFixable (may be nil) is called synchronously when
+// the report with Role == RoleOwnedCaddy has ANY finding with a fixed version; the callee returns fast
+// (it spawns its own goroutine). Host alerts + the reboot-required alert are raised here.
+func (r *Runner) WithHost(plan func(ctx context.Context) HostPlan, store *HostStore, onOwnedCaddyFixable func(ctx context.Context)) *Runner {
+	r.hostPlan, r.hostStore, r.onOwnedCaddyFixable = plan, store, onOwnedCaddyFixable
+	return r
 }
 
 const minInterval = time.Hour
@@ -81,9 +105,15 @@ func (r *Runner) Run(ctx context.Context) {
 	}
 }
 
-// ScanAll scans every app's targets sequentially (one Trivy container at a time — it
-// is heavy) and persists per-app results.
+// ScanAll scans the host (when WithHost is set), then every app's targets, sequentially (one Trivy
+// container at a time — it is heavy) and persists the results.
 func (r *Runner) ScanAll(ctx context.Context) {
+	if r.hostPlan != nil && r.hostStore != nil {
+		r.scanHost(ctx)
+	}
+	if r.targets == nil || ctx.Err() != nil {
+		return
+	}
 	byProject := map[string][]Target{}
 	for _, t := range r.targets(ctx) {
 		byProject[t.Project] = append(byProject[t.Project], t)
@@ -98,6 +128,9 @@ func (r *Runner) ScanAll(ctx context.Context) {
 
 // ScanProject scans one app's targets on demand (e.g. after a deploy).
 func (r *Runner) ScanProject(ctx context.Context, project string) {
+	if r.targets == nil {
+		return
+	}
 	var tgs []Target
 	for _, t := range r.targets(ctx) {
 		if t.Project == project {

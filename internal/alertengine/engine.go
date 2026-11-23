@@ -32,7 +32,12 @@ type Config struct {
 	AdminURL          string // for the "open in dashboard" link in notifications
 }
 
-const maxNotifyAttempts = 3
+const (
+	drainMessages = 100 // messages one drain sends at most
+	// partialKeep bounds how long the notifier remembers the channels that took a message whose delivery
+	// failed elsewhere: longer than a critical is retried (24h).
+	partialKeep = 25 * time.Hour
+)
 
 // Engine owns the evaluator + notifier + heartbeat.
 type Engine struct {
@@ -40,12 +45,26 @@ type Engine struct {
 	snapFn func() *monitor.Snapshot
 	cfg    Config
 	log    *slog.Logger
-	wake   chan struct{} // evaluator signals the notifier
+	wake   chan struct{}    // evaluator signals the notifier
+	now    func() time.Time // the notifier's clock (quiet hours, retry backoff); a test seam
+	// pendingAlert is store.PendingAlert; a test seam (a read can't be made to fail on its own).
+	pendingAlert func(row alertstore.OutboxRow, criticalOnly bool) (alertstore.PendingAlert, bool, error)
+
+	partial map[string]partialSend // AlertKey → the channels that took its current message (notifier goroutine only)
+}
+
+// partialSend records a message that some channels took and others didn't, so its retries go only to
+// the others.
+type partialSend struct {
+	msg string         // which message: its newest row, rows combined and level
+	ok  map[int64]bool // ids of the channels that took it
+	at  time.Time
 }
 
 // New builds an Engine. snapFn returns the latest poller snapshot (may be nil).
 func New(store *alertstore.Store, snapFn func() *monitor.Snapshot, cfg Config, log *slog.Logger) *Engine {
-	return &Engine{store: store, snapFn: snapFn, cfg: cfg, log: log, wake: make(chan struct{}, 1)}
+	return &Engine{store: store, snapFn: snapFn, cfg: cfg, log: log, wake: make(chan struct{}, 1), now: time.Now,
+		pendingAlert: store.PendingAlert, partial: map[string]partialSend{}}
 }
 
 // RunEvaluator ticks the evaluator until ctx is cancelled.
@@ -108,93 +127,274 @@ func (e *Engine) RunNotifier(ctx context.Context) {
 		case <-t.C:
 		case <-e.wake:
 		}
-		e.drain(ctx)
-		e.store.PruneOutbox(ctx, time.Now().Add(-7*24*time.Hour).Unix())
+		e.notifyOnce(ctx)
 	}
 }
 
+// notifyOnce is one notifier cycle. The outbox is pruned BEFORE the drain: when alerting is enabled
+// after a long time off, rows past the unsent limit are dropped instead of replayed.
+func (e *Engine) notifyOnce(ctx context.Context) {
+	e.store.PruneOutbox(ctx, time.Now())
+	e.drain(ctx)
+}
+
+// drain sends up to drainMessages messages, one per alert: all undelivered rows of an alert go out as one
+// message reporting its latest state (alertstore.PendingAlert has the full rule). Pending critical alerts
+// go first, and are looked for again before every non-critical message, so a critical never waits behind
+// a backlog. Quiet hours HOLD every non-critical alert: its rows stay unsent (no attempt counted) and go
+// out with the first drain after quiet hours end. CRITICAL always pages (plan §8). A failed send backs off
+// as the store decides (FinishAlert), and an alert whose send failed, or whose outcome couldn't be
+// recorded, isn't tried again in the same drain; an alert delivered earlier in the drain is sent again
+// when it has a new critical row.
 func (e *Engine) drain(ctx context.Context) {
-	pending, err := e.store.PendingOutbox(100)
+	e.forgetPartial()
+	handled := map[string]bool{} // AlertKey of every alert tried in this drain
+	failed := map[string]bool{}  // of them, those whose send failed or whose outcome wasn't recorded
+	sent := 0
+	try := func(row alertstore.OutboxRow, criticalOnly bool) bool {
+		if ctx.Err() != nil || sent >= drainMessages {
+			return false
+		}
+		k := row.AlertKey()
+		handled[k] = true
+		sent++
+		if !e.deliver(ctx, row, criticalOnly) {
+			failed[k] = true
+		}
+		return true
+	}
+	criticals := func(quiet bool) bool {
+		crit, err := e.store.PendingAlerts(drainMessages, true, e.now())
+		if err != nil {
+			return false
+		}
+		for _, row := range crit {
+			// An alert delivered earlier in this drain is listed only for a critical row raised since:
+			// it goes now. One whose send failed, or whose delivery wasn't recorded, waits for the next
+			// drain.
+			if failed[row.AlertKey()] {
+				continue
+			}
+			if !try(row, quiet) {
+				return false
+			}
+		}
+		return true
+	}
+	quiet := e.inQuietHours(e.now())
+	if !criticals(quiet) || quiet {
+		return
+	}
+	rest, err := e.store.PendingAlerts(drainMessages, false, e.now())
 	if err != nil {
 		return
 	}
-	now := time.Now()
-	for _, row := range pending {
-		if ctx.Err() != nil {
+	for _, row := range rest {
+		if handled[row.AlertKey()] {
+			continue
+		}
+		// A critical raised while this batch is being sent goes out before the next non-critical alert.
+		if !criticals(false) {
 			return
 		}
-		// Quiet hours suppress WARNING; CRITICAL always pages (plan §8).
-		if row.Level != alert.LevelCritical && e.inQuietHours(now) {
-			e.store.MarkSent(ctx, row.ID, true, maxNotifyAttempts)
+		// Intentional: the rest of the batch stays unsent — quiet hours began while it was being sent
+		// (owner decision: non-critical alerts are held until quiet hours end).
+		if e.inQuietHours(e.now()) {
+			return
+		}
+		if handled[row.AlertKey()] { // sent by criticals() just now
 			continue
 		}
-		// Mooring-originated infra alert (plan §8.4): rule_id=0, NEVER deferred to an
-		// app and not tied to a rule/silence — route straight to ALL channels.
-		if row.RuleID == 0 {
-			channels, err := e.store.AllChannels()
-			if err != nil || len(channels) == 0 {
-				e.store.MarkSent(ctx, row.ID, false, maxNotifyAttempts)
-				continue
-			}
-			e.store.MarkSent(ctx, row.ID, e.sendAll(ctx, channels, e.render(row), row.Kind), maxNotifyAttempts)
-			continue
+		if !try(row, false) {
+			return
 		}
-		// Silenced (operator) → drop.
-		if e.store.IsSilenced(row.RuleID, row.Target, now.Unix()) {
-			e.store.MarkSent(ctx, row.ID, true, maxNotifyAttempts)
-			continue
-		}
-		rule, ok := e.store.RuleByID(row.RuleID)
-		if !ok {
-			e.store.MarkSent(ctx, row.ID, true, maxNotifyAttempts)
-			continue
-		}
-		channels, err := e.store.ChannelsForRule(rule.ChannelID)
-		if err != nil || len(channels) == 0 {
-			e.store.MarkSent(ctx, row.ID, false, maxNotifyAttempts)
-			continue
-		}
-		e.store.MarkSent(ctx, row.ID, e.sendAll(ctx, channels, e.render(row), row.Kind), maxNotifyAttempts)
 	}
 }
 
-// sendAll delivers n to every channel, rate-limited between sends so a slow channel
-// can't spam-cannon the box. Returns whether every send succeeded.
-func (e *Engine) sendAll(ctx context.Context, channels []alert.Channel, n alert.Notification, kind string) bool {
+// deliver sends one message for row's alert, combining every undelivered row of the alert, and records
+// the outcome. criticalOnly: the quiet-hours pass. It reports false when the send failed or its outcome
+// couldn't be recorded (finish).
+func (e *Engine) deliver(ctx context.Context, row alertstore.OutboxRow, criticalOnly bool) bool {
+	p, ok, err := e.pendingAlert(row, criticalOnly)
+	if err != nil {
+		e.log.Warn("alert: reading a pending alert failed; it is tried again on the next send cycle", "kind", row.Kind, "err", err)
+		return false
+	}
+	if !ok {
+		return true // nothing of it is pending any more
+	}
+	latest := p.Latest
+	var channels []alertstore.BuiltChannel
+	if latest.RuleID == 0 {
+		// Mooring-originated infra alert (plan §8.4): rule_id=0, NEVER deferred to an
+		// app and not tied to a rule/silence — route straight to ALL channels.
+		channels, err = e.store.AllChannels()
+	} else {
+		// Silenced (operator) → drop. (Silence closes the rows it covers; this catches a row raised in
+		// between.)
+		if e.store.IsSilenced(latest.RuleID, latest.Target, e.now().Unix()) {
+			return e.finish(ctx, p, true)
+		}
+		rule, ok := e.store.RuleByID(latest.RuleID)
+		if !ok {
+			return e.finish(ctx, p, true)
+		}
+		channels, err = e.store.ChannelsForRule(rule.ChannelID)
+	}
+	if err != nil || len(channels) == 0 {
+		e.finish(ctx, p, false)
+		return false
+	}
+	ok = e.sendAll(ctx, p, channels)
+	recorded := e.finish(ctx, p, ok)
+	if recorded && ok {
+		// Only now: until the delivery is recorded its rows stay unsent, and the record of the channels that
+		// took the message keeps the next drains from sending it again (they retry the record).
+		delete(e.partial, p.Latest.AlertKey())
+	}
+	return recorded && ok
+}
+
+// finish records the outcome of one delivery of p (FinishAlert) and reports whether it was recorded.
+//
+// Intentional: a delivery that couldn't be recorded counts as a failed attempt for the rest of the drain.
+// Its rows stay unsent and due (a full disk fails writes while reads still work), and the drain looks for
+// pending criticals again before every message, so it would send the same critical before each one.
+func (e *Engine) finish(ctx context.Context, p alertstore.PendingAlert, delivered bool) bool {
+	if err := e.store.FinishAlert(ctx, p, delivered, e.now()); err != nil {
+		e.log.Warn("alert: recording a delivery's outcome failed; the alert is tried again on the next send cycle",
+			"kind", p.Latest.Kind, "delivered", delivered, "err", err)
+		return false
+	}
+	return true
+}
+
+// sendAll delivers p's message to every channel that hasn't taken it yet, rate-limited between sends so
+// a slow channel can't spam-cannon the box. Returns whether every channel has it now. A retry of the
+// same message (no new row since) skips the channels that took it, so one broken channel doesn't make
+// the working ones get it again on every retry, and a message every channel took whose delivery wasn't
+// recorded isn't sent again. deliver forgets the message once its delivery is recorded.
+func (e *Engine) sendAll(ctx context.Context, p alertstore.PendingAlert, channels []alertstore.BuiltChannel) bool {
+	k := p.Latest.AlertKey()
+	msg := fmt.Sprintf("%d/%d/%s", p.Latest.ID, p.Count, p.Level)
+	done := e.partial[k]
+	if done.msg != msg {
+		done = partialSend{msg: msg, ok: map[int64]bool{}}
+	}
+	n := e.render(p)
 	allOK := true
 	for _, ch := range channels {
+		if done.ok[ch.ID] {
+			continue
+		}
 		sctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		if err := ch.Send(sctx, n); err != nil {
 			allOK = false
-			e.log.Warn("alert: channel send failed", "kind", kind, "err", err)
+			e.log.Warn("alert: channel send failed", "kind", p.Latest.Kind, "err", err)
+		} else {
+			done.ok[ch.ID] = true
 		}
 		cancel()
 		select {
 		case <-ctx.Done():
-			return allOK
+			allOK = false
 		case <-time.After(e.cfg.NotifyMinInterval):
 		}
+		if ctx.Err() != nil {
+			break
+		}
 	}
+	done.at = e.now()
+	e.partial[k] = done
 	return allOK
 }
 
-func (e *Engine) render(row alertstore.OutboxRow) alert.Notification {
+// forgetPartial drops what the notifier remembers about partly delivered messages older than any retry.
+func (e *Engine) forgetPartial() {
+	cutoff := e.now().Add(-partialKeep)
+	for k, d := range e.partial {
+		if d.at.Before(cutoff) {
+			delete(e.partial, k)
+		}
+	}
+}
+
+// render builds the message for an alert: the latest state, at the alert's level, with a note when
+// several notifications were combined.
+func (e *Engine) render(p alertstore.PendingAlert) alert.Notification {
+	row := p.Latest
 	verb := "FIRING"
 	if row.Transition == "resolved" {
 		verb = "RESOLVED"
 	}
-	title := fmt.Sprintf("[%s] %s — %s (%s)", up(row.Level), verb, row.Kind, row.Target)
+	title := fmt.Sprintf("[%s] %s — %s (%s)", up(p.Level), verb, row.Kind, row.Target)
 	body := row.Summary
+	if note := e.combinedNote(p); note != "" {
+		body += "\n\n" + note
+	}
 	if e.cfg.AdminURL != "" {
 		body += "\n\n" + e.cfg.AdminURL
 	}
-	return alert.Notification{Title: title, Body: body, Level: row.Level}
+	return alert.Notification{Title: title, Body: body, Level: p.Level}
+}
+
+// combinedNote says how many notifications a message combines and since when, e.g. "Fired and recovered
+// 14 times since 23:04.", or "Recovered at 23:00, then fired once." when the first was a recovery ("" for
+// a single notification).
+func (e *Engine) combinedNote(p alertstore.PendingAlert) string {
+	if p.Count < 2 {
+		return ""
+	}
+	since := e.clock(p.Since)
+	var s string
+	switch {
+	case p.First == "resolved" && p.Fired > 0:
+		then := "fired " + times(p.Fired)
+		if p.Resolved > 1 {
+			then += " and recovered " + times(p.Resolved-1)
+		}
+		s = fmt.Sprintf("Recovered at %s, then %s.", since, then)
+	case p.Fired > 0 && p.Fired == p.Resolved:
+		s = fmt.Sprintf("Fired and recovered %s since %s.", times(p.Fired), since)
+	case p.Fired > 0 && p.Resolved > 0:
+		s = fmt.Sprintf("Fired %s and recovered %s since %s.", times(p.Fired), times(p.Resolved), since)
+	case p.Resolved > 0:
+		s = fmt.Sprintf("Recovered %s since %s.", times(p.Resolved), since)
+	default:
+		s = fmt.Sprintf("Fired %s since %s.", times(p.Fired), since)
+	}
+	if p.Level == alert.LevelCritical && p.Latest.Level != alert.LevelCritical {
+		s += " It was critical at least once in that time."
+	}
+	return s
+}
+
+// clock formats a unix time on the notifier's clock: "15:04" within the last day, else with the date.
+func (e *Engine) clock(unix int64) string {
+	now := e.now()
+	t := time.Unix(unix, 0).In(now.Location())
+	if d := now.Sub(t); d >= 0 && d < 24*time.Hour {
+		return t.Format("15:04")
+	}
+	return t.Format("Jan 2 15:04")
+}
+
+func times(n int) string {
+	switch n {
+	case 1:
+		return "once"
+	case 2:
+		return "twice"
+	}
+	return fmt.Sprintf("%d times", n)
 }
 
 // inQuietHours reports whether now falls in the configured quiet window.
 func (e *Engine) inQuietHours(now time.Time) bool {
 	s, end := e.cfg.QuietStartHour, e.cfg.QuietEndHour
-	if s < 0 || end < 0 {
+	// Config loading turns out-of-range hours off (with a load warning); here they disable the window too,
+	// so a bad value can never hold warnings forever. start == end is an empty window.
+	if s < 0 || end < 0 || s > 23 || end > 23 {
 		return false
 	}
 	h := now.Hour()

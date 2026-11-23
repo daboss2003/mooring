@@ -12,20 +12,35 @@ import (
 )
 
 type fakeScanner struct {
-	img map[string]Report
-	fs  map[string]Report
+	img     map[string]Report
+	fs      map[string]Report
+	host    HostScan
+	hostErr error
+	calls   []string // "host" | "image:<ref>" | "fs:<dir>", in call order
 }
 
 func (f *fakeScanner) ScanImage(_ context.Context, ref string) (Report, error) {
+	f.calls = append(f.calls, "image:"+ref)
 	return f.img[ref], nil
 }
 func (f *fakeScanner) ScanFS(_ context.Context, dir, label string) (Report, error) {
+	f.calls = append(f.calls, "fs:"+dir)
 	return f.fs[dir], nil
 }
+func (f *fakeScanner) ScanHost(_ context.Context, _ HostPlan) (HostScan, error) {
+	f.calls = append(f.calls, "host")
+	return f.host, f.hostErr
+}
 
-type fakeSink struct{ sent []alert.Outbox }
+type fakeSink struct {
+	sent []alert.Outbox
+	err  error // non-nil: EnqueueInfra fails and records nothing
+}
 
 func (f *fakeSink) EnqueueInfra(_ context.Context, o alert.Outbox) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.sent = append(f.sent, o)
 	return nil
 }

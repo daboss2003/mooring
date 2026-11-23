@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -39,6 +40,7 @@ import (
 	"github.com/daboss2003/mooring/internal/github"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/hostmon"
+	"github.com/daboss2003/mooring/internal/hostproc"
 	"github.com/daboss2003/mooring/internal/imagescan"
 	"github.com/daboss2003/mooring/internal/imageupdate"
 	"github.com/daboss2003/mooring/internal/l4"
@@ -75,6 +77,9 @@ func cmdServe(args []string) error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err // fail-closed: refuse to boot
+	}
+	for _, w := range cfg.LoadWarnings {
+		log.Warn("config: " + w)
 	}
 
 	// Capture Mooring's own WARN/ERROR operational events (deploys, builds, scans, backups, git
@@ -321,40 +326,63 @@ func cmdServe(args []string) error {
 	// filesystem) — NEVER via the docker socket — and alerts on High/Critical. Results
 	// surface on the Server tab.
 	scanStore := imagescan.NewStore(db)
-	if cfg.Server.ImageScanOn() {
+	// Host scan (on by default): the OS package database + the Go binaries Mooring runs, in the same
+	// runner (one Trivy at a time). Results on the Server tab; fixable High/Critical page.
+	hostScanStore := imagescan.NewHostStore(db)
+	// Set by the edge block below once it knows whether a Mooring-owned Caddy build is in use: the host
+	// scan's hook calls it when that build has a vulnerability with a fix.
+	var refreshOwnedCaddy atomic.Pointer[func(context.Context)]
+	if cfg.Server.ImageScanOn() || cfg.Server.HostScanOn() {
 		iv := cfg.Server.ImageScanInterval.D()
 		if iv <= 0 {
 			iv = 24 * time.Hour
 		}
 		appsRoot := cfg.DataDir + "-apps"
-		targetsFn := func(context.Context) []imagescan.Target {
-			var out []imagescan.Target
-			apps, _ := gitStore.List()
-			for _, app := range apps {
-				def, err := defStore.Current(app.Project)
-				if err != nil || def == nil {
-					continue
-				}
-				hasBuild := false
-				for _, svc := range def.Spec.Compose.Services {
-					if svc.Build != nil {
-						hasBuild = true
+		var targetsFn func(context.Context) []imagescan.Target // nil: app scanning off, host only
+		if cfg.Server.ImageScanOn() {
+			targetsFn = func(context.Context) []imagescan.Target {
+				var out []imagescan.Target
+				apps, _ := gitStore.List()
+				for _, app := range apps {
+					def, err := defStore.Current(app.Project)
+					if err != nil || def == nil {
 						continue
 					}
-					if svc.Image != "" {
-						out = append(out, imagescan.Target{Project: app.Project, Kind: imagescan.KindImage, Ref: svc.Image, Label: svc.Image})
+					hasBuild := false
+					for _, svc := range def.Spec.Compose.Services {
+						if svc.Build != nil {
+							hasBuild = true
+							continue
+						}
+						if svc.Image != "" {
+							out = append(out, imagescan.Target{Project: app.Project, Kind: imagescan.KindImage, Ref: svc.Image, Label: svc.Image})
+						}
+					}
+					if hasBuild {
+						out = append(out, imagescan.Target{Project: app.Project, Kind: imagescan.KindFS, Ref: filepath.Join(appsRoot, app.Project), Label: app.Project + " dependencies"})
 					}
 				}
-				if hasBuild {
-					out = append(out, imagescan.Target{Project: app.Project, Kind: imagescan.KindFS, Ref: filepath.Join(appsRoot, app.Project), Label: app.Project + " dependencies"})
-				}
+				return out
 			}
-			return out
 		}
 		scanRunner := imagescan.NewRunner(imagescan.New("docker", imagescan.TrivyImage, 5*time.Minute), scanStore, alertStore, targetsFn, iv, log)
+		if cfg.Server.HostScanOn() {
+			// Same rule as the edge: running as root, the Mooring-owned build is never used, so it isn't
+			// scanned as the edge's Caddy either.
+			ownedCaddy := edge.OwnedCaddyPath(cfg.DataDir)
+			if os.Geteuid() == 0 || cfg.Edge.Mode != config.EdgeManaged {
+				ownedCaddy = "" // not run (root) or no Mooring edge at all (external): not the edge's Caddy
+			}
+			scanRunner.WithHost(func(context.Context) imagescan.HostPlan { return imagescan.DefaultHostPlan(ownedCaddy) },
+				hostScanStore, func(c context.Context) {
+					if f := refreshOwnedCaddy.Load(); f != nil {
+						(*f)(c)
+					}
+				})
+		}
 		wg.Add(1)
 		go func() { defer wg.Done(); scanRunner.Run(ctx) }()
-		log.Info("image vulnerability scanning enabled", "interval", iv)
+		log.Info("vulnerability scanning enabled", "interval", iv, "apps", cfg.Server.ImageScanOn(), "host", cfg.Server.HostScanOn())
 	}
 
 	// Image-update detection (ON by default) for PULL-IMAGE services: compare each service's
@@ -511,23 +539,12 @@ func cmdServe(args []string) error {
 	var edgeRecon *edge.Reconciler
 	var dnsPlugins *edge.DNSPlugins     // per-provider Caddy DNS plugin state (nil without dns01 or an owned edge)
 	var edgeAgg *edgemetrics.Aggregator // edge-measured latency/req-rate for source:edge autoscaling (nil unless the edge is owned)
+	// Supervised children (the edge's Caddy, the L4 nginx) that are restarted when a package upgrade
+	// replaces the files they run; the watcher starts after the L4 block.
+	var staleChildren []hostproc.Child
 	edgeReason := ""
 	if cfg.Edge.Mode == config.EdgeManaged {
-		base := edge.BaseConfig{
-			AdminListen:    edgeAdminListen(cfg),
-			ACMEEmail:      cfg.Edge.ACMEEmail,
-			ACMECA:         cfg.Edge.ACMECA,
-			CAs:            edgeCAs(cfg),
-			AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
-			AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
-			AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
-			TrustedProxies: cfg.Edge.TrustedProxies,     // CDN/LB in front of the edge; app routes only, never the admin gate
-			ClientIPHeader: cfg.Edge.ClientIPHeader,
-		}
-		// Keys the cookie of routes with lb: cookie. Never logged (it is part of the /load payload only).
-		if dk, derr := config.DecodeKey(cfg.EncryptionKey); derr == nil {
-			base.LBCookieSecret = edge.DeriveLBCookieSecret(dk)
-		}
+		base := edgeBaseConfig(cfg)
 		// Per-namespace DNS-01 wildcards. A namespace's wildcard is rendered ONLY while its provider's
 		// Caddy module is in the RUNNING binary: a wildcard whose module is missing makes Caddy reject
 		// the whole /load, which would deny routes to every OTHER namespace (and to pure HTTP-01 apps)
@@ -555,6 +572,11 @@ func cmdServe(args []string) error {
 		ownedDir := cfg.DataDir
 		if asRoot {
 			ownedDir = "" // ResolveCaddy("") never picks the owned build
+		}
+		// Builds installed before the host scan existed are 0700; the scanner (root with no capabilities)
+		// can only read a world-readable file. data_dir/bin stay 0700, so no other account reaches it.
+		if err := edge.EnsureOwnedCaddyReadable(ownedDir); err != nil {
+			log.Warn("edge: could not make the Mooring-owned Caddy build readable by the host scan", "err", err)
 		}
 		var missing []string
 		if len(providers) > 0 {
@@ -617,6 +639,16 @@ func cmdServe(args []string) error {
 			// BinFn re-resolves at every launch, so the Mooring-owned build takes over on the restart
 			// that follows a plugin install.
 			sup := &edge.Supervisor{CaddyBin: "caddy", BinFn: caddyBin, AdminListen: base.AdminListen, Log: log}
+			// Boot floor WITHOUT the DNS-01 wildcard policy: if the operator's caddy lacks the
+			// DNS provider module, it must fail the first (transactional) reconcile — not the
+			// boot — so a missing module never bricks the whole edge (:80/:443 + all HTTP-01
+			// apps + the admin vhost). The wildcard is then introduced by the first Reconcile.
+			// Likewise without the trusted-proxy fields (Caddy ≥ 2.11), and then without HTTP/3 so
+			// the first reconcile opens QUIC with 0-RTT refused (see edge.BootFloor). Rendered here, before
+			// the install loop starts, because checkBuild reads it.
+			if initCfg, rerr := edge.Render(edge.BootFloor(base), nil, nil); rerr == nil {
+				sup.InitialCfg = initCfg
+			}
 			// Caddy logs the error of a refused /load, which can carry a dns01 token (a provider module
 			// echoes one it finds malformed): keep the tokens out of the journal.
 			var tokens []string
@@ -624,6 +656,23 @@ func cmdServe(args []string) error {
 				tokens = append(tokens, w.DNS01Token)
 			}
 			sup.Stderr = edge.NewRedactWriter(os.Stderr, tokens)
+			// A Caddy that would replace the running one — a downloaded build (install loop, refresh) or a
+			// package-replaced binary (stale watcher) — must pass caddyBuildCheck. tokens: redacted from the
+			// error, which reaches an alert.
+			validate := func(c context.Context, bin string, render []byte) error {
+				return edge.ValidateConfig(c, bin, render, tokens)
+			}
+			checkBuild := func(c context.Context, bin string) error {
+				refused, why, render := edgeRecon.LoadRefused()
+				return caddyBuildCheck(c, bin, procExe(sup.PID()), edgeRenders{Initial: sup.InitialCfg,
+					LastApplied: edgeRecon.LastApplied(), Refused: refused, RefusedWhy: why, RefusedCfg: render}, validate)
+			}
+			// A build checkBuild holds back because of the config Caddy refuses (edge.ErrHeldByConfig) isn't
+			// downloaded again while Caddy refuses that same render.
+			refusedRender := func() []byte {
+				_, _, render := edgeRecon.LoadRefused()
+				return render
+			}
 			// A (re)launched Caddy boots on the route-less base config: push the full config again at once
 			// (an unchanged render would otherwise be skipped as already applied → 404 everywhere). On the
 			// same binary as before, that push already carries the wildcards. On a new one they wait until
@@ -651,12 +700,76 @@ func cmdServe(args []string) error {
 				// Set even when nothing is missing now: Sync restarts the install loop if a module later
 				// disappears from the binary (e.g. a package upgrade replaced the system caddy).
 				dnsInstaller.OnSwap = sup.Restart
+				dnsInstaller.CheckBuild = checkBuild
+				dnsInstaller.RefusedRender = refusedRender
+				// An install loop waiting for Caddy to accept the edge config tries again as soon as it does.
+				edgeRecon.SetRefusalCleared(dnsInstaller.ConfigAccepted)
 				if len(missing) > 0 {
 					dnsInstaller.Start(ctx)
 				}
 				wg.Add(1)
 				go func() { defer wg.Done(); <-ctx.Done(); dnsInstaller.Wait() }()
 			}
+			// The host scan found a vulnerability with a fix in the Mooring-owned Caddy build (apt never
+			// updates it): download a current build. Refresh limits itself to one download a day and swaps
+			// (→ sup.Restart) only a build that differs from the installed one. The owned build can exist
+			// without dns01 (setup installs one for the version minimum), hence the plugin-less installer.
+			refresher := dnsInstaller
+			if refresher == nil && ownedDir != "" {
+				if fi, serr := os.Lstat(edge.OwnedCaddyPath(ownedDir)); serr == nil && fi.Mode().IsRegular() {
+					refresher = &edge.DNSPluginInstaller{DataDir: ownedDir, State: edge.NewDNSPlugins(nil), Log: log, OnSwap: sup.Restart,
+						CheckBuild: checkBuild, RefusedRender: refusedRender}
+				}
+			}
+			if refresher != nil {
+				owned := edge.OwnedCaddyPath(ownedDir)
+				refresh := func(context.Context) {
+					wg.Add(1) // the scan runner calling this is itself counted in wg, so this never races Wait
+					go func() {
+						defer wg.Done()
+						swapped, rerr := refresher.Refresh(ctx)
+						day := strconv.FormatInt(time.Now().Unix()/86400, 10)
+						var o alert.Outbox
+						switch {
+						case rerr == nil && !swapped, errors.Is(rerr, edge.ErrRefreshTooSoon), ctx.Err() != nil:
+							return
+						case rerr != nil:
+							log.Warn("edge: refreshing the Mooring-owned Caddy build failed", "path", owned, "err", rerr.Error())
+							retry := ". Mooring tries again after the next scan (at most once a day); to retry now: sudo rm " + owned + " && sudo mooring setup --yes"
+							switch {
+							case errors.Is(rerr, edge.ErrHeldByConfig):
+								retry = ". The current build keeps running; Mooring tries again after a scan once Caddy accepts the edge config"
+							case errors.Is(rerr, edge.ErrBuildCheckFailed):
+								// Intentional: no rm + setup hint — setup checks a build only against config.yaml's edge
+								// settings, not the routes the edge serves, so it could install the refused build and the
+								// edge would restart onto a binary that rejects its config.
+								retry = ". The current build keeps running; Mooring tries again after the next scan (at most once a day)"
+							}
+							o = alert.Outbox{Kind: "caddy_build_refresh_failed", DedupeKey: "caddyrefresh:fail:" + day,
+								Summary: "The Mooring-owned Caddy build (" + owned + ") has a vulnerability with a fix available, but installing a current build failed: " +
+									rerr.Error() + retry}
+						default:
+							log.Info("edge: installed a current Mooring-owned Caddy build after the host scan found a fixed vulnerability", "path", owned)
+							o = alert.Outbox{Kind: "caddy_build_refreshed", DedupeKey: "caddyrefresh:ok:" + day,
+								Summary: "The Mooring-owned Caddy build (" + owned + ") had a vulnerability with a fix available. Mooring installed a current build, kept the previous one as caddy.bak and restarted the edge."}
+						}
+						o.Target, o.Level, o.Transition = "caddy", alert.LevelWarning, "firing"
+						if aerr := alertStore.EnqueueInfra(ctx, o); aerr != nil {
+							log.Warn("edge: could not enqueue the Caddy refresh alert", "err", aerr)
+						}
+					}()
+				}
+				refreshOwnedCaddy.Store(&refresh)
+			}
+			staleChildren = append(staleChildren, hostproc.Child{
+				Name: "Caddy", Target: "caddy", PID: sup.PID, Restart: sup.Restart,
+				// The binary the relaunch picks must run and accept the rendered config: a half-unpacked
+				// package, or an apt upgrade to a Caddy major the config isn't written for, must not take the
+				// edge down — the old process keeps serving and edge_child_stale says why.
+				Validate: func(c context.Context) error {
+					return caddyRelaunchCheck(c, caddyBin(), procExe(sup.PID()), cfg, checkBuild)
+				},
+			})
 
 			// Edge-measured autoscaling signals (source:edge). The edge emits a per-request access
 			// log to STDOUT (only while some enabled policy uses a source:edge metric — the reactive
@@ -719,15 +832,6 @@ func cmdServe(args []string) error {
 				}
 			}()
 
-			// Boot floor WITHOUT the DNS-01 wildcard policy: if the operator's caddy lacks the
-			// DNS provider module, it must fail the first (transactional) reconcile — not the
-			// boot — so a missing module never bricks the whole edge (:80/:443 + all HTTP-01
-			// apps + the admin vhost). The wildcard is then introduced by the first Reconcile.
-			// Likewise without the trusted-proxy fields (Caddy ≥ 2.11), and then without HTTP/3 so
-			// the first reconcile opens QUIC with 0-RTT refused (see edge.BootFloor).
-			if initCfg, rerr := edge.Render(edge.BootFloor(base), nil, nil); rerr == nil {
-				sup.InitialCfg = initCfg
-			}
 			wg.Add(1)
 			go func() { defer wg.Done(); sup.Run(ctx) }()
 			log.Info("managed edge started", "admin", base.AdminListen)
@@ -811,10 +915,23 @@ func cmdServe(args []string) error {
 			// replica's IP with no scale/deploy event; this rebinds the listener within ~15s.
 			wg.Add(1)
 			go func() { defer wg.Done(); runReconcileLoop(ctx, "l4", l4Reconcile, log) }()
+			staleChildren = append(staleChildren, hostproc.Child{
+				Name: "L4 nginx", Target: "nginx-l4", PID: sup.PID, Restart: sup.Restart,
+				// `nginx -t` on the live config: the upgraded binary loads it with the upgraded stream module.
+				Validate: sup.Validate,
+			})
 			log.Info("managed L4 LB started")
 		} else {
 			log.Warn("managed L4 LB not owned on this host", "reason", why)
 		}
+	}
+
+	// apt / unattended-upgrades restart caddy.service and nginx.service, which Mooring keeps off; its own
+	// children would keep running the replaced (possibly vulnerable) code until Mooring restarts.
+	if len(staleChildren) > 0 {
+		staleWatch := &hostproc.Watcher{Children: staleChildren, Alerts: alertStore, Log: log}
+		wg.Add(1)
+		go func() { defer wg.Done(); staleWatch.Run(ctx) }()
 	}
 
 	srv, err := web.New(cfg, web.Deps{
@@ -823,6 +940,7 @@ func cmdServe(args []string) error {
 		Version:      Version,
 		UpdateCheck:  updateChecker,
 		ImageScans:   scanStore,
+		HostScans:    hostScanStore,
 		ImageUpdates: imageUpdateStore,
 		ServiceLogs:  serviceLogStore,
 		EventLog:     eventStore,
@@ -1238,6 +1356,9 @@ func cmdServe(args []string) error {
 					if newCfg, lerr := config.Load(*configPath); lerr == nil {
 						retentionRunner.SetConfig(toRetentionConfig(newCfg))
 						log.Info("retention policy reloaded")
+						for _, w := range newCfg.LoadWarnings {
+							log.Warn("config (on reload; alerting settings apply at the next restart): " + w)
+						}
 					}
 				}
 			}
@@ -1277,8 +1398,29 @@ func protectManagedProxy(cfg *config.Config) {
 	protectProject(cfg, socketproxy.Project)
 }
 
-// edgeCAs maps the configured private CAs to the edge render's CA type (the trusted-root
-// PEM is passed by FILE PATH — Caddy reads it for the CA's own https).
+// edgeBaseConfig is the managed edge's base config from config.yaml (`mooring setup` checks a Caddy
+// build against it too): the admin listener and vhost, ACME, the CAs, the trusted proxies and the lb:
+// cookie secret. The DNS-01 wildcards (edgeWildcards) are not in it: serve renders a namespace's only
+// while its plugin is in the running Caddy.
+func edgeBaseConfig(cfg *config.Config) edge.BaseConfig {
+	base := edge.BaseConfig{
+		AdminListen:    edgeAdminListen(cfg),
+		ACMEEmail:      cfg.Edge.ACMEEmail,
+		ACMECA:         cfg.Edge.ACMECA,
+		CAs:            edgeCAs(cfg),
+		AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
+		AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
+		AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
+		TrustedProxies: cfg.Edge.TrustedProxies,     // CDN/LB in front of the edge; app routes only, never the admin gate
+		ClientIPHeader: cfg.Edge.ClientIPHeader,
+	}
+	// Keys the cookie of routes with lb: cookie. Never logged (it is part of the /load payload only).
+	if dk, derr := config.DecodeKey(cfg.EncryptionKey); derr == nil {
+		base.LBCookieSecret = edge.DeriveLBCookieSecret(dk)
+	}
+	return base
+}
+
 // edgeAccessRoutes maps the enabled edge routes to the access-log attribution table (host + path
 // prefix → service). A route's Upstream is a "service:port" selector, so its host part is the
 // compose service name — the same (App=AppID, Service) key the scaler uses. Disabled routes and any
@@ -1305,6 +1447,8 @@ func edgeAccessRoutes(routes []edge.Route) []edgemetrics.Route {
 	return out
 }
 
+// edgeCAs maps the configured private CAs to the edge render's CA type (the trusted-root
+// PEM is passed by FILE PATH — Caddy reads it for the CA's own https).
 func edgeCAs(cfg *config.Config) []edge.CA {
 	if len(cfg.Edge.CAs) == 0 {
 		return nil
@@ -1388,6 +1532,133 @@ func probeWritable(dir string) error {
 	return os.Remove(name)
 }
 
+// caddyRelaunchCheck is the stale-child watcher's check before it restarts the edge onto the Caddy now
+// at bin: it must run and be the major version the rendered config is written for. Below
+// edge.MinCaddyVersion while a configured setting needs it (caddyMinNeeds), it is refused only when it
+// is also older than the running Caddy (running: the child's executable, e.g. /proc/<pid>/exe; "" =
+// unknown, refused): a patched build of the same old version is a security update, not a regression.
+// Last, validate (when set) must accept the config the edge serves now (`caddy validate`: a missing DNS
+// module, a config the new release rejects). A failure keeps the old process serving (edge_child_stale
+// says why).
+func caddyRelaunchCheck(ctx context.Context, bin, running string, cfg *config.Config, validate func(ctx context.Context, bin string) error) error {
+	v, err := edge.CaddyVersion(ctx, bin)
+	if err != nil {
+		return err
+	}
+	if v.Major != edge.SupportedCaddyMajor {
+		return fmt.Errorf("%s is Caddy v%s; the edge config is written for Caddy %d", bin, v, edge.SupportedCaddyMajor)
+	}
+	if needs := caddyMinNeeds(cfg); len(needs) > 0 && !v.AtLeast(edge.MinCaddyVersion) {
+		rv, rerr := edge.CaddyVersion(ctx, running)
+		if running == "" || rerr != nil || !v.AtLeast(rv) {
+			return fmt.Errorf("%s is Caddy v%s, older than %s (needed by %s) and older than the running Caddy", bin, v, edge.MinCaddyVersion, strings.Join(needs, ", "))
+		}
+	}
+	if validate != nil {
+		return validate(ctx, bin)
+	}
+	return nil
+}
+
+// edgeRenders is what caddyBuildCheck checks a new Caddy against: the edge configs a restart onto it
+// would boot on and be fed.
+type edgeRenders struct {
+	Initial     []byte // the startup config every launch boots on (Supervisor.InitialCfg)
+	LastApplied []byte // the config Caddy accepted last (Reconciler.LastApplied); nil = none yet
+	// Refused: Caddy refuses the current render (Reconciler.LoadRefused), with its error (tokens
+	// redacted) and the render itself.
+	Refused    bool
+	RefusedWhy string
+	RefusedCfg []byte
+}
+
+// caddyBuildCheck reports whether the edge may restart onto the Caddy at bin, a downloaded build (the
+// DNS plugin install loop, the refresh) or a package-replaced binary (the stale-child watcher). bin
+// must accept r.Initial and r.LastApplied (validate: `caddy validate`). While Caddy refuses the current
+// render, a restarted Caddy is fed that render again; if it refuses it too, the edge serves only the
+// startup config (every app 404) instead of the config it accepted before. So, while refused:
+//   - bin refuses the refused render too: no restart;
+//   - bin accepts it and the running Caddy (running: its executable, /proc/<pid>/exe) refuses it: the
+//     refusal is the running binary's and bin fixes it, so the restart goes ahead (Ubuntu's 2.6.2
+//     refusing edge.trusted_proxies, upgraded to 2.11 by `mooring setup --yes`);
+//   - the running Caddy accepts it too (a refusal `caddy validate` doesn't reproduce), or it can't be
+//     checked: no restart.
+//
+// With nothing accepted yet (r.LastApplied nil) the edge already serves only the startup config, which
+// a restart can't make worse: the refusal doesn't hold it back. An error caused by the refusal rather
+// than by bin is an *edgeRestartHeld.
+func caddyBuildCheck(ctx context.Context, bin, running string, r edgeRenders, validate func(ctx context.Context, bin string, cfg []byte) error) error {
+	if r.Initial != nil {
+		if err := validate(ctx, bin, r.Initial); err != nil {
+			return err
+		}
+	}
+	// Intentional: a refusal with nothing accepted yet doesn't hold the restart back (owner decision): the
+	// edge already serves only the startup config, and blocking kept Ubuntu's 2.6.2 (which refuses
+	// edge.trusted_proxies) running after setup had upgraded it to a 2.11 that accepts the config.
+	if r.Refused && r.LastApplied != nil {
+		if err := refusedRenderCheck(ctx, bin, running, r, validate); err != nil {
+			return err
+		}
+	}
+	if r.LastApplied != nil {
+		return validate(ctx, bin, r.LastApplied)
+	}
+	return nil
+}
+
+// refusedRenderCheck is caddyBuildCheck's decision while Caddy refuses the current render.
+func refusedRenderCheck(ctx context.Context, bin, running string, r edgeRenders, validate func(ctx context.Context, bin string, cfg []byte) error) error {
+	const floor = "a restart would serve only the startup config, and every app would answer 404"
+	const unclear = "Mooring restarts the edge once Caddy accepts its config and the check passes. `sudo systemctl restart mooring` restarts the edge now, but if Caddy refuses the config again every app answers 404 until it is fixed."
+	if len(r.RefusedCfg) == 0 {
+		return &edgeRestartHeld{msg: "Caddy refuses the current edge config and Mooring has no copy of it to check the new Caddy with; " + floor + ": " + r.RefusedWhy, advice: unclear}
+	}
+	if err := validate(ctx, bin, r.RefusedCfg); err != nil {
+		return &edgeRestartHeld{msg: "Caddy refuses the current edge config and so does the Caddy at " + bin + "; " + floor + ": " + err.Error(), err: err,
+			advice:   "Fix what Caddy reports in the edge config (the route or setting its error names); Mooring restarts the edge once the check passes. Restarting Mooring now would leave every app answering 404 until the config is fixed.",
+			byConfig: errors.Is(err, edge.ErrValidateRefused)} // a check that couldn't run says nothing about the config
+	}
+	if running == "" {
+		return &edgeRestartHeld{msg: "Caddy refuses the current edge config and no running Caddy can be checked to tell whether its binary is the cause; " + floor + " if Caddy refuses it again: " + r.RefusedWhy, advice: unclear}
+	}
+	err := validate(ctx, running, r.RefusedCfg)
+	switch {
+	case err == nil:
+		return &edgeRestartHeld{msg: "Caddy refuses the current edge config for a reason the new Caddy doesn't change (the running Caddy accepts it in `caddy validate` too); " + floor + " if Caddy refuses it again: " + r.RefusedWhy, advice: unclear,
+			byConfig: true}
+	case !errors.Is(err, edge.ErrValidateRefused):
+		return &edgeRestartHeld{msg: "Caddy refuses the current edge config and the running Caddy can't be checked to tell whether its binary is the cause (" + err.Error() + "); " + floor + " if Caddy refuses it again: " + r.RefusedWhy, err: err, advice: unclear}
+	}
+	return nil // the running binary refuses what bin accepts: the restart fixes the refusal
+}
+
+// edgeRestartHeld is caddyBuildCheck's error when a restart is held back because Caddy refuses the
+// edge's current config, not because of the new binary. StaleAdvice is what the edge_child_stale alert
+// advises in place of its advice for broken upgraded files.
+type edgeRestartHeld struct {
+	msg, advice string
+	err         error // the validate error behind it, if any
+	// byConfig: no Caddy build would pass while Caddy refuses this config (the new Caddy refuses it too,
+	// or the running one accepts it too), so it matches edge.ErrHeldByConfig and the DNS plugin installer
+	// downloads no further build until the refusal ends or changes.
+	byConfig bool
+}
+
+func (e *edgeRestartHeld) Error() string        { return e.msg }
+func (e *edgeRestartHeld) Unwrap() error        { return e.err }
+func (e *edgeRestartHeld) StaleAdvice() string  { return e.advice }
+func (e *edgeRestartHeld) Is(target error) bool { return e.byConfig && target == edge.ErrHeldByConfig }
+
+// procExe is the executable of the running process pid (/proc/<pid>/exe, which runs even once the file
+// is deleted); "" when no process runs (pid 0).
+func procExe(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	return "/proc/" + strconv.Itoa(pid) + "/exe"
+}
+
 // edgeAdminListen returns the Caddy admin listen address — the operator's
 // admin.listen if set (must be a unix socket / loopback, validated at boot), else
 // the preferred unix socket (SBD-2).
@@ -1430,6 +1701,12 @@ func runReconcileLoop(ctx context.Context, name string, reconcile func(context.C
 				}
 				failing = true
 				interval = fast // control surface not ready (or a blip) — retry soon
+				if errors.Is(err, l4.ErrPinRefused) {
+					// Intentional: steady, not fast — an nginx that fails edge.l4_nginx_digest stays refused until
+					// the pinned binary is back (or a new pin + restart); a 3s retry would re-run discovery, render
+					// and hash nginx forever.
+					interval = steady
+				}
 			} else {
 				if failing && succeeded {
 					log.Info(name + " reconcile recovered")

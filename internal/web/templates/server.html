@@ -71,12 +71,12 @@
   </section>
   {{end}}
 
-  {{/* Image / dependency vulnerabilities (opt-in Trivy scan). */}}
+  {{/* Image / dependency vulnerabilities (Trivy scan, on by default). */}}
   {{with .Server}}
   <section class="panel">
     <h2>Vulnerabilities <span class="muted">(image + dependency scan)</span></h2>
     {{if not .ScanEnabled}}
-    <p class="muted">Off. To scan each deployed app's images (from the registry) and its dependencies for known CVEs, set <code>server.image_scan_enabled: true</code> in <code>/etc/mooring/config.yaml</code>. High/Critical findings raise an alert. Trivy never gets the Docker socket. Note it's resource-heavy (it downloads a vulnerability database).</p>
+    <p class="muted">Off (<code>server.image_scan_enabled: false</code>). To scan each deployed app's images (from the registry) and its dependencies for known CVEs, remove the key or set it to <code>true</code> in <code>/etc/mooring/config.yaml</code>. High/Critical findings raise an alert. Trivy never gets the Docker socket. It is resource-heavy (it downloads a vulnerability database).</p>
     {{else if not .Scans}}
     <p class="muted">Scanning is enabled — results appear here after the first scan completes (a few minutes after start, then on schedule).</p>
     {{else}}
@@ -110,6 +110,57 @@
       </tbody>
     </table></div>
     <p class="muted">Findings are the app's known CVEs. Fix by upgrading the flagged packages (rebuild the app / bump the base image / update dependencies) and redeploying.</p>
+    {{end}}
+  </section>
+  {{end}}
+
+  {{/* Host vulnerabilities (Trivy rootfs scan of the OS packages + the Go binaries Mooring runs). */}}
+  {{with .Server}}
+  <section class="panel">
+    <h2>Host vulnerabilities <span class="muted">(OS packages + binaries)</span></h2>
+    {{if .RebootRequired}}
+    <div class="notice" role="status">This host needs a reboot to finish installing updates{{if .RebootPkgs}} ({{.RebootPkgs}}){{end}}.</div>
+    {{end}}
+    {{if not .HostScanEnabled}}
+    <p class="muted">Off (<code>server.host_scan_enabled: false</code>). To scan this host's installed OS packages and the Go binaries Mooring runs for known CVEs, remove the key or set it to <code>true</code> in <code>/etc/mooring/config.yaml</code>. It runs on the <code>server.image_scan_interval</code> schedule and is resource-heavy.</p>
+    {{else if not .HostScanReady}}
+    <p class="muted">On. Results appear here after the first host scan completes (a few minutes after start, then every <code>server.image_scan_interval</code>).</p>
+    {{else}}
+    {{with .HostScan}}
+    <p class="muted">{{if .OS}}<span class="mono">{{.OS}}</span>{{else}}Operating system not detected{{end}} · scanned {{if .ScannedAt}}{{template "ts" .ScannedAt}}{{else}}—{{end}} · {{.Total}} findings, {{.Fixable}} with a fix</p>
+    {{if .EOSL}}<div class="notice" role="status">This OS release is end of life: it gets no more security fixes, so a clean result doesn't mean it's safe.</div>{{end}}
+    {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Target</th><th class="num">Critical</th><th class="num">High</th><th class="num">Medium</th><th class="num">Low</th><th>Findings</th></tr></thead>
+      <tbody>
+        {{range .Reports}}
+        <tr class="{{if or (gt .FixableCritical 0) (gt .FixableHigh 0)}}is-warn{{end}}">
+          <td class="mono">{{.Target}}</td>
+          {{if .Error}}
+          <td colspan="5" class="muted">{{.Error}}</td>
+          {{else}}
+          <td class="num">{{if gt .Critical 0}}<span class="pill pill-down">{{.Critical}} ({{.FixableCritical}} fixable)</span>{{else}}0{{end}}</td>
+          <td class="num">{{if gt .High 0}}<span class="pill pill-warn">{{.High}} ({{.FixableHigh}} fixable)</span>{{else}}0{{end}}</td>
+          <td class="num">{{if gt .Medium 0}}{{.Medium}} ({{.FixableMedium}} fixable){{else}}0{{end}}</td>
+          <td class="num">{{if gt .Low 0}}{{.Low}} ({{.FixableLow}} fixable){{else}}0{{end}}</td>
+          <td>
+            {{if .Top}}
+            <details>
+              <summary class="link">view</summary>
+              <ul class="root-list">
+                {{range .Top}}<li class="mono">{{.Severity}} · {{.ID}} · {{.Package}} {{.Installed}}{{if .Fixed}} → fixed {{.Fixed}}{{else}} · no fix yet{{end}}{{if .URL}} <a href="{{.URL}}" target="_blank" rel="noopener noreferrer">↗</a>{{end}}</li>{{end}}
+              </ul>
+              {{if gt .Total (len .Top)}}<p class="muted">The worst {{len .Top}} of {{.Total}}.</p>{{end}}
+            </details>
+            {{else}}<span class="muted">clean</span>{{end}}
+          </td>
+          {{end}}
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    <p class="muted">Fix by upgrading only the flagged packages: <code>sudo apt-get update &amp;&amp; sudo apt-get install --only-upgrade &lt;package&gt;…</code>, or <code>sudo dnf upgrade &lt;package&gt;…</code> (<code>yum</code> on Amazon Linux 2 and release 7). A full <code>apt-get upgrade</code> or <code>dnf upgrade</code> can also upgrade Docker, and upgrading Docker or the container runtime restarts Docker and every container on this host. Binaries update with the packages that installed them; <code>mooring</code> updates with a Mooring release; Mooring refreshes its own Caddy build. A High or Critical finding with a fix raises an alert the first time a scan finds it; the alert gives the command with the package names.</p>
+    {{end}}
     {{end}}
   </section>
   {{end}}

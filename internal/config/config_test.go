@@ -210,6 +210,33 @@ func TestServerChecksDefaultOn(t *testing.T) {
 	}
 }
 
+func TestHostScanDefaultOn(t *testing.T) {
+	cfg, err := Parse([]byte(validYAML(t, "")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Server.HostScanOn() {
+		t.Error("the host scan must default ON when unset")
+	}
+	off, err := Parse([]byte(validYAML(t, "server:\n  host_scan_enabled: false\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Server.HostScanOn() {
+		t.Error("host_scan_enabled: false must disable it")
+	}
+	if !off.Server.ImageScanOn() {
+		t.Error("turning off the host scan must not turn off the app image scan")
+	}
+	on, err := Parse([]byte(validYAML(t, "server:\n  host_scan_enabled: true\n  image_scan_enabled: false\n")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !on.Server.HostScanOn() || on.Server.ImageScanOn() {
+		t.Error("the two scans are independent")
+	}
+}
+
 func TestValidConfigLoads(t *testing.T) {
 	cfg, err := Parse([]byte(validYAML(t, "")))
 	if err != nil {
@@ -682,6 +709,75 @@ func TestEdgeTrustedProxyRulesMatchRenderer(t *testing.T) {
 		rerr := edge.ValidateClientIPHeader(h)
 		if cerr := validateEdgeClientIPHeader(h); (cerr == nil) != (rerr == nil) {
 			t.Errorf("client IP header %q: config err %v, renderer err %v", h, cerr, rerr)
+		}
+	}
+}
+
+// Quiet hours are hours 0–23, or -1 to disable them; anything else turns quiet hours off with a load
+// warning (never refuses to boot). 0 + 24 used to make every hour quiet, so warnings were held forever.
+func TestQuietHoursValidated(t *testing.T) {
+	for _, bad := range []string{
+		"  quiet_start_hour: 0\n  quiet_end_hour: 24\n",
+		"  quiet_start_hour: 24\n  quiet_end_hour: 7\n",
+		"  quiet_start_hour: 22\n  quiet_end_hour: 25\n",
+		"  quiet_start_hour: -2\n  quiet_end_hour: 7\n",
+		"  quiet_start_hour: 22\n  quiet_end_hour: -5\n",
+	} {
+		// Out of range turns quiet hours off with a warning; it never refuses to boot (an upgrade must not
+		// take the edge down over a value older releases accepted).
+		cfg, err := Parse([]byte(validYAML(t, "alerting:\n"+bad)))
+		if err != nil {
+			t.Fatalf("%q refused: %v", bad, err)
+		}
+		if cfg.Alerting.QuietStartHour != -1 || cfg.Alerting.QuietEndHour != -1 {
+			t.Errorf("%q: got %d→%d, want quiet hours off (-1→-1)", bad, cfg.Alerting.QuietStartHour, cfg.Alerting.QuietEndHour)
+		}
+		if len(cfg.LoadWarnings) != 1 || !strings.Contains(cfg.LoadWarnings[0], "quiet_start_hour") {
+			t.Errorf("%q: want one quiet-hours load warning, got %q", bad, cfg.LoadWarnings)
+		}
+	}
+	for _, ok := range []struct {
+		yaml       string
+		start, end int
+	}{
+		{"", -1, -1},
+		{"alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: 7\n", 22, 7},
+		{"alerting:\n  quiet_start_hour: 0\n  quiet_end_hour: 7\n", 0, 7},
+		{"alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: 0\n", 22, 0},
+		{"alerting:\n  quiet_start_hour: 23\n  quiet_end_hour: 23\n", 23, 23},
+		{"alerting:\n  quiet_start_hour: -1\n  quiet_end_hour: -1\n", -1, -1},
+	} {
+		cfg, err := Parse([]byte(validYAML(t, ok.yaml)))
+		if err != nil {
+			t.Fatalf("%q rejected: %v", ok.yaml, err)
+		}
+		if cfg.Alerting.QuietStartHour != ok.start || cfg.Alerting.QuietEndHour != ok.end {
+			t.Errorf("%q: got %d→%d, want %d→%d", ok.yaml, cfg.Alerting.QuietStartHour, cfg.Alerting.QuietEndHour, ok.start, ok.end)
+		}
+	}
+}
+
+// Valid quiet-hour values that mean "never quiet" are kept but reported as a load warning.
+func TestQuietHoursNeverQuietWarning(t *testing.T) {
+	for _, tc := range []struct {
+		yaml string
+		warn bool
+	}{
+		{"alerting:\n  quiet_start_hour: 23\n  quiet_end_hour: 23\n", true},
+		{"alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: -1\n", false}, // -1 in either turns quiet hours off (documented)
+		{"alerting:\n  quiet_start_hour: -1\n  quiet_end_hour: 7\n", false},
+		{"alerting:\n  quiet_start_hour: -1\n", false},
+		{"alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: 7\n", false},
+		{"alerting:\n  quiet_start_hour: -1\n  quiet_end_hour: -1\n", false},
+		{"", false}, // unset → 0/0 → disabled, no warning
+	} {
+		cfg, err := Parse([]byte(validYAML(t, tc.yaml)))
+		if err != nil {
+			t.Fatalf("%q refused: %v", tc.yaml, err)
+		}
+		got := len(cfg.LoadWarnings) == 1 && strings.Contains(cfg.LoadWarnings[0], "no quiet hours")
+		if got != tc.warn || (!tc.warn && len(cfg.LoadWarnings) != 0) {
+			t.Errorf("%q: warnings %q, want warning=%v", tc.yaml, cfg.LoadWarnings, tc.warn)
 		}
 	}
 }

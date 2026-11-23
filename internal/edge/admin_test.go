@@ -522,6 +522,7 @@ type fakeCaddyAdmin struct {
 	mu       sync.Mutex
 	calls    int
 	accepted []byte
+	bodies   [][]byte // every /load body, in order
 	reject   func(body []byte, n int) bool
 	errBody  func(body []byte) string
 }
@@ -532,6 +533,7 @@ func (f *fakeCaddyAdmin) server(t *testing.T) *httptest.Server {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		f.calls++
+		f.bodies = append(f.bodies, body)
 		if f.reject(body, f.calls) {
 			msg := `loading tls app module: decoding module config: dns.providers.route53: json: unknown field "api_token"`
 			if f.errBody != nil {
@@ -732,6 +734,305 @@ func TestReconcileRecordsRefusalUnderTheLock(t *testing.T) {
 	if !called {
 		t.Fatal("the refusal hook was not called")
 	}
+}
+
+// LastApplied is a copy of the config Caddy last accepted (what the stale-child watcher validates on the
+// next binary): nil before the first load, the accepted fallback when a wildcard is refused, unchanged by
+// a refused load and by a Caddy restart (which only forces the next load).
+func TestLastApplied(t *testing.T) {
+	admin := &fakeCaddyAdmin{reject: func(body []byte, _ int) bool { return strings.Contains(string(body), `"challenges"`) }}
+	rec, _ := wildcardReconciler(t, admin)
+	if got := rec.LastApplied(); got != nil {
+		t.Fatalf("before any load LastApplied = %q; want nil", got)
+	}
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	accepted := append([]byte(nil), admin.accepted...)
+	admin.mu.Unlock()
+	got := rec.LastApplied()
+	if len(accepted) == 0 || !bytes.Equal(got, accepted) || strings.Contains(string(got), `"challenges"`) {
+		t.Fatalf("LastApplied must be the config Caddy accepted (without the refused wildcard):\n%s\naccepted:\n%s", got, accepted)
+	}
+	got[0] = 'X'
+	if again := rec.LastApplied(); again[0] == 'X' {
+		t.Error("LastApplied must return a copy")
+	}
+
+	admin.mu.Lock()
+	admin.reject = func([]byte, int) bool { return true }
+	admin.mu.Unlock()
+	// The render still differs from what is loaded (it carries the wildcard): it is loaded and refused,
+	// and so is the fallback without the wildcard.
+	if err := rec.Reconcile(context.Background()); err == nil {
+		t.Fatal("a refused load must fail the reconcile")
+	}
+	if got := rec.LastApplied(); !bytes.Equal(got, accepted) {
+		t.Errorf("a refused load must leave LastApplied as it was:\n%s", got)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	rec.ReloadAfterRestart(ctx) // forces a /load, which Caddy refuses
+	if got := rec.LastApplied(); !bytes.Equal(got, accepted) {
+		t.Errorf("a Caddy restart must not clear LastApplied:\n%s", got)
+	}
+
+	admin.mu.Lock()
+	admin.reject = func([]byte, int) bool { return false }
+	admin.mu.Unlock()
+	if err := rec.RevertToLastGood(context.Background()); err != nil { // nothing last-good: the base render
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	floor := append([]byte(nil), admin.accepted...)
+	admin.mu.Unlock()
+	if got := rec.LastApplied(); bytes.Equal(floor, accepted) || !bytes.Equal(got, floor) {
+		t.Errorf("after RevertToLastGood loaded the base render, LastApplied must be it:\n%s", got)
+	}
+}
+
+// LoadRefused: Caddy refusing the current render for a reason other than one namespace's wildcard is
+// recorded, with Caddy's error (dns01 tokens redacted) and the exact render it refused, until a render is
+// accepted or the render is back to what Caddy serves. The old config keeps serving meanwhile, but a
+// restarted child would boot on the startup config and be fed the refused render again (every app 404),
+// so serve restarts the edge only onto a binary that accepts that render when the running one refuses
+// it. A /load that never reached Caddy, or a restart, changes nothing.
+func TestReconcilerLoadRefused(t *testing.T) {
+	ctx := context.Background()
+	admin := &fakeCaddyAdmin{
+		reject: func(body []byte, _ int) bool { return strings.Contains(string(body), "bad.example.com") },
+		errBody: func([]byte) string {
+			return `loading http app module: json: unknown field "bogus" near ` + shopWildcard.DNS01Token
+		},
+	}
+	rec, reports := wildcardReconciler(t, admin)
+	refused := func() (bool, string) {
+		t.Helper()
+		r, why, render := rec.LoadRefused()
+		if r != (render != nil) {
+			t.Errorf("refused=%v but the refused render is %q: it is kept exactly while the render is refused", r, render)
+		}
+		return r, why
+	}
+	if r, why := refused(); r || why != "" {
+		t.Fatalf("before any load: refused=%v why=%q", r, why)
+	}
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := refused(); r {
+		t.Fatal("an accepted render must not be refused")
+	}
+	accepted := rec.LastApplied()
+
+	// A route Caddy refuses whatever the wildcards: the render, and the same render without the wildcard.
+	if err := rec.store.Save(ctx, Route{Hostname: "bad.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	sent := len(admin.bodies)
+	admin.mu.Unlock()
+	if err := rec.Reconcile(ctx); err == nil {
+		t.Fatal("a render Caddy refuses must fail the reconcile")
+	}
+	r, why := refused()
+	if !r || !strings.Contains(why, `unknown field "bogus"`) {
+		t.Fatalf("after Caddy refused the render: refused=%v why=%q; want refused with Caddy's error", r, why)
+	}
+	// The render is the one the reconcile tried first (with the wildcard), byte for byte: the one a
+	// restarted Caddy is fed again. The fallback without the wildcard was refused too.
+	admin.mu.Lock()
+	tried := append([][]byte(nil), admin.bodies[sent:]...)
+	admin.mu.Unlock()
+	_, _, render := rec.LoadRefused()
+	if len(tried) < 2 || !bytes.Equal(render, tried[0]) || !strings.Contains(string(render), "bad.example.com") || !strings.Contains(string(render), `"challenges"`) {
+		t.Fatalf("the refused render must be the full render Caddy refused (%d loads):\n%s", len(tried), render)
+	}
+	render[0] = 'X'
+	if _, _, again := rec.LoadRefused(); again[0] == 'X' {
+		t.Error("LoadRefused must return a copy of the render")
+	}
+	if strings.Contains(why, shopWildcard.DNS01Token) || !strings.Contains(why, "[redacted]") {
+		t.Errorf("the reason must carry no dns01 token: %q", why)
+	}
+	if len(*reports) != 0 {
+		t.Errorf("a refusal the wildcard isn't the cause of must not be pinned on it: %v", *reports)
+	}
+	if !bytes.Equal(rec.LastApplied(), accepted) {
+		t.Error("the config Caddy accepted before keeps serving")
+	}
+
+	// A /load that never reaches Caddy says nothing about the render.
+	live := rec.admin
+	rec.admin = NewAdmin("127.0.0.1:1")
+	if err := rec.Reconcile(ctx); err == nil {
+		t.Fatal("an unreachable admin API must fail the reconcile")
+	}
+	rec.admin = live
+	if r2, why2 := refused(); !r2 || why2 != why {
+		t.Errorf("an unreachable admin API must leave the refusal as it was: refused=%v why=%q", r2, why2)
+	}
+	if _, _, again := rec.LoadRefused(); !bytes.Equal(again, tried[0]) {
+		t.Error("an unreachable admin API must leave the refused render as it was")
+	}
+	// A restart forces the refused render again: still refused.
+	rctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	rec.ReloadAfterRestart(rctx)
+	cancel()
+	if r, _ := refused(); !r {
+		t.Error("the render Caddy refused after a restart is still refused")
+	}
+
+	// The route is removed: the render is what Caddy serves again, without any /load.
+	routes, err := rec.store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rt := range routes {
+		if rt.Hostname == "bad.example.com" {
+			if err := rec.store.Delete(ctx, rt.ID()); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	admin.mu.Lock()
+	before := admin.calls
+	admin.mu.Unlock()
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	after := admin.calls
+	admin.mu.Unlock()
+	// ReloadAfterRestart cleared lastGood, so this render is loaded once (and accepted).
+	if r, why := refused(); r || why != "" || after-before > 1 {
+		t.Errorf("a render Caddy accepts clears the refusal: refused=%v why=%q (%d loads)", r, why, after-before)
+	}
+
+	// Refused again, then back to the render Caddy already serves: no /load, and no longer refused.
+	if err := rec.store.Save(ctx, Route{Hostname: "bad.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Reconcile(ctx); err == nil {
+		t.Fatal("a render Caddy refuses must fail the reconcile")
+	}
+	routes, _ = rec.store.List()
+	for _, rt := range routes {
+		if rt.Hostname == "bad.example.com" {
+			_ = rec.store.Delete(ctx, rt.ID())
+		}
+	}
+	admin.mu.Lock()
+	before = admin.calls
+	admin.mu.Unlock()
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	after = admin.calls
+	admin.mu.Unlock()
+	if r, _ := refused(); r || after != before {
+		t.Errorf("a render equal to what Caddy serves: refused=%v, %d loads; want not refused and no /load", r, after-before)
+	}
+
+	// Without wildcards (nothing to fall back on) a refusal is recorded too.
+	rec.SetWildcards(func() []WildcardCert { return nil })
+	if err := rec.store.Save(ctx, Route{Hostname: "bad.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Reconcile(ctx); err == nil {
+		t.Fatal("a render Caddy refuses must fail the reconcile")
+	}
+	if r, _ := refused(); !r {
+		t.Error("a refused render without wildcards must be recorded")
+	}
+
+	// Only the wildcard is refused: the rest is loaded, so the render isn't refused.
+	routes, _ = rec.store.List()
+	for _, rt := range routes {
+		if rt.Hostname == "bad.example.com" {
+			_ = rec.store.Delete(ctx, rt.ID())
+		}
+	}
+	rec.SetWildcards(func() []WildcardCert { return []WildcardCert{shopWildcard} })
+	// A new route, so the render differs from the config Caddy serves and is loaded.
+	if err := rec.store.Save(ctx, Route{Hostname: "other.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	admin.mu.Lock()
+	admin.reject = func(body []byte, _ int) bool { return strings.Contains(string(body), `"challenges"`) }
+	admin.mu.Unlock()
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(*reports) != 1 {
+		t.Fatalf("reports = %v; want the refused wildcard", *reports)
+	}
+	if r, why := refused(); r {
+		t.Errorf("a refused wildcard is left out and the rest loaded: refused=%v why=%q", r, why)
+	}
+}
+
+// The refusal-cleared hook runs once each time a reconcile ends a refusal LoadRefused reports (a render
+// accepted, or the render back to the config Caddy serves), after the reconciler lock is released; never
+// while the refusal lasts, and not for a reconcile that had nothing refused.
+func TestReconcilerRefusalClearedHook(t *testing.T) {
+	ctx := context.Background()
+	admin := &fakeCaddyAdmin{reject: func(body []byte, _ int) bool { return strings.Contains(string(body), "bad.example.com") }}
+	rec, _ := wildcardReconciler(t, admin)
+	rec.SetWildcards(func() []WildcardCert { return nil })
+	var cleared atomic.Int32
+	rec.SetRefusalCleared(func() {
+		cleared.Add(1)
+		if !rec.mu.TryLock() {
+			t.Error("the refusal-cleared hook must run after the reconciler lock is released")
+			return
+		}
+		rec.mu.Unlock()
+	})
+	bad := Route{Hostname: "bad.example.com", Upstream: "web:8080", UpstreamScheme: "http", Enabled: true}
+	removeBad := func() {
+		t.Helper()
+		routes, err := rec.store.List()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, rt := range routes {
+			if rt.Hostname == bad.Hostname {
+				if err := rec.store.Delete(ctx, rt.ID()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	step := func(what string, wantErr bool, want int32) {
+		t.Helper()
+		if err := rec.Reconcile(ctx); (err != nil) != wantErr {
+			t.Fatalf("%s: reconcile err=%v", what, err)
+		}
+		if got := cleared.Load(); got != want {
+			t.Fatalf("%s: hook ran %d times; want %d", what, got, want)
+		}
+	}
+	step("accepted, nothing refused before", false, 0)
+	step("unchanged, nothing refused before", false, 0)
+	if err := rec.store.Save(ctx, bad); err != nil {
+		t.Fatal(err)
+	}
+	step("refused", true, 0)
+	step("still refused", true, 0)
+	removeBad()
+	step("back to the config Caddy serves", false, 1)
+	step("unchanged again", false, 1)
+	if err := rec.store.Save(ctx, bad); err != nil {
+		t.Fatal(err)
+	}
+	step("refused again", true, 1)
+	admin.mu.Lock()
+	admin.reject = func([]byte, int) bool { return false }
+	admin.mu.Unlock()
+	step("the same render accepted", false, 2)
 }
 
 // NewRedactWriter removes every secret form, also when a secret is split across two writes, and holds a

@@ -88,8 +88,8 @@ version` says `v2.x`.
 
 ## Step 3. Install Mooring
 
-Add Mooring's signed APT repository once, then install. `sudo apt upgrade` then keeps Mooring up to
-date, and every download is signature-checked:
+Add Mooring's signed APT repository once, then install. Updates then come from the same repository
+(see [Keep Mooring up to date](#keep-mooring-up-to-date)), and every download is signature-checked:
 
 ```bash
 curl -fsSL https://daboss2003.github.io/mooring/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/mooring.gpg
@@ -136,7 +136,7 @@ so don't use `apt install caddy` on its own.
    |---|---|
    | `no caddy` | go on to 2 |
    | `v2.11…` or later (official builds start with `v`) | go on to 2 |
-   | `2.6.2`, anything without a leading `v`, or below `v2.11` | remove it first: `sudo apt-get remove -y caddy` |
+   | `2.6.2`, anything without a leading `v`, or below `v2.11` | go on to 2 — setup upgrades it in place |
 
 2. Let Mooring install the official Caddy and prepare the host. Without `--yes` it only prints what
    it would do; read it, then apply:
@@ -146,10 +146,21 @@ so don't use `apt install caddy` on its own.
    sudo mooring setup --yes    # apply it
    ```
 
-   This installs Caddy from Caddy's official repository, turns off the separate `caddy` service
-   that package brings (Mooring supervises its own Caddy, and the packaged service would take
-   ports 80/443), and caps Docker's container logs so they can't fill the disk. Capping the logs
-   restarts Docker, which is why you do this before deploying any app.
+   This installs Caddy from Caddy's official repository, or upgrades an older Caddy in place from
+   that repository, turns off the separate `caddy` service that package brings (Mooring supervises
+   its own Caddy, and the packaged service would take ports 80/443), and caps Docker's container
+   logs so they can't fill the disk. Capping the logs restarts Docker, which is why you do this
+   before deploying any app.
+
+   If the upgrade can't run (another apt process holds its lock, or Caddy's repository can't be
+   reached), setup prints a warning, keeps the current Caddy and carries on with the other steps.
+   Run `sudo mooring setup --yes` again once apt is free.
+
+   Setup reads `/etc/mooring/config.yaml` when it exists. With `edge.mode: external` (your own
+   proxy fronts Mooring), setup doesn't install, upgrade or turn off Caddy or nginx, or their
+   services: write that config (Step 6) before you run setup. With no config file yet, setup
+   prepares the default managed edge as described above. If the file exists but doesn't load,
+   setup leaves Caddy and nginx alone until it does: `sudo mooring doctor` shows the error.
 
 **Check:**
 
@@ -157,6 +168,9 @@ so don't use `apt install caddy` on its own.
 caddy version              # v2.11 or later
 systemctl is-enabled caddy # disabled (or "not-found")
 ```
+
+After a package upgrade replaces Caddy or nginx, Mooring restarts its own copy on the updated files
+within a few minutes.
 
 When `edge.dns01` is set for a namespace, Mooring installs a Caddy build with that DNS provider's
 plugin as `/var/lib/mooring/bin/caddy` and runs the edge from it. The Caddy package you installed
@@ -304,7 +318,10 @@ module takes other credentials (Route 53, for example) is refused; see
    2. **Permissions:** keep **Zone / DNS / Edit** and add **Zone / Zone / Read**.
    3. **Zone Resources:** **Include / Specific zone /** your domain (the registered domain, e.g.
       `example.com`, even when the wildcard is for `app.example.com`).
-   4. Optional: **Client IP Address Filtering → Is in →** this server's public IP.
+   4. Optional: **Client IP Address Filtering → Is in →** every address this server calls out
+      from, IPv4 **and IPv6**: `curl -4 -s https://ifconfig.me` and `curl -6 -s https://ifconfig.me`
+      on the server. A server with IPv6 reaches Cloudflare's API over IPv6, and a token that lists
+      only the IPv4 address is refused (`Code 9109: Cannot use the access token from location`).
    5. **Continue to summary → Create Token**, and copy it: it's shown once. Don't set an expiry:
       Mooring renews the certificate with it.
 2. **Check the token** from the server, without leaving it in your shell history:
@@ -412,7 +429,8 @@ removed user's sessions end at once.
 ## Optional: non-HTTP services (DNS, MQTT) and the L4 load balancer
 
 For a service on a privileged non-HTTP port, install nginx with the stream module, and set
-`edge.l4_enabled: true` in the config:
+`edge.l4_enabled: true` in the config. The L4 load balancer runs only with `edge.mode: managed`;
+with `external`, `setup --l4` installs and disables nothing:
 
 ```bash
 sudo mooring setup --l4 --yes
@@ -447,8 +465,10 @@ out, so you sign in again with the new factor.
 
 ## Keep Mooring up to date
 
-- **APT repository (Step 3):** `sudo apt update && sudo apt upgrade`. The package keeps the service
-  enabled and restarts it on the new version.
+- **APT repository (Step 3):** `sudo apt-get update && sudo apt-get install --only-upgrade mooring`.
+  The package keeps the service enabled and restarts it on the new version. A full
+  `sudo apt upgrade` also upgrades Docker when an update for it is available, which restarts Docker
+  and every container on the host.
 - **`.deb` file:** download the newer release the same way and `sudo apt install` it. To let the
   dashboard's **Server tab** clean up old `.deb` files, download them into
   `/var/lib/mooring/deb-cache` (create it with
@@ -496,7 +516,8 @@ and copy the template from `/etc/mooring/config.example.yaml` in Step 6.
 | `config: … must not be world-accessible` / `… group-writable` / `… owned by root` | the file's owner or mode is wrong | `sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml` |
 | `sudo systemctl enable` seems to hang | it's waiting on a password prompt you can't see | press Ctrl-C and run it with `sudo` |
 | `N: Download is performed unsandboxed as root …` during `apt install ./mooring….deb` | apt's sandbox user can't read your home folder | harmless (`dpkg -l mooring` confirms the install); download into `/tmp` to avoid it |
-| `caddy version` prints `2.6.2` (no leading `v`) | the distribution's old Caddy | [Step 4](#step-4-install-caddy-the-https-edge): `sudo apt-get remove -y caddy`, then `sudo mooring setup --yes` |
+| `caddy version` prints `2.6.2` (no leading `v`) | the distribution's old Caddy | `sudo mooring setup --yes` (it upgrades it to Caddy's official release) |
+| `Could not get lock /var/lib/dpkg/lock-frontend` (or `/var/lib/apt/lists/lock`) during `mooring setup --yes` | unattended-upgrades or another apt run is installing updates | wait for it to finish, then run `sudo mooring setup --yes` again |
 | Log: `edge: Caddy DNS plugin install failed`; wildcard names fail with `ERR_SSL_PROTOCOL_ERROR` | the server can't download the plugin build from `caddyserver.com` (the log line has the reason) | allow outbound HTTPS to `caddyserver.com`; Mooring retries on its own. `sudo mooring doctor` shows the plugin's state |
 | Log: `edge child exited: address already in use` | a packaged `caddy` or `nginx` service holds port 80/443 | `sudo mooring setup --yes` (it turns them off), or `sudo systemctl disable --now caddy nginx` |
 | Deploy: *the edge has not issued the TLS cert yet* | the hostname doesn't resolve to this server yet, or port 80 is closed | check [Step 7](#step-7-point-dns-at-the-server) (`dig +short <name>`) and [Step 1](#step-1-open-ports-80-and-443) |

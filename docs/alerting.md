@@ -22,7 +22,7 @@ alerting:
 sudo systemctl restart mooring
 ```
 
-> **Restart, not reload.** The alerting engine starts at boot, so `systemctl reload` won't turn it on — you must `systemctl restart mooring`. (See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).)
+> **Restart, not reload.** The alerting engine reads `alerting.*` at boot, so `systemctl reload` neither turns it on nor applies a change to its settings (quiet hours, intervals, the heartbeat) — you must `systemctl restart mooring`. (See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).)
 
 Everything else is managed in the dashboard — no files or config to hand-edit. The **Alerts** page shows open alerts and links to two dedicated screens: **Channels** (where alerts go) and **Rules** (what to watch for). Each has an **Add** button that opens a form. Alerting is **not** part of any app's `mooring.yaml`: channels and rules are platform-level and live in the dashboard, and channel credentials (SMTP passwords, webhook secrets, bot tokens) are stored **encrypted at rest** — they are never rendered back into a form or written to a file. Open problems also appear on the **Incidents** screen.
 
@@ -32,6 +32,22 @@ Everything else is managed in the dashboard — no files or config to hand-edit.
 - **Your apps** — containers going down, becoming unhealthy, or restart-looping; a dependency an app reports as down.
 - **The platform** — crashed or out-of-memory containers, a restart storm, low memory headroom, a full disk.
 - **The edge** — a namespace with a [catch-all route](./edge-and-tls.md#catch-all-routes) whose wildcard certificate isn't served raises a critical `edge_catchall_dark` alert naming the namespace and the cause; it resolves when the certificate is served again.
+- **Host and edge maintenance** — host vulnerabilities, a pending reboot, the supervised Caddy or L4 nginx running replaced files, and refreshes of the Mooring-owned Caddy build (see below).
+
+### Host and edge maintenance alerts
+
+Mooring raises these on its own. They need no rule and go to every enabled channel.
+
+| Kind | Level | Target | Sent when |
+|---|---|---|---|
+| `host_vulnerabilities` | `critical` if a new finding is Critical, else `warning` | `host` | A [host scan](./server-tab.md#host-vulnerabilities) finds a High or Critical finding with a fixed version (identified by CVE ID, package and target) that no earlier `host_vulnerabilities` alert included. Counts the new findings and gives the totals. Gives the upgrade command for the OS packages with such a finding (`apt-get install --only-upgrade` or `dnf upgrade`, up to 20 names), says when the upgrade restarts Docker, and what fixes each affected binary. A scan with only already-alerted findings, or fewer findings, sends nothing. Findings without a fixed version never alert. |
+| `host_reboot_required` | `warning` | `host` | After a host scan while `/run/reboot-required` exists (Debian/Ubuntu). Lists the packages from `/run/reboot-required.pkgs`. Sent again when the package list changes. |
+| `edge_child_restarted` | `warning` | `caddy` or `nginx-l4` | A package upgrade replaced the binary or a loaded library of the supervised Caddy or L4 nginx, and Mooring restarted it after the replaced files had stayed the same for 2 minutes and the new files passed a start check. |
+| `edge_child_stale` | `warning` | `caddy` or `nginx-l4` | The supervised Caddy or L4 nginx still runs replaced files and Mooring did not restart it: the new files failed the start check, or it was already restarted automatically in the last 30 minutes. |
+| `caddy_build_refreshed` | `warning` | `caddy` | With `edge.mode: managed`, the host scan found a finding with a fixed version in the Mooring-owned Caddy build (`<data_dir>/bin/caddy`), and Mooring downloaded, verified and swapped in a current build, then restarted the edge. The previous build is kept as `bin/caddy.bak`. A download whose Go build info equals the installed build is not swapped and sends no alert (it is logged). At most one download every 20 hours. |
+| `caddy_build_refresh_failed` | `warning` | `caddy` | That refresh failed (download or verification), or downloaded nothing because Caddy still refuses the edge config that held the last build back; the installed build keeps running. At most one alert a day. |
+
+Each of these is sent once per condition while Mooring runs; after a restart a condition that still holds is sent once more.
 
 ## How it decides what to send
 
@@ -114,7 +130,26 @@ Requirements: the **managed edge must be enabled** (Mooring needs it to expose n
 
 > **If sign-in is rejected** (the ntfy app says *"user phone not authorized"* or *"invalid credentials"* even with the exact username + password from the Channels page): just **re-submit the ntfy channel form** with the same hostname and topic. Mooring restarts the ntfy server so it re-reads the current credentials, after which the username + password shown on the Channels page work. (Before v0.3.50 a re-configure rewrote the credentials but didn't restart the server, so the displayed password could lag what the running server expected.)
 
-Alerts are **deduplicated** — one problem is one page, not a flood — and they respect your **quiet hours**: non-critical alerts are held overnight, while critical ones always come through. Mooring paces its own sending so a slow mail server or bot can never turn it into a spam-cannon.
+Alerts are **deduplicated** — one problem is one page, not a flood — and they respect your **quiet hours** (see below). Mooring paces its own sending so a slow mail server or bot can never turn it into a spam-cannon.
+
+### Quiet hours
+
+`alerting.quiet_start_hour` and `alerting.quiet_end_hour` (0–23, server local time) set a nightly window from the start of the start hour to the start of the end hour; a start later than the end wraps past midnight (`22` and `7` cover 22:00–06:59; use `0` for midnight). The same hour for both means no quiet hours. `-1` for either disables quiet hours (the default). Any other value turns quiet hours off, and Mooring logs a `config:` warning at startup.
+
+- Critical alerts are sent immediately, inside the window too.
+- Every other alert is held while the window lasts, then sent when it ends, oldest alert first.
+
+### How notifications are sent
+
+- Critical alerts are sent before any other pending alert, also when they are raised while other alerts are being sent.
+- All pending notifications of one alert are sent as one message. It reports the alert's latest state and ends with a line such as `Fired and recovered 14 times since 23:04.`, or `Recovered at 23:00, then fired once.` when the first of them is a recovery. One alert is one rule on one target, or one of Mooring's own alerts (for example the self-heal alert of one service).
+- That message is critical when any of the notifications it combines is critical, including one whose delivery failed until it was dropped. It is sent immediately, inside quiet hours too, when it combines a critical notification that has not been sent yet. A message that is critical only because of a dropped critical notification is held during quiet hours like a warning, and sent when they end. A critical raised for a service whose warning is being held sends one message that includes the warning; the warning is not sent again in the morning.
+- A self-heal alert's recovery is sent at the highest level the alert reached: a held warning that recovers during the window is reported once in the morning, with its recovery.
+- If Mooring can't record a self-heal alert (for example, the disk is full), it tries again on every check until it can. Only the service's latest state is recorded. A recovery is not sent for an alert that was never recorded. When Mooring can't tell whether the alert was recorded (it can't read its records, or the alert may be older than the 7 days records are kept), the recovery is sent.
+- A failed send is retried on the channels that failed only (after a restart of Mooring, on every channel). A message every channel took is not sent again when Mooring can't record its delivery; only the record is retried. A message that isn't critical is tried 3 times in all, on the following send cycles (Mooring sends every 15 seconds and when an alert is raised). A critical message is retried 15 seconds after the first failure, then with the wait doubling up to one hour between tries, until its notifications are 24 hours old. A message that still fails is dropped; its notifications are reported with the alert's next message.
+- Mooring's own alerts for a condition that lasts are not repeated while it lasts. `low_headroom` (a failing service needs a restart while memory headroom is below the floor) is sent once per failure of the service (once more if Mooring restarts meanwhile) and resolved when the service recovers. `scale_refused_no_capacity` (a service can't scale up for lack of host capacity) is sent once, also across a restart of Mooring, and resolved when the service scales up or no longer needs to.
+- **Clear & retry** on a service's open self-heal circuit closes the service's self-heal alert without a message; a later failure of the service is a new alert. The self-heal alert of a service whose app no longer has any container is closed the same way. If Mooring can't record the close, it tries again on every check; until it can, the service's later alerts wait, and one that recovers meanwhile is not sent.
+- Notifications still unsent 48 hours after they were raised are dropped without being sent, also while `alerting.enabled` is false, so enabling alerting later doesn't replay old states. Sent and dropped notifications are kept for 7 days.
 
 ## Knowing Mooring itself is alive (the dead-man's switch)
 
@@ -125,6 +160,6 @@ A dashboard that's down can't alert you that it's down. So Mooring sends a perio
 On the **Alerts** page you can see every open alert and:
 
 - **Acknowledge** it — you've seen it; stop re-paging.
-- **Silence** it for a while — useful during planned maintenance.
+- **Silence** it for a while — useful during planned maintenance. The silence drops the alert's notifications that are waiting to be sent (for example held by quiet hours) and every notification it raises while silenced. It lasts until the chosen time, also when the alert resolves and fires again before then; a firing after that time is sent.
 
 An alert **auto-resolves** on its own once the underlying problem clears.

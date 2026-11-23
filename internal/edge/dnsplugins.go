@@ -2,12 +2,19 @@ package edge
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -223,19 +230,51 @@ type DNSPluginInstaller struct {
 	MaxBackoff  time.Duration
 	// Install replaces InstallPluginBuild in tests.
 	Install func(ctx context.Context, opt InstallOptions) (string, error)
+	// CheckBuild, when set, is InstallOptions.Check for every build this installer downloads (the install
+	// loop's and Refresh's): the download must pass it before it replaces the current binary and the edge
+	// restarts on it. The install loop also runs it on a binary already on disk before restarting the
+	// edge onto it. serve runs `caddy validate` of the config the edge serves, so a build that would
+	// refuse it (and crash-loop the edge) is never swapped in. nil = only the version and module checks.
+	// An error matching ErrHeldByConfig says the edge config Caddy refuses, not the build, is the cause.
+	CheckBuild func(ctx context.Context, bin string) error
+	// RefusedRender, when set, returns the edge config Caddy refuses now (Reconciler.LoadRefused), nil
+	// when it refuses none. After a downloaded build fails CheckBuild with ErrHeldByConfig, no build is
+	// downloaded or checked again (install loop, Refresh, the build on disk) while Caddy still refuses
+	// that same config, for at most MaxBackoff after that check: every one would fail the same way. nil =
+	// nothing is remembered.
+	RefusedRender func() []byte
 	// SyncRetry is the first wait before Sync reads the modules again after a failed read (doubling, up
 	// to 2 minutes); 0 = 5s. Tests shorten it.
 	SyncRetry time.Duration
+	// RefreshEvery is the least time between two Refresh downloads, across restarts (refreshAttemptRel);
+	// 0 = 20h.
+	RefreshEvery time.Duration
 
 	syncGen atomic.Uint64 // bumped by Launched; a Sync for an older launch never writes the state
-	// Guarded by State.mu: synced is the binary file the state's OK was last read from (Check or Sync);
-	// launched is the file at the binary path when the current launch started.
+	// Guarded by State.mu: synced is the binary file the state's OK was last read from (Check or Sync, or
+	// the build a Refresh swapped in after checking it); launched is the file at the binary path when the
+	// current launch started.
 	synced, launched *binIdentity
+	// diskRefused is the binary on disk that last failed CheckBuild in attempt's shortcut: while the file
+	// at the path is still that one, attempt downloads a build instead of checking it again.
+	diskRefused atomic.Pointer[diskRefusal]
+	// held is the refused render that held the last downloaded build back (ErrHeldByConfig), nil when none.
+	held     atomic.Pointer[heldBuild]
+	kickOnce sync.Once
+	kick     chan struct{} // ConfigAccepted → a Run waiting after a held attempt tries again
+	// Test seams: now is the clock a held build's age is measured on (nil = time.Now); after is Run's
+	// backoff timer (nil = time.After).
+	now   func() time.Time
+	after func(time.Duration) <-chan time.Time
 
 	running atomic.Bool // the install loop (Start) is running
 	startMu sync.Mutex  // orders Start's wg.Add before Wait (a WaitGroup can't Add from zero during Wait)
 	stopped bool        // Wait was called: no new loop starts
 	wg      sync.WaitGroup
+
+	refreshMu   sync.Mutex
+	refreshing  bool      // a Refresh is downloading
+	lastRefresh time.Time // when this process's last Refresh download started (refreshAttemptRel keeps it across restarts)
 }
 
 // syncErrPrefix starts SyncErr.
@@ -264,6 +303,120 @@ func statBin(path string) *binIdentity {
 func (a *binIdentity) same(b *binIdentity) bool {
 	return a != nil && b != nil && a.path == b.path && os.SameFile(a.fi, b.fi) &&
 		a.fi.Size() == b.fi.Size() && a.fi.ModTime().Equal(b.fi.ModTime())
+}
+
+// ErrHeldByConfig matches (errors.Is) a CheckBuild error caused by the edge config Caddy refuses now
+// rather than by the build checked: no build would pass the check while Caddy refuses that config. It is
+// also the start of the error an install attempt or Refresh fails with, without downloading, while it
+// waits for Caddy to accept the edge config.
+var ErrHeldByConfig = errors.New("edge: waiting for Caddy to accept the edge config")
+
+// heldBuild is the refused render (its sum) that held the last downloaded build back, the check's error,
+// and when the check failed (clock).
+type heldBuild struct {
+	render string
+	err    error
+	at     time.Time
+}
+
+// diskRefusal is a binary on disk that failed CheckBuild in attempt's shortcut. held is the sum of the
+// refused render that held it back (ErrHeldByConfig), "" when the check failed for another reason.
+type diskRefusal struct {
+	id   *binIdentity
+	held string
+}
+
+// refusedSum is the SHA-256 of RefusedRender, "" when Caddy refuses no render or there is no hook.
+func (i *DNSPluginInstaller) refusedSum() string {
+	if i.RefusedRender == nil {
+		return ""
+	}
+	r := i.RefusedRender()
+	if len(r) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(r)
+	return hex.EncodeToString(sum[:])
+}
+
+// check runs CheckBuild on bin. held is the sum of the render Caddy refuses when the check failed because
+// of it (ErrHeldByConfig) and that render was the refused one both before and after the check (a render
+// that changed meanwhile isn't the one checked); "" otherwise.
+func (i *DNSPluginInstaller) check(ctx context.Context, bin string) (held string, err error) {
+	before := i.refusedSum()
+	err = i.CheckBuild(ctx, bin)
+	if errors.Is(err, ErrHeldByConfig) && before != "" && before == i.refusedSum() {
+		held = before
+	}
+	return held, err
+}
+
+// downloadCheck is InstallOptions.Check for a download: CheckBuild, remembering the refused render when
+// it held the build back. nil without CheckBuild.
+func (i *DNSPluginInstaller) downloadCheck() func(context.Context, string) error {
+	if i.CheckBuild == nil {
+		return nil
+	}
+	return func(ctx context.Context, bin string) error {
+		held, err := i.check(ctx, bin)
+		if held != "" {
+			i.held.Store(&heldBuild{render: held, err: err, at: i.clock()})
+		}
+		return err
+	}
+}
+
+// waitingForConfig returns the error an attempt or Refresh fails with, before downloading anything, while
+// Caddy still refuses the render that held the last downloaded build back, for at most MaxBackoff after
+// that build's check; nil (forgetting that render) once Caddy refuses no render or another one, or
+// MaxBackoff has passed.
+func (i *DNSPluginInstaller) waitingForConfig() error {
+	h := i.held.Load()
+	if h == nil {
+		return nil
+	}
+	// Intentional: a held build is forgotten MaxBackoff after its check even while Caddy refuses the same
+	// render. A download that refuses that render for a reason of its own (a bad build) is held back too,
+	// while the refusal may be the running binary's, which only another build fixes: without this, no build
+	// would be downloaded until the render changed or Mooring restarted. Costs at most one download per
+	// MaxBackoff while held.
+	until := h.at.Add(i.maxBackoff())
+	if cur := i.refusedSum(); cur != h.render || !i.clock().Before(until) {
+		i.held.CompareAndSwap(h, nil)
+		return nil
+	}
+	return fmt.Errorf("%w: %w (no new build is downloaded until Caddy accepts an edge config, the refused one changes, or %s)",
+		ErrHeldByConfig, h.err, until.UTC().Format(time.RFC3339))
+}
+
+// ConfigAccepted tells the install loop that Caddy accepted an edge config after refusing one (serve
+// calls it from Reconciler.SetRefusalCleared): a loop backing off after an attempt held back by the
+// config (ErrHeldByConfig) tries again now, unless a ConfigAccepted started that attempt (see Run). Any
+// other backoff is kept. Never blocks.
+func (i *DNSPluginInstaller) ConfigAccepted() {
+	select {
+	case i.kickCh() <- struct{}{}:
+	default:
+	}
+}
+
+func (i *DNSPluginInstaller) kickCh() chan struct{} {
+	i.kickOnce.Do(func() { i.kick = make(chan struct{}, 1) })
+	return i.kick
+}
+
+func (i *DNSPluginInstaller) clock() time.Time {
+	if i.now != nil {
+		return i.now()
+	}
+	return time.Now()
+}
+
+func (i *DNSPluginInstaller) timer(d time.Duration) <-chan time.Time {
+	if i.after != nil {
+		return i.after(d)
+	}
+	return time.After(d)
 }
 
 func (i *DNSPluginInstaller) minBackoff() time.Duration {
@@ -540,16 +693,27 @@ func (i *DNSPluginInstaller) Wait() {
 }
 
 // Run installs the missing plugins and retries a failure with exponential backoff (MinBackoff,
-// doubling, capped at MaxBackoff) until every installable provider is on disk or ctx ends. Edge
+// doubling, capped at MaxBackoff) until every installable provider is on disk or ctx ends. After an
+// attempt held back by the edge config Caddy refuses (ErrHeldByConfig), ConfigAccepted ends the wait
+// early, unless a ConfigAccepted started that attempt: a wake never ends two waits in a row. Edge
 // settings change only on a restart, which runs Check + Run again.
 func (i *DNSPluginInstaller) Run(ctx context.Context) {
 	backoff := i.minBackoff()
+	woken := false // the next attempt is the one a ConfigAccepted started
 	for {
 		missing := i.pending()
 		if len(missing) == 0 || ctx.Err() != nil {
 			return
 		}
-		if err := i.attempt(ctx, missing); err == nil {
+		// A wake from before this attempt is spent by it: the attempt sees the refusal as it is now.
+		select {
+		case <-i.kickCh():
+		default:
+		}
+		err := i.attempt(ctx, missing)
+		byWake := woken
+		woken = false
+		if err == nil {
 			backoff = i.minBackoff()
 			continue
 		}
@@ -557,10 +721,19 @@ func (i *DNSPluginInstaller) Run(ctx context.Context) {
 		for _, p := range missing {
 			i.State.update(p, func(s *ProviderStatus) { s.NextAttempt = next })
 		}
+		var accepted chan struct{} // nil: never ready
+		// Intentional: after an attempt a wake started is held back again, wakes are ignored until the timer
+		// ends this wait. A refusal that keeps clearing and coming back would otherwise download a ~50 MB build
+		// per clear with no backoff; this way a wake adds at most one download per backoff period.
+		if errors.Is(err, ErrHeldByConfig) && !byWake {
+			accepted = i.kickCh()
+		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-i.timer(backoff):
+		case <-accepted:
+			woken = true
 		}
 		backoff = min(backoff*2, i.maxBackoff())
 	}
@@ -584,12 +757,81 @@ func (i *DNSPluginInstaller) pending() []string {
 }
 
 // attempt makes the missing modules available: if the binary the edge will launch already has them
-// (`mooring setup` installed a build meanwhile), it only restarts the edge onto it; otherwise it builds
-// one Caddy with EVERY configured provider (so a provider already present is never dropped) plus the
-// plugins the system caddy carries, and installs it. The new build takes effect on the restart
-// (OnSwap); OK follows from Sync on that launch.
+// (`mooring setup` installed a build meanwhile) and passes CheckBuild, it only restarts the edge onto
+// it; otherwise it builds one Caddy with EVERY configured provider (so a provider already present is
+// never dropped) plus the plugins the system caddy carries, and installs it. The new build takes effect
+// on the restart (OnSwap); OK follows from Sync on that launch. A binary on disk that fails CheckBuild
+// fails the attempt like an install (Run backs off), and the same unchanged file is not offered again
+// (while Caddy refuses the same render, when that render held it back): the next attempt downloads a
+// build. While Caddy refuses the render that held the last download back (waitingForConfig), the
+// attempt fails at once: nothing is checked or downloaded.
 func (i *DNSPluginInstaller) attempt(ctx context.Context, missing []string) error {
-	var pkgs, want []string
+	if err := i.waitingForConfig(); err != nil {
+		i.installFailed(missing, err)
+		return err
+	}
+	dns, want := i.dnsPackages()
+	if bin := ResolveCaddy(i.DataDir); bin != "" {
+		id := statBin(bin)
+		// Intentional: the same unchanged file that failed CheckBuild is not checked again, the attempt
+		// downloads a build instead; checking it again would fail the same way, and no download would ever run.
+		// A file held back by a refused render is checked again once Caddy refuses no render or another one.
+		if r := i.diskRefused.Load(); r == nil || !id.same(r.id) || (r.held != "" && r.held != i.refusedSum()) {
+			if mods, err := CaddyModules(ctx, bin); err == nil && hasAll(mods, want) {
+				// setup checks a build only against config.yaml's edge settings, not the routes the edge
+				// serves: check it as a download is checked.
+				if i.CheckBuild != nil {
+					// Intentional: a refusal here doesn't stop the downloads (only a download's does): this file
+					// may be an older Caddy than the build server's, which may accept the refused render.
+					if held, cerr := i.check(ctx, bin); cerr != nil {
+						i.diskRefused.Store(&diskRefusal{id: id, held: held})
+						err := fmt.Errorf("edge: the Caddy on disk (%s) has the DNS plugin(s) but fails its check, so the edge isn't restarted onto it; the next attempt downloads a new build: %w", bin, cerr)
+						i.installFailed(missing, err)
+						return err
+					}
+				}
+				i.markOnDisk()
+				i.log().Info("edge: the Caddy on disk already has the DNS plugin(s); restarting the edge onto it", "caddy", bin)
+				i.swap()
+				return nil
+			}
+		}
+	}
+	pkgs, extras := i.withSystemPlugins(ctx, dns)
+	for _, p := range missing {
+		i.State.update(p, func(s *ProviderStatus) { s.Installing = true })
+	}
+	i.log().Info("edge: installing a Caddy build with the DNS plugin(s) for the wildcard certs",
+		"missing", strings.Join(missing, ","), "packages", strings.Join(pkgs, ","), "path", OwnedCaddyPath(i.DataDir))
+	path, err := i.install(ctx, InstallOptions{DataDir: i.DataDir, Packages: pkgs, WantModules: want, BuildServer: i.BuildServer,
+		Client: i.Client, Check: i.downloadCheck()}, extras)
+	if err != nil {
+		i.installFailed(missing, err)
+		return err
+	}
+	i.markOnDisk()
+	i.log().Info("edge: Caddy DNS plugin(s) installed; restarting the edge on the new binary", "path", path)
+	i.swap()
+	return nil
+}
+
+// installFailed records a failed attempt for the missing providers (the error, one more attempt) and
+// logs it; Run retries with backoff.
+func (i *DNSPluginInstaller) installFailed(missing []string, err error) {
+	for _, p := range missing {
+		i.State.update(p, func(s *ProviderStatus) {
+			s.Installing = false
+			s.Err = err.Error()
+			s.Attempts++
+		})
+	}
+	i.log().Warn("edge: Caddy DNS plugin install failed — wildcards using it stay off (subdomains fall back to per-name HTTP-01; a catch-all has no certificate) until it succeeds; retrying with backoff",
+		"missing", strings.Join(missing, ","), "err", err.Error())
+}
+
+// dnsPackages returns the Go module path (deduplicated) and the module ID of every configured provider
+// Mooring knows.
+func (i *DNSPluginInstaller) dnsPackages() (pkgs, want []string) {
 	seen := map[string]bool{}
 	for _, p := range i.Providers {
 		mod, ok := DNSProviderModule(p)
@@ -600,18 +842,14 @@ func (i *DNSPluginInstaller) attempt(ctx context.Context, missing []string) erro
 		pkgs = append(pkgs, mod)
 		want = append(want, DNSModuleID(p))
 	}
-	if bin := ResolveCaddy(i.DataDir); bin != "" {
-		if mods, err := CaddyModules(ctx, bin); err == nil && hasAll(mods, want) {
-			i.markOnDisk()
-			i.log().Info("edge: the Caddy on disk already has the DNS plugin(s); restarting the edge onto it", "caddy", bin)
-			i.swap()
-			return nil
-		}
-	}
-	// Carry plugins over only from the system caddy (root-owned): the Mooring-owned build is writable by
-	// the service user, so its own report of what's built in must not decide what goes into the next
-	// build.
-	var extras []string
+	return pkgs, want
+}
+
+// withSystemPlugins returns the packages of a new owned build: dns plus the non-standard plugins of the
+// system caddy (extras), sorted. Plugins are carried over only from the system caddy (root-owned): the
+// Mooring-owned build is writable by the service user, so its own report of what's built in must not
+// decide what goes into the next build.
+func (i *DNSPluginInstaller) withSystemPlugins(ctx context.Context, dns []string) (pkgs, extras []string) {
 	if sys, err := exec.LookPath("caddy"); err == nil {
 		if x, xerr := CaddyExtraPackages(ctx, sys); xerr != nil {
 			i.log().Warn("edge: can't read the plugins in the system Caddy (needs `list-modules --packages --skip-standard`); the new build has only the DNS providers",
@@ -620,6 +858,11 @@ func (i *DNSPluginInstaller) attempt(ctx context.Context, missing []string) erro
 			extras = x
 		}
 	}
+	seen := map[string]bool{}
+	pkgs = append(pkgs, dns...)
+	for _, p := range dns {
+		seen[p] = true
+	}
 	for _, x := range extras {
 		if !seen[x] {
 			seen[x] = true
@@ -627,40 +870,262 @@ func (i *DNSPluginInstaller) attempt(ctx context.Context, missing []string) erro
 		}
 	}
 	sort.Strings(pkgs)
-	for _, p := range missing {
-		i.State.update(p, func(s *ProviderStatus) { s.Installing = true })
-	}
-	i.log().Info("edge: installing a Caddy build with the DNS plugin(s) for the wildcard certs",
-		"missing", strings.Join(missing, ","), "packages", strings.Join(pkgs, ","), "path", OwnedCaddyPath(i.DataDir))
+	return pkgs, extras
+}
+
+// install runs one install of opt (i.Install, else InstallPluginBuild). A build with carried plugins
+// that fails is retried at once with only the DNS providers: a carried plugin may not build against the
+// latest Caddy, and Mooring doesn't use it. A build that failed the check (CheckBuild) is not: the edge
+// config doesn't use the carried plugins, so a second download would fail the same way.
+func (i *DNSPluginInstaller) install(ctx context.Context, opt InstallOptions, extras []string) (string, error) {
 	install := i.Install
 	if install == nil {
 		install = InstallPluginBuild
 	}
-	opt := InstallOptions{DataDir: i.DataDir, Packages: pkgs, WantModules: want, BuildServer: i.BuildServer, Client: i.Client}
 	path, err := install(ctx, opt)
-	if err != nil && len(extras) > 0 {
-		// A carried plugin may not build against the latest Caddy; Mooring doesn't use it, so try again
-		// with only the DNS providers rather than fail forever.
+	if err != nil && len(extras) > 0 && !errors.Is(err, ErrBuildUnchanged) && !errors.Is(err, ErrBuildCheckFailed) {
 		i.log().Warn("edge: the Caddy build with the carried plugins failed; retrying with only the DNS providers", "err", err.Error())
-		opt.Packages = dnsOnly(pkgs, extras)
+		opt.Packages = dnsOnly(opt.Packages, extras)
 		path, err = install(ctx, opt)
 	}
+	return path, err
+}
+
+// ErrRefreshTooSoon: Refresh ran (or is running) within RefreshEvery.
+var ErrRefreshTooSoon = errors.New("edge: the Mooring-owned Caddy was refreshed recently")
+
+// refreshEvery defaults to 20h: below the host scan's default 24h interval, so the hook a daily scan
+// runs is never refused because this scan started a few minutes earlier than the last one's download,
+// while the download still happens at most about once a day.
+func (i *DNSPluginInstaller) refreshEvery() time.Duration {
+	if i.RefreshEvery > 0 {
+		return i.RefreshEvery
+	}
+	return 20 * time.Hour
+}
+
+// refreshAttemptRel is the file in data_dir that records when the last Refresh download attempt
+// started (a unix timestamp in seconds). It sits next to the owned build, but never matches
+// "caddy.new*": an install deletes old files with that prefix.
+const refreshAttemptRel = "bin/caddy.refresh-attempt"
+
+// maxRefreshAttemptSize bounds a read of the record (a timestamp is a dozen bytes).
+const maxRefreshAttemptSize = 64
+
+// recordedAttempt returns the attempt time an earlier Refresh recorded (in this process or before a
+// restart); ok=false (no limit) when there is none, it can't be read, or it is later than now.
+func (i *DNSPluginInstaller) recordedAttempt(now time.Time) (at time.Time, ok bool) {
+	at, err := readRefreshAttempt(i.DataDir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return time.Time{}, false
+	case err != nil:
+		i.log().Warn("edge: can't read the last Caddy build refresh attempt; not limiting this refresh",
+			"path", filepath.Join(i.DataDir, refreshAttemptRel), "err", err.Error())
+		return time.Time{}, false
+	case at.After(now):
+		// Intentional: a recorded time in the future sets no limit. The clock was set back after it was
+		// written; honouring it would hold every refresh off until the clock caught up.
+		i.log().Warn("edge: the last Caddy build refresh attempt is recorded in the future (the clock changed); not limiting this refresh",
+			"path", filepath.Join(i.DataDir, refreshAttemptRel), "recorded", at.UTC().Format(time.RFC3339))
+		return time.Time{}, false
+	}
+	return at, true
+}
+
+// openRefreshRoot opens an os.Root on dataDir (no path out of it, whatever symlinks are planted there)
+// and checks that its bin is a real directory: a symlinked bin dir is refused, as for an install.
+func openRefreshRoot(dataDir string) (*os.Root, error) {
+	root, err := os.OpenRoot(dataDir)
 	if err != nil {
-		for _, p := range missing {
-			i.State.update(p, func(s *ProviderStatus) {
-				s.Installing = false
-				s.Err = err.Error()
-				s.Attempts++
-			})
-		}
-		i.log().Warn("edge: Caddy DNS plugin install failed — wildcards using it stay off (subdomains fall back to per-name HTTP-01; a catch-all has no certificate) until it succeeds; retrying with backoff",
-			"missing", strings.Join(missing, ","), "err", err.Error())
+		return nil, err
+	}
+	if fi, err := root.Lstat("bin"); err != nil {
+		root.Close()
+		return nil, err
+	} else if !fi.IsDir() {
+		root.Close()
+		return nil, errors.New("bin is not a directory (a symlink is refused)")
+	}
+	return root, nil
+}
+
+// readRefreshAttempt reads the time recorded at refreshAttemptRel in dataDir. The record must be a
+// regular file (a symlink is refused, never followed) holding a unix timestamp.
+func readRefreshAttempt(dataDir string) (time.Time, error) {
+	root, err := openRefreshRoot(dataDir)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer root.Close()
+	fi, err := root.Lstat(refreshAttemptRel)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !fi.Mode().IsRegular() {
+		return time.Time{}, errors.New("not a regular file (a symlink is refused)")
+	}
+	f, err := root.Open(refreshAttemptRel)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer f.Close()
+	// os.Root follows a symlink that stays inside data_dir: the file opened must be the one checked.
+	if ofi, err := f.Stat(); err != nil || !os.SameFile(fi, ofi) {
+		return time.Time{}, errors.New("replaced while being read")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, maxRefreshAttemptSize+1))
+	if err != nil {
+		return time.Time{}, err
+	}
+	if len(b) > maxRefreshAttemptSize {
+		return time.Time{}, fmt.Errorf("over %d bytes: not a timestamp", maxRefreshAttemptSize)
+	}
+	sec, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return time.Time{}, errors.New("not a unix timestamp")
+	}
+	return time.Unix(sec, 0), nil
+}
+
+// writeRefreshAttempt records at in dataDir's refreshAttemptRel as a 0600 file. It writes a new file
+// and renames it into place: a rename replaces a symlink at the path instead of writing through it, and
+// a reader never sees a half-written record. Nothing else in bin is touched.
+func writeRefreshAttempt(dataDir string, at time.Time) error {
+	root, err := openRefreshRoot(dataDir)
+	if err != nil {
 		return err
 	}
+	defer root.Close()
+	var rnd [6]byte
+	if _, err := rand.Read(rnd[:]); err != nil {
+		return err
+	}
+	tmp := refreshAttemptRel + ".tmp." + hex.EncodeToString(rnd[:])
+	f, err := root.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, werr := f.WriteString(strconv.FormatInt(at.Unix(), 10) + "\n")
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = root.Rename(tmp, refreshAttemptRel)
+	}
+	if werr != nil {
+		_ = root.Remove(tmp)
+	}
+	return werr
+}
+
+// Refresh downloads a current build of the Mooring-owned Caddy with the same packages the install loop
+// uses (every configured provider + the system caddy's extra plugins; DNS-only retry), checked like an
+// install (CheckBuild included: a build that fails it is deleted and its error, wrapping
+// ErrBuildCheckFailed, returned), and swaps it in only when its Go build info differs from the installed
+// build's (SkipIfSame).
+// Swapped → OnSwap() and (true, nil); when every provider was OK, the relaunch onto the new build keeps
+// OK without reading it again (it was checked for every module). Unchanged build, no owned build,
+// DataDir == "", or the install loop running (it installs a current build itself) → (false, nil).
+// Within RefreshEvery of the previous download attempt, or while another Refresh runs → (false,
+// ErrRefreshTooSoon). The start of each attempt is recorded in <data_dir>/bin/caddy.refresh-attempt, so
+// the limit holds across a Mooring restart; a missing, unreadable or corrupt record, or one later than
+// the current time, sets no limit (the in-memory limit of this process still applies), and a failure
+// to write it is logged, never returned. A failed download keeps the current build and returns the
+// error. While Caddy refuses the render that held the last downloaded build back (CheckBuild failed
+// with ErrHeldByConfig, see RefusedRender), it returns (false, error matching ErrHeldByConfig) without
+// downloading or recording an attempt. Works with no Providers.
+func (i *DNSPluginInstaller) Refresh(ctx context.Context) (bool, error) {
+	if i.DataDir == "" {
+		return false, nil
+	}
+	owned := OwnedCaddyPath(i.DataDir)
+	if fi, err := os.Lstat(owned); err != nil || !fi.Mode().IsRegular() {
+		return false, nil
+	}
+	if i.running.Load() {
+		return false, nil
+	}
+	i.refreshMu.Lock()
+	if i.refreshing || (!i.lastRefresh.IsZero() && time.Since(i.lastRefresh) < i.refreshEvery()) {
+		i.refreshMu.Unlock()
+		return false, ErrRefreshTooSoon
+	}
+	now := time.Now()
+	if last, ok := i.recordedAttempt(now); ok && now.Sub(last) < i.refreshEvery() {
+		i.refreshMu.Unlock()
+		return false, ErrRefreshTooSoon
+	}
+	// After the rate limit, so a refresh within RefreshEvery stays ErrRefreshTooSoon (no alert); before the
+	// attempt is recorded, since nothing is downloaded.
+	if err := i.waitingForConfig(); err != nil {
+		i.refreshMu.Unlock()
+		i.log().Warn("edge: Caddy build refresh waits for Caddy to accept the edge config; keeping the current build", "err", err.Error())
+		return false, err
+	}
+	i.refreshing, i.lastRefresh = true, now
+	i.refreshMu.Unlock()
+	defer func() {
+		i.refreshMu.Lock()
+		i.refreshing = false
+		i.refreshMu.Unlock()
+	}()
+	if err := writeRefreshAttempt(i.DataDir, now); err != nil {
+		i.log().Warn("edge: can't record the Caddy build refresh attempt; the refresh limit won't survive a Mooring restart",
+			"path", filepath.Join(i.DataDir, refreshAttemptRel), "err", err.Error())
+	}
+
+	dns, want := i.dnsPackages()
+	pkgs, extras := i.withSystemPlugins(ctx, dns)
+	i.log().Info("edge: refreshing the Mooring-owned Caddy build", "packages", strings.Join(pkgs, ","), "path", owned)
+	path, err := i.install(ctx, InstallOptions{DataDir: i.DataDir, Packages: pkgs, WantModules: want,
+		BuildServer: i.BuildServer, Client: i.Client, SkipIfSame: true, Check: i.downloadCheck()}, extras)
+	switch {
+	case errors.Is(err, ErrBuildUnchanged):
+		i.log().Info("edge: the downloaded Caddy build is the same as the installed one; kept", "path", owned)
+		return false, nil
+	case err != nil:
+		i.log().Warn("edge: Caddy build refresh failed; keeping the current build", "err", err.Error())
+		return false, err
+	}
+	// The new build passed the checks (every provider's module, CheckBuild), so the next launch has them all.
 	i.markOnDisk()
-	i.log().Info("edge: Caddy DNS plugin(s) installed; restarting the edge on the new binary", "path", path)
+	i.adoptRefreshed(owned)
+	i.log().Info("edge: refreshed the Mooring-owned Caddy build; restarting the edge on it", "path", path)
 	i.swap()
-	return nil
+	return true, nil
+}
+
+// adoptRefreshed records the build Refresh just swapped in at path as the file the state was read from
+// (synced), so the relaunch onto it keeps OK and its first config push carries the wildcards: the build
+// was checked for every provider's module (WantModules), which is what Sync would read from it. Only
+// when every provider is OK already, i.e. the running edge has every module too.
+func (i *DNSPluginInstaller) adoptRefreshed(path string) {
+	p := i.State
+	id := statBin(path)
+	if p == nil || id == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, name := range i.Providers {
+		if _, ok := DNSProviderModule(name); !ok {
+			continue
+		}
+		s := p.st[strings.ToLower(strings.TrimSpace(name))]
+		if s != nil && s.Permanent {
+			continue
+		}
+		if s == nil || !s.OK {
+			// Intentional: nothing is recorded, so the relaunch reads the new build (Sync), as after an
+			// install. Setting OK here would hand the wildcard to the old process before the restart (it may
+			// lack the module: a refused /load pins the namespace off until Mooring restarts), and a failing
+			// Sync of that process could clear OK again with synced already on the new build, leaving the
+			// wildcard off with no read to turn it on.
+			return
+		}
+	}
+	i.synced = id
 }
 
 // markOnDisk records that the next launch's binary has every known provider's module. A Permanent

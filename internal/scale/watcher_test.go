@@ -515,3 +515,53 @@ func pendingInfra(t *testing.T, a *alertstore.Store) int {
 	}
 	return len(rows)
 }
+
+// Pre-existing spam (re-audit): a persistent refusal enqueued scale_refused_no_capacity on every tick, and
+// the dedupe skips only an UNSENT duplicate, so once the notifier delivered the first page each tick paged
+// again (20 ticks, 19 messages). It pages once per episode, resolves when the condition clears, and a
+// restarted Mooring re-adopts the open alert instead of paging again.
+func TestRefusalPagesOncePerEpisode(t *testing.T) {
+	st := testStore(t)
+	enablePolicy(t, st, 6*GiBw)
+	alerts := newAlertStore(t)
+	var snap *monitor.Snapshot
+	var clock int64
+	w := newWatcher(t, st, &snap, &clock, &fakeScaler{}, alerts)
+	var sent []alertstore.OutboxRow
+	run := func(w *Watcher, n int) {
+		for i := 0; i < n; i++ {
+			clock += 100
+			w.Tick(context.Background())
+			rows, _ := alerts.PendingOutbox(100)
+			for _, r := range rows { // the notifier delivers between ticks
+				if p, ok, _ := alerts.PendingAlert(r, false); ok {
+					alerts.FinishAlert(context.Background(), p, true, time.Now())
+				}
+			}
+			sent = append(sent, rows...)
+		}
+	}
+	clock = 1000
+	snap = snapWeb(1, 95, 100<<20, 512<<20, 8*GiBw, 1*GiBw)
+	run(w, 20)
+	if len(sent) != 1 || sent[0].Transition != "firing" {
+		t.Fatalf("20 ticks of a persistent refusal: %d messages %+v, want one page", len(sent), sent)
+	}
+	// Mooring restarts while the refusal holds: no second page.
+	w2 := newWatcher(t, st, &snap, &clock, &fakeScaler{}, alerts)
+	w2.states, _ = st.LoadStates() // what Run does first
+	run(w2, 5)
+	if len(sent) != 1 {
+		t.Fatalf("after a restart the open alert is re-adopted, not paged again: %+v", sent)
+	}
+	snap = snapWeb(1, 5, 100<<20, 512<<20, 8*GiBw, 1*GiBw) // load drops
+	run(w2, 10)
+	if len(sent) != 2 || sent[1].Transition != "resolved" {
+		t.Fatalf("the refusal resolves when load drops: %+v", sent)
+	}
+	snap = snapWeb(1, 95, 100<<20, 512<<20, 8*GiBw, 1*GiBw)
+	run(w2, 10)
+	if len(sent) != 3 || sent[2].Transition != "firing" {
+		t.Fatalf("a new refusal pages again: %+v", sent)
+	}
+}

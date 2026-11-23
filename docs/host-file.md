@@ -138,8 +138,8 @@ alerting:
   enabled: false
   eval_interval: 30s
   notify_min_interval: 5s
-  quiet_start_hour: -1                # -1 disables quiet hours (suppresses WARNING; CRITICAL always pages)
-  quiet_end_hour: -1
+  quiet_start_hour: -1                # 0-23, or -1 to disable quiet hours (holds WARNING until they end; CRITICAL always pages)
+  quiet_end_hour: -1                  # 0-23 (0 = midnight), or -1; any other value turns quiet hours off (logged at startup)
   dead_mans_url: ""                   # outbound heartbeat to an external cron-monitor
   dead_mans_interval: 5m
 
@@ -150,7 +150,8 @@ server:
   version_check_enabled: true         # self-update / security-advisory check (api.github.com only)
   version_check_interval: 6h
   image_scan_enabled: true            # Trivy vulnerability scanning (heavy — turn off on a tiny box)
-  image_scan_interval: 24h
+  image_scan_interval: 24h            # also the host scan's schedule (1h floor)
+  host_scan_enabled: true             # Trivy scan of the host's OS packages + the binaries Mooring runs (Server tab); on by default
   image_update_check_enabled: true    # detect newer images for pull-image services (Server tab); on by default
   image_update_interval: 24h          # how often to re-check the registry (1h floor)
   route_error_log_enabled: true       # the per-route edge error log (Errors tab); on by default
@@ -216,7 +217,7 @@ read right to left (the last address not in `trusted_proxies`); apps receive it 
 These are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
 dashboard listener in external-edge mode.
 
-> **Reload vs. restart.** Most of `config.yaml` — the allowlist, `auth`/`users`, alerting tuning, retention — is picked up by `systemctl reload mooring`. A few things are read only at boot and need a full `systemctl restart` (the GitHub credentials, the bind address, the encryption key, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`). See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
+> **Reload vs. restart.** `systemctl reload mooring` applies the dashboard allowlist (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), `auth`/`users` and `retention.*`. Everything else is read only at boot and needs a full `systemctl restart`, including every `alerting.*` setting (quiet hours, intervals, the heartbeat), the GitHub credentials, the bind address, the encryption key, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`. See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
 
 ## Acknowledging changes
 
