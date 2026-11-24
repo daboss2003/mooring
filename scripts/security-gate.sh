@@ -45,6 +45,13 @@ fuzz internal/opsclient FuzzValidateRelPath
 fuzz internal/web       FuzzSingleXFF
 fuzz internal/web       FuzzConfinedUnder
 fuzz internal/web       FuzzVerifyWebhookSig
+# Security logs: every line an app, the edge or a local user writes is hostile input.
+fuzz internal/siem/query  FuzzParse
+fuzz internal/siem/redact FuzzRedact
+fuzz internal/siem/parse  FuzzAppLine
+fuzz internal/siem/parse  FuzzEdgeAccess
+fuzz internal/siem/parse  FuzzAuthLog
+fuzz internal/siem/parse  FuzzJournal
 
 hr "Phase-1 external static tools (run if installed)"
 if have govulncheck; then run "govulncheck (zero reachable)" govulncheck ./...; else skip govulncheck; fi

@@ -120,7 +120,7 @@ on-disk config file the proxy auto-loads — **the admin API is the single sourc
 
 ### Supervision & capabilities
 
-> **Current isolation (be precise):** the edge is a separate **process**, but today it is **co-resident** in the control-plane systemd unit — it runs as the **same** low-privilege user and shares the unit's cgroup + `MemoryMax` (384 MB, sized to cover Mooring + Caddy + nginx + forked compose). A *dedicated edge user, slice, and per-edge `MemoryMax`* — so a public-plane traffic spike can't pressure the control plane, and the cap is held by the child alone — is a **planned hardening, not yet implemented**.
+> **Current isolation (be precise):** the edge is a separate **process**, but today it is **co-resident** in the control-plane systemd unit — it runs as the **same** low-privilege user and shares the unit's cgroup + `MemoryMax` (1 GB, sized to cover Mooring and its security-log pipeline + Caddy + nginx + forked compose). A *dedicated edge user, slice, and per-edge `MemoryMax`* — so a public-plane traffic spike can't pressure the control plane, and the cap is held by the child alone — is a **planned hardening, not yet implemented**.
 
 - The child runs as the **control plane's** low-privilege user (a dedicated edge user/slice is planned).
 - **`CAP_NET_BIND_SERVICE` is granted by the base unit, by default** (it is the *only* allowed

@@ -43,6 +43,9 @@ type Line struct {
 	Svc  string `json:"svc"`            // service name
 	Copy string `json:"copy,omitempty"` // short (12-char) container id of the replica; "" for a synthetic marker
 	Text string `json:"text"`           // the log line (CR/·control already sanitized upstream)
+	// TS is the line's Docker timestamp, set only on lines handed to Manager's line sink (zero when
+	// Docker gave none). It is not stored: the store keeps At, the capture time.
+	TS time.Time `json:"-"`
 }
 
 const (

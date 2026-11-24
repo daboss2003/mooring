@@ -31,6 +31,9 @@ import (
 	"time"
 )
 
+// ErrNotFound is matched (errors.Is) by the error Get returns for a missing object.
+var ErrNotFound = errors.New("s3: object not found")
+
 // Config describes the target bucket and credentials. UsePathStyle defaults the
 // caller toward path-style URLs (https://endpoint/bucket/key), which every
 // S3-compatible server understands; virtual-host style is secondary.
@@ -75,6 +78,9 @@ func New(cfg Config, hc *http.Client) (*Client, error) {
 		return nil, errors.New("s3: bucket required")
 	case cfg.AccessKeyID == "" || cfg.SecretAccessKey == "":
 		return nil, errors.New("s3: access key and secret key required")
+	case strings.ContainsAny(cfg.Endpoint, "@/?#\\ \t\r\n"):
+		// Credentials or a path in the endpoint would end up in the request URL, and so in errors.
+		return nil, errors.New("s3: endpoint must be host[:port] (no credentials, path or query)")
 	}
 
 	if hc == nil {
@@ -132,9 +138,44 @@ func (c *Client) Put(ctx context.Context, key string, r io.Reader, size int64, c
 	}
 	defer drainClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return responseError("put "+key, resp)
+		return c.responseError("put "+key, resp)
 	}
 	return nil
+}
+
+// Get streams the object at key. The caller must close the body and must bound how much it reads
+// (io.LimitReader): size is the server's Content-Length (-1 when it sent none) and is not checked
+// here. The body is returned exactly as stored (no transparent decompression). A missing object
+// returns an error matching ErrNotFound.
+func (c *Client) Get(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	if key == "" {
+		return nil, 0, errors.New("s3: get: empty key")
+	}
+	u := c.objectURL(key)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("s3: get: %w", err)
+	}
+	req.URL = u
+	c.sign(req, unsignedPayload)
+	// Intentional: set after signing so it stays unsigned (proxies may rewrite it). An explicit
+	// value also stops net/http from asking for gzip and inflating the body behind our back.
+	req.Header.Set("Accept-Encoding", "identity")
+
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("s3: get %q: %w", key, err)
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return resp.Body, resp.ContentLength, nil
+	case http.StatusNotFound:
+		drainClose(resp.Body)
+		return nil, 0, fmt.Errorf("s3: get %q: %w", key, ErrNotFound)
+	default:
+		defer drainClose(resp.Body)
+		return nil, 0, c.responseError("get "+key, resp)
+	}
 }
 
 // Delete removes key. It is idempotent: a 404 (already gone) is not an error.
@@ -159,7 +200,7 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 	case http.StatusOK, http.StatusNoContent, http.StatusNotFound:
 		return nil
 	default:
-		return responseError("delete "+key, resp)
+		return c.responseError("delete "+key, resp)
 	}
 }
 
@@ -167,12 +208,23 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 // can't OOM the box. A full 1000-key page is well under this.
 const maxListPage = 16 << 20
 
+// maxListPages and maxListObjects bound one List call, so an endpoint that keeps answering
+// "truncated" can't make it loop or grow forever. Vars so a test can lower them.
+var (
+	maxListPages   = 4096
+	maxListObjects = 1 << 19
+)
+
 // List returns every object under prefix, following ListObjectsV2 continuation tokens
-// across as many pages as needed. prefix "" lists the whole bucket.
+// across as many pages as needed (at most maxListPages pages and maxListObjects objects; past
+// either, or on a repeated continuation token, it fails). prefix "" lists the whole bucket.
 func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 	var out []Object
 	token := ""
-	for {
+	for page := 0; ; page++ {
+		if page >= maxListPages {
+			return nil, fmt.Errorf("s3: list %q: more than %d pages", prefix, maxListPages)
+		}
 		params := [][2]string{{"list-type", "2"}}
 		if prefix != "" {
 			params = append(params, [2]string{"prefix", prefix})
@@ -197,7 +249,7 @@ func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 		body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxListPage))
 		drainClose(resp.Body)
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("s3: list %q: unexpected status %s: %s", prefix, resp.Status, snippet(body))
+			return nil, fmt.Errorf("s3: list %q: unexpected status %s: %s", prefix, resp.Status, snippet(c.scrub(string(body))))
 		}
 		if rerr != nil {
 			return nil, fmt.Errorf("s3: list %q: read body: %w", prefix, rerr)
@@ -207,10 +259,16 @@ func (c *Client) List(ctx context.Context, prefix string) ([]Object, error) {
 		if err := xml.Unmarshal(body, &lr); err != nil {
 			return nil, fmt.Errorf("s3: list %q: parse: %w", prefix, err)
 		}
+		if len(out)+len(lr.Contents) > maxListObjects {
+			return nil, fmt.Errorf("s3: list %q: more than %d objects", prefix, maxListObjects)
+		}
 		for _, o := range lr.Contents {
 			out = append(out, Object{Key: o.Key, Size: o.Size, LastModified: o.LastModified})
 		}
 		if lr.IsTruncated && lr.NextContinuationToken != "" {
+			if lr.NextContinuationToken == token {
+				return nil, fmt.Errorf("s3: list %q: the server repeated its continuation token", prefix)
+			}
 			token = lr.NextContinuationToken
 			continue
 		}
@@ -303,15 +361,29 @@ func (c *Client) host() string {
 }
 
 // responseError builds an error from a non-success response, including a bounded body
-// snippet (S3 errors are small XML documents). The response body carries no secret.
-func responseError(op string, resp *http.Response) error {
+// snippet (S3 errors are small XML documents), scrubbed of the client's credentials.
+func (c *Client) responseError(op string, resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
-	return fmt.Errorf("s3: %s: unexpected status %s: %s", op, resp.Status, snippet(body))
+	// Intentional: scrub the whole body first; a credential straddling the cut would survive a
+	// scrub of the cut text.
+	return fmt.Errorf("s3: %s: unexpected status %s: %s", op, resp.Status, snippet(c.scrub(string(body))))
+}
+
+// scrub removes the access key id and secret key from text the server sent back. S3 never
+// receives the secret, but a hostile or misconfigured endpoint can echo anything, and the error
+// text reaches logs and the dashboard.
+func (c *Client) scrub(s string) string {
+	for _, cred := range []string{c.cfg.SecretAccessKey, c.cfg.AccessKeyID} {
+		if cred != "" {
+			s = strings.ReplaceAll(s, cred, "[redacted]")
+		}
+	}
+	return s
 }
 
 // snippet trims a body for safe inclusion in an error string.
-func snippet(b []byte) string {
-	s := strings.TrimSpace(string(b))
+func snippet(body string) string {
+	s := strings.TrimSpace(body)
 	if len(s) > 512 {
 		s = s[:512] + "…"
 	}

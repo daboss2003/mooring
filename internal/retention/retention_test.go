@@ -2,6 +2,7 @@ package retention
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -102,6 +103,31 @@ func TestSecurityRowArchivedBeforeDelete(t *testing.T) {
 	}
 	if len(archived) != 1 || archived[0] != "intrusion/security" {
 		t.Errorf("archive = %v, want [intrusion/security]", archived)
+	}
+}
+
+// The archived row keeps the request's User-Agent (events.user_agent, migration 0039).
+func TestSecurityRowArchiveKeepsUserAgent(t *testing.T) {
+	db := newDB(t)
+	dir := t.TempDir()
+	old := time.Now().Add(-400 * 24 * time.Hour).Unix()
+	if _, err := db.Exec(`INSERT INTO events(ts, actor, ip, action, target, outcome, level, detail, user_agent)
+		VALUES(?, 'op', '203.0.113.7', 'login', '', 'deny', 'security', 'invalid password', 'curl/8.5.0')`, old); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(db, quietLog(), dir, defaultCfg()).Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "events-archive.ndjson"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e eventRow
+	if err := json.Unmarshal(bytes.TrimSpace(b), &e); err != nil {
+		t.Fatalf("archive line %q: %v", b, err)
+	}
+	if e.UA != "curl/8.5.0" {
+		t.Errorf("archived UA = %q, want curl/8.5.0", e.UA)
 	}
 }
 

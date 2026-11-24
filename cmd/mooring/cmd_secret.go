@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 
+	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/envimport"
 	"github.com/daboss2003/mooring/internal/envstore"
@@ -117,9 +118,23 @@ func cmdSecretImport(args []string) error {
 		out = append(out, e)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	// Counts only: neither values nor key names go in the audit row.
+	ev := audit.Event{Action: "secret_import", Target: *slug, Outcome: audit.OK,
+		Detail: fmt.Sprintf("%d added, %d changed, %d unchanged, %d applied",
+			len(d.Added), len(d.Changed), len(d.Unchanged), applied)}
+	if n := len(d.Rotations); n > 0 {
+		if *confirmRot {
+			ev.Detail += fmt.Sprintf("; %d rotations confirmed", n)
+		} else {
+			ev.Detail += fmt.Sprintf("; %d rotations held back", n)
+		}
+	}
 	if _, err := es.Save(context.Background(), *slug, out, "cli:secret-import"); err != nil {
+		ev.Outcome, ev.Detail = audit.Error, "store failed"
+		cliAudit(db, ev)
 		return err
 	}
+	cliAudit(db, ev)
 
 	fmt.Printf("imported into %q: %d added, %d changed, %d unchanged (%d applied)\n",
 		*slug, len(d.Added), len(d.Changed), len(d.Unchanged), applied)

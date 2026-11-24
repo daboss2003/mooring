@@ -79,13 +79,14 @@ type Config struct {
 	Git        GitConfig     `yaml:"git"`
 	GitHub     GitHubConfig  `yaml:"github"`
 
-	CaddyEditor       EditorBlock     `yaml:"caddy_editor"`
-	ComposeValidation EditorBlock     `yaml:"compose_validation"`
-	Setup             SetupConfig     `yaml:"setup"`
-	Retention         RetentionConfig `yaml:"retention"`
-	Alerting          AlertingConfig  `yaml:"alerting"`
-	Server            ServerConfig    `yaml:"server"`
-	Backups           BackupConfig    `yaml:"backups"`
+	CaddyEditor       EditorBlock        `yaml:"caddy_editor"`
+	ComposeValidation EditorBlock        `yaml:"compose_validation"`
+	Setup             SetupConfig        `yaml:"setup"`
+	Retention         RetentionConfig    `yaml:"retention"`
+	Alerting          AlertingConfig     `yaml:"alerting"`
+	Server            ServerConfig       `yaml:"server"`
+	Backups           BackupConfig       `yaml:"backups"`
+	SecurityLogs      SecurityLogsConfig `yaml:"security_logs"`
 
 	DataDir string `yaml:"data_dir"`
 
@@ -1171,6 +1172,7 @@ func applyDefaults(c *Config) {
 	if c.Setup.OutputCapKB == 0 {
 		c.Setup.OutputCapKB = 256
 	}
+	c.LoadWarnings = append(c.LoadWarnings, securityLogsWarnings(c.SecurityLogs)...)
 }
 
 // Load reads, parses, and fully validates the config at path. It is the only
@@ -1625,25 +1627,33 @@ func (c *Config) Validate() error {
 			add("backups.enabled requires encryption_key (snapshots are AES-256 encrypted)")
 		}
 		if s := c.Backups.S3; s != nil {
-			if strings.TrimSpace(s.Bucket) == "" {
-				add("backups.s3.bucket is required when backups.s3 is set")
-			}
-			if strings.TrimSpace(s.Region) == "" {
-				add("backups.s3.region is required when backups.s3 is set")
-			}
-			if strings.TrimSpace(s.Endpoint) == "" {
-				add("backups.s3.endpoint is required when backups.s3 is set (e.g. s3.us-east-1.amazonaws.com)")
-			}
-			if strings.TrimSpace(s.AccessKeyID) == "" || strings.TrimSpace(s.SecretAccessKey) == "" {
-				add("backups.s3 requires access_key_id and secret_access_key")
-			}
+			validateS3("backups.s3", s, add)
 		}
 	}
+
+	// --- Security logs (on by default) ---
+	c.validateSecurityLogs(add)
 
 	if len(errs) > 0 {
 		return fmt.Errorf("config: refusing to boot:\n  - %s", strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+// validateS3 checks an S3 destination block named key (backups.s3, security_logs.archive.s3).
+func validateS3(key string, s *BackupS3, add func(string, ...any)) {
+	if strings.TrimSpace(s.Bucket) == "" {
+		add("%s.bucket is required when %s is set", key, key)
+	}
+	if strings.TrimSpace(s.Region) == "" {
+		add("%s.region is required when %s is set", key, key)
+	}
+	if strings.TrimSpace(s.Endpoint) == "" {
+		add("%s.endpoint is required when %s is set (e.g. s3.us-east-1.amazonaws.com)", key, key)
+	}
+	if strings.TrimSpace(s.AccessKeyID) == "" || strings.TrimSpace(s.SecretAccessKey) == "" {
+		add("%s requires access_key_id and secret_access_key", key)
+	}
 }
 
 // Allowlist returns the parsed allowlist prefixes (valid after Validate).

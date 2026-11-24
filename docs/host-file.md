@@ -184,6 +184,24 @@ backups:
   helper_image: "busybox:1.36"
   s3: null                            # optional off-box destination (bucket/endpoint/region/keys/…)
 
+# --- Security logs (on by default) ---  see docs/security-logs.md
+security_logs:
+  enabled: true
+  hot_retention: 14d                  # kept and searchable on this server (1d–90d)
+  hot_max_disk_mb: 10240              # disk for the on-server segments + security.db (minimum 256)
+  archive:
+    retention: 365d                   # archived hours older than this are deleted from S3 (minimum 1d)
+    s3: null                          # optional encrypted off-box copy: the same keys as backups.s3
+  pii:
+    hash_fields: []                   # more field names stored as a keyed hash
+    drop_fields: []                   # more field names removed
+    keep_fields: []                   # names taken out of the built-in lists
+  host_logs:
+    enabled: true
+    auth_log: ""                      # "" = /var/log/auth.log, else /var/log/secure
+    fail2ban_log: ""                  # "" = /var/log/fail2ban.log
+    journal: null                     # null = the journal only when there is no auth log file
+
 # --- Mode-3 setup-script sandbox (off by default, hard-gated) ---
 setup:
   enabled: false
@@ -217,7 +235,13 @@ read right to left (the last address not in `trusted_proxies`); apps receive it 
 These are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
 dashboard listener in external-edge mode.
 
-> **Reload vs. restart.** `systemctl reload mooring` applies the dashboard allowlist (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), `auth`/`users` and `retention.*`. Everything else is read only at boot and needs a full `systemctl restart`, including every `alerting.*` setting (quiet hours, intervals, the heartbeat), the GitHub credentials, the bind address, the encryption key, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`. See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
+> **Reload vs. restart.** `systemctl reload mooring` applies the dashboard allowlist (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), `auth`/`users` and `retention.*`. Everything else is read only at boot and needs a full `systemctl restart`, including every `alerting.*` setting (quiet hours, intervals, the heartbeat), every `security_logs.*` setting, the GitHub credentials, the bind address, the encryption key, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`. See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
+
+### Security logs
+
+`security_logs` is on by default; the keys, their ranges and the `archive.s3` destination are in
+[Security logs](./security-logs.md#configuration). Without `archive.s3`, security logs are kept on
+this server only, and Mooring logs a `config:` warning at startup.
 
 ## Acknowledging changes
 

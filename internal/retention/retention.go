@@ -102,7 +102,7 @@ func (r *Runner) Pass(ctx context.Context) (int, error) {
 	cutoff := time.Now().Add(-cfg.EventsMaxAge).Unix()
 	for {
 		n, err := r.pruneBatch(ctx,
-			`SELECT seq, ts, actor, ip, action, target, outcome, level, detail
+			`SELECT seq, ts, actor, ip, action, target, outcome, level, detail, user_agent
 			   FROM events WHERE ts < ? ORDER BY seq LIMIT ?`,
 			[]any{cutoff, batchSize},
 			func(lastSeq int64) (string, []any) {
@@ -135,7 +135,7 @@ func (r *Runner) Pass(ctx context.Context) (int, error) {
 			lim = batchSize
 		}
 		n, err := r.pruneBatch(ctx,
-			`SELECT seq, ts, actor, ip, action, target, outcome, level, detail
+			`SELECT seq, ts, actor, ip, action, target, outcome, level, detail, user_agent
 			   FROM events ORDER BY seq LIMIT ?`,
 			[]any{lim},
 			func(lastSeq int64) (string, []any) {
@@ -169,6 +169,7 @@ type eventRow struct {
 	Outcome string `json:"outcome"`
 	Level   string `json:"level"`
 	Detail  string `json:"detail"`
+	UA      string `json:"ua,omitempty"`
 }
 
 // pruneBatch reads ONE batch via selectSQL, archives the security rows in it
@@ -183,7 +184,7 @@ func (r *Runner) pruneBatch(ctx context.Context, selectSQL string, selectArgs []
 	var lastSeq int64
 	for rows.Next() {
 		var e eventRow
-		if err := rows.Scan(&e.Seq, &e.TS, &e.Actor, &e.IP, &e.Action, &e.Target, &e.Outcome, &e.Level, &e.Detail); err != nil {
+		if err := rows.Scan(&e.Seq, &e.TS, &e.Actor, &e.IP, &e.Action, &e.Target, &e.Outcome, &e.Level, &e.Detail, &e.UA); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("retention: scan: %w", err)
 		}

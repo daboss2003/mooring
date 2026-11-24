@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/daboss2003/mooring/internal/apitoken"
 	"github.com/daboss2003/mooring/internal/audit"
 )
 
@@ -71,7 +72,7 @@ func (s *Server) handleAPITokenRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.audit.Log(r.Context(), audit.Event{
 		Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "api_token_revoke",
-		Target: id, Outcome: outcome, Level: audit.Security,
+		Target: apitoken.AuditTarget(id), Outcome: outcome, Level: audit.Security,
 	})
 	http.Redirect(w, r, "/settings/api-tokens", http.StatusSeeOther)
 }

@@ -26,6 +26,7 @@ See also: [README](../README.md) · [Configuration / root of trust](./architectu
   - [`secret import`](#mooring-secret-import)
   - [`token mint` / `list` / `revoke`](#mooring-token-mint--list--revoke)
   - [`restore`](#mooring-restore)
+  - [`security-logs fetch` / `verify` / `decrypt`](#mooring-security-logs-fetch--verify--decrypt)
   - [Root-of-trust: `gen-key` / `hash-password` / `gen-totp` / `verify-key`](#root-of-trust-gen-key--hash-password--gen-totp--verify-key)
   - [`version` / `help`](#mooring-version--help)
 - [Exit codes](#exit-codes)
@@ -83,7 +84,7 @@ mooring serving bind=127.0.0.1:9000 edge_mode=managed db=/var/lib/mooring/moorin
 
 - **Purpose:** check and install the host **prerequisites** the managed planes need. The running service is deliberately unprivileged (it can't install packages, edit host DNS, or grant capabilities — a compromised dashboard mustn't either), so these are run by *you* over SSH, as root, once. Linux-only.
 - **Usage:**
-  - `mooring doctor [--l4] [--config PATH]` — **read-only.** Reports each prerequisite (Caddy and its DNS plugins per the Caddy checks below, Docker and the Docker installation checks below, DNS, the state dirs + run dir, that `CAP_NET_BIND_SERVICE` is active, egress reachability, socket-proxy liveness, Docker log rotation; `--l4` adds nginx + the stream module + a `systemd-resolved :53` conflict, or with `edge.mode: external` one skipped `l4` line, since the L4 load balancer runs only with `edge.mode: managed`) and prints the exact fix for anything off. Changes nothing. `--config` (default `/etc/mooring/config.yaml`) is the config the checks read.
+  - `mooring doctor [--l4] [--config PATH]` — **read-only.** Reports each prerequisite (Caddy and its DNS plugins per the Caddy checks below, Docker and the Docker installation checks below, DNS, the state dirs + run dir, that `CAP_NET_BIND_SERVICE` is active, egress reachability, socket-proxy liveness, Docker log rotation, the security-log checks below; `--l4` adds nginx + the stream module + a `systemd-resolved :53` conflict, or with `edge.mode: external` one skipped `l4` line, since the L4 load balancer runs only with `edge.mode: managed`) and prints the exact fix for anything off. Changes nothing. `--config` (default `/etc/mooring/config.yaml`) is the config the checks read.
   - `mooring setup [--l4] [--restart] [--yes] [--config PATH]` — prints a **fix plan** (a dry run); `--yes` applies it (needs root, uses apt). `--l4` includes the L4 prerequisites; `--restart` restarts the mooring service at the end. `--config` (default `/etc/mooring/config.yaml`) is the config setup reads for `edge.mode`, `data_dir`, the `dns01` providers and the settings that need Caddy 2.11.
 - **Caddy checks:** `doctor` checks the Caddy the edge will run: the Mooring-owned build `<data_dir>/bin/caddy` when it exists, otherwise the system `caddy`.
   - `caddy` — missing fails (with `edge.mode: external` it is skipped: Mooring runs no Caddy). Older than 2.11 fails when `edge.trusted_proxies`, any `dns01` namespace or `catch_all` is configured, and is a warning otherwise; for the system `caddy` the fix is `sudo mooring setup --yes`, which upgrades it to Caddy's official release (with `edge.mode: external` no fix is shown: setup doesn't upgrade it). A Mooring-owned build more than 180 days old is a warning with the refresh command: `sudo rm /var/lib/mooring/bin/caddy && sudo mooring setup --yes`.
@@ -94,13 +95,18 @@ mooring serving bind=127.0.0.1:9000 edge_mode=managed db=/var/lib/mooring/moorin
   - `docker installs` — looks for the `docker` CLI in `/usr/bin`, `/usr/local/bin` and `/snap/bin` (symlinks to the same binary count once) and for the Docker snap (`/snap/docker`). Two installations fail, including the snap next to an apt or `/usr/local` install.
   - `daemon match` — compares the daemon ID from the socket-proxy's `GET /info` with `docker info --format '{{.ID}}'`. Different IDs fail: deploys go to one daemon while the dashboard and edge read another. A warning means one side could not be read; run `doctor` as root with the service running. With `docker.external_proxy: true`, a proxy that does not answer `/info` skips the check.
   - Neither command removes a Docker installation. A failure prints the removal commands for the snap and apt installs.
+- **Security-log checks:** only while `security_logs` is on (the default); see [Security logs](./security-logs.md#host-log-access). With `host_logs.enabled: false` only `security archive` and `memory max` run. Without a loadable config the defaults apply and there is no `security archive` line.
+  - `adm group` — the `mooring` user must be in `adm`: a warning otherwise, fix `sudo usermod -aG adm mooring && sudo systemctl restart mooring` (or `sudo mooring setup --yes`). `doctor` also reads the running service's groups (its `MainPID` in `/proc`): a membership added since the service started is a warning, fix `sudo systemctl restart mooring`. Skipped on a host without an `adm` group or a `mooring` user.
+  - `auth log`, `fail2ban log`, `journal` — one line per host log security logs follow: whether the service can read it, from the file's owner, group and mode against the `mooring` user's groups and the unit's `SupplementaryGroups=`. A file readable only through an ACL shows as unreadable. The journal is readable through the `systemd-journal`, `adm` or `wheel` group. A missing auth log is a warning, a missing Fail2Ban log is skipped. An unreadable file's fix is the `adm` membership, or `chgrp adm` + `chmod g+r` on the file; for the auth log also `security_logs.host_logs.journal: true`.
+  - `security archive` — a warning when `security_logs.archive.s3` isn't set (security logs stay on this server only); otherwise the bucket, prefix and retention. The config warning for the same case isn't repeated as a `config` line.
+  - `memory max` — a warning when the loaded unit's `MemoryMax` is below the shipped unit's `1G` (the upgrade's unit isn't loaded, or a drop-in lowers it). Fix: `sudo systemctl daemon-reload && sudo systemctl restart mooring`; `systemctl cat mooring` shows an override.
 - **What `setup --yes` does:**
   - **Edge mode:** the Caddy, Mooring-owned build and nginx steps below, and disabling the `caddy` and `nginx` services, are planned only for the managed edge. With `edge.mode: external` setup installs, upgrades and disables none of them, `--l4` included, and the report has a skipped `edge` line. When there is no file at `--config` (setup runs before the config is written), setup plans for `edge.mode: managed` (the default). When the file exists but doesn't load, setup also leaves them alone and the report has an `edge` warning: fix the file (`sudo mooring doctor` shows the error) and run setup again. The Docker log cap and enabling the mooring service are planned in every mode.
   - **System `caddy`:** when there is none on `PATH` (even when a Mooring-owned build exists: the package is the fallback), adds the Caddy apt repo (key fetched over HTTPS) + installs `caddy`; a failed install stops setup. When it is older than 2.11 (Ubuntu and Debian ship 2.6.2), adds the same repo and upgrades it in place to Caddy's official release, keeping a changed `/etc/caddy/Caddyfile`. If a step of the upgrade fails (apt's lock is held, the repo is unreachable, the package is held) or apt keeps the old version, setup prints a warning, keeps the current `caddy` and goes on with the other steps; run it again once apt is free, or check `apt-cache policy caddy`. When its version can't be read, an existing system `caddy` is left alone.
   - **apt:** every `apt-get` command runs with `DEBIAN_FRONTEND=noninteractive` and `NEEDRESTART_MODE=l` (needrestart lists the services that need a restart; it doesn't prompt or restart them).
   - **Mooring-owned build:** installs a Caddy build from `caddyserver.com` as `<data_dir>/bin/caddy` when a configured `dns01` provider's plugin is missing from the Caddy the edge runs, or when that Caddy is older than 2.11 and a setting needs 2.11 (`edge.trusted_proxies`, a `dns01` namespace, `catch_all`). When the same run upgrades the system `caddy`, the build for 2.11 is installed only if the system `caddy` is still older than 2.11 after the upgrade. Before it is installed, the build must run, be 2.11 or later, have each `dns01` provider's module, and accept the edge's startup config and the edge config rendered from the edge settings in `config.yaml` (`caddy validate`, run as the `mooring` user; without app routes or DNS-01 wildcards). That config includes the issuer of each `edge.cas` CA, so a `trusted_root` the `mooring` user can't read, or that isn't a PEM certificate, fails the check. No certificate is requested and no CA is contacted. If the build fails, setup prints a warning and carries on. Mooring retries a build for a `dns01` plugin at startup; the build for 2.11 alone is retried only by running `sudo mooring setup --yes` again. A build that fails the config check is not installed and the warning carries Caddy's error, with the `dns01` tokens removed: fix that setting in `config.yaml` and run `sudo mooring setup --yes` again.
-  - **The running service:** at the end, setup prints what the running mooring service needs. It was running without an edge because no Caddy was installed: restart it (`sudo systemctl restart mooring`) so the edge starts. A Mooring-owned build was installed: restart it so the edge switches to the build. The running edge used the upgraded system `caddy`: Mooring restarts the edge on it within a few minutes (`sudo systemctl restart mooring` switches at once). `--restart` restarts the service instead.
-  - **Other steps:** with `--l4` installs `nginx` + `libnginx-mod-stream`; disables the **distro** caddy/nginx units (Mooring supervises its own children), including the unit a package installed in the same run brings; **caps Docker's container logs** — it merges `log-opts.max-size` into `/etc/docker/daemon.json` (preserving your other keys, backing up the original) and restarts Docker; and enables the mooring service when it is disabled. (The bind capability + runtime/state dirs are already provided by the unit + postinstall — no drop-in step.)
+  - **The running service:** at the end, setup prints what the running mooring service needs. It was running without an edge because no Caddy was installed: restart it (`sudo systemctl restart mooring`) so the edge starts. A Mooring-owned build was installed: restart it so the edge switches to the build. The running edge used the upgraded system `caddy`: Mooring restarts the edge on it within a few minutes (`sudo systemctl restart mooring` switches at once). It added the `mooring` user to `adm` while the service runs: restart it so the service gets the group. `--restart` restarts the service instead.
+  - **Other steps:** with `--l4` installs `nginx` + `libnginx-mod-stream`; disables the **distro** caddy/nginx units (Mooring supervises its own children), including the unit a package installed in the same run brings; **caps Docker's container logs** — it merges `log-opts.max-size` into `/etc/docker/daemon.json` (preserving your other keys, backing up the original) and restarts Docker; adds the `mooring` user to `adm` (`usermod -aG adm mooring`) when the host has that group, the user isn't in it, and neither `security_logs.enabled` nor `security_logs.host_logs.enabled` is `false`; and enables the mooring service when it is disabled. (The bind capability + runtime/state dirs are already provided by the unit + postinstall — no drop-in step.)
 - **What it will NOT do automatically:** rewrite host DNS / free `:53` (it prints the steps — too easy to lock yourself out). The Docker restart **bounces running containers**, so it's a labelled step in the dry-run plan you review first — run `setup` *before* deploying apps and it disrupts nothing.
 
 ```console
@@ -243,6 +249,78 @@ $ mooring restore --from /var/lib/mooring/backups/2026-06-15.mbk --force
 previous database kept at /var/lib/mooring/mooring.db.pre-restore-1718409600
 restored /var/lib/mooring/mooring.db from /var/lib/mooring/backups/2026-06-15.mbk
 start Mooring again: systemctl start mooring
+```
+
+---
+
+### `mooring security-logs fetch` / `verify` / `decrypt`
+
+Commands for the security-log archive in S3 (`security_logs.archive.s3`, see [Security logs](./security-logs.md)). Each sealed segment (one capture hour of a host's security events, gzip NDJSON) is stored as two objects:
+
+```
+<prefix>v1/YYYY/MM/DD/HH/<box>-<seq>.ndjson.gz.enc   the segment, encrypted with encryption_key
+<prefix>v1/YYYY/MM/DD/HH/<box>-<seq>.seal.json       its seal (JSON)
+```
+
+`YYYY/MM/DD/HH` is the UTC capture hour, `<box>` the name of the host that wrote the segment and `<seq>` the segment's number within that hour (at least 4 digits). Each host writing to the same bucket and prefix needs its own box name: Mooring doesn't overwrite a seal that belongs to another segment, so a segment whose key is already taken is not uploaded (it raises an alert). A seal holds `v`, `name`, `box`, `hour`, `seq`, `n` (the segment's position in its host's seal order: 1, 2, ...), `events`, `first`, `last`, `sha256` (of the decrypted segment), `prev_sha256` (the `sha256` of the segment sealed before it on the same host, `""` for the first), `enc_sha256` and `enc_bytes` (of the `.enc` object), `archived_at` and `mac`. `mac` is an HMAC-SHA256 of all the other fields, keyed from `encryption_key`, so a seal can't be edited without the key. A seal with `"sha256_mismatch": true` belongs to a segment that changed on the host after it was sealed; it is uploaded anyway, and `actual_sha256` is the hash of what was uploaded.
+
+The three commands read the config file (`--config PATH`, default `/etc/mooring/config.yaml`). Run them as root or as the `mooring` user. Flags may come before or after the positional argument. `mooring security-logs help` prints the usage.
+
+#### `mooring security-logs fetch`
+
+- **Purpose:** download the archive objects of a time range, still encrypted.
+- **Usage:** `mooring security-logs fetch --from <time> --to <time> -o <dir> [--config PATH]`
+- **Flags:**
+  - `--from <time>`, `--to <time>` — the range, as RFC 3339 (`2026-11-22T14:00:00Z`) or a UTC date (`2026-11-22`). A date as `--to` includes that whole day. Every segment whose hour overlaps the range is fetched, for every host under the prefix.
+  - `-o <dir>` — where to write (created `0700` when missing). Each object is written as a `0600` file under its key without the prefix: `<dir>/v1/YYYY/MM/DD/HH/<box>-<seq>.…`.
+- **Notes:** keys that don't match the layout are skipped. When any of the files to write already exists, nothing is downloaded. Fails when `security_logs.archive.s3` is not set.
+
+```console
+$ sudo mooring security-logs fetch --from 2026-11-20 --to 2026-11-22 -o ./audit
+fetched 144 object(s) (72 segment(s), 10485760 bytes) to ./audit
+```
+
+#### `mooring security-logs verify`
+
+- **Purpose:** check a directory of downloaded objects (for example one written by `fetch`).
+- **Usage:** `mooring security-logs verify <dir> [--config PATH]`
+- **Checks:**
+  - every `.ndjson.gz.enc` object has its `.seal.json`, and every seal its object;
+  - each seal's `mac` verifies with `encryption_key` or `encryption_key_previous` (a seal without a `mac` is reported as unauthenticated);
+  - each object decrypts with `encryption_key` or `encryption_key_previous`;
+  - the decrypted segment's SHA-256 is the seal's `sha256`, and the object's size and SHA-256 are the seal's `enc_bytes` and `enc_sha256`;
+  - no seal has `sha256_mismatch` set;
+  - each file name and its `YYYY/MM/DD/HH` directories match the seal's `box`, `seq` and `hour`;
+  - per host, the `prev_sha256` links form one chain, with `n` increasing along it: no missing segment, fork, restart or duplicate. Only seals whose `mac` verifies are part of the chain.
+- **Notes:** the directory is read recursively; symlinks are not followed and other files are ignored. When the oldest segment's predecessor is not in the directory (the range starts after the host's first segment), verify prints a `note:` line, not a problem. Missing segments after the newest one in the directory can't be detected. Each problem is printed as a `problem:` line. Exits `1` on any problem, or when the directory holds no seals.
+
+```console
+$ sudo mooring security-logs verify ./audit
+note: box web-1: the chain starts at v1/2026/11/20/00/web-1-0001; the segments before it are not in this directory
+checked 72 segment(s) from 1 host(s) (web-1), 2026-11-20T00:00Z to 2026-11-22T23:00Z: 72 verified
+OK
+
+$ sudo mooring security-logs verify ./audit
+note: box web-1: the chain starts at v1/2026/11/20/00/web-1-0001; the segments before it are not in this directory
+problem: box web-1: segment(s) missing before v1/2026/11/21/10/web-1-0001 (its prev_sha256 3f9a0c1d2e4b is not in this directory)
+checked 71 segment(s) from 1 host(s) (web-1), 2026-11-20T00:00Z to 2026-11-22T23:00Z: 71 verified
+mooring security-logs: 1 problem(s) found
+```
+
+#### `mooring security-logs decrypt`
+
+- **Purpose:** decrypt one archive object to its gzip NDJSON (one event per line).
+- **Usage:** `mooring security-logs decrypt <file.ndjson.gz.enc> [-o out.ndjson.gz] [--config PATH]`
+- **Flags:**
+  - `-o <file>` — the output file (`0600`). Default: the input path without `.enc`. `-` writes to stdout. An existing file is not overwritten.
+- **Notes:** tries `encryption_key`, then `encryption_key_previous` (and prints `decrypted with encryption_key_previous` when that one worked). The whole object is authenticated before anything is written: with a wrong key, or a corrupt or tampered object, the command fails and writes nothing.
+
+```console
+$ sudo mooring security-logs decrypt ./audit/v1/2026/11/21/09/web-1-0001.ndjson.gz.enc
+wrote ./audit/v1/2026/11/21/09/web-1-0001.ndjson.gz (48213 bytes, gzip NDJSON)
+
+$ sudo mooring security-logs decrypt ./audit/v1/2026/11/21/09/web-1-0001.ndjson.gz.enc -o - | gunzip | wc -l
+1342
 ```
 
 ---

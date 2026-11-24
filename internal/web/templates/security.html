@@ -1,0 +1,153 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  {{with .Security}}
+  <h1>Security logs</h1>
+  <p class="muted">Events from your apps, the edge, Mooring and this host, with secrets removed and personal data hashed. Only the owner can search or export them.</p>
+
+  {{if not .On}}
+  <section class="panel">
+    <h2>Security logs are off</h2>
+    <p class="muted">Mooring is not collecting security logs on this host. They are on by default: to turn them back on, set
+      <code>security_logs.enabled: true</code> (or remove the key) in <code>/etc/mooring/config.yaml</code> and restart Mooring.
+      If the key is already on, Mooring's startup log says why collection did not start.</p>
+    <pre class="stream">security_logs:
+  enabled: true</pre>
+    <p class="muted small">Reference: <a href="https://github.com/daboss2003/mooring/blob/main/docs/security-logs.md">docs/security-logs.md</a></p>
+  </section>
+  {{else}}
+  {{with .Status}}{{if .Problem}}<div class="notice notice-warn" role="status">Collection problem: {{.Problem}}. Details are under <a href="#collection">Collection</a>.</div>{{end}}{{end}}
+
+  {{/* data-replace-url: app.js puts this search's URL, with personal data hashed, in the address bar. */}}
+  <form method="get" action="/security" class="toolbar sec-search"{{if .ReplaceURL}} data-replace-url="{{.ReplaceURL}}"{{end}}>
+    <div class="field field-grow">
+      <label for="sec-q">Search</label>
+      <input type="text" id="sec-q" name="q" value="{{.Q}}" placeholder="kind:ssh.login out:failure" autocomplete="off" spellcheck="false" aria-describedby="sec-hint">
+    </div>
+    <div class="field">
+      <label for="sec-range">Range</label>
+      <select id="sec-range" name="range">
+        {{range .Presets}}<option value="{{.Value}}"{{if eq .Value $.Security.Range}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="field">
+      <label for="sec-from">From (UTC)</label>
+      <input type="datetime-local" id="sec-from" name="from" value="{{.From}}" step="1">
+    </div>
+    <div class="field">
+      <label for="sec-to">To (UTC)</label>
+      <input type="datetime-local" id="sec-to" name="to" value="{{.To}}" step="1">
+    </div>
+    <div class="toolbar-actions">
+      <button type="submit" class="btn btn-primary btn-sm">Search</button>
+      <a href="/security" class="btn btn-sm btn-ghost">Reset</a>
+    </div>
+  </form>
+  <div class="sec-hint muted small" id="sec-hint">
+    <p>Examples: <code>kind:ssh.login out:failure</code> <code>ip:203.0.113.0/24</code> <code>src:edge f.status&gt;=500</code> <code>lvl&gt;=warn app:shop</code></p>
+    <p>A term is <code>field:value</code>, or a comparison with <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code> <code>~</code> (contains); a leading <code>-</code> negates it, and other words match the message.
+      From and To override the range. Type emails and device IDs as plain text: they are stored hashed, and the search hashes them the same way.</p>
+  </div>
+
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+
+  {{if .Searched}}
+  <section class="panel">
+    <h2><span>Events</span>
+      <a class="btn btn-sm" href="{{.Export}}" title="Download every match as NDJSON, oldest first, up to 100,000 events">Export NDJSON</a>
+    </h2>
+    <p class="muted small">{{.Window}}. Scanned {{.Scanned}} events. Newest first, {{.PageSize}} per page. Select a row to see the full event.</p>
+    {{if .Capped}}<div class="notice notice-warn">The search stopped early; narrow the range or add terms.</div>{{end}}
+    {{if .Rows}}
+    <div class="table-scroll table-tall">
+      <div class="sec-results">
+        <div class="sec-cols sec-head">
+          <span></span><span>Time (UTC)</span><span>Source</span><span>Level</span><span>Kind</span><span>Outcome</span><span>Actor</span><span>IP</span>
+        </div>
+        {{range .Rows}}
+        <details class="sec-ev">
+          <summary class="sec-cols sec-row">
+            <span class="sec-caret" aria-hidden="true"></span>
+            <span title="{{.ISO}}"><time class="mono" datetime="{{.ISO}}">{{.When}}</time> <span class="muted small">{{.Ago}}</span></span>
+            <span title="{{.Src}}{{if .Where}} {{.Where}}{{end}}"><span class="mono">{{.Src}}</span>{{if .Where}} <span class="muted">·</span> {{.Where}}{{end}}</span>
+            <span><span class="sec-lvl {{.LvlClass}}">{{.Lvl}}</span></span>
+            <span><code class="chip" title="{{.Kind}}">{{.Kind}}</code></span>
+            <span>{{if .Out}}<span class="pill {{.OutClass}}">{{.Out}}</span>{{else}}<span class="muted">—</span>{{end}}</span>
+            <span class="mono" title="{{.Actor}}">{{if .Actor}}{{.Actor}}{{else}}<span class="muted">—</span>{{end}}</span>
+            <span class="mono">{{if .IP}}{{.IP}}{{else}}<span class="muted">—</span>{{end}}</span>
+            {{if .Msg}}<span class="sec-msg">{{.Msg}}</span>{{end}}
+          </summary>
+          <pre class="stream sec-json">{{.JSON}}</pre>
+        </details>
+        {{end}}
+      </div>
+    </div>
+    {{else}}
+    <p class="muted sec-empty">{{if .Capped}}No match in the events searched before the search stopped.{{else}}No events match this search in the selected time range.{{end}}</p>
+    {{end}}
+    {{if .OlderURL}}<p class="mt1"><a class="btn btn-sm btn-ghost" href="{{.OlderURL}}">Show older events</a></p>{{end}}
+  </section>
+  {{end}}
+
+  {{/* Live refresh: the collection status reloads every 15 seconds. */}}
+  <div data-poll-url="/security/status" data-poll-interval="15000">
+    {{template "securitystatus" $}}
+  </div>
+  {{end}}
+  {{end}}
+</main>
+{{template "bottom" .}}
+
+{{/* The collection status: rendered inline AND returned by /security/status for the live refresh. */}}
+{{define "securitystatus"}}{{with .Security}}
+{{if not .On}}
+<section class="panel" id="collection">
+  <h2>Collection</h2>
+  <p class="muted">Security logs are off.</p>
+</section>
+{{else}}{{with .Status}}
+<section class="panel" id="collection">
+  <h2><span>Collection</span> <span class="muted small">Updates every 15 seconds</span></h2>
+  {{if not .Enabled}}<div class="notice notice-warn">Collection is stopped. Search covers the events already on this host.</div>{{end}}
+  <div class="stat-grid sec-stats">
+    <div class="stat-card{{if .QueueHigh}} is-warn{{end}}">
+      <div class="stat-label">Queue</div>
+      <div class="stat-value sec-stat-value">{{.Queue}}</div>
+      <div class="stat-sub">Events waiting to be stored</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Stored on this host</div>
+      <div class="stat-value sec-stat-value">{{.Disk}}</div>
+      <div class="stat-sub">{{.Segments}} segments</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Oldest event kept</div>
+      <div class="stat-value sec-stat-value">{{if .Oldest}}{{.Oldest}}{{else}}None yet{{end}}</div>
+      <div class="stat-sub">{{if .Oldest}}UTC, {{.OldestAgo}}{{else}}Events appear as sources report them{{end}}</div>
+    </div>
+    <div class="stat-card{{if .ArchiveErr}} is-down{{else if not .ArchiveOn}} is-wait{{end}}">
+      <div class="stat-label">S3 archive</div>
+      <div class="stat-value sec-stat-value">{{if .ArchiveOn}}On{{else}}Off{{end}}</div>
+      <div class="stat-sub">{{if .ArchiveOn}}{{if .LastArchived}}Last upload {{.LastArchived}}{{else}}No upload yet{{end}}, {{.ArchiveBehind}} behind{{else}}Set <code>security_logs.archive.s3</code> to keep a copy off this host{{end}}</div>
+    </div>
+  </div>
+  {{if .ArchiveErr}}<div class="error" role="alert">The last archive upload failed: {{.ArchiveErr}}</div>{{end}}
+  <div class="table-scroll"><table class="grid">
+    <thead><tr><th>Source</th><th>State</th><th class="num">Events</th><th class="num">Dropped</th><th>Last event (UTC)</th></tr></thead>
+    <tbody>
+      {{range .Sources}}
+      <tr>
+        <td class="mono">{{.Name}}</td>
+        <td class="wrap-cell">{{if .OK}}<span class="pill pill-ok">Collecting</span>{{else}}<span class="pill pill-down">Not collecting</span>{{if .Err}} <span class="sec-src-err">{{.Err}}</span>{{end}}{{end}}</td>
+        <td class="num">{{.Events}}</td>
+        <td class="num{{if .HasDropped}} sec-dropped{{end}}">{{.Dropped}}</td>
+        <td class="mono">{{if .LastSeen}}{{.LastSeen}} <span class="muted">{{.Ago}}</span>{{else}}<span class="muted">No events yet</span>{{end}}</td>
+      </tr>
+      {{else}}
+      <tr><td colspan="5" class="empty">No sources have reported yet.</td></tr>
+      {{end}}
+    </tbody>
+  </table></div>
+</section>
+{{end}}{{end}}
+{{end}}{{end}}

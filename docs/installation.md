@@ -114,7 +114,9 @@ Fedora / RHEL: the same release has `mooring_<version>_linux_<arch>.rpm`
 
 The package creates the `mooring` service user, its folders (`/etc/mooring`, `/var/lib/mooring`,
 `/var/lib/mooring-apps`, `/var/lib/caddy`), a config template, and the systemd service. It does
-**not** start the service: that happens in Step 8, once the config exists.
+**not** start the service: that happens in Step 8, once the config exists. The service user is also
+added to the `adm` group, which lets [security logs](./security-logs.md) (on by default) read the
+host's auth and Fail2Ban logs.
 
 **Check:** `mooring version` prints a version, and `systemctl list-unit-files mooring.service`
 shows the service (disabled for now).
@@ -492,6 +494,7 @@ sudo install -m 0755 mooring /usr/local/bin/mooring     # the path the unit runs
 sudo groupadd --system mooring
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin --gid mooring mooring
 sudo usermod -aG docker mooring
+sudo usermod -aG adm mooring             # security logs read the host's auth and Fail2Ban logs
 sudo install -d -o root    -g mooring -m 0750 /etc/mooring
 sudo install -d -o mooring -g mooring -m 0700 /var/lib/mooring
 sudo install -d -o mooring -g mooring -m 0700 /var/lib/mooring-apps

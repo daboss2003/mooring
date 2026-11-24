@@ -32,6 +32,9 @@ Disaster recovery:
   restore          Restore Mooring's database from an encrypted backup archive
                    (.mbk). Run with the service stopped; needs the same master key.
 
+Security logs (the encrypted S3 archive):
+  security-logs    fetch, decrypt and verify archived security-log segments.
+
 Scoped machine API tokens (§17.1 — minted ONLY here, never from the web):
   token mint       Mint a scoped, CIDR-bound, expiring bearer token (shown once).
   token list       List tokens (id, state, expiry, scopes — never the secret).
@@ -79,6 +82,8 @@ func main() {
 		err = cmdRestore(args)
 	case "restore-volume":
 		err = cmdRestoreVolume(args)
+	case "security-logs":
+		err = cmdSecurityLogs(args)
 	case "gen-key":
 		err = cmdGenKey(args)
 	case "hash-password":

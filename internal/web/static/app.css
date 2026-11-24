@@ -246,6 +246,7 @@ details.accordion > summary:hover { color: var(--primary); }
 .table-tall { max-height: 72vh; overflow-y: auto; }
 .table-tall thead th { position: sticky; top: 0; z-index: 1; background: var(--surface-2); box-shadow: inset 0 -1px 0 var(--border); }
 .grid td.empty { text-align: center; color: var(--muted); padding: 2.5rem 0.8rem; }
+.grid td.num, .grid th.num { text-align: right; font-variant-numeric: tabular-nums; }
 /* a compact inline token for an action/identifier in a dense table */
 .chip { display: inline-block; padding: 0.1rem 0.45rem; border-radius: 6px; background: var(--surface-2);
   border: 1px solid var(--border); color: var(--fg); font-size: 0.82em; white-space: nowrap; }
@@ -273,6 +274,7 @@ details.accordion > summary:hover { color: var(--primary); }
   border-radius: var(--radius-md); padding: 0.7rem 0.95rem; margin: 0.9rem 0; color: var(--muted); font-size: 0.9rem;
 }
 .notice code { color: var(--fg); }
+.notice-warn { border-left-color: var(--warn); }
 
 /* Service-health grid (overview) — a prominent, live health panel: one cell per service,
    coloured by its container HEALTHCHECK state. Updates in place via the polled fragment. */
@@ -358,6 +360,47 @@ details.accordion > summary .badge { margin-left: 0.4rem; }
 .ovl-foot { padding: 0 0.9rem 0.9rem; }
 .ovl-box .stream { margin: 0.55rem 0.9rem 0.9rem; flex: 1 1 auto; min-height: 0; max-height: none; overflow: auto; }
 
+/* Security logs: each event is a native <details> whose <summary> is a grid row (no JS): the fields on
+   one line and the message on its own line below; opening it shows the full event JSON. The list
+   scrolls horizontally inside .table-scroll on narrow screens. */
+.sec-hint { margin: -0.4rem 0 1rem; }
+.sec-hint p { margin: 0 0 0.3rem; }
+.sec-hint code { display: inline-block; margin: 0.1rem 0.15rem 0.1rem 0; padding: 0.05rem 0.4rem; border-radius: 6px;
+  background: var(--surface-2); border: 1px solid var(--border); color: var(--fg); }
+.sec-results { min-width: 48rem; font-size: 0.86rem; }
+/* Columns shrink to their minimum before the list scrolls sideways; on a wide screen they reach their
+   maximum and the actor takes the rest. */
+.sec-cols { display: grid; align-items: center; gap: 0.1rem 0.6rem;
+  grid-template-columns: 0.75rem minmax(9.5rem, 10.5rem) minmax(5rem, 10rem) 4.5rem minmax(6rem, 12rem) 5.25rem minmax(5rem, 1fr) minmax(6.5rem, 10rem); }
+.sec-cols > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sec-cols > .sec-msg { grid-column: 2 / -1; }
+.sec-head { position: sticky; top: 0; z-index: 1; padding: 0.55rem 0.6rem; background: var(--surface-2);
+  box-shadow: inset 0 -1px 0 var(--border);
+  color: var(--muted); font-weight: 600; font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.sec-ev { border-bottom: 1px solid var(--border); }
+.sec-ev:last-child { border-bottom: 0; }
+.sec-row { padding: 0.5rem 0.6rem; cursor: pointer; list-style: none; border-radius: 6px; }
+.sec-row::-webkit-details-marker { display: none; }
+.sec-row:hover { background: rgba(255,255,255,0.03); }
+.sec-row:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
+.sec-ev[open] > .sec-row { background: var(--surface-2); }
+.sec-caret::before { content: "\25B8"; display: inline-block; color: var(--faint); transition: transform .12s ease; }
+.sec-ev[open] .sec-caret::before { transform: rotate(90deg); color: var(--fg); }
+.sec-msg { color: #cbd5e1; }
+.sec-json { margin: 0.4rem 0.6rem 0.9rem; max-height: 28rem; }
+.sec-empty { margin: 1.5rem 0 0.5rem; text-align: center; }
+.sec-lvl { display: inline-block; padding: 0.05rem 0.45rem; border-radius: 6px; font-size: 0.74rem; font-weight: 600;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
+.sec-lvl-debug { color: var(--faint); }
+.sec-lvl-warn { color: var(--warn); background: rgba(251,191,36,.12); border-color: rgba(251,191,36,.35); }
+.sec-lvl-error { color: var(--error); background: rgba(248,113,113,.12); border-color: rgba(248,113,113,.35); }
+.sec-lvl-critical { color: #fff; background: rgba(248,113,113,.4); border-color: rgba(248,113,113,.6); }
+.sec-stats { margin: 0.2rem 0 1rem; }
+.sec-stats .stat-value.sec-stat-value { font-size: 1.25rem; }
+.sec-stats .stat-sub code { color: var(--fg); }
+.sec-src-err { color: #fca5a5; font-size: 0.84rem; }
+.sec-dropped { color: var(--warn); font-weight: 600; }
+
 /* ============================= buttons ============================= */
 .btn, button[type=submit] {
   display: inline-flex; align-items: center; gap: 0.4rem; cursor: pointer; font: inherit;
@@ -410,10 +453,11 @@ dialog.modal form { padding: 1.4rem 1.5rem; max-width: none; }
 .row label { margin-bottom: 0; }
 label { display: grid; gap: 0.35rem; font-size: 0.86rem; font-weight: 500; color: #cbd5e1; margin-bottom: 0.2rem; }
 .check label { margin: 0; font-weight: 400; }
-input[type=text], input[type=password], input[type=number], input[type=email], input[type=url], select, textarea {
+input[type=text], input[type=password], input[type=number], input[type=email], input[type=url], input[type=datetime-local], select, textarea {
   padding: 0.55rem 0.75rem; border-radius: var(--radius-md); border: 1px solid var(--border-2);
   background: var(--bg-2); color: var(--fg); font: inherit; width: 100%;
 }
+input[type=datetime-local] { color-scheme: dark; min-width: 13.5rem; }
 input.w-num { width: 6rem; }
 input.w-num-lg { width: 8rem; }
 input[type=checkbox], input[type=radio] { width: auto; accent-color: var(--primary); }

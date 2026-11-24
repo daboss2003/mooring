@@ -25,8 +25,8 @@ edge:
   acme_ca: "https://acme-v02.api.letsencrypt.org/directory"   # required in managed mode
   # Optional: own a managed L4 (TCP/UDP) load balancer for non-HTTP stream services
   # (DNS 53, DoT 853, MQTTS 8883) so they can run as an auto-scaled internal replica
-  # pool. Requires nginx installed on the host + the privileged-ports systemd drop-in
-  # (see /usr/share/mooring/systemd/). Off by default.
+  # pool. Requires nginx and its stream module on the host (sudo mooring setup --l4 --yes).
+  # Off by default.
   # l4_enabled: true
   # l4_nginx_digest: ""               # optional SHA-256 pin of the nginx binary
 
@@ -42,3 +42,32 @@ data_dir: "/var/lib/mooring"
 #   version_check_enabled: false      # stop checking GitHub for Mooring updates + advisories
 #   image_scan_enabled: false         # stop the Trivy scan of your apps' images (it's a bit heavy)
 #   host_scan_enabled: false          # stop the Trivy scan of this server's packages and binaries
+
+# Security logs collect app output, the edge's access log, Mooring's audit events and the
+# host's sshd/sudo/su/Fail2Ban logs, with secrets and personal data removed. ON by default:
+# 14 days are kept on this server; set archive.s3 to also keep an encrypted copy off it.
+# Shown with the defaults. See docs/security-logs.md.
+# security_logs:
+#   enabled: true                     # false turns collection off
+#   hot_retention: 14d                # kept and searchable on this server (1d–90d)
+#   hot_max_disk_mb: 10240            # disk for the on-server copy (minimum 256)
+#   archive:
+#     retention: 365d                 # archived hours older than this are deleted (minimum 1d)
+#     s3:                             # no default: without it nothing leaves this server
+#       bucket: "my-security-logs"
+#       endpoint: "s3.eu-west-1.amazonaws.com"
+#       region: "eu-west-1"
+#       access_key_id: "<access key id>"
+#       secret_access_key: "<secret access key>"
+#       prefix: "mooring/"            # optional; letters, digits, / - _ . and a trailing /
+#       path_style: true
+#       insecure: false               # true allows plain http:// (a private MinIO)
+#   pii:
+#     hash_fields: []                 # more field names stored as a keyed hash
+#     drop_fields: []                 # more field names removed
+#     keep_fields: []                 # names taken out of the built-in lists
+#   host_logs:
+#     enabled: true                   # false: no host logs
+#     auth_log: ""                    # "" = /var/log/auth.log, else /var/log/secure
+#     fail2ban_log: ""                # "" = /var/log/fail2ban.log
+#     journal:                        # unset = the journal only when there is no auth log file

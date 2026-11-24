@@ -589,6 +589,18 @@
     });
   })();
 
+  // ---- Security logs: personal data stays out of the address bar ----
+  // After a search with an email or device ID, the page renders the same search's URL with those
+  // values as their stored hashes; put it in the address bar (history, bookmarks, Referer) without
+  // reloading. Same-origin paths only.
+  (function replaceSearchURL() {
+    var el = document.querySelector("[data-replace-url]");
+    if (!el || !window.history || !history.replaceState) return;
+    var u = el.getAttribute("data-replace-url") || "";
+    if (u.charAt(0) !== "/" || u.charAt(1) === "/") return;
+    try { history.replaceState(history.state, "", u); } catch (_) { /* the links already carry it */ }
+  })();
+
   (function setTopbarTitle() {
     var h1 = document.querySelector("main.wrap h1");
     var tt = document.querySelector("[data-page-title]");

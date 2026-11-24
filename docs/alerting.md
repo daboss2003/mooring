@@ -33,6 +33,7 @@ Everything else is managed in the dashboard — no files or config to hand-edit.
 - **The platform** — crashed or out-of-memory containers, a restart storm, low memory headroom, a full disk.
 - **The edge** — a namespace with a [catch-all route](./edge-and-tls.md#catch-all-routes) whose wildcard certificate isn't served raises a critical `edge_catchall_dark` alert naming the namespace and the cause; it resolves when the certificate is served again.
 - **Host and edge maintenance** — host vulnerabilities, a pending reboot, the supervised Caddy or L4 nginx running replaced files, and refreshes of the Mooring-owned Caddy build (see below).
+- **Security logs** — uploads of the [security-log archive](./security-logs.md#s3-archive) to S3 failing (see below).
 
 ### Host and edge maintenance alerts
 
@@ -46,6 +47,9 @@ Mooring raises these on its own. They need no rule and go to every enabled chann
 | `edge_child_stale` | `warning` | `caddy` or `nginx-l4` | The supervised Caddy or L4 nginx still runs replaced files and Mooring did not restart it: the new files failed the start check, or it was already restarted automatically in the last 30 minutes. |
 | `caddy_build_refreshed` | `warning` | `caddy` | With `edge.mode: managed`, the host scan found a finding with a fixed version in the Mooring-owned Caddy build (`<data_dir>/bin/caddy`), and Mooring downloaded, verified and swapped in a current build, then restarted the edge. The previous build is kept as `bin/caddy.bak`. A download whose Go build info equals the installed build is not swapped and sends no alert (it is logged). At most one download every 20 hours. |
 | `caddy_build_refresh_failed` | `warning` | `caddy` | That refresh failed (download or verification), or downloaded nothing because Caddy still refuses the edge config that held the last build back; the installed build keeps running. At most one alert a day. |
+| `security_log_archive_failed` | `warning` | `security-logs` | Uploads of [security logs](./security-logs.md#s3-archive) to `security_logs.archive.s3` have failed for an hour, or 6 sealed segments are waiting to be uploaded. Gives the number waiting, since when uploads have failed, and the last error. Resolved when an upload works again. |
+| `security_log_segment_changed` | `critical` | `security-logs` | A sealed [security-log](./security-logs.md#s3-archive) segment changed on the server before it was uploaded (its SHA-256 no longer matches the one recorded when it was sealed; it is uploaded flagged `sha256_mismatch`), or its archive key already holds another segment's seal (it is not uploaded; see [Archive seals](./security-logs.md#archive-seals)). One alert per segment, never resolved. |
+| `security_logs_not_running` | `warning` | `security-logs` | Security logs are turned on but couldn't start (for example the security database can't be opened), so nothing is collected. Gives the error. Resolved by the next start that works. |
 
 Each of these is sent once per condition while Mooring runs; after a restart a condition that still holds is sent once more.
 

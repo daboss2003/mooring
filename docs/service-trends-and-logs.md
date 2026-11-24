@@ -64,8 +64,11 @@ logs around that entry's timestamp.
 The list updates live (every few seconds) unless you opened it from an Errors entry, which shows a
 fixed window around that request's time instead.
 
-Capture begins when a service starts running. All copies of a service share one history. A service
-accepts up to 200 lines per second; lines beyond that are dropped and replaced with a
+Capture begins when a service starts running. When a copy restarts, or Mooring itself is stopped and
+started again, capture resumes after the copy's last captured line: output written in between is read
+back, at most the copy's last 1000 lines. A copy not seen running for 24 hours starts over from the
+time Mooring started. All copies of a service share one history. A service accepts up to 200 lines per
+second, lines read back included; lines beyond that are dropped and replaced with a
 `… N line(s) dropped` marker. Lines longer than 8 KiB are cut.
 
 For comparison, the live **View logs** tail shows roughly the last 300 lines from Docker and then
@@ -108,6 +111,9 @@ Storage:
 
 - Captured lines are stored under `<data_dir>/service-logs/<app>/<service>/` as JSONL files, separate
   from Mooring's database. Lines are written to disk every 30 seconds, or sooner for a busy service.
+- Each copy's position (the time of its last captured line) is kept in `<data_dir>/log-cursors.json`,
+  written within 10 seconds of a change and at shutdown. If Mooring stops without writing it, up to
+  10 seconds of output can be captured twice.
 - Old lines are removed a file at a time, so a service can briefly hold somewhat more than its limits
   on disk; search never shows lines outside the service's window or line cap.
 - When all captured logs together exceed `service_log_max_disk_mb`, the oldest files are removed

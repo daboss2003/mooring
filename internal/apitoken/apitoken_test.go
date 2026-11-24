@@ -163,3 +163,29 @@ func TestCIDRUnionOnlyActive(t *testing.T) {
 		t.Errorf("union must contain ONLY active tokens' CIDRs, got %v", union)
 	}
 }
+
+// AuditTarget never returns a token's secret: an id stays, a whole pasted token keeps only its id,
+// anything else is dropped.
+func TestAuditTargetNeverKeepsASecret(t *testing.T) {
+	m, err := Mint([]string{"status:read"}, []string{"203.0.113.0/24"}, time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := m.Record.ID
+	_, secret, _ := SplitBearer(m.Plaintext)
+	for _, tc := range []struct{ in, want string }{
+		{id, id},
+		{m.Plaintext, id},
+		{"  " + m.Plaintext + "\n", id},
+		{"not an id; " + secret, ""},
+		{"", ""},
+	} {
+		got := AuditTarget(tc.in)
+		if got != tc.want {
+			t.Errorf("AuditTarget(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+		if secret != "" && strings.Contains(got, secret) {
+			t.Errorf("AuditTarget(%q) kept the secret", tc.in)
+		}
+	}
+}

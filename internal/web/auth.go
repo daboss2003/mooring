@@ -10,7 +10,7 @@ import (
 	"github.com/daboss2003/mooring/internal/crypto"
 )
 
-// totpLastStepKey holds the last consumed TOTP time step (single-operator), so a
+// totpLastStepKey + ":" + username holds that user's last consumed TOTP time step, so a
 // code cannot be replayed within its validity window (review #4).
 const totpLastStepKey = "auth_totp_last_step"
 
@@ -44,7 +44,7 @@ func (s *Server) requirePerm(perm string, next http.HandlerFunc) http.HandlerFun
 			_ = s.audit.Log(r.Context(), audit.Event{
 				Actor: user, IP: ClientIP(r.Context()).String(), Action: "rbac_deny",
 				Target: r.Method + " " + r.URL.Path, Outcome: audit.Deny, Level: audit.Security,
-				Detail: "role lacks '" + perm + "'",
+				Detail: "role lacks '" + perm + "'", UA: r.UserAgent(),
 			})
 			http.Error(w, "forbidden — your role can't perform this action", http.StatusForbidden)
 			return
@@ -62,7 +62,8 @@ func (s *Server) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	// The UA rides on ctx so the lockout event recordFailure may write carries it too.
+	ctx := audit.WithUserAgent(r.Context(), r.UserAgent())
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
@@ -78,7 +79,7 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	if s.locked(ctx, peer, username) {
 		_ = s.audit.Log(ctx, audit.Event{
 			Actor: username, IP: peer, Action: "login", Outcome: audit.Deny,
-			Level: audit.Security, Detail: "locked out",
+			Level: audit.Security, Detail: "locked out", UA: r.UserAgent(),
 		})
 		s.renderLogin(w, r, "Too many attempts. Try again later.")
 		return
@@ -105,18 +106,33 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	pwOK, _ := crypto.VerifyPassword(hashToCheck, []byte(password))
 	<-s.verifySem
 	ok := userMatch && pwOK
+	why := "invalid password"
+	if !userMatch {
+		why = "unknown user"
+	}
 
 	// TOTP, when configured. Only checked when the password already matched (&&
 	// short-circuits), so an attacker without the password can't burn the watermark.
 	if ok {
-		ok = s.verifyTOTPOnce(ctx, username, totp)
+		switch s.checkTOTPOnce(ctx, username, totp) {
+		case totpPassed:
+		case totpReplayed:
+			ok, why = false, "TOTP code already used"
+		case totpCheckFailed:
+			ok, why = false, "TOTP check failed"
+		default:
+			ok, why = false, "invalid TOTP code"
+		}
 	}
 
 	if !ok {
 		s.recordFailure(ctx, peer, username)
+		// Intentional: the audit row says which check failed (so the SIEM can tell a guessed
+		// password from a stolen one missing its second factor); the response is the same for
+		// every reason, so it confirms neither a username nor a password.
 		_ = s.audit.Log(ctx, audit.Event{
 			Actor: username, IP: peer, Action: "login", Outcome: audit.Deny,
-			Level: audit.Security, Detail: "invalid credentials",
+			Level: audit.Security, Detail: why, UA: r.UserAgent(),
 		})
 		s.renderLogin(w, r, "Invalid credentials.")
 		return
@@ -132,9 +148,20 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 	s.setSessionCookie(w, rawID)
 	_ = s.audit.Log(ctx, audit.Event{
 		Actor: username, IP: peer, Action: "login", Outcome: audit.OK, Level: audit.Security,
+		UA: r.UserAgent(),
 	})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
+
+// totpResult is the outcome of checkTOTPOnce.
+type totpResult int
+
+const (
+	totpPassed      totpResult = iota // the code was valid and unused, or the user has no 2FA
+	totpWrong                         // unknown user, or a missing, malformed or wrong code
+	totpReplayed                      // a valid code whose step (or a later one) was already used
+	totpCheckFailed                   // the watermark write failed
+)
 
 // verifyTOTPOnce validates a TOTP code against the configured secret and atomically
 // advances the single-use watermark so the same code can't be replayed within its
@@ -143,17 +170,22 @@ func (s *Server) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 // skew (plan §5.9). Callers must gate this behind a prior password match (&&-short-
 // circuit) so an attacker without the password can't burn the watermark.
 func (s *Server) verifyTOTPOnce(ctx context.Context, username, code string) bool {
+	return s.checkTOTPOnce(ctx, username, code) == totpPassed
+}
+
+// checkTOTPOnce is verifyTOTPOnce reporting why a code was refused (for the audit row only).
+func (s *Server) checkTOTPOnce(ctx context.Context, username, code string) totpResult {
 	sec := s.security()
 	u, ok := sec.user(username)
 	if !ok {
-		return false // unknown user — fail closed
+		return totpWrong // unknown user — fail closed
 	}
 	if u.totpSecret == "" {
-		return true // 2FA not configured for this user
+		return totpPassed // 2FA not configured for this user
 	}
 	step, vok := crypto.ValidateTOTPStep(u.totpSecret, code, time.Now(), 1)
 	if !vok {
-		return false
+		return totpWrong
 	}
 	// The single-use watermark is PER USER (a code is one secret's; one user's login must not
 	// burn another's watermark within the same 30s step).
@@ -162,10 +194,12 @@ func (s *Server) verifyTOTPOnce(ctx context.Context, username, code string) bool
 		 ON CONFLICT(key) DO UPDATE SET value = @s WHERE CAST(value AS INTEGER) < @s`,
 		sql.Named("k", totpLastStepKey+":"+username), sql.Named("s", int64(step)))
 	if err != nil {
-		return false
+		return totpCheckFailed
 	}
-	n, _ := res.RowsAffected()
-	return n == 1 // n==0 → already consumed (replay)
+	if n, _ := res.RowsAffected(); n != 1 {
+		return totpReplayed // n==0 → already consumed (replay)
+	}
+	return totpPassed
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +211,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if sess := SessionFrom(ctx); sess != nil {
 		_ = s.audit.Log(ctx, audit.Event{
 			Actor: sess.Username, IP: ClientIP(ctx).String(), Action: "logout", Outcome: audit.OK,
+			UA: r.UserAgent(),
 		})
 	}
 	http.Redirect(w, r, "/login", http.StatusSeeOther)

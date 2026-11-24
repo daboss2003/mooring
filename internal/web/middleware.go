@@ -7,6 +7,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/session"
 )
 
@@ -94,7 +95,8 @@ func (s *Server) allowlistMiddleware(next http.Handler) http.Handler {
 			}
 		}
 
-		r = r.WithContext(withClientIP(r.Context(), client))
+		// The User-Agent rides in the context so every audit event of this request records it.
+		r = r.WithContext(audit.WithUserAgent(withClientIP(r.Context(), client), r.UserAgent()))
 		next.ServeHTTP(w, r)
 	})
 }

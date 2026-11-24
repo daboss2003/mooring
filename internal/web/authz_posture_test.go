@@ -45,14 +45,23 @@ var csrfExempt = map[string]bool{
 
 var mutatingVerb = map[string]bool{"POST": true, "PUT": true, "PATCH": true, "DELETE": true}
 
+// ownerOnly are the routes only the owner role may use (requirePerm("admin")), GETs included:
+// security-log search, status and export. Every route under /security must be listed here.
+var ownerOnly = map[string]bool{
+	"GET /security":        true,
+	"GET /security/status": true,
+	"GET /security/export": true,
+}
+
 type routeReg struct {
 	key      string // "VERB /pattern"
 	verb     string
 	pattern  string
 	hasAuth  bool
 	hasCSRF  bool
-	hasToken bool // wrapped in requireToken (the bearer-API auth gate)
-	isHandle bool // mux.Handle (raw handler) vs mux.HandleFunc
+	hasToken bool     // wrapped in requireToken (the bearer-API auth gate)
+	isHandle bool     // mux.Handle (raw handler) vs mux.HandleFunc
+	perms    []string // the literal capability of every requirePerm in the chain
 }
 
 // extractRoutes parses server.go and returns every mux route registration in
@@ -116,6 +125,13 @@ func extractRoutesFromFile(f *ast.File, fset *token.FileSet) []routeReg {
 		}
 		r := routeReg{key: key, verb: parts[0], pattern: parts[1], isHandle: sel.Sel.Name == "Handle"}
 		ast.Inspect(call.Args[1], func(m ast.Node) bool {
+			if c, ok := m.(*ast.CallExpr); ok {
+				if s, ok := c.Fun.(*ast.SelectorExpr); ok && s.Sel.Name == "requirePerm" && len(c.Args) > 0 {
+					if lit, ok := c.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						r.perms = append(r.perms, strings.Trim(lit.Value, "`\""))
+					}
+				}
+			}
 			if s, ok := m.(*ast.SelectorExpr); ok {
 				switch s.Sel.Name {
 				case "requireAuth", "requirePerm":
@@ -154,6 +170,68 @@ func TestRoutePostureFromTable(t *testing.T) {
 		if authExempt[r.key] && authed {
 			t.Errorf("AUTHZ: %q is in the auth-exempt allowlist but wires an auth gate (remove one)", r.key)
 		}
+	}
+}
+
+func hasPerm(r routeReg, perm string) bool {
+	for _, p := range r.perms {
+		if p == perm {
+			return true
+		}
+	}
+	return false
+}
+
+// ownerOnlyViolations is the owner-only rule: a listed route must carry requirePerm("admin"), and a
+// route under /security must be listed (so a new one can't ship on plain requireAuth).
+func ownerOnlyViolations(routes []routeReg) []string {
+	var bad []string
+	for _, r := range routes {
+		if ownerOnly[r.key] && !hasPerm(r, "admin") {
+			bad = append(bad, r.key+` is owner-only but not wrapped in requirePerm("admin")`)
+		}
+		if strings.HasPrefix(r.pattern, "/security") && !ownerOnly[r.key] {
+			bad = append(bad, r.key+" is under /security but not in ownerOnly")
+		}
+	}
+	return bad
+}
+
+func TestOwnerOnlyRoutesRequireAdmin(t *testing.T) {
+	routes := extractRoutes(t)
+	for _, v := range ownerOnlyViolations(routes) {
+		t.Error("AUTHZ: " + v)
+	}
+	live := map[string]bool{}
+	for _, r := range routes {
+		live[r.key] = true
+	}
+	for k := range ownerOnly {
+		if !live[k] {
+			t.Errorf("AUTHZ: owner-only entry %q no longer exists in the route table (remove it)", k)
+		}
+	}
+}
+
+// Self-test: the owner-only rule fires on a /security route gated by requireAuth or a weaker perm.
+func TestOwnerOnlyDetectorFires(t *testing.T) {
+	src := `package web
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /security", s.requireAuth(s.handleSecurity))
+	mux.HandleFunc("GET /security/status", s.requirePerm("deploy", s.handleSecurityStatus))
+	mux.HandleFunc("GET /security/new", s.requirePerm("admin", s.handleNew))
+	mux.HandleFunc("GET /security/export", s.requirePerm("admin", s.handleSecurityExport))
+	return mux
+}`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "snippet.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ownerOnlyViolations(extractRoutesFromFile(f, fset))
+	if len(got) != 3 {
+		t.Fatalf("want 3 violations (requireAuth only, deploy perm, unlisted route), got %d: %v", len(got), got)
 	}
 }
 

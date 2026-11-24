@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/apitoken"
@@ -124,6 +125,13 @@ func (s *Server) requireToken(scopeFn func(*http.Request) string, h http.Handler
 			return
 		}
 		s.apiTokens.TouchLastUsed(r.Context(), id, now)
+		ip := ClientIP(r.Context()).String()
+		if apiTokenUseSeen.first(id+"|"+ip, now) {
+			_ = s.audit.Log(r.Context(), audit.Event{
+				Actor: "api:" + id, IP: ip, Action: "api_token_use", Target: r.Method + " " + r.URL.Path,
+				Outcome: audit.OK, Level: audit.Info, UA: r.UserAgent(),
+			})
+		}
 		r = r.WithContext(withTokenID(r.Context(), id))
 		h(w, r)
 	}
@@ -139,7 +147,56 @@ func (s *Server) auditAPI(r *http.Request, tokenID string, outcome audit.Outcome
 	_ = s.audit.Log(r.Context(), audit.Event{
 		Actor: actor, IP: ClientIP(r.Context()).String(), Action: "api_request",
 		Outcome: outcome, Level: audit.Security, Target: r.Method + " " + r.URL.Path, Detail: detail,
+		UA: r.UserAgent(),
 	})
+}
+
+// A successful bearer request is audited (api_token_use) at most once per token and client
+// address per tokenUseWindow. Intentional: CI deploys and pollers would otherwise write a row per
+// request. The map is process-wide like apiDeployLimiter (one Server per process, token ids are
+// unique) and holds at most tokenUseMaxKeys entries.
+const (
+	tokenUseWindow  = 5 * time.Minute
+	tokenUseMaxKeys = 10000
+)
+
+var apiTokenUseSeen = newSeenWindow(tokenUseWindow, tokenUseMaxKeys)
+
+// seenWindow remembers when each key was last recorded.
+type seenWindow struct {
+	mu     sync.Mutex
+	seen   map[string]time.Time
+	window time.Duration
+	max    int
+}
+
+func newSeenWindow(window time.Duration, max int) *seenWindow {
+	return &seenWindow{seen: map[string]time.Time{}, window: window, max: max}
+}
+
+// first reports whether key was not recorded within the window before now, and records it if so.
+func (sw *seenWindow) first(key string, now time.Time) bool {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	at, ok := sw.seen[key]
+	// A recording "in the future" (the clock stepped back) doesn't suppress the key.
+	if d := now.Sub(at); ok && d >= 0 && d < sw.window {
+		return false
+	}
+	if !ok && len(sw.seen) >= sw.max {
+		for k, t := range sw.seen {
+			if d := now.Sub(t); d < 0 || d >= sw.window {
+				delete(sw.seen, k)
+			}
+		}
+		if len(sw.seen) >= sw.max {
+			// Intentional: still full of live keys, so forget them all. That costs some duplicate
+			// rows, never a missing one, and keeps the map bounded.
+			clear(sw.seen)
+		}
+	}
+	sw.seen[key] = now
+	return true
 }
 
 // --- read endpoints ---

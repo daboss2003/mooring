@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,6 +28,7 @@ import (
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/docker"
 	"github.com/daboss2003/mooring/internal/edge"
+	"github.com/daboss2003/mooring/internal/siem/hostlog"
 )
 
 // cmd_doctor.go is the host-prerequisites helper. Mooring's RUNTIME service is
@@ -40,7 +43,8 @@ import (
 // `setup` only performs SAFE, idempotent, well-understood mutations (install Caddy /
 // nginx+stream, upgrade a system caddy older than 2.11 from Caddy's apt repo, install the
 // Mooring-owned Caddy build at <data_dir>/bin/caddy when config.yaml needs one — those for the
-// managed edge only — and cap Docker's logs). It NEVER auto-rewrites host DNS or frees :53 —
+// managed edge only — cap Docker's logs, and add the mooring user to the adm group for security
+// logs). It NEVER auto-rewrites host DNS or frees :53 —
 // that broke a box once already — it prints those steps for you to run. The bind
 // capability + runtime/state dirs are provided by the unit + postinstall, not setup.
 const (
@@ -152,6 +156,9 @@ func cmdSetup(args []string) error {
 	if hint := setupRestartHint(done, *restart, running); hint != "" {
 		fmt.Println(hint)
 	}
+	if hint := admRestartHint(done, *restart, active == "active"); hint != "" {
+		fmt.Println(hint)
+	}
 	printDNSGuidance(*l4)
 	return nil
 }
@@ -161,6 +168,7 @@ type applied struct {
 	ownedCaddy           bool // a Mooring-owned Caddy build
 	systemCaddyInstalled bool // the system caddy package, where there was none
 	systemCaddyUpgraded  bool // the system caddy package, over an older one
+	admGroupAdded        bool // the mooring user joined the adm group
 }
 
 // runningEdge is what the mooring service's edge ran on before setup applied its steps.
@@ -234,6 +242,7 @@ func applySteps(w io.Writer, steps []step) (applied, error) {
 		done.ownedCaddy = done.ownedCaddy || strings.HasPrefix(s.desc, ownedCaddyStepPrefix) || strings.HasPrefix(s.desc, ownedCaddyIfOldStepPrefix)
 		done.systemCaddyInstalled = done.systemCaddyInstalled || s.desc == caddyInstallStepDesc
 		done.systemCaddyUpgraded = done.systemCaddyUpgraded || strings.HasPrefix(s.desc, caddyUpgradeStepPrefix)
+		done.admGroupAdded = done.admGroupAdded || s.desc == admGroupStepDesc
 	}
 	return done, nil
 }
@@ -320,6 +329,9 @@ func plan(apply, l4, restart bool, cfg *config.Config, mode setupEdgeMode) []ste
 			step{"cap Docker container logs (json-file max-size=10m) in /etc/docker/daemon.json", func() error { return applyDockerLogCap(apply) }},
 			step{"restart docker to apply the log cap — BOUNCES running containers (run setup before deploying apps)", func() error { return run(apply, "systemctl", "restart", "docker") }},
 		)
+	}
+	if s, ok := admGroupStep(apply, cfg); ok {
+		steps = append(steps, s)
 	}
 	// Enable the mooring service so it survives a reboot. The package intentionally does NOT
 	// auto-enable on install (it can't boot without a config yet), so an operator who only ran
@@ -827,6 +839,9 @@ func preflight(l4 bool, cfg *config.Config, runtimeChecks bool) report {
 			r.add(x)
 		}
 	}
+	for _, x := range securityLogChecks(cfg, runtimeChecks) {
+		r.add(x)
+	}
 	if l4 {
 		for _, x := range l4Checks(managed) {
 			r.add(x)
@@ -883,8 +898,8 @@ func doctorProxyAddr(cfg *config.Config) string {
 }
 
 // systemctlShow reads one property of the live mooring unit. ok=false when systemctl
-// is unavailable (so callers degrade rather than false-alarm).
-func systemctlShow(prop string) (string, bool) {
+// is unavailable (so callers degrade rather than false-alarm). A var so tests can stand in for it.
+var systemctlShow = func(prop string) (string, bool) {
 	out, err := exec.Command("systemctl", "show", "mooring", "-p", prop, "--value").Output() // literal: SEC-1 safe (no -c)
 	if err != nil {
 		return "", false
@@ -1262,10 +1277,14 @@ func checkEgress() result {
 }
 
 // configWarnings reports each config.yaml value Mooring corrected instead of refusing to boot
-// (config.LoadWarnings, e.g. out-of-range quiet hours turned off) as a warn.
+// (config.LoadWarnings, e.g. out-of-range quiet hours turned off) as a warn. Security logs without an
+// archive are the security archive line instead (checkSecurityArchive).
 func configWarnings(cfg *config.Config) []result {
 	var out []result
 	for _, w := range cfg.LoadWarnings {
+		if strings.HasPrefix(w, config.WarnSecurityLogsNoArchive) {
+			continue
+		}
 		out = append(out, result{"config", "warn", w, "fix it in " + config.DefaultPath + ", then sudo systemctl restart mooring"})
 	}
 	return out
@@ -1317,6 +1336,384 @@ func checkSocketProxy(cfg *config.Config) result {
 		return result{"socket-proxy", "warn", fmt.Sprintf("%s returned HTTP %d", addr, resp.StatusCode), "check the socket-proxy container"}
 	}
 	return result{"socket-proxy", "ok", "managed socket-proxy answering on " + addr, ""}
+}
+
+// --- security logs: the adm group, host log access, the archive, the unit's memory cap ---
+//
+// Security logs (docs/security-logs.md) read the host's auth and Fail2Ban logs and the journal with the
+// service's groups: the mooring user's own (the group database), plus the unit's SupplementaryGroups.
+// Whether a file is readable is worked out from those groups and the file's owner, group and mode, the
+// same way for root and for any other user running doctor. (Running a child as mooring, as the Caddy
+// checks do, wouldn't answer it: that child gets no supplementary groups.)
+
+// admGroupStepDesc is setup's step that adds the mooring user to adm (applySteps reads it).
+const admGroupStepDesc = "add the mooring service user to the adm group (security logs read the host's auth and Fail2Ban logs)"
+
+// admGroupFix adds the mooring user to adm and restarts the service so it runs with the group.
+const admGroupFix = "sudo usermod -aG adm mooring && sudo systemctl restart mooring   (or: sudo mooring setup --yes)"
+
+// minServiceMemoryMax is the MemoryMax the shipped unit sets (1G); a lower one in the loaded unit is a warn.
+const minServiceMemoryMax = 1 << 30
+
+// serviceAccount is the mooring user as the group database has it.
+type serviceAccount struct {
+	uid, gid string
+	groups   []string // every gid the user is in, the primary one included
+}
+
+// lookupGroupGID is the gid of the host group name; ok=false when there is none. A var so tests can
+// stand in for the group database.
+var lookupGroupGID = func(name string) (string, bool) {
+	g, err := user.LookupGroup(name)
+	if err != nil {
+		return "", false
+	}
+	return g.Gid, true
+}
+
+// lookupServiceAccount reads the mooring user; ok=false when there is none. A var so tests can stand in
+// for it.
+var lookupServiceAccount = func() (serviceAccount, bool) {
+	u, err := user.Lookup("mooring")
+	if err != nil {
+		return serviceAccount{}, false
+	}
+	gids, _ := u.GroupIds()
+	if !slices.Contains(gids, u.Gid) {
+		gids = append(gids, u.Gid)
+	}
+	return serviceAccount{uid: u.Uid, gid: u.Gid, groups: gids}, true
+}
+
+// serviceProcessGroups is the supplementary gids of the running mooring service (its MainPID's /proc
+// status); ok=false when it isn't running or can't be read. A var so tests can stand in for it.
+var serviceProcessGroups = func() ([]string, bool) {
+	pid, ok := systemctlShow("MainPID")
+	if n, err := strconv.Atoi(pid); !ok || err != nil || n <= 0 {
+		return nil, false
+	}
+	b, err := os.ReadFile(filepath.Join("/proc", pid, "status"))
+	if err != nil {
+		return nil, false
+	}
+	return parseStatusGroups(string(b)), true
+}
+
+// parseStatusGroups reads the gids of the first Groups line of /proc/<pid>/status contents.
+func parseStatusGroups(data string) []string {
+	for _, line := range strings.Split(data, "\n") {
+		if v, ok := strings.CutPrefix(line, "Groups:"); ok {
+			var out []string
+			for _, f := range strings.Fields(v) {
+				if _, err := strconv.ParseUint(f, 10, 32); err == nil {
+					out = append(out, f)
+				}
+			}
+			return out
+		}
+	}
+	return nil
+}
+
+// resolveHostLogs is what security logs follow with config.yaml's host_logs (the follower's own
+// resolution). A var so tests can stand in for the host's files.
+var resolveHostLogs = func(h config.SecurityLogsHost) hostlog.Config {
+	return hostlog.FromConfig(h, "", slog.New(slog.DiscardHandler))
+}
+
+// journalDirs are where journald keeps the system journal: persistent, then volatile.
+var journalDirs = []string{"/var/log/journal", "/run/log/journal"}
+
+// securityLogChecks are doctor's security-log lines. cfg nil (config.yaml not loaded): the defaults,
+// without the archive line. None when security logs are off; with host logs off, only the archive and
+// the memory cap. runtime adds the running service's groups to the adm check.
+func securityLogChecks(cfg *config.Config, runtime bool) []result {
+	if cfg != nil && !cfg.SecurityLogs.On() {
+		return nil
+	}
+	var out []result
+	if cfg == nil || cfg.SecurityLogs.HostLogs.On() {
+		out = append(out, checkAdmGroup(runtime))
+		out = append(out, checkHostLogs(cfg)...)
+	}
+	if cfg != nil {
+		out = append(out, checkSecurityArchive(cfg))
+	}
+	v, ok := systemctlShow("MemoryMax")
+	return append(out, memoryMaxResult(v, ok))
+}
+
+// checkAdmGroup reports whether the mooring user is in the adm group (the group of the host's auth and
+// Fail2Ban logs, with a read ACL on the journal) and, with runtime, whether the running service has it:
+// its MainPID's groups, so a membership added since it started shows as needing a restart.
+func checkAdmGroup(runtime bool) result {
+	const name = "adm group"
+	adm, ok := lookupGroupGID("adm")
+	if !ok {
+		return result{name, "skip", "this host has no adm group: security logs read only the host logs whose own mode lets the mooring service read them", ""}
+	}
+	acct, ok := lookupServiceAccount()
+	if !ok {
+		return result{name, "skip", "no mooring user on this host (install the mooring package)", ""}
+	}
+	var running, procHas bool
+	if runtime {
+		var groups []string
+		groups, running = serviceProcessGroups()
+		procHas = slices.Contains(groups, adm)
+	}
+	switch {
+	case !slices.Contains(acct.groups, adm) && running && procHas:
+		return result{name, "warn", "the mooring user isn't in the adm group (the running service has it from a SupplementaryGroups= setting)", admGroupFix}
+	case !slices.Contains(acct.groups, adm):
+		return result{name, "warn", "the mooring user isn't in the adm group — security logs can't read the host's auth and Fail2Ban logs or the journal", admGroupFix}
+	case running && !procHas:
+		return result{name, "warn", "the mooring user is in the adm group, but the running service started without it", "sudo systemctl restart mooring"}
+	}
+	return result{name, "ok", "the mooring user is in the adm group (host auth and Fail2Ban logs, the journal)", ""}
+}
+
+// admGroupStep is setup's step that adds the mooring user to adm: planned when security logs read host
+// logs (cfg nil: the default, on), the host has an adm group, and the user exists and isn't in it.
+func admGroupStep(apply bool, cfg *config.Config) (step, bool) {
+	if cfg != nil && (!cfg.SecurityLogs.On() || !cfg.SecurityLogs.HostLogs.On()) {
+		return step{}, false
+	}
+	adm, ok := lookupGroupGID("adm")
+	if !ok {
+		return step{}, false
+	}
+	if acct, ok := lookupServiceAccount(); !ok || slices.Contains(acct.groups, adm) {
+		return step{}, false
+	}
+	return step{admGroupStepDesc, func() error { return run(apply, "usermod", "-aG", "adm", "mooring") }}, true
+}
+
+// admRestartHint is the line setup prints when it added the mooring user to adm while the service runs
+// (active) without --restart: the running service gets the group only when it restarts.
+func admRestartHint(done applied, restart, active bool) string {
+	if !done.admGroupAdded || restart || !active {
+		return ""
+	}
+	return "Restart Mooring so the service gets the adm group: sudo systemctl restart mooring"
+}
+
+// serviceGroups is the uid and the gids the mooring service runs with: the account's groups and the
+// unit's SupplementaryGroups (names that don't exist are left out). ok=false without a mooring user.
+func serviceGroups() (uint32, map[uint32]bool, bool) {
+	acct, ok := lookupServiceAccount()
+	if !ok {
+		return 0, nil, false
+	}
+	uid, err := strconv.ParseUint(acct.uid, 10, 32)
+	if err != nil {
+		return 0, nil, false
+	}
+	ids := map[uint32]bool{}
+	add := func(gid string) {
+		if n, err := strconv.ParseUint(gid, 10, 32); err == nil {
+			ids[uint32(n)] = true
+		}
+	}
+	for _, g := range acct.groups {
+		add(g)
+	}
+	if v, ok := systemctlShow("SupplementaryGroups"); ok {
+		for _, name := range strings.Fields(v) {
+			if gid, ok := lookupGroupGID(name); ok {
+				add(gid)
+			} else {
+				add(name) // a numeric gid
+			}
+		}
+	}
+	return uint32(uid), ids, true
+}
+
+// checkHostLogs reports, for each host log security logs follow, whether the mooring service can read
+// it. Nothing without a mooring user (the adm line says so).
+func checkHostLogs(cfg *config.Config) []result {
+	var h config.SecurityLogsHost
+	if cfg != nil {
+		h = cfg.SecurityLogs.HostLogs
+	}
+	follow := resolveHostLogs(h)
+	uid, groups, ok := serviceGroups()
+	if !ok {
+		return nil
+	}
+	var out []result
+	switch {
+	case follow.AuthLog != "":
+		out = append(out, checkHostLogFile("auth log", follow.AuthLog, uid, groups, true))
+	case !follow.Journal:
+		out = append(out, result{"auth log", "warn", "no auth log file, and the journal isn't read: security logs collect no sshd/sudo/su events",
+			"set security_logs.host_logs.auth_log in " + config.DefaultPath + ", or remove host_logs.journal: false"})
+	}
+	if follow.Fail2BanLog != "" {
+		out = append(out, checkHostLogFile("fail2ban log", follow.Fail2BanLog, uid, groups, false))
+	}
+	if follow.Journal {
+		out = append(out, checkJournal(groups))
+	}
+	return out
+}
+
+// checkHostLogFile reports whether uid with groups can read the log at path. A missing auth log
+// (required) is a warn; a missing Fail2Ban log is a skip (Fail2Ban isn't installed). A file readable
+// only through a POSIX ACL is reported as unreadable.
+func checkHostLogFile(name, path string, uid uint32, groups map[uint32]bool, required bool) result {
+	fi, err := os.Stat(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist) && !required:
+		return result{name, "skip", path + " isn't there (Fail2Ban isn't installed, or logs elsewhere: security_logs.host_logs.fail2ban_log)", ""}
+	case errors.Is(err, fs.ErrNotExist):
+		return result{name, "warn", path + " doesn't exist: security logs collect no sshd/sudo/su events from it",
+			"set security_logs.host_logs.auth_log to the host's auth log in " + config.DefaultPath}
+	case err != nil:
+		return result{name, "warn", "could not check " + path + " (" + err.Error() + ")", "re-run as root: sudo mooring doctor"}
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return result{name, "warn", "could not read the owner of " + path, ""}
+	}
+	perm := fi.Mode().Perm()
+	desc := fmt.Sprintf("%s (%s:%s %04o)", path, userName(st.Uid), groupName(st.Gid), perm)
+	if readable, via := readableBy(uid, groups, st.Uid, st.Gid, perm); readable {
+		return result{name, "ok", "security logs read " + desc + " through " + via, ""}
+	}
+	return result{name, "warn", "the mooring service can't read " + desc, hostLogFileFix(path, st.Gid, perm, required)}
+}
+
+// hostLogFileFix is the fix for a host log the service can't read: join adm when the file is adm's and
+// group-readable, else make it adm's (or, without an adm group, one of the service's groups); for the
+// auth log, or read sshd/sudo/su from the journal as well.
+func hostLogFileFix(path string, fgid uint32, perm fs.FileMode, auth bool) string {
+	adm, admOK := lookupGroupGID("adm")
+	if admOK && adm == strconv.FormatUint(uint64(fgid), 10) && perm&0o040 != 0 {
+		return admGroupFix
+	}
+	fix := "make it readable by one of the mooring service's groups"
+	if admOK {
+		fix = "sudo chgrp adm " + path + " && sudo chmod g+r " + path + " (and the same mode in its logrotate `create` line)"
+	}
+	if auth {
+		fix += "; or also read sshd/sudo/su from the journal: security_logs.host_logs.journal: true"
+	}
+	return fix
+}
+
+// readableBy reports whether uid with groups may read a file owned by fuid:fgid with perm, by the Unix
+// rule (the owner bits for the owner, else the group bits for a member, else the others bits), and
+// through what.
+func readableBy(uid uint32, groups map[uint32]bool, fuid, fgid uint32, perm fs.FileMode) (bool, string) {
+	switch {
+	case fuid == uid:
+		return perm&0o400 != 0, "its owner"
+	case groups[fgid]:
+		return perm&0o040 != 0, "the " + groupName(fgid) + " group"
+	}
+	return perm&0o004 != 0, "its mode (readable by everyone)"
+}
+
+// checkJournal reports whether the service can read the system journal: as a member of systemd-journal
+// (the journal files' group), adm or wheel.
+func checkJournal(groups map[uint32]bool) result {
+	dir := ""
+	for _, d := range journalDirs {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			dir = d
+			break
+		}
+	}
+	if dir == "" {
+		return result{"journal", "warn", "no systemd journal in " + strings.Join(journalDirs, " or ") + ": security logs collect no sshd/sudo/su events",
+			"install rsyslog (it writes /var/log/auth.log), or set security_logs.host_logs.auth_log"}
+	}
+	// Intentional: by group, not by the files' mode. The journal files are root:systemd-journal 0640, and
+	// systemd's tmpfiles give adm and wheel a read ACL on them, which the mode doesn't show (reading an ACL
+	// needs getxattr, not in the standard library on every platform this builds for).
+	for _, g := range []string{"systemd-journal", "adm", "wheel"} {
+		if gid, ok := lookupGroupGID(g); ok {
+			if n, err := strconv.ParseUint(gid, 10, 32); err == nil && groups[uint32(n)] {
+				return result{"journal", "ok", "security logs read sshd/sudo/su from the journal (" + dir + ") through the " + g + " group", ""}
+			}
+		}
+	}
+	return result{"journal", "warn", "the mooring service isn't in the adm or systemd-journal group, so journalctl shows it none of the host's sshd/sudo/su entries", admGroupFix}
+}
+
+// checkSecurityArchive reports where security logs are archived, or that they stay on this host only.
+func checkSecurityArchive(cfg *config.Config) result {
+	s := cfg.SecurityLogs
+	s3 := s.Archive.S3
+	if s3 == nil {
+		return result{"security archive", "warn", "security_logs.archive.s3 isn't set — security logs are kept only on this host (" + daysText(s.HotRetentionOrDefault()) + ")",
+			"add an S3 bucket as security_logs.archive.s3 in " + config.DefaultPath + ", then sudo systemctl restart mooring (docs/security-logs.md)"}
+	}
+	endpoint := strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(s3.Endpoint, "https://"), "http://"), "/")
+	return result{"security archive", "ok", "security logs are archived to " + endpoint + "/" + s3.Bucket + "/" + s3.Prefix +
+		" and kept " + daysText(s.Archive.RetentionOrDefault()) + " there", ""}
+}
+
+// daysText writes d as "14 days" ("1 day"), or as a duration when it isn't whole days.
+func daysText(d time.Duration) string {
+	switch n := d / (24 * time.Hour); {
+	case d%(24*time.Hour) != 0 && d%time.Hour == 0:
+		return strconv.FormatInt(int64(d/time.Hour), 10) + "h"
+	case d%(24*time.Hour) != 0:
+		return d.String()
+	case n == 1:
+		return "1 day"
+	default:
+		return strconv.FormatInt(int64(n), 10) + " days"
+	}
+}
+
+// memoryMaxResult maps the loaded unit's MemoryMax (bytes, "infinity") to a result: below what the
+// shipped unit sets is a warn (the upgrade's unit isn't loaded, or a drop-in lowers it).
+func memoryMaxResult(v string, ok bool) result {
+	const name = "memory max"
+	if v == "infinity" && ok {
+		return result{name, "ok", "the unit sets no MemoryMax", ""}
+	}
+	n, err := strconv.ParseUint(v, 10, 64)
+	if !ok || err != nil {
+		return result{name, "warn", "could not read the unit's MemoryMax", "verify: systemctl show mooring -p MemoryMax"}
+	}
+	if n < minServiceMemoryMax {
+		return result{name, "warn", "the unit's MemoryMax is " + sizeText(n) + "; the shipped unit sets " + sizeText(minServiceMemoryMax),
+			"sudo systemctl daemon-reload && sudo systemctl restart mooring; if it stays low, a drop-in or a copy in /etc/systemd/system sets it (systemctl cat mooring)"}
+	}
+	return result{name, "ok", "MemoryMax is " + sizeText(n), ""}
+}
+
+// sizeText writes a byte count as systemd does: "1G", "384M", else "N bytes".
+func sizeText(n uint64) string {
+	switch {
+	case n > 0 && n%(1<<30) == 0:
+		return strconv.FormatUint(n>>30, 10) + "G"
+	case n > 0 && n%(1<<20) == 0:
+		return strconv.FormatUint(n>>20, 10) + "M"
+	}
+	return strconv.FormatUint(n, 10) + " bytes"
+}
+
+// userName and groupName are an id's name, or the id when it has none.
+func userName(uid uint32) string {
+	id := strconv.FormatUint(uint64(uid), 10)
+	if u, err := user.LookupId(id); err == nil {
+		return u.Username
+	}
+	return id
+}
+
+func groupName(gid uint32) string {
+	id := strconv.FormatUint(uint64(gid), 10)
+	if g, err := user.LookupGroupId(id); err == nil {
+		return g.Name
+	}
+	return id
 }
 
 // --- one Docker daemon behind both planes ---

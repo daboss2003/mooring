@@ -115,6 +115,13 @@ type tmplData struct {
 	// reads to decide whether to offer a "logs around this error" deep-link.
 	ServiceLog        *serviceLogView
 	ServiceLogEnabled bool
+
+	// Security logs page (owner only) and its status fragment.
+	Security *securityView
+
+	// CanAdmin is the session's role allowing admin actions (the owner): the shell's owner-only
+	// links. render sets it from the request's session; a handler's value is ignored.
+	CanAdmin bool
 }
 
 type eventRow struct {
@@ -372,6 +379,8 @@ func (s *Server) render(w http.ResponseWriter, r *http.Request, name string, dat
 	if data.UpdateBanner == nil {
 		data.UpdateBanner = s.updateBanner()
 	}
+	// From the live users on every render, so a reload that changes a role applies on the next page.
+	data.CanAdmin = s.canAdmin(sessionUser(r))
 	var buf bytes.Buffer
 	if err := s.templates.ExecuteTemplate(&buf, name, data); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)

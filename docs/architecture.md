@@ -43,7 +43,7 @@ Mooring does **not** run as a Compose container. It runs as its own `systemd` un
 - It can never appear in a managed project's container list, so its own controls can **never target itself**.
 - A stack `down` can **never** take Mooring down — because Mooring isn't in any stack.
 
-It runs **non-root** under a dedicated low-privilege user that is a member of the `docker` group. The unit is hardened: `MemoryMax`, `OOMScoreAdjust=-100`, `ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, and the full sandbox set (`RestrictAddressFamilies`, `RestrictNamespaces`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service`, empty `CapabilityBoundingSet`, tight `ReadWritePaths`, and — critically — **network egress allow-listing** via `IPAddressDeny=any` + a narrow `IPAddressAllow`). The egress allowlist is the single highest-leverage control against unknown attacks: even a perfect SSRF or RCE in the core cannot reach cloud metadata or call home, because those destinations are physically unreachable from the cgroup.
+It runs **non-root** under a dedicated low-privilege user that is a member of the `docker` group and, when the host has one, the `adm` group (read-only access to the host's auth and Fail2Ban logs for [security logs](./security-logs.md)). The unit is hardened: `MemoryMax`, `OOMScoreAdjust=-100`, `ProtectSystem=strict`, `NoNewPrivileges`, `PrivateTmp`, and the full sandbox set (`RestrictAddressFamilies`, `RestrictNamespaces`, `MemoryDenyWriteExecute`, `SystemCallFilter=@system-service`, empty `CapabilityBoundingSet`, tight `ReadWritePaths`, and — critically — **network egress allow-listing** via `IPAddressDeny=any` + a narrow `IPAddressAllow`). The egress allowlist is the single highest-leverage control against unknown attacks: even a perfect SSRF or RCE in the core cannot reach cloud metadata or call home, because those destinations are physically unreachable from the cgroup.
 
 ### The admin UI binds loopback only
 
@@ -51,7 +51,7 @@ Mooring's admin UI binds `127.0.0.1:9000` and **never** binds a public port itse
 
 ### The edge is a supervised child process
 
-The child Caddy is a separate process supervised by the core. **Today it is co-resident** in the core's systemd unit — same low-priv user, same cgroup, sharing the unit's `MemoryMax` (384 MB, sized to cover Mooring + Caddy + nginx + forked compose). One consequence holds now, one is planned:
+The child Caddy is a separate process supervised by the core. **Today it is co-resident** in the core's systemd unit — same low-priv user, same cgroup, sharing the unit's `MemoryMax` (1 GB, sized to cover Mooring and its security-log pipeline + Caddy + nginx + forked compose; `GOMEMLIMIT=600MiB` for the Go process). One consequence holds now, one is planned:
 
 1. **Crash isolation (now)** — Mooring supervises the child with backoff. If the child dies, the admin UI stays up to show *why*. If Mooring dies, the child keeps serving.
 2. **OOM isolation (planned)** — a dedicated edge slice with its own `MemoryMax`, so a public-plane traffic spike can't pressure the control-plane cgroup, is a planned hardening; today they share one cap.

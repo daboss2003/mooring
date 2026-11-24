@@ -25,11 +25,31 @@ install -d -o mooring -g mooring -m 0700 /var/lib/mooring
 install -d -o mooring -g mooring -m 0700 /var/lib/mooring-apps
 install -d -o mooring -g mooring -m 0700 /var/lib/caddy
 
+# The adm group lets security logs read the host's auth.log, fail2ban.log and the journal. It is
+# added once: the marker keeps an upgrade from re-adding a membership the operator removed (after
+# that, `sudo mooring setup --yes` adds it again). The marker is root's, in /etc/mooring, where the
+# service user can't remove it. A user already in adm only gets the marker; a failed usermod
+# leaves none, so the next upgrade tries again.
+ADM_MARKER=/etc/mooring/.adm-group-added
+if getent group adm >/dev/null 2>&1 && [ ! -e "$ADM_MARKER" ]; then
+    case " $(id -nG mooring 2>/dev/null) " in
+        *" adm "*) adm_ok=yes ;;
+        *) if usermod -aG adm mooring; then adm_ok=yes; else adm_ok=no; fi ;;
+    esac
+    if [ "$adm_ok" = yes ]; then
+        (umask 077 && : > "$ADM_MARKER") || true
+    fi
+fi
+
 # Pick up the shipped unit. On an UPGRADE of an already-configured install, keep boot-start
 # ENABLED and bring the new binary up — an update must NEVER silently disable boot-start or leave
 # the service stopped (the presence of /etc/mooring/config.yaml means Mooring is already set up, so
-# this is an upgrade/reinstall, not a first install). A fresh install has no config yet and is left
-# for the operator to enable after writing config.yaml (see the steps printed below).
+# this is an upgrade/reinstall, not a first install). daemon-reload loads the new unit (its
+# MemoryMax, GOMEMLIMIT and SupplementaryGroups), and the restart starts the service with it and
+# with the groups added above. A unit copied to /etc/systemd/system, or a drop-in, overrides the
+# shipped one; `mooring doctor` reports a MemoryMax that stayed below 1G. A fresh install has no
+# config yet and is left for the operator to enable after writing config.yaml (see the steps
+# printed below).
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload || true
     if [ -f /etc/mooring/config.yaml ]; then

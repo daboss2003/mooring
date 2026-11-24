@@ -161,7 +161,7 @@ func (s *Server) handleAlertChannelSave(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "channel rejected: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_save", Target: name, Outcome: audit.OK, Level: audit.Security})
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_save", Target: name, Outcome: audit.OK, Level: audit.Security, UA: r.UserAgent()})
 	http.Redirect(w, r, "/alerts/channels", http.StatusSeeOther)
 }
 
@@ -177,7 +177,7 @@ func (s *Server) handleAlertChannelDelete(w http.ResponseWriter, r *http.Request
 		s.teardownManagedNtfy(r.Context())
 	}
 	_ = s.alertStore.DeleteChannel(r.Context(), id)
-	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_delete", Target: strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security})
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_delete", Target: strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security, UA: r.UserAgent()})
 	http.Redirect(w, r, "/alerts/channels", http.StatusSeeOther)
 }
 
@@ -206,12 +206,12 @@ func (s *Server) handleAlertChannelTest(w http.ResponseWriter, r *http.Request) 
 	defer cancel()
 	n := alert.Notification{Title: "[test] Mooring alert channel", Body: "This is a test notification from Mooring.", Level: alert.LevelWarning}
 	if err := ch.Send(ctx, n); err != nil {
-		_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_test", Target: strconv.FormatInt(id, 10), Outcome: audit.Error, Level: audit.Security})
+		_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_test", Target: strconv.FormatInt(id, 10), Outcome: audit.Error, Level: audit.Security, UA: r.UserAgent()})
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("send failed: " + err.Error() + "\n"))
 		return
 	}
-	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_test", Target: strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security})
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_channel_test", Target: strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security, UA: r.UserAgent()})
 	_, _ = w.Write([]byte("test notification sent.\n"))
 }
 
@@ -235,7 +235,7 @@ func (s *Server) handleAlertRuleSave(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rule rejected: "+err.Error(), http.StatusUnprocessableEntity)
 		return
 	}
-	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_rule_save", Target: rule.Name, Outcome: audit.OK, Level: audit.Security})
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_rule_save", Target: rule.Name, Outcome: audit.OK, Level: audit.Security, UA: r.UserAgent()})
 	http.Redirect(w, r, "/alerts/rules", http.StatusSeeOther)
 }
 
@@ -246,7 +246,20 @@ func (s *Server) handleAlertRuleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.ParseForm()
 	id, _ := strconv.ParseInt(r.PostFormValue("id"), 10, 64)
-	_ = s.alertStore.DeleteRule(r.Context(), id)
+	ev := audit.Event{
+		Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_rule_delete",
+		Target: strconv.FormatInt(id, 10), Outcome: audit.OK, Level: audit.Security, UA: r.UserAgent(),
+	}
+	rule, found := s.alertStore.RuleByID(id) // the name, for the audit row
+	if found {
+		ev.Target, ev.Detail = rule.Name, "id "+ev.Target
+	}
+	if err := s.alertStore.DeleteRule(r.Context(), id); err != nil {
+		ev.Outcome, ev.Detail = audit.Error, "delete failed"
+	} else if !found {
+		ev.Outcome, ev.Detail = audit.Error, "no such rule"
+	}
+	_ = s.audit.Log(r.Context(), ev)
 	http.Redirect(w, r, "/alerts/rules", http.StatusSeeOther)
 }
 
@@ -258,7 +271,7 @@ func (s *Server) handleAlertAck(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	ruleID, _ := strconv.ParseInt(r.PostFormValue("rule_id"), 10, 64)
 	_ = s.alertStore.Ack(r.Context(), ruleID, r.PostFormValue("target"))
-	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_ack", Target: r.PostFormValue("target"), Outcome: audit.OK, Level: audit.Security})
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_ack", Target: r.PostFormValue("target"), Outcome: audit.OK, Level: audit.Security, UA: r.UserAgent()})
 	http.Redirect(w, r, "/alerts", http.StatusSeeOther)
 }
 
@@ -275,6 +288,6 @@ func (s *Server) handleAlertSilence(w http.ResponseWriter, r *http.Request) {
 	}
 	until := time.Now().Add(time.Duration(mins) * time.Minute).Unix()
 	_ = s.alertStore.Silence(r.Context(), ruleID, r.PostFormValue("target"), until)
-	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_silence", Target: r.PostFormValue("target"), Outcome: audit.OK, Level: audit.Security})
+	_ = s.audit.Log(r.Context(), audit.Event{Actor: sessionUser(r), IP: ClientIP(r.Context()).String(), Action: "alert_silence", Target: r.PostFormValue("target"), Outcome: audit.OK, Level: audit.Security, UA: r.UserAgent()})
 	http.Redirect(w, r, "/alerts", http.StatusSeeOther)
 }

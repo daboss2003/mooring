@@ -51,7 +51,7 @@ The rule:
 - Read the real `net.Conn` peer. **If the peer is *not* in `trusted_proxies`, ignore `X-Forwarded-For` entirely and allowlist the peer.** Only if the peer *is* a trusted proxy does Mooring take the single, **overwritten** XFF value. The managed edge **overwrites** XFF to the real client (single-hop, spoof-safe) — it never *appends*.
 - **`trusted_proxies` must be the edge proxy's specific IP (`≤ /24`), not a docker-bridge CIDR**, and monitored-app containers must not share that CIDR — otherwise a hostile container could connect to `:9000` directly with a forged XFF and be admitted.
 - **Belt-and-suspenders, mandatory in managed mode:** a host firewall on `:9000` (drop everything but the edge IP) **and** an edge-layer `remote_ip` allowlist. The XFF overwrite is **never the sole anchor**.
-- Lockout keys on the **(real peer, username)** pair *and* a **global per-username** throttle, so rotating XFF values cannot bypass the lockout.
+- Lockout keys on the **(client address, username)** pair *and* a **global per-username** throttle, so rotating XFF values cannot bypass the lockout. The client address is the TCP peer, or the single `X-Forwarded-For` value a trusted proxy (the edge) set.
 
 > A shipped unit test proves that a **forged-XFF direct connection from a bridge peer is rejected**. This test runs first in the known-attack checklist ([§8](#8-the-assurance-program-15)).
 

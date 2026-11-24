@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 // lets each test mutate one field to assert the fail-closed boot check fires.
 func validYAML(t *testing.T, overrides string) string {
 	t.Helper()
-	hash, err := crypto.HashPassword([]byte("a-strong-password"), crypto.DefaultArgon2Params)
+	hash, err := validHash()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,6 +39,11 @@ edge:
 `
 	return base + overrides
 }
+
+// validHash is one argon2 hash of a test password, computed once (hashing takes ~100ms).
+var validHash = sync.OnceValues(func() (string, error) {
+	return crypto.HashPassword([]byte("a-strong-password"), crypto.DefaultArgon2Params)
+})
 
 func mustReject(t *testing.T, yaml, wantSubstr string) {
 	t.Helper()
@@ -732,7 +738,7 @@ func TestQuietHoursValidated(t *testing.T) {
 		if cfg.Alerting.QuietStartHour != -1 || cfg.Alerting.QuietEndHour != -1 {
 			t.Errorf("%q: got %d→%d, want quiet hours off (-1→-1)", bad, cfg.Alerting.QuietStartHour, cfg.Alerting.QuietEndHour)
 		}
-		if len(cfg.LoadWarnings) != 1 || !strings.Contains(cfg.LoadWarnings[0], "quiet_start_hour") {
+		if w := alertingWarnings(cfg); len(w) != 1 || !strings.Contains(w[0], "quiet_start_hour") {
 			t.Errorf("%q: want one quiet-hours load warning, got %q", bad, cfg.LoadWarnings)
 		}
 	}
@@ -775,9 +781,22 @@ func TestQuietHoursNeverQuietWarning(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%q refused: %v", tc.yaml, err)
 		}
-		got := len(cfg.LoadWarnings) == 1 && strings.Contains(cfg.LoadWarnings[0], "no quiet hours")
-		if got != tc.warn || (!tc.warn && len(cfg.LoadWarnings) != 0) {
+		w := alertingWarnings(cfg)
+		got := len(w) == 1 && strings.Contains(w[0], "no quiet hours")
+		if got != tc.warn || (!tc.warn && len(w) != 0) {
 			t.Errorf("%q: warnings %q, want warning=%v", tc.yaml, cfg.LoadWarnings, tc.warn)
 		}
 	}
+}
+
+// alertingWarnings is the alerting.* load warnings of cfg (the default config also warns that security
+// logs have no S3 archive).
+func alertingWarnings(cfg *Config) []string {
+	var out []string
+	for _, w := range cfg.LoadWarnings {
+		if strings.HasPrefix(w, "alerting.") {
+			out = append(out, w)
+		}
+	}
+	return out
 }

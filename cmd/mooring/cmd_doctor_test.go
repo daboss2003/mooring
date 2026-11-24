@@ -9,9 +9,11 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -22,6 +24,7 @@ import (
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/docker"
 	"github.com/daboss2003/mooring/internal/edge"
+	"github.com/daboss2003/mooring/internal/siem/hostlog"
 )
 
 func TestCheckBinary(t *testing.T) {
@@ -2413,5 +2416,589 @@ func TestConfigWarnings(t *testing.T) {
 	got := configWarnings(cfg)
 	if len(got) != 1 || got[0].name != "config" || got[0].state != "warn" || !strings.Contains(got[0].detail, "quiet_start_hour") {
 		t.Fatalf("want one config warn carrying the warning, got %+v", got)
+	}
+}
+
+// --- security logs: the adm group, host log access, the archive, the unit's memory cap ---
+
+// siemHost is the host the security-log checks and the adm setup step read.
+type siemHost struct {
+	groups  map[string]string // groups that exist: name → gid
+	account *serviceAccount   // the mooring user; nil: there is none
+	unit    map[string]string // `systemctl show mooring` properties; nil: systemctl unavailable
+	proc    []string          // the running service's supplementary gids; nil: not running
+	logs    hostlog.Config    // what security logs follow
+}
+
+func stubSIEMHost(t *testing.T, h siemHost) {
+	t.Helper()
+	origGroup, origAcct, origShow, origProc, origLogs := lookupGroupGID, lookupServiceAccount, systemctlShow, serviceProcessGroups, resolveHostLogs
+	lookupGroupGID = func(name string) (string, bool) { g, ok := h.groups[name]; return g, ok }
+	lookupServiceAccount = func() (serviceAccount, bool) {
+		if h.account == nil {
+			return serviceAccount{}, false
+		}
+		return *h.account, true
+	}
+	systemctlShow = func(prop string) (string, bool) {
+		if h.unit == nil {
+			return "", false
+		}
+		return h.unit[prop], true
+	}
+	serviceProcessGroups = func() ([]string, bool) { return h.proc, h.proc != nil }
+	resolveHostLogs = func(config.SecurityLogsHost) hostlog.Config { return h.logs }
+	t.Cleanup(func() {
+		lookupGroupGID, lookupServiceAccount, systemctlShow, serviceProcessGroups, resolveHostLogs = origGroup, origAcct, origShow, origProc, origLogs
+	})
+}
+
+// siemConfig is a loaded config with security logs at their defaults; set may change it.
+func siemConfig(set func(*config.SecurityLogsConfig)) *config.Config {
+	cfg := &config.Config{DataDir: "/var/lib/mooring"}
+	if set != nil {
+		set(&cfg.SecurityLogs)
+	}
+	return cfg
+}
+
+func off() *bool { b := false; return &b }
+
+// resultNamed is the result called name, ok=false when there is none.
+func resultNamed(rs []result, name string) (result, bool) {
+	for _, r := range rs {
+		if r.name == name {
+			return r, true
+		}
+	}
+	return result{}, false
+}
+
+const admFix = "sudo usermod -aG adm mooring && sudo systemctl restart mooring   (or: sudo mooring setup --yes)"
+
+func TestAdmGroupCheck(t *testing.T) {
+	member := &serviceAccount{uid: "998", gid: "998", groups: []string{"998", "999", "4"}}
+	outsider := &serviceAccount{uid: "998", gid: "998", groups: []string{"998", "999"}}
+	groups := map[string]string{"adm": "4", "docker": "999"}
+	cases := []struct {
+		name         string
+		host         siemHost
+		runtime      bool
+		state        string
+		detail, fix  string
+		stepExpected bool
+	}{
+		{name: "no adm group on the host", host: siemHost{groups: map[string]string{"docker": "999"}, account: outsider},
+			state: "skip", detail: "this host has no adm group"},
+		{name: "no mooring user", host: siemHost{groups: groups}, state: "skip", detail: "no mooring user"},
+		{name: "not in adm", host: siemHost{groups: groups, account: outsider}, runtime: true,
+			state: "warn", detail: "the mooring user isn't in the adm group", fix: admFix, stepExpected: true},
+		{name: "not in adm, the running service has it from the unit", host: siemHost{groups: groups, account: outsider, proc: []string{"999", "4"}}, runtime: true,
+			state: "warn", detail: "the running service has it from a SupplementaryGroups= setting", fix: admFix, stepExpected: true},
+		{name: "in adm, the running service started without it", host: siemHost{groups: groups, account: member, proc: []string{"999"}}, runtime: true,
+			state: "warn", detail: "the running service started without it", fix: "sudo systemctl restart mooring"},
+		{name: "in adm, setup doesn't look at the running service", host: siemHost{groups: groups, account: member, proc: []string{"999"}},
+			state: "ok", detail: "the mooring user is in the adm group"},
+		{name: "in adm, running with it", host: siemHost{groups: groups, account: member, proc: []string{"999", "4"}}, runtime: true,
+			state: "ok", detail: "the mooring user is in the adm group"},
+		{name: "in adm, not running", host: siemHost{groups: groups, account: member}, runtime: true,
+			state: "ok", detail: "the mooring user is in the adm group"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stubSIEMHost(t, c.host)
+			got := checkAdmGroup(c.runtime)
+			if got.name != "adm group" || got.state != c.state || !strings.Contains(got.detail, c.detail) || got.fix != c.fix {
+				t.Errorf("got %+v\nwant state %q, detail containing %q, fix %q", got, c.state, c.detail, c.fix)
+			}
+			_, planned := admGroupStep(false, siemConfig(nil))
+			if planned != c.stepExpected {
+				t.Errorf("adm setup step planned=%v, want %v", planned, c.stepExpected)
+			}
+		})
+	}
+}
+
+// setup adds mooring to adm with usermod, only when security logs read host logs, the group exists and
+// the user isn't in it yet. The step is part of the plan, before enabling the service.
+func TestAdmGroupSetupStep(t *testing.T) {
+	outsider := &serviceAccount{uid: "998", gid: "998", groups: []string{"998"}}
+	stubSIEMHost(t, siemHost{groups: map[string]string{"adm": "4"}, account: outsider})
+	stubUnits(t)
+	calls := stubRunCmd(t, nil)
+
+	for _, c := range []struct {
+		name string
+		cfg  *config.Config
+		want bool
+	}{
+		{"defaults", siemConfig(nil), true},
+		{"no config.yaml (security logs are on by default)", nil, true},
+		{"security logs off", siemConfig(func(s *config.SecurityLogsConfig) { s.Enabled = off() }), false},
+		{"host logs off", siemConfig(func(s *config.SecurityLogsConfig) { s.HostLogs.Enabled = off() }), false},
+	} {
+		s, ok := admGroupStep(false, c.cfg)
+		if ok != c.want {
+			t.Errorf("%s: planned=%v, want %v", c.name, ok, c.want)
+			continue
+		}
+		if ok && s.desc != admGroupStepDesc {
+			t.Errorf("%s: desc %q", c.name, s.desc)
+		}
+		if got := stepIndex(plan(false, false, false, c.cfg, setupEdgeExternal), admGroupStepDesc) >= 0; got != c.want {
+			t.Errorf("%s: in the plan=%v, want %v", c.name, got, c.want)
+		}
+	}
+
+	s, _ := admGroupStep(false, siemConfig(nil))
+	out := captureStdout(t, func() {
+		if err := s.do(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if !strings.Contains(out, "$ usermod -aG adm mooring") || len(*calls) != 0 {
+		t.Errorf("dry run printed %q and ran %v; want the command printed, nothing run", out, *calls)
+	}
+	s, _ = admGroupStep(true, siemConfig(nil))
+	var done applied
+	var err error
+	captureStdout(t, func() { done, err = applySteps(os.Stdout, []step{s}) })
+	if err != nil || !done.admGroupAdded {
+		t.Errorf("applied: done=%+v err=%v", done, err)
+	}
+	if got := joined(*calls); !reflect.DeepEqual(got, []string{"usermod -aG adm mooring"}) {
+		t.Errorf("ran %q", got)
+	}
+
+	// Planned before `enable the mooring service` and the --restart step.
+	stubSIEMHost(t, siemHost{groups: map[string]string{"adm": "4"}, account: outsider, unit: map[string]string{"UnitFileState": "disabled"}})
+	steps := plan(false, false, true, siemConfig(nil), setupEdgeExternal)
+	adm, enable, restart := stepIndex(steps, admGroupStepDesc), stepIndex(steps, "enable the mooring service (start on boot)"), stepIndex(steps, "restart the mooring service")
+	if adm < 0 || enable < 0 || restart < 0 || adm > enable || adm > restart {
+		t.Errorf("order: adm %d, enable %d, restart %d", adm, enable, restart)
+	}
+}
+
+func TestAdmRestartHint(t *testing.T) {
+	const msg = "Restart Mooring so the service gets the adm group: sudo systemctl restart mooring"
+	for _, c := range []struct {
+		name            string
+		done            applied
+		restart, active bool
+		want            string
+	}{
+		{"added while running", applied{admGroupAdded: true}, false, true, msg},
+		{"added, --restart restarts it", applied{admGroupAdded: true}, true, true, ""},
+		{"added, not running", applied{admGroupAdded: true}, false, false, ""},
+		{"nothing added", applied{ownedCaddy: true}, false, true, ""},
+	} {
+		if got := admRestartHint(c.done, c.restart, c.active); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// With security logs off, doctor has no security-log line and setup no adm step. With host logs off,
+// only the archive and memory lines remain.
+func TestSecurityLogChecksOff(t *testing.T) {
+	stubSIEMHost(t, siemHost{groups: map[string]string{"adm": "4"}, account: &serviceAccount{uid: "998", gid: "998", groups: []string{"998"}},
+		unit: map[string]string{"MemoryMax": "402653184"}})
+	cfg := siemConfig(func(s *config.SecurityLogsConfig) { s.Enabled = off() })
+	if got := securityLogChecks(cfg, true); len(got) != 0 {
+		t.Errorf("security logs off: %+v, want no checks", got)
+	}
+	if stepIndex(plan(false, false, false, cfg, setupEdgeExternal), admGroupStepDesc) >= 0 {
+		t.Error("security logs off: the adm step is planned")
+	}
+	var names []string
+	for _, r := range securityLogChecks(siemConfig(func(s *config.SecurityLogsConfig) { s.HostLogs.Enabled = off() }), true) {
+		names = append(names, r.name)
+	}
+	if want := []string{"security archive", "memory max"}; !reflect.DeepEqual(names, want) {
+		t.Errorf("host logs off: checks %q, want %q", names, want)
+	}
+}
+
+// Every line on a default host, in order; config.yaml unreadable keeps the host checks but has no
+// archive line (whether one is set isn't known).
+func TestSecurityLogChecksOrder(t *testing.T) {
+	dir := t.TempDir()
+	auth := filepath.Join(dir, "auth.log")
+	if err := os.WriteFile(auth, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubSIEMHost(t, siemHost{groups: map[string]string{"adm": "4"}, account: &serviceAccount{uid: "998", gid: "998", groups: []string{"998", "4"}},
+		unit: map[string]string{"MemoryMax": "1073741824"}, logs: hostlog.Config{AuthLog: auth, Fail2BanLog: filepath.Join(dir, "fail2ban.log")}})
+	names := func(rs []result) []string {
+		var out []string
+		for _, r := range rs {
+			out = append(out, r.name)
+		}
+		return out
+	}
+	if got, want := names(securityLogChecks(siemConfig(nil), true)), []string{"adm group", "auth log", "fail2ban log", "security archive", "memory max"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("checks %q, want %q", got, want)
+	}
+	if got, want := names(securityLogChecks(nil, true)), []string{"adm group", "auth log", "fail2ban log", "memory max"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("no config: checks %q, want %q", got, want)
+	}
+}
+
+func TestMemoryMaxResult(t *testing.T) {
+	for _, c := range []struct {
+		value  string
+		ok     bool
+		state  string
+		detail string
+	}{
+		{"402653184", true, "warn", "the unit's MemoryMax is 384M; the shipped unit sets 1G"},
+		{"536870912", true, "warn", "MemoryMax is 512M"},
+		{"1073741823", true, "warn", "MemoryMax is 1073741823 bytes"},
+		{"1073741824", true, "ok", "MemoryMax is 1G"},
+		{"2147483648", true, "ok", "MemoryMax is 2G"},
+		{"infinity", true, "ok", "the unit sets no MemoryMax"},
+		{"", true, "warn", "could not read the unit's MemoryMax"},
+		{"lots", true, "warn", "could not read the unit's MemoryMax"},
+		{"", false, "warn", "could not read the unit's MemoryMax"},
+	} {
+		got := memoryMaxResult(c.value, c.ok)
+		if got.name != "memory max" || got.state != c.state || !strings.Contains(got.detail, c.detail) {
+			t.Errorf("%q ok=%v: %+v, want %s containing %q", c.value, c.ok, got, c.state, c.detail)
+		}
+		if c.state == "warn" && c.ok && c.value != "" && c.value != "lots" && !strings.Contains(got.fix, "sudo systemctl daemon-reload && sudo systemctl restart mooring") {
+			t.Errorf("%q: fix %q", c.value, got.fix)
+		}
+	}
+}
+
+// The doctor's MemoryMax floor is what the shipped unit sets, GOMEMLIMIT is under it, and the unit adds
+// only the docker group: a SupplementaryGroups= group the host lacks stops the unit from starting, so
+// adm comes from postinstall's group membership.
+func TestShippedUnitMatchesDoctor(t *testing.T) {
+	b, err := os.ReadFile("../../deploy/systemd/mooring.service")
+	if err != nil {
+		t.Fatal(err)
+	}
+	props := map[string]string{}
+	for _, l := range strings.Split(string(b), "\n") {
+		if k, v, ok := strings.Cut(l, "="); ok && !strings.HasPrefix(l, "#") {
+			if k == "Environment" {
+				if ek, ev, ok := strings.Cut(v, "="); ok {
+					k, v = ek, ev
+				}
+			}
+			props[k] = v
+		}
+	}
+	size := func(s string) uint64 {
+		mult := map[string]uint64{"K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30}
+		for _, suf := range []string{"KiB", "MiB", "GiB", "K", "M", "G"} {
+			if n, ok := strings.CutSuffix(s, suf); ok {
+				v, err := strconv.ParseUint(n, 10, 64)
+				if err != nil {
+					t.Fatalf("size %q: %v", s, err)
+				}
+				return v * mult[suf]
+			}
+		}
+		t.Fatalf("size %q has no unit", s)
+		return 0
+	}
+	memMax, goLimit := size(props["MemoryMax"]), size(props["GOMEMLIMIT"])
+	if memMax != minServiceMemoryMax || memoryMaxResult(strconv.FormatUint(memMax, 10), true).state != "ok" {
+		t.Errorf("unit MemoryMax %d, doctor floor %d", memMax, uint64(minServiceMemoryMax))
+	}
+	if goLimit == 0 || goLimit >= memMax {
+		t.Errorf("GOMEMLIMIT %d must be under MemoryMax %d", goLimit, memMax)
+	}
+	if got := strings.Fields(props["SupplementaryGroups"]); !reflect.DeepEqual(got, []string{"docker"}) {
+		t.Errorf("SupplementaryGroups %q, want only docker", got)
+	}
+}
+
+// postinstall adds mooring to adm once: when the group exists and the marker doesn't, before the
+// service is reloaded; then it writes the marker (0600), so an upgrade never re-adds a membership the
+// operator removed. A user already in adm only gets the marker; a failed usermod leaves none. Every
+// command that changes the host is stood in for, and the marker is moved into a temp dir.
+func TestPostinstallAddsAdmOnce(t *testing.T) {
+	const markerPath = "/etc/mooring/.adm-group-added"
+	script, err := os.ReadFile("../../deploy/nfpm/postinstall.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(script), markerPath); n != 1 {
+		t.Fatalf("postinstall names %s %d times, want once (ADM_MARKER)", markerPath, n)
+	}
+	cases := []struct {
+		name                        string
+		admGroup, member, markerSet bool
+		usermodFails                bool
+		wantUsermod, wantMarker     bool
+	}{
+		{name: "first install: added, marker written", admGroup: true, wantUsermod: true, wantMarker: true},
+		{name: "marker present (the operator removed it later): not re-added", admGroup: true, markerSet: true, wantMarker: true},
+		{name: "already in adm: marker only", admGroup: true, member: true, wantMarker: true},
+		{name: "no adm group: nothing", admGroup: false},
+		{name: "usermod failed: no marker, the next upgrade tries again", admGroup: true, usermodFails: true, wantUsermod: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// Not t.TempDir(): its path holds the subtest name, which the shell would read as syntax.
+			dir, err := os.MkdirTemp("", "postinstall")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			logf, marker := filepath.Join(dir, "calls"), filepath.Join(dir, "adm-marker")
+			if c.markerSet {
+				if err := os.WriteFile(marker, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			copyPath := filepath.Join(dir, "postinstall.sh")
+			if err := os.WriteFile(copyPath, []byte(strings.Replace(string(script), markerPath, marker, 1)), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			stub := "#!/bin/sh\necho \"$(basename \"$0\") $*\" >> " + logf + "\n"
+			for name, body := range map[string]string{
+				"groupadd": stub, "useradd": stub, "install": stub, "systemctl": stub,
+				"usermod": stub + "[ \"$2\" = adm ] && [ \"$MOORING_TEST_USERMOD_FAIL\" = yes ] && exit 1\nexit 0\n",
+				"getent":  stub + "[ \"$1 $2\" = \"group adm\" ] && [ \"$MOORING_TEST_ADM\" != yes ] && exit 2\nexit 0\n",
+				"id":      stub + "if [ \"$MOORING_TEST_MEMBER\" = yes ]; then echo mooring docker adm; else echo mooring docker; fi\n",
+			} {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			yes := map[bool]string{true: "yes", false: "no"}
+			cmd := exec.Command("/bin/sh", copyPath)
+			cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "MOORING_TEST_ADM=" + yes[c.admGroup],
+				"MOORING_TEST_MEMBER=" + yes[c.member], "MOORING_TEST_USERMOD_FAIL=" + yes[c.usermodFails]}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("postinstall failed: %v\n%s", err, out)
+			}
+			b, err := os.ReadFile(logf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := strings.Split(strings.TrimSpace(string(b)), "\n")
+			usermod, reload := slices.Index(calls, "usermod -aG adm mooring"), slices.Index(calls, "systemctl daemon-reload")
+			if (usermod >= 0) != c.wantUsermod || (usermod >= 0 && usermod > reload) {
+				t.Errorf("calls %q: usermod -aG adm mooring at %d (want it=%v, before daemon-reload at %d)", calls, usermod, c.wantUsermod, reload)
+			}
+			if !slices.Contains(calls, "usermod -aG docker mooring") {
+				t.Errorf("calls %q: the docker group is no longer added", calls)
+			}
+			fi, err := os.Stat(marker)
+			if (err == nil) != c.wantMarker {
+				t.Fatalf("marker exists=%v, want %v", err == nil, c.wantMarker)
+			}
+			if err == nil && !c.markerSet && fi.Mode().Perm() != 0o600 {
+				t.Errorf("marker mode %o, want 600", fi.Mode().Perm())
+			}
+		})
+	}
+}
+
+// hostLogFile writes a file with perm in a temp dir and returns its path and group id.
+func hostLogFile(t *testing.T, dir, name string, perm os.FileMode) (string, string) {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, []byte("x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, perm); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p, strconv.FormatUint(uint64(fi.Sys().(*syscall.Stat_t).Gid), 10)
+}
+
+// The file checks go by the file's owner, group and mode against the user and the groups the service
+// gets: its own, the group database's, and the unit's SupplementaryGroups.
+func TestHostLogFileChecks(t *testing.T) {
+	dir := t.TempDir()
+	me := strconv.Itoa(os.Getuid())
+	groupRead, fileGID := hostLogFile(t, dir, "auth.log", 0o640)
+	private, _ := hostLogFile(t, dir, "secure", 0o600)
+	world, _ := hostLogFile(t, dir, "world.log", 0o644)
+	ownerOnly, _ := hostLogFile(t, dir, "owner.log", 0o400)
+	missing := filepath.Join(dir, "none.log")
+	other := func(groups ...string) *serviceAccount {
+		return &serviceAccount{uid: "424242", gid: "424242", groups: append([]string{"424242"}, groups...)}
+	}
+
+	cases := []struct {
+		name         string
+		account      *serviceAccount
+		unitGroups   string
+		groups       map[string]string
+		logs         hostlog.Config
+		check, state string
+		detail, fix  string
+	}{
+		{name: "group-readable, the user is in its group", account: other(fileGID), logs: hostlog.Config{AuthLog: groupRead},
+			check: "auth log", state: "ok", detail: "security logs read " + groupRead},
+		{name: "group-readable through the unit's SupplementaryGroups", account: other(), unitGroups: "docker loggrp", groups: map[string]string{"loggrp": fileGID, "docker": "999"},
+			logs: hostlog.Config{AuthLog: groupRead}, check: "auth log", state: "ok", detail: "through the "},
+		{name: "group-readable, not in its group", account: other(), groups: map[string]string{"adm": "4"}, logs: hostlog.Config{AuthLog: groupRead},
+			check: "auth log", state: "warn", detail: "the mooring service can't read " + groupRead, fix: "sudo chgrp adm " + groupRead},
+		{name: "group-readable, not in its group, no adm group", account: other(), logs: hostlog.Config{AuthLog: groupRead},
+			check: "auth log", state: "warn", detail: "the mooring service can't read " + groupRead, fix: "readable by one of the mooring service's groups"},
+		{name: "group-readable by adm, not in adm", account: other(), groups: map[string]string{"adm": fileGID}, logs: hostlog.Config{AuthLog: groupRead},
+			check: "auth log", state: "warn", detail: "the mooring service can't read", fix: admFix},
+		{name: "owner-only (RHEL's /var/log/secure)", account: other(fileGID), logs: hostlog.Config{AuthLog: private},
+			check: "auth log", state: "warn", detail: "the mooring service can't read " + private, fix: "security_logs.host_logs.journal: true"},
+		{name: "world-readable", account: other(), logs: hostlog.Config{AuthLog: world}, check: "auth log", state: "ok", detail: "security logs read " + world},
+		{name: "the service user owns it", account: &serviceAccount{uid: me, gid: "424242", groups: []string{"424242"}}, logs: hostlog.Config{AuthLog: ownerOnly},
+			check: "auth log", state: "ok", detail: "through its owner"},
+		{name: "owner bits apply to the owner, not the group's", account: &serviceAccount{uid: me, gid: fileGID, groups: []string{fileGID}}, logs: hostlog.Config{AuthLog: hostLogPerm(t, dir, "noowner.log", 0o040)},
+			check: "auth log", state: "warn", detail: "can't read"},
+		{name: "auth log missing", account: other(), logs: hostlog.Config{AuthLog: missing}, check: "auth log", state: "warn", detail: missing + " doesn't exist"},
+		{name: "no auth log and no journal", account: other(), logs: hostlog.Config{}, check: "auth log", state: "warn", detail: "no sshd/sudo/su events"},
+		{name: "fail2ban log missing", account: other(), logs: hostlog.Config{AuthLog: world, Fail2BanLog: missing}, check: "fail2ban log", state: "skip", detail: missing + " isn't there"},
+		{name: "fail2ban log readable", account: other(fileGID), logs: hostlog.Config{AuthLog: world, Fail2BanLog: groupRead}, check: "fail2ban log", state: "ok", detail: groupRead},
+		{name: "fail2ban log unreadable", account: other(), logs: hostlog.Config{AuthLog: world, Fail2BanLog: private}, check: "fail2ban log", state: "warn", detail: "can't read " + private},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stubSIEMHost(t, siemHost{groups: c.groups, account: c.account, unit: map[string]string{"SupplementaryGroups": c.unitGroups}, logs: c.logs})
+			got, ok := resultNamed(checkHostLogs(siemConfig(nil)), c.check)
+			if !ok || got.state != c.state || !strings.Contains(got.detail, c.detail) || !strings.Contains(got.fix, c.fix) {
+				t.Errorf("got %+v (found %v)\nwant %s, detail containing %q, fix containing %q", got, ok, c.state, c.detail, c.fix)
+			}
+		})
+	}
+}
+
+// hostLogPerm writes a file with perm and returns its path.
+func hostLogPerm(t *testing.T, dir, name string, perm os.FileMode) string {
+	p, _ := hostLogFile(t, dir, name, perm)
+	return p
+}
+
+// The journal is readable to members of systemd-journal (its files' group) and of adm and wheel (systemd's
+// read ACLs on it).
+func TestJournalCheck(t *testing.T) {
+	jdir := t.TempDir()
+	orig := journalDirs
+	t.Cleanup(func() { journalDirs = orig })
+	groups := map[string]string{"adm": "4", "systemd-journal": "101", "wheel": "10"}
+	cases := []struct {
+		name   string
+		dirs   []string
+		member []string
+		state  string
+		detail string
+	}{
+		{"in adm", []string{jdir}, []string{"4"}, "ok", "through the adm group"},
+		{"in systemd-journal", []string{jdir}, []string{"101"}, "ok", "through the systemd-journal group"},
+		{"in wheel", []string{jdir}, []string{"10"}, "ok", "through the wheel group"},
+		{"in none of them", []string{jdir}, nil, "warn", "isn't in the adm or systemd-journal group"},
+		{"no journal on the host", []string{filepath.Join(jdir, "nope")}, []string{"4"}, "warn", "no systemd journal"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			journalDirs = c.dirs
+			stubSIEMHost(t, siemHost{groups: groups, account: &serviceAccount{uid: "998", gid: "998", groups: append([]string{"998"}, c.member...)},
+				unit: map[string]string{}, logs: hostlog.Config{Journal: true}})
+			rs := checkHostLogs(siemConfig(nil))
+			got, ok := resultNamed(rs, "journal")
+			if !ok || got.state != c.state || !strings.Contains(got.detail, c.detail) {
+				t.Errorf("got %+v (found %v), want %s containing %q", got, ok, c.state, c.detail)
+			}
+			if _, ok := resultNamed(rs, "auth log"); ok {
+				t.Errorf("an auth log line without an auth log: %+v", rs)
+			}
+			if c.state == "warn" && got.fix == "" {
+				t.Error("a journal warning has no fix")
+			}
+		})
+	}
+}
+
+func TestSecurityArchiveCheck(t *testing.T) {
+	got := checkSecurityArchive(siemConfig(nil))
+	if got.name != "security archive" || got.state != "warn" ||
+		got.detail != "security_logs.archive.s3 isn't set — security logs are kept only on this host (14 days)" || !strings.Contains(got.fix, "security_logs.archive.s3") {
+		t.Errorf("no archive: %+v", got)
+	}
+	got = checkSecurityArchive(siemConfig(func(s *config.SecurityLogsConfig) { s.HotRetention = config.Duration(36 * time.Hour) }))
+	if !strings.Contains(got.detail, "(36h)") {
+		t.Errorf("36h: %+v", got)
+	}
+	got = checkSecurityArchive(siemConfig(func(s *config.SecurityLogsConfig) {
+		s.Archive.S3 = &config.BackupS3{Bucket: "sec", Endpoint: "s3.eu-west-1.amazonaws.com", Region: "eu-west-1", Prefix: "mooring/", AccessKeyID: "AKIA", SecretAccessKey: "s3cr3t"}
+	}))
+	if got.state != "ok" || got.detail != "security logs are archived to s3.eu-west-1.amazonaws.com/sec/mooring/ and kept 365 days there" {
+		t.Errorf("archive: %+v", got)
+	}
+	if strings.Contains(got.detail+got.fix, "s3cr3t") || strings.Contains(got.detail+got.fix, "AKIA") {
+		t.Errorf("the archive line shows a credential: %+v", got)
+	}
+}
+
+// The load warning about no archive is doctor's security archive line, not a second config line.
+func TestConfigWarningsLeaveTheArchiveToItsCheck(t *testing.T) {
+	cfg := &config.Config{LoadWarnings: []string{
+		config.WarnSecurityLogsNoArchive + " — security logs are kept only on this host (14 days)",
+		"security_logs.hot_max_disk_mb 100 is below the minimum 256; using 256",
+	}}
+	got := configWarnings(cfg)
+	if len(got) != 1 || !strings.Contains(got[0].detail, "hot_max_disk_mb") {
+		t.Errorf("config lines %+v, want only the hot_max_disk_mb warning", got)
+	}
+}
+
+func TestParseStatusGroups(t *testing.T) {
+	for in, want := range map[string][]string{
+		"Name:\tmooring\nUid:\t998\t998\t998\t998\nGroups:\t4 999 \nNSpid:\t1\n": {"4", "999"},
+		"Groups:\t\n":            nil,
+		"Uid:\t1\n":              nil,
+		"Groups:\t4 x 999\n":     {"4", "999"},
+		"Groups:\t4\nGroups:\t5": {"4"},
+	} {
+		if got := parseStatusGroups(in); !reflect.DeepEqual(got, want) {
+			t.Errorf("%q: %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The running service's groups are read from its MainPID's /proc status: a group the user joined after
+// the service started isn't there. MainPID 0 (stopped) or unreadable is "not running".
+func TestServiceProcessGroupsReadsProc(t *testing.T) {
+	if _, err := os.Stat("/proc/self/status"); err != nil {
+		t.Skip("no /proc")
+	}
+	orig := systemctlShow
+	t.Cleanup(func() { systemctlShow = orig })
+	pid := strconv.Itoa(os.Getpid())
+	systemctlShow = func(prop string) (string, bool) { return map[string]string{"MainPID": pid}[prop], true }
+	got, ok := serviceProcessGroups()
+	gids, err := os.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var want []string
+	for _, g := range gids {
+		want = append(want, strconv.Itoa(g))
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !ok || !slices.Equal(got, want) {
+		t.Errorf("groups %q ok=%v, want this process's %q", got, ok, want)
+	}
+	for _, v := range []string{"0", "", "x", "-3"} {
+		systemctlShow = func(string) (string, bool) { return v, true }
+		if _, ok := serviceProcessGroups(); ok {
+			t.Errorf("MainPID %q: reported running", v)
+		}
 	}
 }

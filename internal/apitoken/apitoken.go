@@ -160,6 +160,19 @@ func SplitBearer(bearer string) (id, secret string, ok bool) {
 // ValidID reports whether s is a well-formed token id (for the store lookup).
 func ValidID(s string) bool { return idRe.MatchString(s) }
 
+// AuditTarget is what an audit event records for a typed token id: the id, the id part of a whole
+// token pasted in its place, else "". Intentional: what was typed is never stored as is — a pasted
+// token would put its secret in the audit log.
+func AuditTarget(typed string) string {
+	if ValidID(typed) {
+		return typed
+	}
+	if id, _, ok := SplitBearer(typed); ok {
+		return id
+	}
+	return ""
+}
+
 // VerifySecret constant-time-checks the presented secret against the record and its
 // active window. The argon2id verify ALWAYS runs first (even for an expired/revoked
 // record) so the cost is identical whether or not the token is active — an

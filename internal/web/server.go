@@ -48,6 +48,7 @@ import (
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/session"
 	"github.com/daboss2003/mooring/internal/setupstore"
+	"github.com/daboss2003/mooring/internal/siem/query"
 	"github.com/daboss2003/mooring/internal/startgate"
 	"github.com/daboss2003/mooring/internal/store"
 	"github.com/daboss2003/mooring/internal/updatecheck"
@@ -138,6 +139,12 @@ type Deps struct {
 	// EdgeDNSPlugins is the per-provider Caddy DNS plugin state (nil when no namespace uses dns01 or the
 	// edge isn't owned). The catch-all deploy gate, the catch-all watch and the Edge page read it.
 	EdgeDNSPlugins *edge.DNSPlugins
+
+	// SecurityLogs is the security-log pipeline the owner-only Security logs page searches and exports
+	// (nil when security logs are off; leave the interface nil, not a typed nil pointer).
+	SecurityLogs SecurityLogs
+	// AuditSink, when set, also receives every audit event this server records (security logs).
+	AuditSink func(time.Time, audit.Event)
 }
 
 // Server holds everything the request pipeline needs. Construct with New.
@@ -223,6 +230,10 @@ type Server struct {
 	eventLog       *eventlog.Store              // deduped operational events for the Activity tab (may be nil)
 	edgeErrors     *edgeerr.Store               // per-route edge 4xx/5xx error log (may be nil)
 	pendingApps    atomic.Pointer[[]pendingApp] // undeployed mooring.*.yaml siblings found in connected repos
+
+	securityLogs    SecurityLogs                      // security-log search/export/status (nil when off)
+	securityExports chan struct{}                     // concurrency cap on security-log exports
+	secParse        func(string) (query.Query, error) // test seam: replaces query.Parse on the Security logs page
 }
 
 // New builds a Server from a validated config and its dependencies.
@@ -288,6 +299,9 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 		logStreams:    make(chan struct{}, maxConcurrentLogStreams),
 	}
 	s.edgeDNSPlugins = d.EdgeDNSPlugins
+	s.securityLogs = d.SecurityLogs
+	s.audit.SetSink(d.AuditSink)
+	s.securityExports = make(chan struct{}, securityExportConcurrency)
 	s.sweepDiscoveryScratch() // clear any orphaned multi-file-connect scratch dirs from a prior run
 	sec, err := buildSecState(cfg)
 	if err != nil {
@@ -314,6 +328,10 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 	// applied via `systemctl restart`, not only via reload. Closes the gap where a
 	// pre-TOTP session kept full access after TOTP was turned on.
 	s.reconcileAuthEpoch(context.Background())
+	// Operator changes applied by a restart (config.yaml edited while Mooring was stopped).
+	auditUsersSinceLastRun(context.Background(), s.audit,
+		func(k string) string { return s.getSetting(context.Background(), k) },
+		func(k, v string) error { return s.setSetting(context.Background(), k, v) }, s.security())
 	return s, nil
 }
 
@@ -440,6 +458,8 @@ func (s *Server) Reload(ctx context.Context) error {
 		return err
 	}
 	sec.tokenCIDRUnion = s.activeTokenUnion(ctx)
+	auditUserChanges(ctx, s.audit, s.security(), sec, "system")
+	_ = s.setSetting(ctx, usersSnapshotKey, usersSnapshot(sec)) // so the next start doesn't report it again
 	s.sec.Store(sec)
 	// Revoke all sessions if the auth config (password / TOTP / username) changed, so a
 	// session minted under the OLD config can't bypass the new one — the "I enabled 2FA
@@ -614,6 +634,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /alerts/ack", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAlertAck))))
 	mux.HandleFunc("POST /alerts/silence", capBody(loginBodyLimit, s.requirePerm("deploy", s.requireCSRF(s.handleAlertSilence))))
 	mux.HandleFunc("GET /events", s.requireAuth(s.withCSRFToken(s.handleEvents)))
+	// Security logs: search, live pipeline status, NDJSON export. Owner only, GETs included
+	// (requirePerm("admin"); pinned by ownerOnly in authz_posture_test.go).
+	mux.HandleFunc("GET /security", s.requirePerm("admin", s.withCSRFToken(s.handleSecurity)))
+	mux.HandleFunc("GET /security/status", s.requirePerm("admin", s.handleSecurityStatus))
+	mux.HandleFunc("GET /security/export", s.requirePerm("admin", s.handleSecurityExport))
 	// Operator UI prefs (M7): persisted tile order. UI-only, never Tier-1.
 	mux.HandleFunc("POST /settings/tile-order", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleTileOrder))))
 	// API tokens (M19): read-only view + revoke. Minting stays CLI-only by design.
@@ -759,6 +784,6 @@ func clearWriteDeadline(w http.ResponseWriter) {
 func (s *Server) auditDeny(r *http.Request, peer, client netip.Addr) {
 	_ = s.audit.Log(r.Context(), audit.Event{
 		IP: peer.String(), Action: "allowlist_deny", Outcome: audit.Deny, Level: audit.Security,
-		Target: r.URL.Path, Detail: "resolved client " + client.String(),
+		Target: r.URL.Path, Detail: "resolved client " + client.String(), UA: r.UserAgent(),
 	})
 }

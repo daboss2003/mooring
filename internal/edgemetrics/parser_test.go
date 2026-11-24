@@ -4,12 +4,12 @@ import "testing"
 
 func TestParseAccess(t *testing.T) {
 	// A real Caddy access line (the shape from the operator's own edge logs).
-	line := []byte(`{"level":"info","ts":1786489778.46,"logger":"http.log.access.log0","msg":"handled request","request":{"remote_ip":"1.2.3.4","host":"api.anchor-api.credlockng.com","method":"GET","uri":"/api/v2/agent/x/config?trace=1"},"duration":0.1262139,"status":200}`)
+	line := []byte(`{"level":"info","ts":1786489778.46,"logger":"http.log.access.log0","msg":"handled request","request":{"remote_ip":"1.2.3.4","host":"api.example.com","method":"GET","uri":"/api/v2/agent/x/config?trace=1"},"duration":0.1262139,"status":200}`)
 	host, path, durMs, status, ok := ParseAccess(line)
 	if !ok {
 		t.Fatal("a valid access line should parse")
 	}
-	if host != "api.anchor-api.credlockng.com" {
+	if host != "api.example.com" {
 		t.Errorf("host = %q", host)
 	}
 	if path != "/api/v2/agent/x/config" { // query stripped

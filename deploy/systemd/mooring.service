@@ -1,11 +1,13 @@
 # Mooring runs as its own systemd unit, NOT a compose container, so it can
 # never appear in a managed project's container list and a stack `down` can't
 # take it down (plan §3). Runs non-root as a dedicated low-priv user in the
-# `docker` group. Hardening per plan §3 / §15 Phase 4.
+# `docker` group (below) and, through its group membership, `adm` (security logs).
+# Hardening per plan §3 / §15 Phase 4.
 #
 # Install:
 #   useradd --system --no-create-home --shell /usr/sbin/nologin mooring
 #   usermod -aG docker mooring
+#   usermod -aG adm mooring
 #   install -m0755 mooring /usr/local/bin/mooring
 #   install -d -o mooring -g mooring -m0700 /var/lib/mooring
 #   install -d -o mooring -g mooring -m0700 /var/lib/mooring-apps  # app run dirs
@@ -25,6 +27,11 @@ Wants=network-online.target
 Type=simple
 User=mooring
 Group=mooring
+# docker: the write plane's docker/compose children. User= also gives the service the mooring
+# user's own groups from the group database; postinstall adds it to adm once (when the host has
+# that group), for read-only access to auth.log, fail2ban.log and the journal (docs/security-logs.md).
+# Intentional: adm is not listed here. systemd doesn't start a unit whose SupplementaryGroups=
+# names a group the host lacks (exit 216/GROUP), and not every distribution has adm.
 SupplementaryGroups=docker
 ExecStart=/usr/local/bin/mooring serve --config /etc/mooring/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
@@ -32,12 +39,14 @@ Restart=on-failure
 RestartSec=2s
 
 # --- Memory accounting: MemoryMax kills INSIDE this cgroup, incl. the supervised
-# Caddy + nginx children AND forked docker/compose (plan §0, §3). They are CO-RESIDENT
-# in this cgroup (not a separate slice), so the cap must cover all of them: 192M with a
-# 150M Go limit left almost nothing for Caddy+nginx and risked OOM-killing the control
-# plane itself. GOMEMLIMIT sits under the cap for the Go process.
-MemoryMax=384M
-Environment=GOMEMLIMIT=150MiB
+# Caddy + nginx children AND forked docker/compose and journalctl (plan §0, §3). They are
+# CO-RESIDENT in this cgroup (not a separate slice), so the cap must cover all of them.
+# GOMEMLIMIT is the Go process's soft limit (Mooring itself, with the security-log pipeline:
+# parsing, redaction, the on-box store and the S3 archive); the ~400M above it is left for
+# Caddy, nginx and the forked children. `mooring doctor` warns when the loaded unit's
+# MemoryMax is below 1G (an upgrade whose unit wasn't loaded, or a drop-in lowering it).
+MemoryMax=1G
+Environment=GOMEMLIMIT=600MiB
 # OOMScoreAdjust only biases the GLOBAL killer; it is NOT a substitute for MemoryMax.
 OOMScoreAdjust=-100
 # HOME for forked children only (Mooring itself never reads HOME): docker compose's

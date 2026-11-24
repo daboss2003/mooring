@@ -1,0 +1,4 @@
+go test fuzz v1
+string("0")
+string("0")
+string("emAil%22%3A0%20%400.AA")

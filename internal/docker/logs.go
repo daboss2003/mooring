@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // streamClient is a no-overall-timeout client for following log streams (the
@@ -22,20 +23,43 @@ func (c *Client) streamClient() *http.Client {
 const (
 	maxLogLineBytes  = 8 << 10 // truncate pathological lines
 	maxLogFrameBytes = 1 << 20 // sanity cap on a single stdcopy frame
+	// maxTimestampPrefix is room for Docker's "2006-01-02T15:04:05.000000000Z " prefix (plus slack
+	// for a numeric zone), buffered on top of maxLogLineBytes so the cut applies to the text after it.
+	maxTimestampPrefix = 40
 )
 
 // StreamLogs follows a container's logs through the read-only socket-proxy (read
 // plane — no docker child, no semaphore), demultiplexing the stdcopy framing and
 // invoking onLine per (truncated) line until ctx is done or the stream ends.
 func (c *Client) StreamLogs(ctx context.Context, id string, tail int, follow bool, onLine func(string)) error {
+	return c.streamLogs(ctx, id, tail, time.Time{}, follow, false, func(_ time.Time, s string) { onLine(s) })
+}
+
+// StreamLogsSince is StreamLogs with Docker's per-line timestamps: onLine gets each line's
+// timestamp (zero when a line has none) and the line without it, cut to the same 8 KiB. A non-zero
+// since starts the stream at that time (Docker includes lines stamped exactly since); tail still caps
+// the backlog to the last tail lines.
+func (c *Client) StreamLogsSince(ctx context.Context, id string, tail int, since time.Time, follow bool, onLine func(ts time.Time, line string)) error {
+	return c.streamLogs(ctx, id, tail, since, follow, true, onLine)
+}
+
+func (c *Client) streamLogs(ctx context.Context, id string, tail int, since time.Time, follow, timestamps bool, onLine func(time.Time, string)) error {
 	q := url.Values{}
 	q.Set("stdout", "1")
 	q.Set("stderr", "1")
-	q.Set("timestamps", "0")
+	if timestamps {
+		q.Set("timestamps", "1")
+	} else {
+		q.Set("timestamps", "0")
+	}
 	if tail <= 0 || tail > 5000 {
 		tail = 500
 	}
 	q.Set("tail", strconv.Itoa(tail))
+	if !since.IsZero() {
+		// The Engine API takes seconds with an optional 9-digit fraction.
+		q.Set("since", strconv.FormatInt(since.Unix(), 10)+"."+fmt.Sprintf("%09d", since.Nanosecond()))
+	}
 	if follow {
 		q.Set("follow", "1")
 	}
@@ -52,15 +76,16 @@ func (c *Client) StreamLogs(ctx context.Context, id string, tail int, follow boo
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("docker: logs status %d", resp.StatusCode)
 	}
-	return demuxLogs(resp.Body, onLine)
+	return demuxLogs(resp.Body, timestamps, onLine)
 }
 
 // demuxLogs reads the Docker multiplexed log stream (8-byte stdcopy headers) and
 // emits whole lines. Falls back to raw line reading if the stream isn't framed
 // (a TTY container). Bounded line + frame sizes guard against a hostile stream.
-func demuxLogs(r io.Reader, onLine func(string)) error {
+// With timestamps, each line's leading Docker timestamp is parsed and stripped.
+func demuxLogs(r io.Reader, timestamps bool, onLine func(time.Time, string)) error {
 	br := bufio.NewReaderSize(r, 64<<10)
-	emit := newLineEmitter(onLine)
+	emit := newLineEmitter(onLine, timestamps)
 
 	header := make([]byte, 8)
 	for {
@@ -121,14 +146,22 @@ func emitRaw(br *bufio.Reader, emit *lineEmitter) error {
 }
 
 // lineEmitter accumulates bytes and emits whole lines, truncating any line longer
-// than maxLogLineBytes.
+// than maxLogLineBytes (counted after the timestamp prefix when timestamps is set).
 type lineEmitter struct {
-	onLine func(string)
-	buf    strings.Builder
-	trunc  bool
+	onLine     func(time.Time, string)
+	timestamps bool
+	limit      int // bytes buffered per line
+	buf        strings.Builder
+	trunc      bool
 }
 
-func newLineEmitter(onLine func(string)) *lineEmitter { return &lineEmitter{onLine: onLine} }
+func newLineEmitter(onLine func(time.Time, string), timestamps bool) *lineEmitter {
+	e := &lineEmitter{onLine: onLine, timestamps: timestamps, limit: maxLogLineBytes}
+	if timestamps {
+		e.limit += maxTimestampPrefix
+	}
+	return e
+}
 
 // Write satisfies io.Writer so io.CopyN can target the emitter.
 func (e *lineEmitter) Write(p []byte) (int, error) { e.write(p); return len(p), nil }
@@ -139,7 +172,7 @@ func (e *lineEmitter) write(p []byte) {
 			e.flush()
 			continue
 		}
-		if e.buf.Len() >= maxLogLineBytes {
+		if e.buf.Len() >= e.limit {
 			e.trunc = true
 			continue
 		}
@@ -151,13 +184,41 @@ func (e *lineEmitter) flush() {
 	if e.buf.Len() == 0 && !e.trunc {
 		return
 	}
-	line := e.buf.String()
-	if e.trunc {
+	line, trunc := e.buf.String(), e.trunc
+	e.buf.Reset()
+	e.trunc = false
+	var ts time.Time
+	if e.timestamps {
+		ts, line = splitTimestamp(line)
+		if line == "" && !trunc {
+			return // an empty line, skipped as it is without timestamps
+		}
+	}
+	if len(line) > maxLogLineBytes {
+		line, trunc = line[:maxLogLineBytes], true
+	}
+	if trunc {
 		line += "…"
 	}
 	if e.onLine != nil {
-		e.onLine(strings.TrimRight(line, "\r"))
+		e.onLine(ts, strings.TrimRight(line, "\r"))
 	}
-	e.buf.Reset()
-	e.trunc = false
+}
+
+// splitTimestamp splits Docker's "<RFC 3339 nano> " line prefix off. A line without one is
+// returned whole with a zero time.
+func splitTimestamp(line string) (time.Time, string) {
+	head := line
+	if len(head) > maxTimestampPrefix {
+		head = head[:maxTimestampPrefix]
+	}
+	i := strings.IndexByte(head, ' ')
+	if i <= 0 {
+		return time.Time{}, line
+	}
+	ts, err := time.Parse(time.RFC3339Nano, line[:i])
+	if err != nil {
+		return time.Time{}, line
+	}
+	return ts, line[i+1:]
 }

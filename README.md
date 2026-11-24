@@ -119,7 +119,7 @@ Mooring is secure out of the box, with no tuning required: the dashboard is priv
 
 📖 **[Read the docs →](./docs/README.md)** — start with the three-page on-ramp: **[Introduction](./docs/introduction.md) → [Install](./docs/installation.md) → [First steps](./docs/first-steps.md)**.
 
-Guides: [Deploy from Git](./docs/gitops.md) · [Edge & TLS](./docs/edge-and-tls.md) · [Secrets & config files](./docs/config-files-and-secrets.md) · [Import a `.env`](./docs/env-import.md) · [Scaling & self-healing](./docs/scaling-and-self-healing.md) · [Alerts](./docs/alerting.md) · [Backups](./docs/backup-and-recovery.md) · [Many apps on one server](./docs/host-file.md) · [The `mooring.yaml` file](./docs/definition-file.md). For internals: [Architecture](./docs/architecture.md) · [Security](./docs/security.md).
+Guides: [Deploy from Git](./docs/gitops.md) · [Edge & TLS](./docs/edge-and-tls.md) · [Secrets & config files](./docs/config-files-and-secrets.md) · [Import a `.env`](./docs/env-import.md) · [Scaling & self-healing](./docs/scaling-and-self-healing.md) · [Alerts](./docs/alerting.md) · [Security logs](./docs/security-logs.md) · [Backups](./docs/backup-and-recovery.md) · [Many apps on one server](./docs/host-file.md) · [The `mooring.yaml` file](./docs/definition-file.md). For internals: [Architecture](./docs/architecture.md) · [Security](./docs/security.md).
 
 ## License & contributing
 

@@ -71,7 +71,7 @@ This also applies to a rollback made while auto-deploy was already off. A rollba
 
 ### Audit trail
 
-Each deploy request is recorded with the action `api_deploy` and the actor `api:<token id>`: the client IP, the app (and commit, once fetched), the outcome and the reason for a refusal. Each deploy the API starts is recorded with the action `git_deploy` and the same actor when it finishes, with the outcome the dashboard records for a deploy (`ok`, or `error` with the failure). Read them with `GET /api/v1/audit`.
+Each deploy request is recorded with the action `api_deploy` and the actor `api:<token id>`: the client IP, the app (and commit, once fetched), the outcome and the reason for a refusal. Each deploy the API starts is recorded with the action `git_deploy` and the same actor when it finishes, with the outcome the dashboard records for a deploy (`ok`, or `error` with the failure). A request accepted with a token is recorded with the action `api_token_use` and the actor `api:<token id>`, at most once per token and client address every 5 minutes. Read them with `GET /api/v1/audit`.
 
 ### Example
 

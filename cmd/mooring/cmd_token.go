@@ -2,15 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/daboss2003/mooring/internal/apitoken"
+	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/store"
 )
@@ -78,9 +84,19 @@ func cmdTokenMint(args []string) error {
 	if err != nil {
 		return err // scope/CIDR/ttl validation (the structural guards) happen here
 	}
+	ev := audit.Event{Action: "api_token_mint", Target: m.Record.ID, Outcome: audit.OK}
 	if err := ts.Insert(context.Background(), m.Record, *label, now); err != nil {
+		ev.Outcome, ev.Detail = audit.Error, "store failed"
+		cliAudit(db, ev)
 		return err
 	}
+	nets := make([]string, 0, len(m.Record.CIDRs))
+	for _, p := range m.Record.CIDRs {
+		nets = append(nets, p.String())
+	}
+	ev.Detail = fmt.Sprintf("scopes=%s cidrs=%s expires=%s label=%q", strings.Join(m.Record.Scopes, ","),
+		strings.Join(nets, ","), time.Unix(m.Record.ExpiresAt, 0).UTC().Format(time.RFC3339), *label)
+	cliAudit(db, ev)
 
 	fmt.Println("token minted — copy the value below, it is shown ONCE and cannot be recovered:")
 	fmt.Println()
@@ -149,11 +165,54 @@ func cmdTokenRevoke(args []string) error {
 	}
 	defer db.Close()
 
-	if err := ts.Revoke(context.Background(), *id); err != nil {
+	err = ts.Revoke(context.Background(), *id)
+	ev := audit.Event{Action: "api_token_revoke_cli", Target: apitoken.AuditTarget(*id), Outcome: audit.OK}
+	if err != nil {
+		ev.Outcome, ev.Detail = audit.Error, "revoke failed"
+		if errors.Is(err, apitoken.ErrNotFound) {
+			ev.Detail = "no such token id"
+		}
+	}
+	cliAudit(db, ev)
+	if err != nil {
 		return err
 	}
 	fmt.Printf("token %s revoked — it is rejected at auth immediately; reload to drop it from the IP gate union\n", *id)
 	return nil
+}
+
+// cliAudit records a CLI action as a security event in the events table: actor cliActor(),
+// IP "local". A failed write is reported on stderr and doesn't fail the command, which has
+// already done its work.
+func cliAudit(db *store.DB, e audit.Event) {
+	e.Actor, e.IP, e.Level = cliActor(), "local", audit.Security
+	if err := audit.New(db, nil).Log(context.Background(), e); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not record %s in the audit log: %v\n", e.Action, err)
+	}
+}
+
+// cliActor names who ran the command: "cli:" + the sudo caller ($SUDO_USER), else the
+// effective user (its uid when it has no name).
+func cliActor() string {
+	name := os.Getenv("SUDO_USER")
+	if name == "" {
+		uid := strconv.Itoa(os.Geteuid())
+		name = "uid " + uid
+		if u, err := user.LookupId(uid); err == nil && u.Username != "" {
+			name = u.Username
+		}
+	}
+	var b strings.Builder
+	for _, r := range name {
+		if !unicode.IsPrint(r) {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > 64 {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return "cli:" + b.String()
 }
 
 func splitCSV(s string) []string {

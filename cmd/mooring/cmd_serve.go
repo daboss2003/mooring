@@ -146,6 +146,7 @@ func cmdServe(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	clampMemoryLimit(log, os.ReadFile) // GOMEMLIMIT never above the service's memory cap
 
 	// Master cipher for secrets at rest (ops shared secrets in M3, env in M5).
 	cipher, err := openCipher(cfg)
@@ -279,6 +280,14 @@ func cmdServe(args []string) error {
 	// Alert engine (M10, plan §8): read-and-notify only. Runs only when enabled;
 	// the evaluator + notifier + heartbeat are joined before the deferred db.Close.
 	alertStore := alertstore.New(db, cipher)
+
+	// Security logs (docs/security-logs.md; on by default): app output, the edge access log, Mooring's
+	// audit events and the host's auth logs, redacted, kept on this host and archived to S3. Started
+	// before the edge and the web server, which feed it. Its deferred close runs at return, after the
+	// body's stop() + wg.Wait(), so it drains after every source has stopped (and before db.Close).
+	secLogs := openSecurityLogs(ctx, cfg, alertStore, log)
+	defer secLogs.close()
+	secLogs.followCLIAudit(db, log)
 
 	// If a Mooring-hosted ntfy alert channel is configured, reconcile its protected
 	// container to running at boot (best-effort, ungated). restart:unless-stopped covers
@@ -794,19 +803,13 @@ func cmdServe(args []string) error {
 				errAlerts = alertStore
 			}
 			errColl := edgeerr.NewCollector(edgeErrStore, edgeIdx, errAlerts)
-			sup.AccessLine = func(line []byte) {
-				rec, ok := edgemetrics.ParseAccessFull(line)
-				if !ok {
-					return
-				}
-				metricsColl.IngestRecord(rec)
-				errColl.IngestRecord(rec)
-			}
+			sup.AccessLine = edgeAccessLine(secLogs.edgeLine, metricsColl, errColl, cfg.Server.RouteErrorLogOn())
 			// Turn Caddy's access log on/off per reconcile: on when any enabled policy uses a
-			// source:edge metric OR the route error log is enabled (default). Enabling either takes
-			// effect on the next cycle without a restart; an edge with neither pays nothing.
+			// source:edge metric, the route error log is enabled (default) or security logs are
+			// collecting. Enabling either of the first two takes effect on the next cycle without a
+			// restart; an edge with none pays nothing.
 			edgeRecon.SetAccessLog(func() bool {
-				return scalingStore.HasEdgeMetric() || cfg.Server.RouteErrorLogOn()
+				return secLogs.running() || scalingStore.HasEdgeMetric() || cfg.Server.RouteErrorLogOn()
 			})
 			// Re-check catch-all consent every reconcile (reads live config like the access-log hook):
 			// if the operator revokes `catch_all` or drops dns01 on a namespace, its stored catch-all is
@@ -972,6 +975,10 @@ func cmdServe(args []string) error {
 
 		// The catch-all deploy gate, catch-all watch and Edge page read the DNS plugin state.
 		EdgeDNSPlugins: dnsPlugins,
+
+		// The owner-only Security logs page, and every audit event copied into security logs.
+		SecurityLogs: secLogs.webSource(),
+		AuditSink:    secLogs.auditSink(),
 	})
 	if err != nil {
 		return err
@@ -1015,8 +1022,10 @@ func cmdServe(args []string) error {
 	// service container's stdout/stderr through the read-only socket-proxy — the SAME stream the live
 	// tail uses — teeing it into the bounded servicelog store. It reconciles off the monitor snapshot
 	// (attach new containers, drop vanished ones) on a 15s cadence, like the edge-pool discovery
-	// refresher.
-	if serviceLogStore != nil {
+	// refresher. Security logs use the same stream (the sink sees every line, before the store's
+	// per-service rate cap); with service logs off the manager runs for them alone (nil store).
+	removeStaleLogCursors(cfg.DataDir, serviceLogStore != nil || secLogs.running())
+	if serviceLogStore != nil || secLogs.running() {
 		logTargets := func() []servicelog.Target {
 			snap := mon.Snapshot()
 			if snap == nil {
@@ -1036,9 +1045,17 @@ func cmdServe(args []string) error {
 			return out
 		}
 		logMgr := servicelog.NewManager(serviceLogStore, dockerCli, log)
+		// Each container's last captured line survives a restart of Mooring, so output written while
+		// Mooring was stopped is captured on the next start (up to 1000 lines per container).
+		logMgr.SetCursorFile(logCursorsFile(cfg.DataDir))
+		if secLogs.running() {
+			logMgr.SetLineSink(secLogs.appLine)
+		}
 		wg.Add(1)
 		go func() { defer wg.Done(); logMgr.Run(ctx, 15*time.Second, logTargets) }()
-		log.Info("service log capture enabled")
+		if serviceLogStore != nil {
+			log.Info("service log capture enabled")
+		}
 	}
 
 	// Wire container discovery into the edge (plan §8A): each edge reconcile discovers every
@@ -1357,7 +1374,7 @@ func cmdServe(args []string) error {
 						retentionRunner.SetConfig(toRetentionConfig(newCfg))
 						log.Info("retention policy reloaded")
 						for _, w := range newCfg.LoadWarnings {
-							log.Warn("config (on reload; alerting settings apply at the next restart): " + w)
+							log.Warn("config (on reload; alerting and security_logs settings apply at the next restart): " + w)
 						}
 					}
 				}
@@ -1419,6 +1436,35 @@ func edgeBaseConfig(cfg *config.Config) edge.BaseConfig {
 		base.LBCookieSecret = edge.DeriveLBCookieSecret(dk)
 	}
 	return base
+}
+
+// logCursorsFile is where the log capture keeps each container's last captured line.
+func logCursorsFile(dataDir string) string { return filepath.Join(dataDir, "log-cursors.json") }
+
+// removeStaleLogCursors deletes the log capture's cursor file when nothing captures app output (both
+// service logs and security logs off), so it doesn't linger; it holds container ids and times only.
+func removeStaleLogCursors(dataDir string, capturing bool) {
+	if !capturing {
+		_ = os.Remove(logCursorsFile(dataDir))
+	}
+}
+
+// edgeAccessLine is the edge's access-log drain: every raw line goes to security logs first (a copy;
+// it never blocks), then the parsed record to the autoscaling metrics and, when routeErrors, the
+// route error log. The access log can be on for security logs alone, so route_error_log_enabled:
+// false must still mean no route error log.
+func edgeAccessLine(security func([]byte), metrics *edgemetrics.Collector, errs *edgeerr.Collector, routeErrors bool) func([]byte) {
+	return func(line []byte) {
+		security(line)
+		rec, ok := edgemetrics.ParseAccessFull(line)
+		if !ok {
+			return
+		}
+		metrics.IngestRecord(rec)
+		if routeErrors {
+			errs.IngestRecord(rec)
+		}
+	}
 }
 
 // edgeAccessRoutes maps the enabled edge routes to the access-log attribution table (host + path
