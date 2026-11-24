@@ -14,6 +14,7 @@
   - [Edge & TLS (HTTPS)](edge-and-tls.md)
   - [Alerting](alerting.md)
   - [Security logs](security-logs.md)
+  - [Security detections](security-detections.md)
   - [Backup & recovery](backup-and-recovery.md)
   - [Scaling & self-healing](scaling-and-self-healing.md)
   - [Per-service ops (rich monitoring)](app-ops-interface.md)

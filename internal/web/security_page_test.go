@@ -112,17 +112,22 @@ func (f *fakeSecurityLogs) SearchText(text string) string {
 
 var fakePhone = regexp.MustCompile(`^\+?[0-9][0-9 ()-]{6,}$`)
 
-// SearchValue stands in for redaction: email, phone and imei keys are always hashed; actor only
-// when it is an email or a phone number.
+// SearchValue stands in for redaction: a key with an email, phone or imei element (a parent counts,
+// as redaction classifies the full key) is always hashed; actor only when it is an email or a
+// phone number.
 func (f *fakeSecurityLogs) SearchValue(field, value string) string {
 	f.mu.Lock()
 	f.asked = append(f.asked, field)
 	f.mu.Unlock()
-	switch field {
-	case "email", "phone", "imei":
-		return hashOf(value)
-	case "actor":
+	if field == "actor" {
 		if strings.Contains(value, "@") || fakePhone.MatchString(value) {
+			return hashOf(value)
+		}
+		return value
+	}
+	for _, el := range strings.Split(field, ".") {
+		switch el {
+		case "email", "phone", "imei":
 			return hashOf(value)
 		}
 	}
@@ -565,9 +570,13 @@ func TestStoredValue(t *testing.T) {
 		{"actor", "alice@example.com", hashOf("alice@example.com"), true, "actor"},
 		{"actor", "+234 801 234 5678", hashOf("+234 801 234 5678"), true, "actor"},
 		{"actor", "u_1029", "u_1029", false, "actor"}, // a plain user id is stored as is
-		{"f.user.email", "bob@example.com", hashOf("bob@example.com"), true, "email"},
-		{"f.device.imei", "356938035643809", hashOf("356938035643809"), true, "imei"},
+		// Redaction is asked about the full key after "f.": a parent can make a field personal data.
+		{"f.user.email", "bob@example.com", hashOf("bob@example.com"), true, "user.email"},
+		{"f.device.imei", "356938035643809", hashOf("356938035643809"), true, "device.imei"},
+		{"f.phone.number", "8012345678", hashOf("8012345678"), true, "phone.number"},
+		{"f.email", "bob@example.com", hashOf("bob@example.com"), true, "email"},
 		{"f.status", "500", "500", false, "status"},
+		{"f.order.id", "A-77", "A-77", false, "order.id"},
 		{"f.user.email", already, already, false, ""}, // already a stored hash: not hashed twice
 		{"actor", already, already, false, ""},
 		{"f.user.email", "*", "*", false, ""}, // prefix patterns are not values

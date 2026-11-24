@@ -285,7 +285,7 @@ func cmdServe(args []string) error {
 	// audit events and the host's auth logs, redacted, kept on this host and archived to S3. Started
 	// before the edge and the web server, which feed it. Its deferred close runs at return, after the
 	// body's stop() + wg.Wait(), so it drains after every source has stopped (and before db.Close).
-	secLogs := openSecurityLogs(ctx, cfg, alertStore, log)
+	secLogs := openSecurityLogs(ctx, cfg, alertStore, db, log)
 	defer secLogs.close()
 	secLogs.followCLIAudit(db, log)
 
@@ -997,8 +997,11 @@ func cmdServe(args []string) error {
 		EdgeDNSPlugins: dnsPlugins,
 
 		// The owner-only Security logs page, and every audit event copied into security logs.
-		SecurityLogs: secLogs.webSource(),
-		AuditSink:    secLogs.auditSink(),
+		SecurityLogs:      secLogs.webSource(),
+		Detections:        secLogs.detections(),
+		DetectionReporter: secLogs.detectionReporter(),
+		Feeds:             secLogs.feedStatus(),
+		AuditSink:         secLogs.auditSink(),
 	})
 	if err != nil {
 		return err
@@ -1335,6 +1338,9 @@ func cmdServe(args []string) error {
 	// one-shot `compose run --rm` containers. No-op for apps with no scheduled_tasks.
 	wg.Add(1)
 	go func() { defer wg.Done(); srv.RunCron(ctx) }()
+	// The app /ops alerts (docs/app-ops-interface.md "Alerts"); returns at once when detection is off.
+	wg.Add(1)
+	go func() { defer wg.Done(); srv.RunOpsAlerts(ctx) }()
 
 	// Preview-environment reaper: a TTL backstop that tears down abandoned per-PR previews.
 	wg.Add(1)

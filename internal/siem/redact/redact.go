@@ -306,8 +306,9 @@ func (r *Redactor) SecretField(field string) bool {
 	return false
 }
 
-// SearchValue returns value the way Apply would store it in field ("actor", or an F key's last
-// dotted element): hashed when that field/value would be hashed (e.g. an actor that looks like an
+// SearchValue returns value the way Apply would store it in field ("actor", or a full F key such as
+// "phone.number", classified with its dotted parents as Apply does): hashed when that field/value
+// would be hashed (e.g. an actor that looks like an
 // email or phone number, any hash-list field), unchanged otherwise; already-hashed input is
 // returned as is. A secret or dropped field's value is returned unchanged.
 func (r *Redactor) SearchValue(field, value string) string {

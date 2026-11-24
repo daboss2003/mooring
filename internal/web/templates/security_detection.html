@@ -1,0 +1,67 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <p><a href="/security/detections">← Detections</a></p>
+  {{if .Off}}
+  <h1>Detection</h1>
+  {{template "security_subnav" "detections"}}
+  {{template "secdetoff"}}
+  {{else if .Missing}}
+  <h1>Detection</h1>
+  {{template "security_subnav" "detections"}}
+  <section class="panel">
+    <h2>{{.Missing}}</h2>
+    <p class="muted">It may be older than the detections kept on this host. <a href="/security/detections">Back to the detections</a></p>
+  </section>
+  {{else}}{{with .One}}
+  <h1>{{.RuleName}}</h1>
+  {{template "security_subnav" "detections"}}
+  <section class="panel">
+    <h2>Summary</h2>
+    <div class="table-scroll"><table class="grid"><tbody>
+      <tr><td>Severity</td><td>{{template "sec_sev" .}}{{if .Snoozed}} <span class="badge badge-muted">Snoozed</span> <span class="muted small">The rule was snoozed: this detection was recorded, not sent to the alert channels.</span>{{end}}</td></tr>
+      <tr><td>Rule</td><td>{{if .RuleURL}}<a href="{{.RuleURL}}">{{.RuleName}}</a>{{else}}{{.RuleName}}{{end}} <span class="mono muted small">{{.RuleID}}</span>{{if .MoreURL}} <span class="muted">·</span> <a class="small" href="{{.MoreURL}}">All detections of this rule</a>{{end}}</td></tr>
+      <tr><td>Source</td><td>{{.Source}}</td></tr>
+      {{if .MITRE}}<tr><td>MITRE ATT&amp;CK®</td><td>{{template "sec_mitre" .MITRE}}</td></tr>{{end}}
+      {{if or .Key .Geo}}<tr><td>Key</td><td>{{if .Key}}<span class="mono">{{.Key}}</span>{{end}}{{with .Geo}}{{template "sec_geo" .}}{{end}}</td></tr>{{end}}
+      {{if .Where}}<tr><td>App</td><td>{{.Where}}</td></tr>{{end}}
+      {{if .First}}<tr><td>First seen</td><td class="mono">{{.First}} UTC</td></tr>{{end}}
+      {{if .Last}}<tr><td>Last seen</td><td class="mono">{{.Last}} UTC <span class="muted">{{.Ago}}</span></td></tr>{{end}}
+      <tr><td>Events</td><td class="mono">{{.Count}}</td></tr>
+      <tr><td>Summary</td><td class="wrap-cell">{{if .Summary}}{{.Summary}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
+    </tbody></table></div>
+    {{if .RelatedURL}}
+    <div class="queue-actions mt1">
+      <a class="btn btn-sm" href="{{.RelatedURL}}">Find related events</a>
+      <span class="muted small">Every event with <code>{{.RelatedTerm}}</code>, from a minute before the first to a minute after the last.</span>
+    </div>
+    {{end}}
+    {{template "sec_credits" .Credits}}
+  </section>
+
+  <section class="panel">
+    <h2>Evidence</h2>
+    {{if .Evidence}}
+    <p class="muted small">Up to 10 of the events behind this detection. Each link opens the Security logs search on that event, a minute either side.</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Time (UTC)</th><th>Kind</th><th>IP</th><th>Actor</th><th>App</th><th></th></tr></thead>
+      <tbody>
+        {{range .Evidence}}
+        <tr>
+          <td class="mono"{{if .ISO}} title="{{.ISO}}"{{end}}>{{if .When}}{{.When}} <span class="muted small">{{.Ago}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .Kind}}<code class="chip">{{.Kind}}</code>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="mono">{{if .IP}}{{.IP}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="mono">{{if .Actor}}{{.Actor}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .App}}{{.App}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .SearchURL}}<a href="{{.SearchURL}}">Find in Security logs</a>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="muted">No events were kept with this detection.</p>
+    {{end}}
+  </section>
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}

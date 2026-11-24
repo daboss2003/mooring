@@ -1,0 +1,36 @@
+{{/* Shared by the owner-only security pages: Search (security.html), Detections and Rules. */}}
+
+{{/* The tabs; the argument is the active one: "search", "detections" or "rules". */}}
+{{define "security_subnav"}}
+<nav class="subnav" aria-label="Security logs">
+  <a href="/security"{{if eq . "search"}} class="active" aria-current="page"{{end}}>Search</a>
+  <a href="/security/detections"{{if eq . "detections"}} class="active" aria-current="page"{{end}}>Detections</a>
+  <a href="/security/rules"{{if eq . "rules"}} class="active" aria-current="page"{{end}}>Rules</a>
+</nav>
+{{end}}
+
+{{/* The data-licence credits (a detectCredits): DB-IP wherever geolocation or ASN data is shown,
+     Spamhaus wherever its DROP list is, the SANS ISC wherever DShield's block list is. */}}
+{{define "sec_credits"}}{{if or .Geo .Spamhaus .DShield}}<p class="muted small mt1">{{if .Geo}}IP geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">DB-IP</a>. {{end}}{{if .Spamhaus}}Spamhaus DROP list © The Spamhaus Project. {{end}}{{if .DShield}}DShield block list by the <a href="https://isc.sans.edu" target="_blank" rel="noopener noreferrer">SANS Internet Storm Center</a> (CC BY-NC-SA).{{end}}</p>{{end}}{{end}}
+
+{{/* A severity badge (anything with Sev and SevClass; SevClass is from an allowlist). */}}
+{{define "sec_sev"}}<span class="sec-lvl {{.SevClass}}">{{.Sev}}</span>{{end}}
+
+{{/* MITRE ATT&CK technique IDs; only well-formed technique IDs are links. */}}
+{{define "sec_mitre"}}{{range $i, $m := .}}{{if $i}} {{end}}{{if $m.URL}}<a class="mono" href="{{$m.URL}}" target="_blank" rel="noopener noreferrer">{{$m.ID}}</a>{{else}}<span class="mono">{{$m.ID}}</span>{{end}}{{end}}{{end}}
+
+{{/* What enrichment knows about an IP (a geoView): place, network, threat-intel lists. */}}
+{{define "sec_geo"}}<div class="muted small">{{.Place}}{{if and .Place .ASN}} · {{end}}{{.ASN}}{{range .Lists}} <span class="badge badge-warn">{{.}}</span>{{end}}</div>{{end}}
+
+{{define "secdetoff"}}
+<section class="panel">
+  <h2>Detection is off</h2>
+  <p class="muted">Mooring is not running detection rules on this host. Detection reads the security logs, so both need to be on: set
+    <code>security_logs.detection.enabled: true</code> in <code>/etc/mooring/config.yaml</code> (with security logs not turned off) and restart Mooring.
+    If it is already on, Mooring's startup log says why detection did not start.</p>
+  <pre class="stream">security_logs:
+  detection:
+    enabled: true</pre>
+  <p class="muted small">Reference: <a href="https://github.com/daboss2003/mooring/blob/main/docs/security-logs.md">docs/security-logs.md</a></p>
+</section>
+{{end}}

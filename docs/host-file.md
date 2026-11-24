@@ -202,6 +202,13 @@ security_logs:
     auth_log: ""                      # "" = /var/log/auth.log, else /var/log/secure
     fail2ban_log: ""                  # "" = /var/log/fail2ban.log
     journal: null                     # null = the journal only when there is no auth log file
+  feeds:                              # enrichment data Mooring downloads (GeoIP, threat-intel lists)
+    geoip: true                       # DB-IP City + ASN Lite, checked daily
+    spamhaus: true                    # Spamhaus DROP lists, daily
+    tor: true                         # Tor exit list, every 6 hours
+    dshield_contact: ""               # an email address: also DShield's block list, daily
+  detection:
+    enabled: true                     # the detection rules
 
 # --- Mode-3 setup-script sandbox (off by default, hard-gated) ---
 setup:
@@ -242,7 +249,9 @@ dashboard listener in external-edge mode.
 
 `security_logs` is on by default; the keys, their ranges and the `archive.s3` destination are in
 [Security logs](./security-logs.md#configuration). Without `archive.s3`, security logs are kept on
-this server only, and Mooring logs a `config:` warning at startup.
+this server only, and Mooring logs a `config:` warning at startup. The `feeds` downloads connect to
+`download.db-ip.com`, `www.spamhaus.org`, `check.torproject.org` and, with `dshield_contact`,
+`feeds.dshield.org` over HTTPS ([Enrichment](./security-logs.md#outbound-connections)).
 
 ## Acknowledging changes
 

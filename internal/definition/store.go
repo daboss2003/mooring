@@ -169,29 +169,10 @@ func (s *Store) Current(slug string) (*Definition, error) {
 // HMAC-verified and re-parsed. All rows are read before any is verified (single DB connection); a row
 // that fails verification or parsing fails the whole read, naming its app.
 func (s *Store) CurrentAll(ctx context.Context) (map[string]*Definition, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT slug, yaml, hmac, commit_sha FROM definition_versions
-		WHERE id IN (SELECT MAX(id) FROM definition_versions GROUP BY slug)`)
+	all, err := s.latestRows(ctx)
 	if err != nil {
 		return nil, err
 	}
-	type row struct {
-		slug, yaml, commit string
-		mac                []byte
-	}
-	var all []row
-	for rows.Next() {
-		var r row
-		if err := rows.Scan(&r.slug, &r.yaml, &r.mac, &r.commit); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		all = append(all, r)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	rows.Close()
 	out := make(map[string]*Definition, len(all))
 	for _, r := range all {
 		d, err := s.verifyAndParse([]byte(r.yaml), r.mac, r.commit)
@@ -201,6 +182,51 @@ func (s *Store) CurrentAll(ctx context.Context) (map[string]*Definition, error) 
 		out[r.slug] = d
 	}
 	return out, nil
+}
+
+// CurrentEach is CurrentAll for readers that can go on without one app: a row that fails verification
+// or parsing is left out of defs and its error is in bad, keyed by slug; every other app is in defs.
+// err is a failed read of the table.
+func (s *Store) CurrentEach(ctx context.Context) (defs map[string]*Definition, bad map[string]error, err error) {
+	all, err := s.latestRows(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defs, bad = make(map[string]*Definition, len(all)), map[string]error{}
+	for _, r := range all {
+		d, err := s.verifyAndParse([]byte(r.yaml), r.mac, r.commit)
+		if err != nil {
+			bad[r.slug] = err
+			continue
+		}
+		defs[r.slug] = d
+	}
+	return defs, bad, nil
+}
+
+type latestRow struct {
+	slug, yaml, commit string
+	mac                []byte
+}
+
+// latestRows reads every app's newest row. All rows are read and the result set closed before any is
+// verified (single DB connection).
+func (s *Store) latestRows(ctx context.Context) ([]latestRow, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT slug, yaml, hmac, commit_sha FROM definition_versions
+		WHERE id IN (SELECT MAX(id) FROM definition_versions GROUP BY slug)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var all []latestRow
+	for rows.Next() {
+		var r latestRow
+		if err := rows.Scan(&r.slug, &r.yaml, &r.mac, &r.commit); err != nil {
+			return nil, err
+		}
+		all = append(all, r)
+	}
+	return all, rows.Err()
 }
 
 // Version returns a specific past version for ROLLBACK — HMAC-verified and re-derived

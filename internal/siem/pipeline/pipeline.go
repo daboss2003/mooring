@@ -9,10 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os/user"
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,6 +39,12 @@ type Options struct {
 	Subscribers []func(siem.Event)
 	Log         *slog.Logger
 	Now         func() time.Time
+	// Enricher, when set, is called on the pipeline's goroutine for every event converted from a
+	// source line, after redaction and before the event is normalized and stored (enrich.Enricher's
+	// Enrich: Geo). It must be fast. A panic in it is recovered and counted; the event is stored
+	// without Geo. Events of source siem (the pipeline's own, and those given to Emit) are not
+	// enriched.
+	Enricher func(*siem.Event)
 }
 
 const (
@@ -54,6 +62,16 @@ const (
 	drainBudget = 5 * time.Second // how long shutdown spends on what is still queued
 	tickEvery   = 200 * time.Millisecond
 	logEvery    = time.Minute // rate limit of the error logs
+)
+
+const (
+	// emitLaneSize is the lane of the events Mooring's detection emits (Emit): taken after the audit
+	// lane's burst and before the main lane, at most emitBurst in a row.
+	emitLaneSize = 256
+	emitBurst    = 16
+
+	maxGeoLists    = 8  // names in an event's Geo.Lists (the enricher's own bound, checked again)
+	maxGeoListName = 64 // bytes of one of them
 )
 
 // Source indexes (counters, item.src).
@@ -122,14 +140,16 @@ type counters struct {
 type Pipeline struct {
 	st     sink              // nil: no store
 	redact func(*siem.Event) // nil: Run stores nothing (fail closed)
+	enrich func(*siem.Event) // nil: no enrichment
 	parse  parsers
 	subs   []func(siem.Event)
 	now    func() time.Time
 	log    *slog.Logger
 	loc    *time.Location
 
-	q        chan item // app, edge and host lines
-	aq       chan item // Mooring audit events
+	q        chan item       // app, edge and host lines
+	aq       chan item       // Mooring audit events
+	eq       chan siem.Event // events Mooring's detection emits (Emit)
 	qBytes   atomic.Int64
 	maxBytes int64
 	tick     <-chan time.Time // nil: Run's own ticker (tests drive their own)
@@ -138,13 +158,28 @@ type Pipeline struct {
 	lookupUID func(uid string) (name string, err error) // os/user.LookupId (replaced in tests)
 
 	src      [numSrc]counters
-	panics   atomic.Int64 // items lost to a parser, redactor or subscriber panic
+	emitted  counters     // Emit's events (drop-report source "siem"; not in Sources)
+	panics   atomic.Int64 // parser, redactor, enricher or subscriber panics
 	lostDisk atomic.Int64 // events the store refused at the disk-pressure threshold
 	lostErr  atomic.Int64 // events dropped after their store retry failed
-	closing  atomic.Bool  // shutdown began: input is counted as dropped, not queued
-	inflight atomic.Int64 // inputs between their closing check and the queue (shutdown waits for them)
+	closing  atomic.Bool  // shutdown began: input (Emit too) is counted as dropped, not queued
+	// inputsOff is set by DrainInputs and by shutdown: source input (AppLine, EdgeLine, HostLine,
+	// Audit) is counted as dropped, not queued. Emit checks closing only.
+	inputsOff    atomic.Bool
+	inflight     atomic.Int64 // source inputs between their inputsOff check and the queue (the drains wait for them)
+	emitInflight atomic.Int64 // Emit calls between their closing check and the lane (shutdown waits for them)
+
+	drainReq chan drainRequest // DrainInputs → Run
+	stopped  chan struct{}     // closed when Run returns
+	stopOnce sync.Once
 
 	enqueueHook func() // called by an input past its closing check (tests)
+}
+
+// drainRequest asks Run to handle the source lanes (DrainInputs); Run closes done when it has.
+type drainRequest struct {
+	deadline time.Time
+	done     chan struct{}
 }
 
 // New builds a Pipeline.
@@ -162,18 +197,21 @@ func New(opt Options) *Pipeline {
 		opt.Now = time.Now
 	}
 	p := &Pipeline{
-		subs: opt.Subscribers, now: opt.Now, log: opt.Log, loc: opt.HostLoc,
+		subs: opt.Subscribers, enrich: opt.Enricher, now: opt.Now, log: opt.Log, loc: opt.HostLoc,
 		parse: parsers{
 			app: parse.AppLine, edge: parse.EdgeAccess, audit: parse.Audit,
 			auth: parse.AuthLog, f2b: parse.Fail2Ban, journal: parse.Journal,
 		},
 		q:  make(chan item, opt.QueueSize),
 		aq: make(chan item, auditLaneSize),
+		eq: make(chan siem.Event, emitLaneSize),
 		// Intentional: a byte budget on top of the slot count. An edge line can be 1 MiB, so slots alone
 		// would let a flood of large requests hold gigabytes in the queue.
 		maxBytes:  maxQueueBytes,
 		drain:     drainBudget,
 		lookupUID: lookupUser,
+		drainReq:  make(chan drainRequest),
+		stopped:   make(chan struct{}),
 	}
 	if opt.Store != nil { // a nil *store.Store must not become a non-nil interface
 		p.st = opt.Store
@@ -202,7 +240,7 @@ func (p *Pipeline) EdgeLine(raw []byte) {
 	if p == nil || len(raw) == 0 {
 		return
 	}
-	if len(raw) > maxEdgeLine || len(p.q) == cap(p.q) || p.closing.Load() { // the last two only save a useless copy
+	if len(raw) > maxEdgeLine || len(p.q) == cap(p.q) || p.inputsOff.Load() { // the last two only save a useless copy
 		p.src[srcEdge].dropped.Add(1)
 		return
 	}
@@ -216,7 +254,7 @@ func (p *Pipeline) Audit(ts time.Time, ev audit.Event) {
 	}
 	p.inflight.Add(1)
 	defer p.inflight.Add(-1)
-	if p.closing.Load() {
+	if p.inputsOff.Load() {
 		p.src[srcMooring].dropped.Add(1)
 		return
 	}
@@ -232,6 +270,35 @@ func (p *Pipeline) Audit(ts time.Time, ev audit.Event) {
 	}
 }
 
+// Emit queues an event Mooring's own detection produced (a siem.detection, say) without blocking:
+// false when e.Src isn't siem.SrcSIEM or e.Kind is siem.KindDropped (the pipeline's own report),
+// when shutdown began, or when the emitted lane is full (then counted as dropped, source "siem").
+// It still works after DrainInputs, until Run's context ends.
+// The event is not parsed, redacted or enriched: it is normalized, stored and handed to the
+// subscribers like any other. The pipeline takes e over: the caller must not use its F map or Geo
+// afterwards.
+func (p *Pipeline) Emit(e siem.Event) bool {
+	if p == nil || e.Src != siem.SrcSIEM || e.Kind == siem.KindDropped {
+		return false
+	}
+	p.emitInflight.Add(1)
+	defer p.emitInflight.Add(-1)
+	if p.closing.Load() {
+		p.emitted.dropped.Add(1)
+		return false
+	}
+	if p.enqueueHook != nil {
+		p.enqueueHook()
+	}
+	select {
+	case p.eq <- e:
+		return true
+	default:
+		p.emitted.dropped.Add(1)
+		return false
+	}
+}
+
 // HostLine takes one host log line.
 func (p *Pipeline) HostLine(l hostlog.Line) {
 	if p == nil {
@@ -244,7 +311,7 @@ func (p *Pipeline) HostLine(l hostlog.Line) {
 func (p *Pipeline) enqueue(it item) {
 	p.inflight.Add(1)
 	defer p.inflight.Add(-1)
-	if p.closing.Load() {
+	if p.inputsOff.Load() {
 		p.src[it.src].dropped.Add(1)
 		return
 	}
@@ -264,13 +331,60 @@ func (p *Pipeline) enqueue(it item) {
 	}
 }
 
+// DrainInputs is the first step of a two-phase stop, for when a subscriber (detection) stops before
+// the pipeline: from now on source input (AppLine, EdgeLine, HostLine, Audit) is refused and counted
+// as dropped, and everything already queued in the main and audit lanes, with the batch Run holds,
+// is handed to the store and the subscribers before it returns. Emit keeps working until Run's
+// context ends, so what the subscriber emits as it stops is still stored. The drain is bounded like
+// shutdown's: what was queued when it began, for at most drainBudget (or until ctx's deadline, when
+// earlier); what is still queued then is counted as dropped. It returns ctx's error when ctx ends
+// before Run has done it (Run not started, say), and nil when Run has already returned (its shutdown
+// handled everything).
+func (p *Pipeline) DrainInputs(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	// Intentional: wall-clock time, as in shutdown (Options.Now may be a test clock).
+	deadline := time.Now().Add(p.drain)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	// From here on source input is dropped. An input already past its check is waited for, so
+	// nothing can reach the source lanes once Run takes the request.
+	p.inputsOff.Store(true)
+	for p.inflight.Load() > 0 && time.Now().Before(deadline) && ctx.Err() == nil {
+		time.Sleep(50 * time.Microsecond)
+	}
+	req := drainRequest{deadline: deadline, done: make(chan struct{})}
+	select {
+	case p.drainReq <- req:
+	case <-p.stopped:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case <-req.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Run drains the queue until ctx ends, then flushes the store.
 func (p *Pipeline) Run(ctx context.Context) {
+	defer p.stopOnce.Do(func() { close(p.stopped) })
 	if p.redact == nil {
 		// Fail closed: never store events that weren't redacted.
 		p.log.Error("security logs: no redactor configured; nothing is collected")
-		<-ctx.Done()
-		return
+		for {
+			select {
+			case req := <-p.drainReq:
+				close(req.done) // nothing is ever processed
+			case <-ctx.Done():
+				return
+			}
+		}
 	}
 	tick := p.tick
 	if tick == nil {
@@ -280,10 +394,11 @@ func (p *Pipeline) Run(ctx context.Context) {
 	}
 	now := p.now()
 	r := &runner{p: p, lastFlush: now, lastReport: now, reported: map[string]int64{}, logged: map[string]int64{}}
-	burst := 0
+	burst, ebursts := 0, 0
 	for {
 		// The audit lane is taken first, but at most auditBurst in a row, so a flood of audit events
-		// (a login brute force) can't starve the other lanes or the timers.
+		// (a login brute force) can't starve the other lanes or the timers. The emitted lane comes
+		// next, at most emitBurst in a row, then every lane and the timers get a turn.
 		if burst < auditBurst {
 			select {
 			case it := <-p.aq:
@@ -293,19 +408,69 @@ func (p *Pipeline) Run(ctx context.Context) {
 			default:
 			}
 		}
-		burst = 0
+		if ebursts < emitBurst {
+			select {
+			case ev := <-p.eq:
+				r.takeEmitted(ev)
+				ebursts++
+				continue
+			default:
+			}
+		}
+		burst, ebursts = 0, 0
 		select {
 		case it := <-p.aq:
 			r.take(it)
+		case ev := <-p.eq:
+			r.takeEmitted(ev)
 		case it := <-p.q:
 			r.take(it)
 		case <-tick:
 			r.tick(p.now())
+		case req := <-p.drainReq:
+			r.drainInputs(req.deadline)
+			close(req.done)
 		case <-ctx.Done():
 			r.shutdown()
 			return
 		}
 	}
+}
+
+// drainInputs handles DrainInputs on Run's goroutine: the audit and main lanes as they are now (no
+// source input can join them any more), for at most until deadline, then everything taken is
+// committed, so the subscribers have seen it. The emitted lane is left to Run.
+func (r *runner) drainInputs(deadline time.Time) {
+	p := r.p
+	n := len(p.aq) + len(p.q)
+drain:
+	for i := 0; i < n && time.Now().Before(deadline); i++ {
+		select {
+		case it := <-p.aq:
+			r.take(it)
+		default:
+			select {
+			case it := <-p.q:
+				r.take(it)
+			default:
+				break drain
+			}
+		}
+	}
+	// Intentional: what the budget left is counted as dropped now rather than left for shutdown, so
+	// the source lanes cost one drain budget in all, and shutdown has only the emitted lane left.
+	for left := true; left; {
+		select {
+		case it := <-p.aq:
+			p.src[it.src].dropped.Add(1)
+		case it := <-p.q:
+			p.qBytes.Add(-it.size)
+			p.src[it.src].dropped.Add(1)
+		default:
+			left = false
+		}
+	}
+	r.commit(p.now())
 }
 
 // runner is Run's state, used only on its goroutine.
@@ -337,8 +502,18 @@ func (r *runner) take(it item) {
 	}
 }
 
-// convert parses, normalizes and redacts one item. ok is false for a line its parser doesn't take,
-// an unknown host source, or a panic.
+// takeEmitted stores one event given to Emit: normalized, never parsed, redacted or enriched.
+func (r *runner) takeEmitted(ev siem.Event) {
+	now := r.p.now()
+	boundGeo(&ev)
+	ev.Normalize(now)
+	r.p.emitted.events.Add(1)
+	r.p.emitted.last.Store(now.UnixNano())
+	r.add(ev, now)
+}
+
+// convert parses, normalizes, redacts and enriches one item. ok is false for a line its parser
+// doesn't take, an unknown host source, or a parser or redactor panic.
 func (r *runner) convert(it *item, now time.Time) (ev siem.Event, ok bool) {
 	p := r.p
 	// Intentional: a panic in a parser or the redactor (all input is hostile; it shouldn't happen)
@@ -389,8 +564,50 @@ func (r *runner) convert(it *item, now time.Time) (ev siem.Event, ok bool) {
 	// redactor can no longer recognize.
 	preCut(&ev)
 	p.redact(&ev)
+	if p.enrich != nil && ev.Src != siem.SrcSIEM {
+		r.enrichEvent(&ev, now)
+	}
+	boundGeo(&ev)
 	ev.Normalize(ref)
 	return ev, true
+}
+
+// enrichEvent runs the enricher on ev. Intentional: a panic in it is recovered here, not by
+// convert, so the event (already redacted) is still stored, only without Geo.
+func (r *runner) enrichEvent(ev *siem.Event, now time.Time) {
+	defer func() {
+		if v := recover(); v != nil {
+			ev.Geo = nil
+			r.p.panics.Add(1)
+			if r.panicLog.allow(now) {
+				r.p.log.Error("security logs: enrichment failed; the event is stored without it",
+					"err", panicText(v), "suppressed", r.panicLog.take())
+			}
+		}
+	}()
+	r.p.enrich(ev)
+}
+
+// boundGeo bounds e.Geo, which Normalize doesn't: strings cut, at most maxGeoLists lists, and a
+// coordinate that isn't a finite number zeroed (JSON can't encode it, so the event's batch would
+// fail to store). It works on a copy: the Geo may be shared with its producer.
+func boundGeo(e *siem.Event) {
+	g := e.Geo
+	if g == nil {
+		return
+	}
+	c := *g
+	if math.IsNaN(c.Lat) || math.IsInf(c.Lat, 0) || math.IsNaN(c.Lon) || math.IsInf(c.Lon, 0) {
+		c.Lat, c.Lon = 0, 0
+	}
+	c.Country, c.City, c.Org = siem.Cut(c.Country, siem.MaxShort), siem.Cut(c.City, siem.MaxShort), siem.Cut(c.Org, siem.MaxShort)
+	if len(c.Lists) > 0 {
+		c.Lists = make([]string, 0, min(len(g.Lists), maxGeoLists))
+		for _, l := range g.Lists[:min(len(g.Lists), maxGeoLists)] {
+			c.Lists = append(c.Lists, siem.Cut(l, maxGeoListName))
+		}
+	}
+	e.Geo = &c
 }
 
 // preCut bounds an event for the redactor: each string at its bound plus cutSlack (see slackCut),
@@ -685,13 +902,15 @@ type dropCount struct {
 	n              int64
 }
 
-// dropTotals is every drop counter: one per source, then the store's by reason.
+// dropTotals is every drop counter: one per source, the emitted lane's ("siem"), then the store's
+// by reason.
 func (p *Pipeline) dropTotals() []dropCount {
-	out := make([]dropCount, 0, numSrc+2)
+	out := make([]dropCount, 0, numSrc+3)
 	for i := range p.src {
 		out = append(out, dropCount{source: srcNames[i], n: p.src[i].dropped.Load()})
 	}
 	return append(out,
+		dropCount{source: siem.SrcSIEM, n: p.emitted.dropped.Load()},
 		dropCount{source: storeSource, reason: reasonDisk, n: p.lostDisk.Load()},
 		dropCount{source: storeSource, reason: reasonError, n: p.lostErr.Load()})
 }
@@ -744,11 +963,12 @@ func (r *runner) shutdown() {
 	deadline := time.Now().Add(p.drain)
 	// From here on input is counted as dropped instead of queued. An input already past that check
 	// is waited for, so nothing can be queued after the leftover count below.
+	p.inputsOff.Store(true)
 	p.closing.Store(true)
-	for p.inflight.Load() > 0 && time.Now().Before(deadline) {
+	for p.inflight.Load()+p.emitInflight.Load() > 0 && time.Now().Before(deadline) {
 		time.Sleep(50 * time.Microsecond)
 	}
-	n := len(p.aq) + len(p.q)
+	n := len(p.aq) + len(p.eq) + len(p.q)
 drain:
 	for i := 0; i < n && time.Now().Before(deadline); i++ {
 		select {
@@ -756,10 +976,15 @@ drain:
 			r.take(it)
 		default:
 			select {
-			case it := <-p.q:
-				r.take(it)
+			case ev := <-p.eq:
+				r.takeEmitted(ev)
 			default:
-				break drain
+				select {
+				case it := <-p.q:
+					r.take(it)
+				default:
+					break drain
+				}
 			}
 		}
 	}
@@ -768,6 +993,8 @@ drain:
 		select {
 		case it := <-p.aq:
 			p.src[it.src].dropped.Add(1)
+		case <-p.eq:
+			p.emitted.dropped.Add(1)
 		case it := <-p.q:
 			p.qBytes.Add(-it.size)
 			p.src[it.src].dropped.Add(1)

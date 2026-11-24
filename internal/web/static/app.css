@@ -400,6 +400,9 @@ details.accordion > summary .badge { margin-left: 0.4rem; }
 .sec-stats .stat-sub code { color: var(--fg); }
 .sec-src-err { color: #fca5a5; font-size: 0.84rem; }
 .sec-dropped { color: var(--warn); font-weight: 600; }
+/* Detection rules: a row's actions on two short lines (snooze lengths, then edit and reset/delete). */
+.sec-rule-actions { display: grid; gap: 0.35rem; justify-items: start; }
+.sec-snooze .link { margin-left: 0.35rem; }
 
 /* ============================= buttons ============================= */
 .btn, button[type=submit] {

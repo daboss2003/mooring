@@ -27,8 +27,8 @@ type SecurityLogs interface {
 	Search(ctx context.Context, q query.Query, limit int) (store.Result, error)
 	Export(ctx context.Context, q query.Query, w io.Writer, maxEvents int) (int, error)
 	Status() siem.Status
-	// SearchValue is value as redaction stores it (hashed or not); field is "actor" or an F key's
-	// last dotted element.
+	// SearchValue is value as redaction stores it (hashed or not); field is "actor" or an F key as
+	// typed after "f." (the full key: redaction classifies its parents too).
 	SearchValue(field, value string) string
 	// SearchText is free search text as redaction stores message text (emails and phone numbers
 	// hashed).
@@ -445,16 +445,13 @@ func redactedKey(field string) (string, bool) {
 }
 
 // storedValue rewrites the value of an actor or f.<key> term to the form redaction stores it in,
-// so personal data typed in clear text matches its keyed hash. Other fields are never redacted.
+// so personal data typed in clear text matches its keyed hash. Redaction classifies an F key whole
+// (a parent counts: phone.number is personal data), so it gets the full key. Other fields are never
+// redacted.
 func storedValue(sl SecurityLogs) func(field, value string) (string, bool) {
 	return func(field, value string) (string, bool) {
-		var name string
-		switch {
-		case field == "actor":
-			name = "actor"
-		case strings.HasPrefix(field, "f."):
-			name = field[strings.LastIndexByte(field, '.')+1:]
-		default:
+		name, ok := redactedKey(field)
+		if !ok {
 			return value, false
 		}
 		// Already a stored hash, or a prefix pattern (f.email:* = has an email): not a value to hash.

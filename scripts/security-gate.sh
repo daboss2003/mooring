@@ -52,6 +52,11 @@ fuzz internal/siem/parse  FuzzAppLine
 fuzz internal/siem/parse  FuzzEdgeAccess
 fuzz internal/siem/parse  FuzzAuthLog
 fuzz internal/siem/parse  FuzzJournal
+fuzz internal/siem/feeds  FuzzParseSpamhaus
+fuzz internal/siem/feeds  FuzzParseTor
+fuzz internal/siem/feeds  FuzzParseDShield
+fuzz internal/siem/feeds  FuzzDecodeSnapshot
+fuzz internal/siem/detect FuzzEvent
 
 hr "Phase-1 external static tools (run if installed)"
 if have govulncheck; then run "govulncheck (zero reachable)" govulncheck ./...; else skip govulncheck; fi

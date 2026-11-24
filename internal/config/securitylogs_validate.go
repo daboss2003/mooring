@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/daboss2003/mooring/internal/siem"
 )
@@ -18,6 +19,10 @@ const (
 
 // securityPIINameRe is one pii field name: a field's last dotted element as an app writes it.
 var securityPIINameRe = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
+
+// securityContactRe is feeds.dshield_contact: an email address (sent in a User-Agent header, so no
+// whitespace; control characters are refused separately).
+var securityContactRe = regexp.MustCompile(`^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,63}$`)
 
 // WarnSecurityLogsNoArchive starts the load warning for security logs with no archive.s3; doctor
 // reports that case as its own check.
@@ -62,6 +67,22 @@ func (c *Config) validateSecurityLogs(add func(string, ...any)) {
 			}
 		}
 	}
+	if c := s.Feeds.DShieldContact; c != "" && !validSecurityContact(c) {
+		add("security_logs.feeds.dshield_contact: %q is not an email address (\"\" turns the DShield list off)", c)
+	}
+}
+
+// validSecurityContact reports whether c is usable as feeds.dshield_contact.
+func validSecurityContact(c string) bool {
+	if !securityContactRe.MatchString(c) {
+		return false
+	}
+	for _, r := range c {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // validateSecurityArchivePrefix checks the object-key prefix of the security-log archive: "" or

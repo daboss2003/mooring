@@ -37,6 +37,16 @@ func (s *Server) handleOpsConfigPost(w http.ResponseWriter, r *http.Request) {
 	}
 	project := r.PathValue("project")
 
+	if r.PostFormValue("enabled") != "on" && s.appOpsAlertsDeclared(project) {
+		// Intentional (owner decision): turning ops off is refused while the yaml declares app-level
+		// alerts. Alerts need enabled: true, so the write-back of an "off" would fail and the yaml would
+		// silently keep ops on; refused before anything is applied.
+		cfg, _, _ := s.opsStore.Get(project)
+		cfg.Project = project
+		s.renderOpsConfig(w, r, project, &cfg, opsDisableRefused)
+		return
+	}
+
 	in := ops.SetInput{
 		Enabled:      r.PostFormValue("enabled") == "on",
 		BaseURL:      r.PostFormValue("base_url"),
@@ -68,6 +78,18 @@ func (s *Server) handleOpsConfigPost(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/apps/"+project, http.StatusSeeOther)
 }
 
+const opsDisableRefused = "This app's mooring.yaml declares ops alerts; remove them from mooring.yaml and deploy before turning the ops interface off."
+
+// appOpsAlertsDeclared reports whether the app's canonical mooring.yaml declares alerts on its app-level
+// ops_interface. An unreadable canonical reports false: the write-back skips it too.
+func (s *Server) appOpsAlertsDeclared(project string) bool {
+	if s.defStore == nil {
+		return false
+	}
+	def, err := s.defStore.Current(project)
+	return err == nil && def != nil && def.Spec.OpsInterface != nil && len(def.Spec.OpsInterface.Alerts) > 0
+}
+
 // opsWriteBack persists the just-applied ops config (everything but the secret VALUE)
 // into the canonical mooring.yaml, so "the file, dashboard-updated last" stays true
 // and an export/redeploy reflects the edit. It reads the NORMALIZED config back from
@@ -88,8 +110,11 @@ func (s *Server) opsWriteBack(r *http.Request, project string) {
 		return
 	}
 	ref := ""
+	var alerts []definition.OpsAlert
 	if def.Spec.OpsInterface != nil {
 		ref = def.Spec.OpsInterface.Secret // the value is excepted; keep the reference, if any
+		// The dashboard doesn't edit alerts; only the yaml declares them, so they are kept as they are.
+		alerts = def.Spec.OpsInterface.Alerts
 	}
 	def.Spec.OpsInterface = &definition.OpsInterface{
 		Enabled:      cfg.Enabled,
@@ -99,6 +124,7 @@ func (s *Server) opsWriteBack(r *http.Request, project string) {
 		Mode:         cfg.OpsMode,
 		BasePath:     cfg.BasePath,
 		Adapter:      cfg.Adapter,
+		Alerts:       alerts,
 	}
 	canon, cerr := definition.Canonical(def)
 	if cerr != nil {

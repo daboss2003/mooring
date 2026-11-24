@@ -1,0 +1,83 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Detections</h1>
+  <p class="muted">What the detection rules found in the security logs, most recently seen first. High and critical detections are also sent to your alert channels.</p>
+  {{template "security_subnav" "detections"}}
+  {{if .Off}}{{template "secdetoff"}}{{else}}{{with .Det}}
+  <form method="get" action="/security/detections" class="toolbar">
+    <div class="field">
+      <label for="det-sev">Severity</label>
+      <select id="det-sev" name="severity">
+        {{range .Severities}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="field">
+      <label for="det-rule">Rule</label>
+      <select id="det-rule" name="rule">
+        {{range .RuleOpts}}<option value="{{.ID}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="field">
+      <label for="det-app">App</label>
+      <input type="text" id="det-app" name="app" value="{{.Form.App}}" placeholder="Any app" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="det-from">From (UTC)</label>
+      <input type="datetime-local" id="det-from" name="from" value="{{.Form.From}}" step="1">
+    </div>
+    <div class="field">
+      <label for="det-to">To (UTC)</label>
+      <input type="datetime-local" id="det-to" name="to" value="{{.Form.To}}" step="1">
+    </div>
+    <div class="toolbar-actions">
+      <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+      <a href="/security/detections" class="btn btn-sm btn-ghost">Reset</a>
+    </div>
+  </form>
+  {{/* Live refresh: the newest page reloads its list every 30 seconds (older pages don't). */}}
+  {{if .PollURL}}<div data-poll-url="{{.PollURL}}" data-poll-interval="{{.PollMS}}">{{template "secdetlist" $}}</div>
+  {{else}}{{template "secdetlist" $}}{{end}}
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}
+
+{{/* The list: rendered inline AND returned by /security/detections/rows for the live refresh. */}}
+{{define "secdetlist"}}{{if .Off}}{{template "secdetoff"}}{{else}}{{with .Det}}
+{{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{else}}
+<section class="panel">
+  <h2><span>Detections</span>{{if .PollURL}} <span class="muted small">Updates every 30 seconds</span>{{end}}</h2>
+  {{if .Rows}}
+  <div class="table-scroll"><table class="grid">
+    <thead><tr><th>Last seen (UTC)</th><th>Severity</th><th class="wrap-cell">Rule and summary</th><th class="wrap-cell">Key</th><th>App</th><th class="num">Count</th></tr></thead>
+    <tbody>
+      {{range .Rows}}
+      <tr>
+        <td{{if .First}} title="First seen {{.First}} UTC"{{end}}><a class="mono" href="{{.URL}}">{{if .Last}}{{.Last}}{{else}}Open{{end}}</a> <span class="muted small">{{.Ago}}</span></td>
+        <td>{{template "sec_sev" .}}{{if .Snoozed}} <span class="badge badge-muted" title="The rule was snoozed: recorded, not sent to the alert channels">Snoozed</span>{{end}}</td>
+        <td class="wrap-cell"><a href="{{.URL}}">{{.RuleName}}</a>{{if .MITRE}} <span class="small">{{template "sec_mitre" .MITRE}}</span>{{end}}{{if .Summary}}<div class="sec-msg small">{{.Summary}}</div>{{end}}</td>
+        <td class="wrap-cell">{{if .Key}}<span class="mono">{{.Key}}</span>{{else}}<span class="muted">—</span>{{end}}{{with .Geo}}{{template "sec_geo" .}}{{end}}</td>
+        <td>{{if .Where}}{{.Where}}{{else}}<span class="muted">—</span>{{end}}</td>
+        <td class="num">{{.Count}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table></div>
+  {{template "sec_credits" .Credits}}
+  {{else if .Filtered}}
+  <p class="muted sec-empty">No detections match these filters.</p>
+  {{else}}
+  <div class="sec-empty">
+    <p><strong>No detections</strong></p>
+    <p class="muted">None of the rules has fired{{if .NewestURL}} before these{{end}}. <a href="/security/rules">Review the detection rules</a></p>
+  </div>
+  {{end}}
+  {{if or .NewestURL .OlderURL}}
+  <div class="pager mt1">
+    {{if .NewestURL}}<a class="btn btn-sm btn-ghost" href="{{.NewestURL}}">Newest detections</a>{{end}}
+    {{if .OlderURL}}<a class="btn btn-sm btn-ghost" href="{{.OlderURL}}">Older detections</a>{{end}}
+  </div>
+  {{end}}
+</section>
+{{end}}
+{{end}}{{end}}{{end}}

@@ -24,6 +24,7 @@ const (
 	outboxSentRetention = 7 * 24 * time.Hour // delivered and closed rows (OpenInfraAlerts reads them)
 	outboxUnsentMaxAge  = 48 * time.Hour     // rows never sent: alerting disabled, or no channel worked
 	outboxPruneEvery    = 10 * time.Minute   // how often EnqueueInfra prunes
+	pruneTimeout        = 30 * time.Second   // EnqueueInfra's prune, after its insert
 )
 
 // Delivery retries (owner decision): a message that isn't critical is tried warningAttempts times in all,
@@ -41,6 +42,8 @@ type Store struct {
 	db        *store.DB
 	cipher    *secret.Cipher
 	nextPrune atomic.Int64 // unix sec before which EnqueueInfra doesn't prune again
+
+	beforePrune func(ctx context.Context) // tests: called first in PruneOutbox, with its context
 }
 
 // New builds a Store.
@@ -211,7 +214,6 @@ func (s *Store) AllChannels() ([]BuiltChannel, error) {
 // It also prunes the outbox (at most every outboxPruneEvery): producers enqueue whether or not
 // alerting is enabled, and with alerting disabled nothing else would drop the rows.
 func (s *Store) EnqueueInfra(ctx context.Context, o alert.Outbox) error {
-	s.maybePrune(ctx)
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO alert_outbox(rule_id, target, kind, level, transition, summary, dedupe_key, created_at)
 		 SELECT 0, ?, ?, ?, ?, ?, ?, ?
@@ -221,6 +223,10 @@ func (s *Store) EnqueueInfra(ctx context.Context, o alert.Outbox) error {
 		    WHERE newest.sent_at=0 AND newest.transition=? AND newest.level=? AND newest.kind=? AND newest.summary=?)`,
 		o.Target, o.Kind, o.Level, o.Transition, o.Summary, o.DedupeKey, time.Now().Unix(),
 		o.DedupeKey, o.Transition, o.Level, o.Kind, o.Summary)
+	// Intentional: the prune runs after the insert, on a bounded context of its own (maybePrune): run
+	// first on the caller's, a slow prune spent the caller's deadline (the detection engine gives an
+	// alert 3 seconds) and the alert was not recorded. The error returned is the insert's.
+	s.maybePrune(ctx)
 	return err
 }
 
@@ -261,13 +267,17 @@ func (s *Store) CloseInfraAlert(ctx context.Context, o alert.Outbox) error {
 	return tx.Commit()
 }
 
+// maybePrune prunes the outbox when outboxPruneEvery has passed since the last time, within
+// pruneTimeout of its own: the caller's context only passes on its values.
 func (s *Store) maybePrune(ctx context.Context) {
 	now := time.Now()
 	next := s.nextPrune.Load()
 	if now.Unix() < next || !s.nextPrune.CompareAndSwap(next, now.Add(outboxPruneEvery).Unix()) {
 		return
 	}
-	s.PruneOutbox(ctx, now)
+	pctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), pruneTimeout)
+	defer cancel()
+	s.PruneOutbox(pctx, now)
 }
 
 // InfraResolveLevel returns the level a "resolved" row for the infra alert under dedupeKey should carry:
@@ -827,6 +837,9 @@ func (s *Store) FinishAlert(ctx context.Context, p PendingAlert, delivered bool,
 // hours after they were raised are closed. The notifier calls it each cycle and EnqueueInfra every 10
 // minutes, so it also runs with alerting disabled.
 func (s *Store) PruneOutbox(ctx context.Context, now time.Time) {
+	if s.beforePrune != nil {
+		s.beforePrune(ctx)
+	}
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM alert_outbox WHERE sent_at>0 AND sent_at<?`, now.Add(-outboxSentRetention).Unix())
 	// Intentional: closed unsent, not given up. A row this old was raised while alerting was disabled or no
 	// channel worked (quiet hours hold a row less than a day, a critical is retried for a day), and

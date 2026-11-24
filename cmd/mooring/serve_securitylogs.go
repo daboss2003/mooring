@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/alert"
@@ -20,6 +21,9 @@ import (
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/siem"
 	"github.com/daboss2003/mooring/internal/siem/archive"
+	"github.com/daboss2003/mooring/internal/siem/detect"
+	"github.com/daboss2003/mooring/internal/siem/enrich"
+	"github.com/daboss2003/mooring/internal/siem/feeds"
 	"github.com/daboss2003/mooring/internal/siem/hostlog"
 	"github.com/daboss2003/mooring/internal/siem/pipeline"
 	"github.com/daboss2003/mooring/internal/siem/query"
@@ -34,10 +38,15 @@ const (
 	kindSecLogsArchiveFailed  = "security_log_archive_failed"
 	kindSecLogsSegmentChanged = "security_log_segment_changed"
 	kindSecLogsNotRunning     = "security_logs_not_running"
+	kindDetectionNotRunning   = "security_detection_not_running"
+	kindFeedsNotRunning       = "security_feeds_not_running"
 )
 
 // securityLogPrune is how often the on-host store is pruned (and its due hours sealed).
 const securityLogPrune = 5 * time.Minute
+
+// securityFeedsDelay is how long after start the enrichment feeds are first checked.
+const securityFeedsDelay = 2 * time.Minute
 
 // securityLogs is serve's security-log collection (docs/security-logs.md): the on-host store, the
 // pipeline every source feeds, the host-log follower, the S3 archiver and the periodic prune. A nil
@@ -49,25 +58,35 @@ type securityLogs struct {
 	red      *redact.Redactor
 	follower *hostlog.Follower
 	arch     *archive.Archiver
-	dir      string // <data_dir>/security-logs
+	enr      *enrich.Enricher // GeoIP + threat-intel enrichment (filled by feeds)
+	feeds    *feeds.Manager   // nil when it couldn't start
+	det      *detect.Engine   // nil when detection is off or didn't start
+	dir      string           // <data_dir>/security-logs
 	failed   string
+	log      *slog.Logger
 
 	workerCtx   context.Context // the follower's, the archiver's, the prune's and the CLI poll's: ended by close
 	stopWorkers context.CancelFunc
 	workers     sync.WaitGroup
 	stopPipe    context.CancelFunc
 	pipeDone    chan struct{}
+	stopDet     context.CancelFunc
+	detDone     chan struct{}
 	closeOnce   sync.Once
 }
 
 // openSecurityLogs builds and starts security-log collection when cfg turns it on (nil when off).
 // Intentional: a failure to start never refuses boot (an upgrade must not take the edge down): it is
 // logged, alerted and shown on the Security page, and Mooring runs without security logs.
-func openSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, log *slog.Logger) *securityLogs {
+func openSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, db *store.DB, log *slog.Logger) *securityLogs {
 	if !cfg.SecurityLogs.On() {
+		// Turned off instead of fixed: nothing that was failing runs any more.
+		resolveInfra(alerts, kindSecLogsNotRunning, "security-logs:not-running", "Security logs are turned off.")
+		resolveInfra(alerts, kindDetectionNotRunning, "security-logs:detection-not-running", "Security logs, and with them security detection, are turned off.")
+		resolveInfra(alerts, kindFeedsNotRunning, "security-logs:feeds-not-running", "Security logs, and with them the enrichment feeds, are turned off.")
 		return nil
 	}
-	s, err := startSecurityLogs(ctx, cfg, alerts, log)
+	s, err := startSecurityLogs(ctx, cfg, alerts, db, log)
 	if err != nil {
 		log.Error("security logs: not started; Mooring runs without them", "err", err)
 		if alerts != nil {
@@ -91,7 +110,7 @@ func openSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstor
 	return s
 }
 
-func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, log *slog.Logger) (*securityLogs, error) {
+func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, db *store.DB, log *slog.Logger) (*securityLogs, error) {
 	master, err := config.DecodeKey(cfg.EncryptionKey)
 	if err != nil {
 		return nil, err
@@ -121,19 +140,98 @@ func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertsto
 	if err != nil {
 		return nil, err
 	}
-	s := &securityLogs{store: st, red: red, dir: dir, pipeDone: make(chan struct{})}
-	s.pipe = pipeline.New(pipeline.Options{Store: st, Redactor: red, Log: log})
+	s := &securityLogs{store: st, red: red, dir: dir, log: log, pipeDone: make(chan struct{})}
+
+	// Enrichment (docs/security-logs.md "Enrichment"): GeoIP and threat-intel lists, kept current by
+	// the feeds manager. A manager that can't start leaves events unenriched; collection goes on.
+	s.enr = enrich.New()
+	if fm, ferr := feeds.New(feeds.Options{
+		Dir: filepath.Join(dir, "feeds"), Enricher: s.enr,
+		GeoIP: cfg.SecurityFeedGeoIP(), Spamhaus: cfg.SecurityFeedSpamhaus(), Tor: cfg.SecurityFeedTor(),
+		DShieldContact: cfg.SecurityDShieldContact(), Version: Version, Log: log.With("component", "feeds"),
+	}); ferr != nil {
+		log.Error("security logs: the enrichment feeds didn't start; events are stored without geo and list data", "err", ferr)
+		if alerts != nil {
+			_ = alerts.EnqueueInfra(context.Background(), alert.Outbox{
+				Target: "security-logs", Kind: kindFeedsNotRunning, Level: alert.LevelWarning, Transition: "firing",
+				Summary:   "The security-log enrichment feeds didn't start, so events are stored without location and threat-list data: " + ferr.Error() + ". Fix the cause, then restart Mooring.",
+				DedupeKey: "security-logs:feeds-not-running",
+			})
+		}
+	} else {
+		s.feeds = fm
+		resolveInfra(alerts, kindFeedsNotRunning, "security-logs:feeds-not-running", "The security-log enrichment feeds are running again.")
+	}
+
+	// Detection (docs/security-detections.md). The engine hands its siem.detection events back to the
+	// pipeline, which is built after it: Emit reads it through pipeRef.
+	var pipeRef atomic.Pointer[pipeline.Pipeline]
+	var subscribers []func(siem.Event)
+	if cfg.SecurityDetectionOn() {
+		var al detect.Alerter
+		if alerts != nil {
+			al = alerts
+		}
+		eng, derr := detect.New(detect.Options{
+			Dir: dir, MainDB: db, Alerter: al,
+			Emit:     func(e siem.Event) bool { p := pipeRef.Load(); return p != nil && p.Emit(e) },
+			MapValue: detectMapValue(red),
+			Log:      log.With("component", "detect"),
+		})
+		if derr != nil {
+			// Intentional: like security logs themselves, a detection that can't start never refuses
+			// boot; it is logged and alerted, and collection goes on without it.
+			log.Error("security logs: detection didn't start; events are collected but not checked", "err", derr)
+			if alerts != nil {
+				_ = alerts.EnqueueInfra(context.Background(), alert.Outbox{
+					Target: "security-logs", Kind: kindDetectionNotRunning, Level: alert.LevelWarning, Transition: "firing",
+					Summary:   "Security detection is turned on but didn't start, so events aren't checked: " + derr.Error() + ". Fix the cause, then restart Mooring.",
+					DedupeKey: "security-logs:detection-not-running",
+				})
+			}
+		} else {
+			s.det = eng
+			subscribers = append(subscribers, eng.Subscriber())
+			resolveInfra(alerts, kindDetectionNotRunning, "security-logs:detection-not-running", "Security detection is running again.")
+		}
+	} else {
+		resolveInfra(alerts, kindDetectionNotRunning, "security-logs:detection-not-running", "Security detection is turned off.")
+	}
+	s.pipe = pipeline.New(pipeline.Options{Store: st, Redactor: red, Log: log, Enricher: s.enr.Enrich, Subscribers: subscribers})
+	pipeRef.Store(s.pipe)
 
 	// The pipeline drains on its own context, after every source has stopped (close).
 	pipeCtx, stopPipe := context.WithCancel(context.Background())
 	s.stopPipe = stopPipe
 	go func() { defer close(s.pipeDone); s.pipe.Run(pipeCtx) }()
 
+	// The engine runs on its own context too: close stops it after the pipeline has handed it every
+	// source event and before the pipeline stops, since its last step stores and emits the
+	// detections still pending.
+	if s.det != nil {
+		detCtx, stopDet := context.WithCancel(context.Background())
+		s.stopDet, s.detDone = stopDet, make(chan struct{})
+		go func() { defer close(s.detDone); s.det.Run(detCtx) }()
+	}
+
 	wctx, stopWorkers := context.WithCancel(ctx)
 	s.workerCtx, s.stopWorkers = wctx, stopWorkers
 	s.follower = hostlog.New(hostlog.FromConfig(cfg.SecurityLogs.HostLogs, filepath.Join(dir, "hostlog"), log))
 	s.workers.Add(1)
 	go func() { defer s.workers.Done(); s.follower.Run(wctx, s.pipe.HostLine) }()
+	if s.feeds != nil {
+		s.workers.Add(1)
+		go func() {
+			defer s.workers.Done()
+			// The files already on disk are in use from the start; downloads wait until boot is over.
+			select {
+			case <-wctx.Done():
+				return
+			case <-time.After(securityFeedsDelay):
+			}
+			s.feeds.Run(wctx)
+		}()
+	}
 
 	if sc := cfg.SecurityLogs.Archive.S3; sc != nil {
 		cl, cerr := s3ClientFor(sc)
@@ -179,8 +277,22 @@ func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertsto
 			}
 		}
 	}()
-	log.Info("security logs enabled", "dir", dir, "box", box, "archive", s.arch != nil)
+	log.Info("security logs enabled", "dir", dir, "box", box, "archive", s.arch != nil, "feeds", s.feeds != nil, "detection", s.det != nil)
 	return s, nil
+}
+
+// resolveInfra closes an open "didn't start" alert of kind after a start that worked, or when what
+// failed to start is turned off.
+func resolveInfra(alerts *alertstore.Store, kind, dedupe, summary string) {
+	if alerts == nil {
+		return
+	}
+	if open, err := alerts.OpenInfraAlerts(context.Background(), kind); err == nil && len(open) > 0 {
+		_ = alerts.EnqueueInfra(context.Background(), alert.Outbox{
+			Target: "security-logs", Kind: kind, Level: alert.LevelWarning, Transition: "resolved",
+			Summary: summary, DedupeKey: dedupe,
+		})
+	}
 }
 
 // cliAuditPoll is how often serve copies the audit events CLI commands wrote.
@@ -300,8 +412,16 @@ func diskUsageOf(dir string) func() (uint64, uint64, bool) {
 	}
 }
 
+// drainInputsTimeout bounds close's wait for the pipeline's source drain (which keeps to its own
+// budget, pipeline drainBudget); it only matters if the pipeline's Run isn't serving.
+const drainInputsTimeout = 10 * time.Second
+
 // close stops the host follower, the archiver and the prune, drains the pipeline and closes the
 // store. Call it after every other source (log tailers, the edge, the web server) has stopped.
+//
+// With detection running it stops in two phases: the pipeline first hands every source event it
+// still holds to the engine, which is still running (DrainInputs), then the engine stops (its last
+// step stores and emits the pending detections), then the pipeline stops, storing those.
 func (s *securityLogs) close() {
 	if s == nil || s.store == nil {
 		return
@@ -309,8 +429,24 @@ func (s *securityLogs) close() {
 	s.closeOnce.Do(func() {
 		s.stopWorkers()
 		s.workers.Wait()
+		if s.feeds != nil {
+			s.feeds.Close() // its Run (a worker) has returned
+		}
+		if s.stopDet != nil {
+			dctx, cancel := context.WithTimeout(context.Background(), drainInputsTimeout)
+			if err := s.pipe.DrainInputs(dctx); err != nil && s.log != nil {
+				s.log.Warn("security logs: the queue wasn't handed to detection before it stopped", "err", err)
+			}
+			cancel()
+			s.stopDet()
+			<-s.detDone
+		}
 		s.stopPipe()
 		<-s.pipeDone
+		if s.det != nil {
+			_ = s.det.Close()
+		}
+		s.enr.Close() // after the pipeline has drained: no enrichment can still be running
 		_ = s.store.Close()
 	})
 }
@@ -343,6 +479,49 @@ func (s *securityLogs) auditSink() func(time.Time, audit.Event) {
 		return nil
 	}
 	return s.pipe.Audit
+}
+
+// detections is what the Detections and Rules pages use (nil when detection isn't running; an untyped
+// nil, so the web layer sees "off").
+func (s *securityLogs) detections() siem.DetectionService {
+	if s == nil || s.det == nil {
+		return nil
+	}
+	return s.det
+}
+
+// detectionReporter is where the app /ops alerts report (nil when detection isn't running).
+func (s *securityLogs) detectionReporter() siem.Reporter {
+	if s == nil || s.det == nil {
+		return nil
+	}
+	return s.det
+}
+
+// feedStatus reports the enrichment feeds (nil when they aren't running).
+func (s *securityLogs) feedStatus() siem.FeedStatusSource {
+	if s == nil || s.feeds == nil {
+		return nil
+	}
+	return s.feeds
+}
+
+// detectMapValue maps a clear value in a detection rule's query to its stored form, as Apply stores
+// it: field is "actor" or "f.<key>", and the redactor classifies the full key (its dotted parents
+// count, as when the event was stored). A prefix pattern (value*) and an already-hashed value stay.
+func detectMapValue(red *redact.Redactor) func(field, value string) string {
+	return func(field, value string) string {
+		if strings.HasSuffix(value, "*") {
+			return value
+		}
+		switch {
+		case field == "actor":
+			return red.SearchValue("actor", value)
+		case strings.HasPrefix(field, "f."):
+			return red.SearchValue(strings.TrimPrefix(field, "f."), value)
+		}
+		return value
+	}
 }
 
 // webSource is what the Security page reads: nil (off) only when security logs are off.

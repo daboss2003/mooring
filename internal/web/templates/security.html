@@ -4,6 +4,7 @@
   {{with .Security}}
   <h1>Security logs</h1>
   <p class="muted">Events from your apps, the edge, Mooring and this host, with secrets removed and personal data hashed. Only the owner can search or export them.</p>
+  {{template "security_subnav" "search"}}
 
   {{if not .On}}
   <section class="panel">
@@ -85,6 +86,7 @@
     {{else}}
     <p class="muted sec-empty">{{if .Capped}}No match in the events searched before the search stopped.{{else}}No events match this search in the selected time range.{{end}}</p>
     {{end}}
+    {{template "sec_credits" .Credits}}
     {{if .OlderURL}}<p class="mt1"><a class="btn btn-sm btn-ghost" href="{{.OlderURL}}">Show older events</a></p>{{end}}
   </section>
   {{end}}

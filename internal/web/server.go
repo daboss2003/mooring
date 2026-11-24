@@ -48,6 +48,7 @@ import (
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/session"
 	"github.com/daboss2003/mooring/internal/setupstore"
+	"github.com/daboss2003/mooring/internal/siem"
 	"github.com/daboss2003/mooring/internal/siem/query"
 	"github.com/daboss2003/mooring/internal/startgate"
 	"github.com/daboss2003/mooring/internal/store"
@@ -143,6 +144,12 @@ type Deps struct {
 	// SecurityLogs is the security-log pipeline the owner-only Security logs page searches and exports
 	// (nil when security logs are off; leave the interface nil, not a typed nil pointer).
 	SecurityLogs SecurityLogs
+	// Detections serves the owner-only Detections and Rules pages (nil when detection is off).
+	Detections siem.DetectionService
+	// DetectionReporter takes the app /ops alerts' detections (nil when detection is off).
+	DetectionReporter siem.Reporter
+	// Feeds reports the enrichment feeds' state (nil when security logs are off).
+	Feeds siem.FeedStatusSource
 	// AuditSink, when set, also receives every audit event this server records (security logs).
 	AuditSink func(time.Time, audit.Event)
 }
@@ -232,6 +239,9 @@ type Server struct {
 	pendingApps    atomic.Pointer[[]pendingApp] // undeployed mooring.*.yaml siblings found in connected repos
 
 	securityLogs    SecurityLogs                      // security-log search/export/status (nil when off)
+	detections      siem.DetectionService             // Detections/Rules pages (nil when detection is off)
+	detectReporter  siem.Reporter                     // where the app /ops alerts report (nil when detection is off)
+	feeds           siem.FeedStatusSource             // enrichment feed state (nil when security logs are off)
 	securityExports chan struct{}                     // concurrency cap on security-log exports
 	secParse        func(string) (query.Query, error) // test seam: replaces query.Parse on the Security logs page
 }
@@ -300,6 +310,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 	}
 	s.edgeDNSPlugins = d.EdgeDNSPlugins
 	s.securityLogs = d.SecurityLogs
+	s.detections, s.detectReporter, s.feeds = d.Detections, d.DetectionReporter, d.Feeds
 	s.audit.SetSink(d.AuditSink)
 	s.securityExports = make(chan struct{}, securityExportConcurrency)
 	s.sweepDiscoveryScratch() // clear any orphaned multi-file-connect scratch dirs from a prior run
@@ -639,6 +650,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /security", s.requirePerm("admin", s.withCSRFToken(s.handleSecurity)))
 	mux.HandleFunc("GET /security/status", s.requirePerm("admin", s.handleSecurityStatus))
 	mux.HandleFunc("GET /security/export", s.requirePerm("admin", s.handleSecurityExport))
+	mux.HandleFunc("GET /security/detections", s.requirePerm("admin", s.withCSRFToken(s.handleDetections)))
+	mux.HandleFunc("GET /security/detections/rows", s.requirePerm("admin", s.handleDetectionRows))
+	mux.HandleFunc("GET /security/detections/{id}", s.requirePerm("admin", s.withCSRFToken(s.handleDetection)))
+	mux.HandleFunc("GET /security/rules", s.requirePerm("admin", s.withCSRFToken(s.handleSecurityRules)))
+	mux.HandleFunc("GET /security/rules/edit", s.requirePerm("admin", s.withCSRFToken(s.handleSecurityRuleEdit)))
+	mux.HandleFunc("GET /security/rules/new", s.requirePerm("admin", s.withCSRFToken(s.handleSecurityRuleEdit)))
+	mux.HandleFunc("POST /security/rules/save", capBody(64<<10, s.requirePerm("admin", s.requireCSRF(s.handleSecurityRuleSave))))
+	mux.HandleFunc("POST /security/rules/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecurityRuleDelete))))
+	mux.HandleFunc("POST /security/rules/reset", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecurityRuleReset))))
+	mux.HandleFunc("POST /security/rules/snooze", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecurityRuleSnooze))))
 	// Operator UI prefs (M7): persisted tile order. UI-only, never Tier-1.
 	mux.HandleFunc("POST /settings/tile-order", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleTileOrder))))
 	// API tokens (M19): read-only view + revoke. Minting stays CLI-only by design.

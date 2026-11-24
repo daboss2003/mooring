@@ -18,7 +18,7 @@ See also: [Command-line reference](./cli.md#mooring-security-logs-fetch--verify-
 | `edge` | One event per request through the managed edge (`edge.mode: managed`). `ip` is the client address: behind [`edge.trusted_proxies`](./host-file.md#edge-trusted-proxies), the address the trusted proxy reports. | `http.request` |
 | `mooring` | Mooring's own audit events: sign-ins and failed sign-ins, lockouts, API token use, user, role and config changes, deploys and other operator actions. Events written by `mooring token` and `mooring secret import` (actor `cli:<user>`) are copied within 30 seconds while Mooring runs, and on its next start otherwise. | `mooring.<action>`, for example `mooring.login` |
 | `host` | `sshd`, `sudo`, `su` and user and group changes (`useradd`, `usermod`, `passwd`, `groupadd`, …) from `/var/log/auth.log`, else `/var/log/secure`, or from the systemd journal when neither file exists; Fail2Ban bans and unbans from `/var/log/fail2ban.log`. | `ssh.*`, `sudo.command`, `su.session`, `host.user_change`, `fail2ban.*`, `log` |
-| `siem` | The collector's own events. | `siem.dropped`, `siem.archive_failed` |
+| `siem` | The collector's own events, and detections. | `siem.dropped`, `siem.archive_failed`, `siem.detection` |
 
 ## Event format
 
@@ -36,6 +36,7 @@ to S3 and written by an export.
 | `out` | `success` or `failure`, for an event with an outcome. |
 | `actor` | The account or user acting. An email address or phone number is stored as a keyed hash. |
 | `ip` | The client IP address. |
+| `geo` | What is known about `ip`: country, city, ASN, organisation and threat-intel lists (see [Enrichment](#enrichment)). |
 | `f` | The other structured fields, after redaction. Nested keys are flattened with dots (`req.method`). Values are strings, numbers or booleans. |
 | `msg` | The message text, after redaction. |
 
@@ -62,6 +63,7 @@ Limits: `msg` 8 KiB; `f` at most 64 fields, keys up to 64 bytes, string values u
 | `mooring.<action>` | `mooring` | `success` / `failure` | The audit event: `target`, `ua` (the client's User-Agent). For example `mooring.login` (`msg`: `invalid password`, `invalid TOTP code`, `unknown user`, …), `mooring.login_lockout`, `mooring.api_token_use`, `mooring.api_token_mint`, `mooring.api_token_revoke_cli`, `mooring.secret_import`, `mooring.user_added`, `mooring.user_removed`, `mooring.user_role_changed`, `mooring.user_password_changed`, `mooring.user_totp_changed`, `mooring.alert_rule_delete`, `mooring.env_set_secret`, `mooring.security_logs_export`. |
 | `siem.dropped` | `siem` | | `source`, `count`, `reason`: events dropped because the collector's queue was full, refused at the disk-pressure threshold (`reason` `disk`) or not stored after an error (`reason` `error`), or lost on this server. |
 | `siem.archive_failed` | `siem` | | `segment`, `error` |
+| `siem.detection` | `siem` | | A [detection](./security-detections.md): `rule`, `severity`, `count`, `mitre`, `key`, `detection_id`; `msg` is the detection's summary. |
 
 ## Security events from your app
 
@@ -154,6 +156,110 @@ Searching for a hashed value by its clear value finds it (any letter case for an
 
 **Event kinds.** An app line's `event` value starting with `mooring.`, `siem.`, `ssh.`, `sudo.`,
 `su.`, `fail2ban.`, `host.` or `http.` is stored as kind `log`, with the field kept.
+
+## Enrichment
+
+Before an event is stored, Mooring looks up its `ip` in GeoIP databases and threat-intel lists it
+keeps on the server, and adds what it finds as `geo`:
+
+```json
+"geo":{"cc":"NG","city":"Lagos","lat":6.4273,"lon":3.4211,"asn":36923,"org":"Example Networks Limited","lists":["tor-exit"]}
+```
+
+| Key | Search | Meaning |
+|---|---|---|
+| `cc` | `geo.cc:NG` | Country, ISO 3166-1 alpha-2. |
+| `city` | `geo.city:Lagos` | City, English name, up to 64 bytes. |
+| `lat`, `lon` | | Approximate coordinates of the city (not a device's position). |
+| `asn` | `geo.asn:36923`, `geo.asn>=64512` | Autonomous system number. |
+| `org` | `geo.org~airtel` | Organisation of the autonomous system, up to 128 bytes. |
+| `lists` | `list:tor-exit` | The lists the address is on, at most 8: `spamhaus-drop`, `tor-exit`, `dshield`. |
+
+Keys with nothing known are left out, and an event with nothing known has no `geo`. Every event with
+an `ip` is enriched, except events with `src` `siem`. These addresses are skipped: private (`10/8`,
+`172.16/12`, `192.168/16`, `fc00::/7`), loopback, link-local, shared address space (`100.64/10`),
+multicast, unspecified, documentation (`192.0.2/24`, `198.51.100/24`, `203.0.113/24`,
+`2001:db8::/32`, `3fff::/20`), the other IANA special-purpose ranges (`0/8`, `192.0.0/24`,
+`192.88.99/24`, `198.18/15`, `240/4`, `2001::/23`, `2002::/16`) and IPv6 addresses outside
+`2000::/3`. An IPv4-mapped IPv6 address (`::ffff:203.0.113.7`) is looked up as its IPv4 address.
+
+### Feeds
+
+Mooring downloads the data itself and keeps it up to date:
+
+| Feed | Data | Updates | On disk |
+|---|---|---|---|
+| `dbip-city` | DB-IP City Lite: `cc`, `city`, `lat`, `lon` | Checked daily; DB-IP publishes a new file each month | about 130 MB |
+| `dbip-asn` | DB-IP ASN Lite: `asn`, `org` | Checked daily; a new file each month | about 10 MB |
+| `spamhaus-drop` | Spamhaus DROP (IPv4 and IPv6) and ASN-DROP: list `spamhaus-drop` for an address in a listed network or in a listed autonomous system (the address's `asn` from `dbip-asn`: ASN-DROP matches only with `feeds.geoip`) | Daily | under 1 MB |
+| `tor-exits` | Tor exit relays: list `tor-exit` | Every 6 hours | under 1 MB |
+| `dshield` | DShield's recommended block list (the most active attacking /24 networks): list `dshield` | Daily, only with `feeds.dshield_contact` | under 100 KB |
+
+- DB-IP: Mooring downloads the current month's file (UTC), or the previous month's until the current
+  one is published, and only when it is newer than the file in use. A download is refused over 120
+  MB compressed or 256 MB uncompressed for City, 20 MB or 40 MB for ASN. The file must open as a
+  MaxMind DB of the right type with a search tree and records; the ASN file is also verified in
+  full. While a new file is checked the previous one stays in use, so an update needs room for both
+  for a moment.
+- Spamhaus: each file must end with its metadata line, and its size and record count must match.
+  Each file is at most 4 MB. An update downloads `drop_v4.json`, `drop_v6.json` and `asndrop.json`.
+  After an update that received any of them, successful or not, the next is at least 24 hours
+  later. After one that received none, the retry wait below applies, at least 1 hour.
+- Tor: at most 2 MB and at least 100 addresses.
+- DShield: at most 256 KB.
+- An entry broader than an IPv4 `/8` or an IPv6 `/16` is skipped. A list with no valid entry is
+  refused.
+- A refused or failed update keeps the data in use and is retried after 1 hour, then 2, 4, 8 and 16
+  hours, then every 24 hours until it works. After an HTTP `429` the wait is that, or what its
+  `Retry-After` header says when longer (at most 24 hours).
+- Each update's time, and the wait a failure would set (24 hours for Spamhaus), are saved in
+  `state.json` before the first request, so after a crash during an update the next one waits that
+  long. An update stopped by a Mooring shutdown is retried 5 minutes after it started (Spamhaus: 1
+  hour, or 24 hours when it received a file). When `state.json` can't be written, nothing is downloaded and the
+  update counts as failed.
+- A recorded time in the future (the clock was set back) is moved back to the current time, and the
+  next update with it, so the wait after the last update is kept; no feed waits more than 24 hours
+  for its next update.
+
+The data is kept in `<data_dir>/security-logs/feeds/` (`/var/lib/mooring/security-logs/feeds/`,
+mode `0700`, files `0600`): `dbip-city.mmdb`, `dbip-asn.mmdb`, `spamhaus-drop.json`,
+`tor-exits.json`, `dshield.json`, and `state.json` with each feed's version, last attempt, next try
+and last error. What is there is used from startup, so enrichment works after a restart and without
+network access until the next update. A file that can't be used (damaged or changed) is reported
+in the feed's last error, the feed starts without data, and the file is downloaded again at the
+next update.
+
+### Outbound connections
+
+Feed downloads use HTTPS (port 443) to these hosts only:
+
+| Host | Feeds |
+|---|---|
+| `download.db-ip.com` | `dbip-city`, `dbip-asn` |
+| `www.spamhaus.org` | `spamhaus-drop` |
+| `check.torproject.org` | `tor-exits` |
+| `feeds.dshield.org` | `dshield` (only with `feeds.dshield_contact`) |
+
+Allow them in an egress firewall, or turn the feeds off. Redirects are not followed. A host whose
+name resolves to any address of a kind skipped above (private, loopback, link-local, shared address
+space, …) is refused, and the address that was checked is the one connected to; a NAT64 address
+(`64:ff9b::/96`) is judged by the IPv4 address it carries. `HTTPS_PROXY` and other proxy settings
+are not used. The User-Agent is `Mooring/<version>`; for DShield, `Mooring/<version> (+<dshield_contact>)`.
+
+### DShield contact
+
+SANS ISC asks automated users of its DShield feeds to identify themselves with a contact address.
+DShield's list is downloaded only when `feeds.dshield_contact` is set to an email address SANS ISC
+can reach; the address is sent in the User-Agent of that download only.
+
+### Attribution
+
+IP geolocation by [DB-IP](https://db-ip.com), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Spamhaus DROP list © The Spamhaus
+Project. Tor exit list from [The Tor Project](https://www.torproject.org). DShield block list from
+the [SANS Internet Storm Center](https://isc.sans.edu), licensed under
+[CC BY-NC-SA](https://creativecommons.org/licenses/by-nc-sa/4.0/); SANS ISC allows using it to
+protect your own network and asks that it is not resold.
 
 ## Storage on the server
 
@@ -436,6 +542,13 @@ security_logs:
     auth_log: ""                      # "" = /var/log/auth.log, else /var/log/secure
     fail2ban_log: ""                  # "" = /var/log/fail2ban.log
     journal: null                     # null: the journal only when there is no auth log file
+  feeds:
+    geoip: true                       # DB-IP City + ASN Lite, checked daily
+    spamhaus: true                    # Spamhaus DROP lists, daily
+    tor: true                         # Tor exit list, every 6 hours
+    dshield_contact: ""               # an email address: also DShield's block list, daily
+  detection:
+    enabled: true
 ```
 
 | Key | Default | Range | Meaning |
@@ -450,10 +563,17 @@ security_logs:
 | `host_logs.auth_log` | `""` | absolute path | The auth log; `""` reads `/var/log/auth.log`, else `/var/log/secure`. |
 | `host_logs.fail2ban_log` | `""` | absolute path | The Fail2Ban log; `""` reads `/var/log/fail2ban.log`, also once it appears. |
 | `host_logs.journal` | unset | `true` / `false` | Unset: read `sshd`, `sudo`, `su` and user and group changes from the journal when there is no auth log file, or when the auth log can't be read (instead of the file). `true`: read the journal as well. `false`: never. |
+| `feeds.geoip` | `true` | | `false`: no DB-IP downloads; `geo` has no `cc`, `city`, `lat`, `lon`, `asn` or `org`. See [Enrichment](#enrichment). |
+| `feeds.spamhaus` | `true` | | `false`: no Spamhaus DROP lists (`spamhaus-drop`). |
+| `feeds.tor` | `true` | | `false`: no Tor exit list (`tor-exit`). |
+| `feeds.dshield_contact` | `""` | an email address | Set: download DShield's block list (`dshield`) daily, with this address in the User-Agent. `""`: not downloaded. |
+| `detection.enabled` | `true` | | `false`: no detection rules run. |
 
 A value outside its range is clamped, and Mooring logs a `config:` warning at startup saying which
 value it used; `sudo mooring doctor` shows the same warnings. So does a `hot_retention` longer than
-`archive.retention`. An invalid `archive.s3`, path or `pii` name refuses startup.
+`archive.retention`. An invalid `archive.s3`, path, `pii` name or `feeds.dshield_contact` refuses
+startup. With `enabled: false`, no feed is downloaded and no detection rule runs. Turning a feed off
+leaves its files in `feeds/`; they are not used.
 
 The block is read at startup: restart Mooring after a change (`sudo systemctl restart mooring`).
 
@@ -464,4 +584,4 @@ security_logs:
   enabled: false
 ```
 
-Detection rules, alerts on security events, and incidents are not part of security logs yet.
+Detection rules and their alerts are described in [Security detections](./security-detections.md).

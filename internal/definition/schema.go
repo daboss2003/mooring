@@ -13,11 +13,13 @@ package definition
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/edge"
@@ -874,14 +876,52 @@ type SelfHealing struct {
 // `secret` at it; the value never lives in this file). base_url is the in-cluster
 // endpoint (origin only, never loopback); base_path is the relative prefix.
 type OpsInterface struct {
-	Enabled      bool   `yaml:"enabled"`
-	BaseURL      string `yaml:"base_url,omitempty"`
-	SecretHeader string `yaml:"secret_header,omitempty"`
-	Secret       string `yaml:"secret,omitempty"` // reference to a declared secret NAME (value resolved at deploy); never the value
-	Mode         string `yaml:"mode,omitempty"`   // auto | rich | basic
-	BasePath     string `yaml:"base_path,omitempty"`
-	Adapter      string `yaml:"adapter,omitempty"`
+	Enabled      bool       `yaml:"enabled"`
+	BaseURL      string     `yaml:"base_url,omitempty"`
+	SecretHeader string     `yaml:"secret_header,omitempty"`
+	Secret       string     `yaml:"secret,omitempty"` // reference to a declared secret NAME (value resolved at deploy); never the value
+	Mode         string     `yaml:"mode,omitempty"`   // auto | rich | basic
+	BasePath     string     `yaml:"base_path,omitempty"`
+	Adapter      string     `yaml:"adapter,omitempty"`
+	Alerts       []OpsAlert `yaml:"alerts,omitempty"` // conditions on the values this endpoint reports (internal/opsalert)
 }
+
+// OpsAlert is one alert on a value the app's own /ops interface reports (ops_interface.alerts).
+type OpsAlert struct {
+	Name     string       `yaml:"name"` // ^[a-z0-9][a-z0-9-]{0,47}$, unique within its ops_interface
+	Metric   OpsMetricRef `yaml:"metric"`
+	When     string       `yaml:"when"`               // increases | above | above_usual
+	Value    float64      `yaml:"value,omitempty"`    // increases: by more than this (default 0); above: the limit (required)
+	Factor   float64      `yaml:"factor,omitempty"`   // above_usual: times the usual level (default 5; 1.5–1000)
+	Min      float64      `yaml:"min,omitempty"`      // above_usual: and at least this
+	Window   string       `yaml:"window,omitempty"`   // increases: compared with this long ago (default 5m); above/above_usual: held this long (default 1m); 30s–24h
+	Severity string       `yaml:"severity,omitempty"` // low | medium | high | critical (default high)
+}
+
+// OpsMetricRef names one value: a /metrics item (group title + item label) or a /queues count.
+type OpsMetricRef struct {
+	Group string `yaml:"group,omitempty"`
+	Label string `yaml:"label,omitempty"`
+	Queue string `yaml:"queue,omitempty"`
+	Count string `yaml:"count,omitempty"`
+}
+
+// Ops alert limits (ops_interface.alerts).
+const (
+	MaxOpsAlerts = 16
+	// MaxOpsAlertInterfaces is how many ops_interface blocks of one app (the app-level one and the
+	// services' together) may declare alerts: each is probed in the background every 30 s.
+	MaxOpsAlertInterfaces = 8
+	OpsAlertWindowMin     = 30 * time.Second
+	OpsAlertWindowMax     = 24 * time.Hour
+	// OpsAlertUsualWindowMax leaves an hour of the 24 h history for an above_usual alert's usual level.
+	OpsAlertUsualWindowMax         = 23 * time.Hour
+	OpsAlertFactorMin      float64 = 1.5
+	OpsAlertFactorMax      float64 = 1000
+	opsAlertRefMax                 = 128 // bytes in a group, label, queue or count name
+)
+
+var opsAlertNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,47}$`)
 
 // Git is the repo-path / auto-pull config (§7.6). AutoDeploy defaults false.
 type Git struct {
@@ -1093,10 +1133,20 @@ func (s *Spec) validateOpsInterface() error {
 	if err := s.validateOIFields(s.OpsInterface, "ops_interface"); err != nil {
 		return err
 	}
+	alerting := 0
+	if s.OpsInterface != nil && len(s.OpsInterface.Alerts) > 0 {
+		alerting++
+	}
 	for name, svc := range s.Compose.Services {
 		if err := s.validateOIFields(svc.OpsInterface, "services."+name+".ops_interface"); err != nil {
 			return err
 		}
+		if svc.OpsInterface != nil && len(svc.OpsInterface.Alerts) > 0 {
+			alerting++
+		}
+	}
+	if alerting > MaxOpsAlertInterfaces {
+		return fmt.Errorf("ops_interface alerts are declared on %d ops_interface blocks (at most %d per app, the app-level ops_interface and the services' together)", alerting, MaxOpsAlertInterfaces)
 	}
 	return nil
 }
@@ -1132,6 +1182,110 @@ func (s *Spec) validateOIFields(oi *OpsInterface, ctx string) error {
 		}
 		if !declared {
 			return fmt.Errorf("%s.secret references undeclared secret %q (add it under spec.secrets)", ctx, oi.Secret)
+		}
+	}
+	return validateOpsAlerts(oi, ctx)
+}
+
+// validateOpsAlerts checks ops_interface.alerts: at most MaxOpsAlerts, on an enabled interface, each
+// with a unique name, one metric reference, a known condition and only the keys that condition uses.
+func validateOpsAlerts(oi *OpsInterface, ctx string) error {
+	if len(oi.Alerts) == 0 {
+		return nil
+	}
+	if !oi.Enabled {
+		return fmt.Errorf("%s.alerts need %s.enabled: true", ctx, ctx)
+	}
+	if len(oi.Alerts) > MaxOpsAlerts {
+		return fmt.Errorf("%s.alerts has %d entries (at most %d)", ctx, len(oi.Alerts), MaxOpsAlerts)
+	}
+	names := map[string]bool{}
+	for i, a := range oi.Alerts {
+		if !opsAlertNameRe.MatchString(a.Name) {
+			return fmt.Errorf("%s.alerts[%d] name %q must match [a-z0-9][a-z0-9-]{0,47}", ctx, i, a.Name)
+		}
+		if names[a.Name] {
+			return fmt.Errorf("%s.alerts name %q declared twice", ctx, a.Name)
+		}
+		names[a.Name] = true
+		at := fmt.Sprintf("%s.alerts %q", ctx, a.Name)
+		if err := validateOpsMetricRef(at, a.Metric); err != nil {
+			return err
+		}
+		for _, f := range []struct {
+			name string
+			v    float64
+		}{{"value", a.Value}, {"factor", a.Factor}, {"min", a.Min}} {
+			if math.IsNaN(f.v) || math.IsInf(f.v, 0) {
+				return fmt.Errorf("%s: %s must be a finite number", at, f.name)
+			}
+		}
+		switch a.When {
+		case "increases", "above":
+			if a.Factor != 0 || a.Min != 0 {
+				return fmt.Errorf("%s: factor and min apply only to when: above_usual", at)
+			}
+			if a.When == "increases" && a.Value < 0 {
+				return fmt.Errorf("%s: value must be >= 0 (the rise that fires the alert)", at)
+			}
+			// Intentional: value is a plain float64 with omitempty, so 0 and "not set" are the same
+			// thing; refusing 0 is the only way "above needs a limit" survives the canonical round-trip.
+			if a.When == "above" && a.Value == 0 {
+				return fmt.Errorf("%s: when: above needs value (the limit, not 0)", at)
+			}
+		case "above_usual":
+			if a.Value != 0 {
+				return fmt.Errorf("%s: value applies only to when: increases and above (use factor and min)", at)
+			}
+			if a.Factor != 0 && (a.Factor < OpsAlertFactorMin || a.Factor > OpsAlertFactorMax) {
+				return fmt.Errorf("%s: factor %g must be between %g and %g", at, a.Factor, OpsAlertFactorMin, OpsAlertFactorMax)
+			}
+			if a.Min < 0 {
+				return fmt.Errorf("%s: min must be >= 0", at)
+			}
+		default:
+			return fmt.Errorf("%s: when %q must be increases, above or above_usual", at, a.When)
+		}
+		if a.Window != "" {
+			if err := validDurationRange(at+" window", a.Window, OpsAlertWindowMin, OpsAlertWindowMax); err != nil {
+				return err
+			}
+			if d, _ := time.ParseDuration(a.Window); a.When == "above_usual" && d > OpsAlertUsualWindowMax {
+				return fmt.Errorf("%s window %q: an above_usual window is at most %s (the usual level needs an hour of the 24h history)", at, a.Window, boundString(OpsAlertUsualWindowMax))
+			}
+		}
+		switch a.Severity {
+		case "", "low", "medium", "high", "critical":
+		default:
+			return fmt.Errorf("%s: severity %q must be low, medium, high or critical", at, a.Severity)
+		}
+	}
+	return nil
+}
+
+// validateOpsMetricRef checks an alert names exactly one value: group + label, or queue + count.
+func validateOpsMetricRef(at string, m OpsMetricRef) error {
+	item := m.Group != "" || m.Label != ""
+	queue := m.Queue != "" || m.Count != ""
+	switch {
+	case item && queue:
+		return fmt.Errorf("%s: metric names group + label or queue + count, not both", at)
+	case item && (m.Group == "" || m.Label == ""):
+		return fmt.Errorf("%s: metric needs both group and label (a /metrics item)", at)
+	case queue && (m.Queue == "" || m.Count == ""):
+		return fmt.Errorf("%s: metric needs both queue and count (a /queues count)", at)
+	case !item && !queue:
+		return fmt.Errorf("%s: metric needs group + label (a /metrics item) or queue + count (a /queues count)", at)
+	}
+	for _, f := range []struct{ name, v string }{{"group", m.Group}, {"label", m.Label}, {"queue", m.Queue}, {"count", m.Count}} {
+		switch {
+		case f.v == "":
+		case len(f.v) > opsAlertRefMax:
+			return fmt.Errorf("%s: metric %s is %d bytes (at most %d)", at, f.name, len(f.v), opsAlertRefMax)
+		case strings.IndexFunc(f.v, unicode.IsControl) >= 0:
+			return fmt.Errorf("%s: metric %s %q contains a control character", at, f.name, f.v)
+		case strings.TrimSpace(f.v) != f.v:
+			return fmt.Errorf("%s: metric %s %q must not start or end with a space", at, f.name, f.v)
 		}
 	}
 	return nil

@@ -301,6 +301,9 @@ func TestSecurityLogsDocBlocksParse(t *testing.T) {
 			if len(s.PII.HashFields)+len(s.PII.DropFields)+len(s.PII.KeepFields) != 0 {
 				t.Errorf("pii lists not empty: %+v", s.PII)
 			}
+			if !full.SecurityFeedGeoIP() || !full.SecurityFeedSpamhaus() || !full.SecurityFeedTor() || !full.SecurityDetectionOn() || full.SecurityDShieldContact() != "" {
+				t.Errorf("feeds/detection not the defaults: %+v %+v", s.Feeds, s.Detection)
+			}
 		})
 	}
 }

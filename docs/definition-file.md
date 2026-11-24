@@ -874,6 +874,7 @@ ops_interface:
 | `secret` | string | A **reference** to a declared `spec.secrets` name; its value is resolved at deploy and never stored here. Omit to keep a dashboard-set value. |
 | `mode` | enum | `auto` (default) \| `rich` \| `basic`. |
 | `adapter` | string | Response adapter (default `ops.v1`). |
+| `alerts` | list | Alerts on the values the endpoint reports: at most 16, needs `enabled: true`; at most 8 `ops_interface` blocks per app (the app-level one and the services') may declare alerts. Each is `{name, metric, when, value, factor, min, window, severity}` — see [App Ops Interface → Alerts](./app-ops-interface.md#alerts). |
 
 > **The structure is read from this file; only the shared-secret VALUE is a dashboard input.** Set the secret value on the env page (or declare a secret and point `secret` at it). The endpoint, paths, headers, and mode come from `mooring.yaml`.
 
@@ -1242,6 +1243,14 @@ spec:
 | `spec.ops_interface.base_url` | string (origin only, never loopback) | when enabled | — |
 | `spec.ops_interface.base_path` / `.secret_header` / `.secret` / `.adapter` | string | no | — / — / — / `ops.v1` |
 | `spec.ops_interface.mode` | `auto` \| `rich` \| `basic` | no | `auto` |
+| `spec.ops_interface.alerts[]` | list (at most 16; needs `enabled: true`; at most 8 `ops_interface` blocks with alerts per app) | no | — |
+| `spec.ops_interface.alerts[].name` | string (`[a-z0-9][a-z0-9-]{0,47}`, unique per `ops_interface`) | yes (per entry) | — |
+| `spec.ops_interface.alerts[].metric` | `{group, label}` \| `{queue, count}` (each 1–128 bytes) | yes (per entry) | — |
+| `spec.ops_interface.alerts[].when` | `increases` \| `above` \| `above_usual` | yes (per entry) | — |
+| `spec.ops_interface.alerts[].value` | number (`increases`: `>= 0`; `above`: not `0`) | with `above` | `0` |
+| `spec.ops_interface.alerts[].factor` / `.min` | number (`above_usual` only; factor `1.5`–`1000`, min `>= 0`) | no | `5` / `0` |
+| `spec.ops_interface.alerts[].window` | duration (`30s`–`24h`; `above_usual` at most `23h`) | no | `5m` (`increases`) / `1m` |
+| `spec.ops_interface.alerts[].severity` | `low` \| `medium` \| `high` \| `critical` | no | `high` |
 | `spec.git.repo` | string (repo URL; set by connect-a-repo) | no | — |
 | `spec.git.ref` | string (fully-qualified) | no | — |
 | `spec.git.auto_deploy` | bool | no | **`false`** |

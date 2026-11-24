@@ -1,0 +1,98 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Detection rules</h1>
+  <p class="muted">Rules run over the security events as they arrive. High and critical detections are also sent to your alert channels; low and medium ones appear on the Detections page only. Built-in rules are tagged with MITRE ATT&amp;CK® technique IDs.</p>
+  {{template "security_subnav" "rules"}}
+  {{if .Off}}{{template "secdetoff"}}{{end}}
+  {{with .Rules}}
+  {{if .Notice}}<div class="notice" role="status">{{.Notice}}</div>{{end}}
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+  {{if .Loaded}}
+  <section class="panel">
+    <h2>Built-in rules</h2>
+    <p class="muted small">Edit changes a built-in rule's severity, counts and windows; Reset puts back its built-in values. A snoozed rule still records its detections but does not send them to the alert channels.</p>
+    {{if .Builtin.Rows}}{{template "secruletable" .Builtin}}{{else}}<p class="muted">No built-in rules are loaded.</p>{{end}}
+  </section>
+
+  <section class="panel">
+    <h2><span>Custom rules</span> <a class="btn btn-sm btn-primary" href="/security/rules/new">New custom rule</a></h2>
+    {{if .Custom.Rows}}{{template "secruletable" .Custom}}{{else}}
+    <p class="muted">No custom rules yet. A custom rule is a search in the Security logs syntax plus a condition, such as at least 20 matching events from one IP in an hour.</p>
+    {{end}}
+  </section>
+  {{end}}
+
+  {{if .FeedsOn}}
+  <section class="panel">
+    <h2>Enrichment feeds</h2>
+    <p class="muted small">Mooring downloads these files to add each event IP's location, network and threat-intel lists. DShield is used only when <code>security_logs.feeds.dshield_contact</code> is set.</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Feed</th><th>State</th><th>Version</th><th>Updated (UTC)</th><th class="num">Entries</th><th>Next try (UTC)</th><th class="wrap-cell">Last error</th></tr></thead>
+      <tbody>
+        {{range .Feeds}}
+        <tr>
+          <td>{{.Label}}{{if ne .Label .Name}} <span class="mono muted small">{{.Name}}</span>{{end}}</td>
+          <td>{{if not .Enabled}}<span class="pill">Off</span>{{else if .Error}}<span class="pill pill-warn">Failing</span>{{else}}<span class="pill pill-ok">On</span>{{end}}</td>
+          <td class="mono">{{if .Version}}{{.Version}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="mono">{{if .Updated}}{{.Updated}} <span class="muted">{{.Ago}}</span>{{else}}<span class="muted">Not downloaded yet</span>{{end}}</td>
+          <td class="num">{{if .HasEntries}}{{.Entries}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="mono">{{if .NextTry}}{{.NextTry}} <span class="muted">{{.NextIn}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="wrap-cell">{{if .LastError}}<span class="sec-src-err">{{.LastError}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        </tr>
+        {{else}}
+        <tr><td colspan="7" class="empty">No feeds have reported yet.</td></tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{template "sec_credits" .FeedCredits}}
+  </section>
+  {{end}}
+  {{end}}
+  {{if not .Off}}<p class="muted small">© 2026 The MITRE Corporation. This work is reproduced and distributed with the permission of The MITRE Corporation.</p>{{end}}
+</main>
+{{template "bottom" .}}
+
+{{/* One table of rules (a ruleTable). Built-in rows offer Reset, custom rows Delete. */}}
+{{define "secruletable"}}
+<div class="table-scroll"><table class="grid">
+  <thead><tr><th class="wrap-cell">Rule</th><th>Severity</th><th class="wrap-cell">Condition</th><th>MITRE ATT&amp;CK®</th><th>State</th><th></th></tr></thead>
+  <tbody>
+    {{range .Rows}}
+    <tr>
+      <td class="wrap-cell"><a href="{{.EditURL}}">{{.Name}}</a> <div class="muted small"><span class="mono">{{.ID}}</span> · {{.TypeLabel}}</div>{{if .Description}}<div class="muted small">{{.Description}}</div>{{end}}</td>
+      <td>{{template "sec_sev" .}}</td>
+      <td class="wrap-cell">{{.Condition}}</td>
+      <td>{{if .MITRE}}{{template "sec_mitre" .MITRE}}{{else}}<span class="muted">—</span>{{end}}</td>
+      <td>{{if .Enabled}}<span class="pill pill-ok">On</span>{{else}}<span class="pill">Off</span>{{end}}{{if .Snoozed}}<div class="muted small" title="{{.SnoozedISO}} ({{.SnoozedIn}})">Snoozed until<br>{{.SnoozedUntil}} UTC</div>{{end}}</td>
+      <td>
+        <div class="sec-rule-actions">
+          <form method="post" action="/security/rules/snooze" class="inline sec-snooze">
+            <input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}">
+            <span class="muted small">Snooze</span>
+            <button type="submit" name="for" value="1h" class="link" title="Don't send this rule's detections for 1 hour">1 h</button>
+            <button type="submit" name="for" value="24h" class="link" title="Don't send this rule's detections for 24 hours">24 h</button>
+            <button type="submit" name="for" value="7d" class="link" title="Don't send this rule's detections for 7 days">7 d</button>
+            {{if .Snoozed}}<button type="submit" name="for" value="clear" class="link">Clear</button>{{end}}
+          </form>
+          <div class="queue-actions">
+          <a class="btn btn-sm btn-ghost" href="{{.EditURL}}">Edit</a>
+          {{if .Builtin}}
+          <form method="post" action="/security/rules/reset" class="inline" data-confirm="Reset {{.Name}} to its built-in values?">
+            <input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}">
+            <button type="submit" class="link">Reset</button>
+          </form>
+          {{else}}
+          <form method="post" action="/security/rules/delete" class="inline" data-confirm="Delete the custom rule {{.Name}}?">
+            <input type="hidden" name="csrf_token" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}">
+            <button type="submit" class="link">Delete</button>
+          </form>
+          {{end}}
+          </div>
+        </div>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table></div>
+{{end}}

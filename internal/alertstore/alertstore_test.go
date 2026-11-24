@@ -898,6 +898,39 @@ func TestEnqueueInfraPrunesStaleUnsentRows(t *testing.T) {
 	}
 }
 
+// A slow prune never spends the caller's deadline: EnqueueInfra records the row first (the detection
+// engine gives each alert 3 seconds), then prunes on a context of its own, which outlives the caller's.
+func TestEnqueueInfraPruneOffTheCallersDeadline(t *testing.T) {
+	s := newStore(t)
+	exec(t, s, `INSERT INTO alert_outbox(rule_id, target, kind, level, transition, summary, dedupe_key, created_at, sent_at)
+		VALUES(0,'x','k','warning','firing','stale','old',?,0)`, time.Now().Add(-72*time.Hour).Unix())
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	var callerErr, pruneCtxErr error
+	ran := false
+	s.beforePrune = func(pctx context.Context) {
+		ran = true
+		<-ctx.Done() // the prune takes longer than the caller's deadline
+		callerErr, pruneCtxErr = ctx.Err(), pctx.Err()
+	}
+	err := s.EnqueueInfra(ctx, alert.Outbox{Target: "security-logs", Kind: "security_detection", Level: alert.LevelWarning,
+		Transition: "firing", Summary: "x", DedupeKey: "siem:r:k"})
+	if err != nil {
+		t.Fatalf("the insert failed on a slow prune: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM alert_outbox WHERE dedupe_key='siem:r:k' AND sent_at=0`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("the enqueued row: %d (%v)", n, err)
+	}
+	if !ran || callerErr == nil || pruneCtxErr != nil {
+		t.Fatalf("prune ran %v; caller's context %v, prune's context %v (want the prune's alive past the caller's deadline)",
+			ran, callerErr, pruneCtxErr)
+	}
+	if r := readRow(t, s, 1); r.sentAt == 0 {
+		t.Fatalf("the prune still runs: the 72-hour-old unsent row is closed: %+v", r)
+	}
+}
+
 // A resolve takes the level of the alert it closes: the highest level among the key's "firing" rows
 // since its last "resolved" row.
 func TestInfraResolveLevel(t *testing.T) {

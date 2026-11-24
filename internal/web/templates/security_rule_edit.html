@@ -1,0 +1,142 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <p><a href="/security/rules">← Rules</a></p>
+  {{if .Off}}
+  <h1>Edit rule</h1>
+  {{template "security_subnav" "rules"}}
+  {{template "secdetoff"}}
+  {{else if .Missing}}
+  <h1>Edit rule</h1>
+  {{template "security_subnav" "rules"}}
+  <section class="panel">
+    <h2>{{.Missing}}</h2>
+    <p class="muted"><a href="/security/rules">Back to the rules</a></p>
+  </section>
+  {{else}}{{with .Edit}}
+  <h1>{{if .New}}New custom rule{{else}}{{.Name}}{{end}}</h1>
+  {{template "security_subnav" "rules"}}
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+
+  {{if .Builtin}}
+  <section class="panel">
+    <h2><span>Rule</span> <span class="badge badge-muted">Built-in</span></h2>
+    {{if .Description}}<p class="muted">{{.Description}}</p>{{end}}
+    <div class="table-scroll"><table class="grid"><tbody>
+      <tr><td>ID</td><td class="mono">{{.ID}}</td></tr>
+      <tr><td>Type</td><td>{{.TypeLabel}}</td></tr>
+      <tr><td>Search</td><td class="wrap-cell"><code>{{.Query}}</code></td></tr>
+      {{if .Then}}<tr><td>Then</td><td class="wrap-cell"><code>{{.Then}}</code></td></tr>{{end}}
+      <tr><td>Group by</td><td class="mono">{{if .GroupBy}}{{.GroupBy}}{{else}}<span class="muted">all events together</span>{{end}}</td></tr>
+      {{if .Field}}<tr><td>Field</td><td class="mono">{{.Field}}</td></tr>{{end}}
+      {{if .MITRELinks}}<tr><td>MITRE ATT&amp;CK®</td><td>{{template "sec_mitre" .MITRELinks}}</td></tr>{{end}}
+      {{if .Snoozed}}<tr><td>Snoozed until</td><td class="mono">{{.Snoozed}}</td></tr>{{end}}
+    </tbody></table></div>
+  </section>
+
+  <section class="panel">
+    <h2>Settings</h2>
+    <p class="muted small">A built-in rule's search and grouping are fixed; these settings are yours to change.</p>
+    <form method="post" action="/security/rules/save" class="stack">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <input type="hidden" name="id" value="{{.ID}}">
+      <label class="check"><input type="checkbox" name="enabled"{{if .Enabled}} checked{{end}}> Enabled</label>
+      {{template "secrulesev" .}}
+      {{template "secruletunables" .}}
+      <div class="queue-actions">
+        <button type="submit" class="btn btn-primary">Save rule</button>
+        <a class="btn btn-ghost" href="/security/rules">Cancel</a>
+      </div>
+    </form>
+  </section>
+
+  {{else}}
+  <section class="panel">
+    <form method="post" action="/security/rules/save" class="stack">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      {{if .New}}
+      <label>ID <span class="muted">(lowercase letters, digits and hyphens; saved as custom.&lt;ID&gt;)</span>
+        <input type="text" name="slug" value="{{.Slug}}" placeholder="admin-probe" required maxlength="48" pattern="[a-z0-9][a-z0-9\-]{0,47}" autocomplete="off" spellcheck="false"></label>
+      {{else}}
+      <input type="hidden" name="id" value="{{.ID}}">
+      <p class="muted small">ID <span class="mono">{{.ID}}</span>{{if .Snoozed}} · Snoozed until {{.Snoozed}}{{end}}</p>
+      {{end}}
+      <label>Name
+        <input type="text" name="name" value="{{.Name}}" placeholder="Admin path probing" required maxlength="100"></label>
+      <label>Description <span class="muted">(optional)</span>
+        <textarea name="description" rows="2" maxlength="500">{{.Description}}</textarea></label>
+      <label>Type
+        <select name="type" data-kind-toggle>
+          {{range .Types}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select></label>
+      {{template "secrulesev" .}}
+      <label>Search <span class="muted">(the events to match, in the Security logs search syntax)</span>
+        <input type="text" name="query" value="{{.Query}}" class="mono" placeholder="src:edge f.path:/admin*" required autocomplete="off" spellcheck="false"></label>
+      <div class="kind-fields" data-kind="{{index .Kinds "then"}}"{{if not (index .Show "then")}} hidden{{end}}>
+        <label>Then <span class="muted">(the closing event's search)</span>
+          <input type="text" name="then" value="{{.Then}}" class="mono" placeholder="kind:ssh.login out:success" autocomplete="off" spellcheck="false"{{if not (index .Show "then")}} disabled{{end}}></label>
+      </div>
+      <label>Group by <span class="muted">(ip, actor, app, kind or f.&lt;name&gt;; blank counts all events together)</span>
+        <input type="text" name="group_by" value="{{.GroupBy}}" class="mono" placeholder="ip" autocomplete="off" spellcheck="false"></label>
+      <div class="kind-fields" data-kind="{{index .Kinds "field"}}"{{if not (index .Show "field")}} hidden{{end}}>
+        <label>Field <span class="muted">(whose values count: ip, actor, app, kind, f.&lt;name&gt;, geo.cc or geo.asn)</span>
+          <input type="text" name="field" value="{{.Field}}" class="mono" placeholder="actor" autocomplete="off" spellcheck="false"{{if not (index .Show "field")}} disabled{{end}}></label>
+      </div>
+      {{template "secruletunables" .}}
+      <label>MITRE ATT&amp;CK® techniques <span class="muted">(optional, comma-separated, such as T1110.001)</span>
+        <input type="text" name="mitre" value="{{.MITRE}}" class="mono" placeholder="T1595" autocomplete="off" spellcheck="false"></label>
+      <label class="check"><input type="checkbox" name="enabled"{{if .Enabled}} checked{{end}}> Enabled</label>
+      <div class="queue-actions">
+        <button type="submit" class="btn btn-primary">{{if .New}}Create rule{{else}}Save rule{{end}}</button>
+        <a class="btn btn-ghost" href="/security/rules">Cancel</a>
+      </div>
+    </form>
+  </section>
+  {{end}}
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}
+
+{{define "secrulesev"}}
+<label>Severity <span class="muted">(high and critical also alert)</span>
+  <select name="severity">
+    {{range .Severities}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+  </select></label>
+{{end}}
+
+{{/* The type-specific numbers (a ruleFormView). A built-in rule shows only those its type uses; a
+     custom rule renders them all and app.js shows the ones of the chosen type (the hidden ones are
+     disabled, so they don't submit). */}}
+{{define "secruletunables"}}
+{{$custom := not .Builtin}}
+{{if or $custom (index .Show "count")}}
+<div class="kind-fields" data-kind="{{index .Kinds "count"}}"{{if not (index .Show "count")}} hidden{{end}}>
+  <label>Count <span class="muted">(at least this many events; distinct values for a distinct rule)</span>
+    <input type="text" name="count" value="{{.Count}}" class="w-num-lg" inputmode="numeric" placeholder="10" autocomplete="off"{{if not (index .Show "count")}} disabled{{end}}></label>
+</div>
+{{end}}
+{{if or $custom (index .Show "window")}}
+<div class="kind-fields" data-kind="{{index .Kinds "window"}}"{{if not (index .Show "window")}} hidden{{end}}>
+  <label>Window <span class="muted">(such as 10m, 24h or 7d)</span>
+    <input type="text" name="window" value="{{.Window}}" class="w-num-lg" placeholder="10m" autocomplete="off" spellcheck="false"{{if not (index .Show "window")}} disabled{{end}}></label>
+</div>
+{{end}}
+{{if or $custom (index .Show "factor")}}
+<div class="kind-fields" data-kind="{{index .Kinds "factor"}}"{{if not (index .Show "factor")}} hidden{{end}}>
+  <label>Factor <span class="muted">(times the usual rate, such as 3)</span>
+    <input type="text" name="factor" value="{{.Factor}}" class="w-num-lg" inputmode="decimal" placeholder="3" autocomplete="off"{{if not (index .Show "factor")}} disabled{{end}}></label>
+</div>
+{{end}}
+{{if or $custom (index .Show "learn")}}
+<div class="kind-fields" data-kind="{{index .Kinds "learn"}}"{{if not (index .Show "learn")}} hidden{{end}}>
+  <label>Learning period <span class="muted">(watched this long before it can fire, such as 7d)</span>
+    <input type="text" name="learn" value="{{.Learn}}" class="w-num-lg" placeholder="7d" autocomplete="off" spellcheck="false"{{if not (index .Show "learn")}} disabled{{end}}></label>
+</div>
+{{end}}
+{{if or $custom (index .Show "speed_kmh")}}
+<div class="kind-fields" data-kind="{{index .Kinds "speed_kmh"}}"{{if not (index .Show "speed_kmh")}} hidden{{end}}>
+  <label>Speed <span class="muted">(km/h; faster travel between two events fires, such as 900)</span>
+    <input type="text" name="speed_kmh" value="{{.Speed}}" class="w-num-lg" inputmode="decimal" placeholder="900" autocomplete="off"{{if not (index .Show "speed_kmh")}} disabled{{end}}></label>
+</div>
+{{end}}
+{{end}}

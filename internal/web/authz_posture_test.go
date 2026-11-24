@@ -46,11 +46,22 @@ var csrfExempt = map[string]bool{
 var mutatingVerb = map[string]bool{"POST": true, "PUT": true, "PATCH": true, "DELETE": true}
 
 // ownerOnly are the routes only the owner role may use (requirePerm("admin")), GETs included:
-// security-log search, status and export. Every route under /security must be listed here.
+// security-log search, status and export, detections and detection rules. Every route under
+// /security must be listed here.
 var ownerOnly = map[string]bool{
-	"GET /security":        true,
-	"GET /security/status": true,
-	"GET /security/export": true,
+	"GET /security":                 true,
+	"GET /security/status":          true,
+	"GET /security/export":          true,
+	"GET /security/detections":      true,
+	"GET /security/detections/rows": true,
+	"GET /security/detections/{id}": true,
+	"GET /security/rules":           true,
+	"GET /security/rules/edit":      true,
+	"GET /security/rules/new":       true,
+	"POST /security/rules/save":     true,
+	"POST /security/rules/delete":   true,
+	"POST /security/rules/reset":    true,
+	"POST /security/rules/snooze":   true,
 }
 
 type routeReg struct {
