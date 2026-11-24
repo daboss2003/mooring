@@ -182,7 +182,8 @@ backups:
   schedule: 24h                       # 1h floor
   retention: 7                        # snapshots kept per volume
   helper_image: "busybox:1.36"
-  s3: null                            # optional off-box destination (bucket/endpoint/region/keys/…)
+  s3: null                            # optional off-box destination (bucket/endpoint/region/keys/…); when set,
+                                      # the Mooring-state backup is also uploaded daily at 03:00, 10 kept (even with enabled: false)
 
 # --- Security logs (on by default) ---  see docs/security-logs.md
 security_logs:

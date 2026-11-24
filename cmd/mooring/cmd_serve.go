@@ -544,6 +544,26 @@ func cmdServe(args []string) error {
 			go func() { defer wg.Done(); backupRunner.Run(ctx) }()
 			log.Info("scheduled app-data backups enabled", "interval", cfg.BackupSchedule(), "retention", cfg.BackupRetention(), "off_box", uploader != nil)
 		}
+
+		// The daily Mooring-state backup (the archive `mooring restore` takes), whenever backups.s3 is
+		// set, app-data backups on or off: uploaded once a day, 10 kept on the server and in S3. Only
+		// the encrypted archive is uploaded; the encryption key stays on this server.
+		if sc := cfg.Backups.S3; sc != nil && backupStore.Available() && len(sc.Problems("backups.s3")) == 0 {
+			if cl, serr := s3ClientFor(sc); serr != nil {
+				log.Warn("backups.s3 misconfigured; the daily Mooring-state backup is off", "err", serr)
+			} else {
+				stateAlert := func(level, title, detail string) {
+					_ = alertStore.EnqueueInfra(context.Background(), alert.Outbox{
+						Target: "backups", Kind: "backup", Level: level, Transition: "firing",
+						Summary: title + ": " + detail, DedupeKey: "backup:mooring-state",
+					})
+				}
+				stateRunner := backupsched.NewState(backupStore, cl, sc.Prefix, stateAlert, log)
+				wg.Add(1)
+				go func() { defer wg.Done(); stateRunner.Run(ctx) }()
+				log.Info("daily Mooring-state backup to S3 enabled", "bucket", sc.Bucket, "keep", backupsched.StateKeep)
+			}
+		}
 	}
 	var edgeRecon *edge.Reconciler
 	var dnsPlugins *edge.DNSPlugins     // per-provider Caddy DNS plugin state (nil without dns01 or an owned edge)

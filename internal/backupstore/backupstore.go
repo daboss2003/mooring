@@ -160,6 +160,12 @@ func (s *Store) Get(ctx context.Context, id string) (Record, bool, error) {
 	return r, true, nil
 }
 
+// SetLocation records where a backup's archive is kept ("local", "local+s3").
+func (s *Store) SetLocation(ctx context.Context, id, loc string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE backups SET location=? WHERE id=?`, loc, id)
+	return err
+}
+
 // Dir returns the backups directory (0700). The app-data backup engine writes its
 // externally-produced .mbk here (see appbackup.LocalFile) and then calls Catalog.
 func (s *Store) Dir() string { return s.dir }

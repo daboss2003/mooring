@@ -55,6 +55,14 @@ func readDisk(path string) (total, used uint64, err error) {
 	return total, total - free, nil
 }
 
+func diskFree(path string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return st.Bavail * uint64(st.Bsize), nil
+}
+
 // readProcesses walks /proc, reading each numeric PID's status for name + RSS, and
 // returns the top-N by resident memory. It is a single pass with NO goroutine per
 // pid (so a box with thousands of PIDs can't explode); per-pid read errors (the

@@ -208,6 +208,10 @@ type Process struct {
 // tolerated (a process can exit mid-scan) — they're skipped, never fatal.
 func Processes(topN int) ([]Process, error) { return readProcesses(topN) }
 
+// DiskFree returns the bytes an unprivileged writer can still use on the filesystem holding path
+// (root-reserved blocks excluded). ErrUnsupported off Linux.
+func DiskFree(path string) (uint64, error) { return diskFree(path) }
+
 // parseProcStatus parses one /proc/[pid]/status into a Process. ok=false when the
 // entry has no resident memory (kernel thread or already-reaped) and should be
 // skipped. Name is capped and stripped of control bytes by the caller's template

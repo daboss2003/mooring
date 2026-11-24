@@ -35,6 +35,46 @@ Restoring replaces Mooring's database, so it's a deliberate command-line step ra
 
 Your apps' definitions and settings are back; redeploy them and Mooring rebuilds their files and re-issues certificates.
 
+### Daily copies in S3
+
+When `backups.s3` is set in `config.yaml` (with or without `backups.enabled`), Mooring takes a
+Mooring-state backup once a day and uploads it to that bucket as
+`<prefix>mooring-state/<YYYYMMDD>T<HHMMSS>Z-<id>.mbk` (UTC). It is the same encrypted archive
+**Back up now** makes, so `mooring restore --from <file>.mbk --force` restores it. Only the archive
+is uploaded: `config.yaml` and the encryption key stay on the server. Keep `encryption_key`
+somewhere else too, or a copy in S3 can't be restored.
+
+- One is taken each day at 03:00 server time (the first hourly check after it). When that day's
+  backup was missed (Mooring was stopped, or this is the first start), it is taken a few minutes
+  after Mooring starts. A restart doesn't add one.
+- At most 10 are kept in the bucket and 10 on the server. In the bucket, the oldest objects under
+  `<prefix>mooring-state/` are deleted; other objects there are never touched. On the server, the
+  newest 10 Mooring-state backups are kept, **Back up now** ones included.
+- A failed upload is kept on the server and retried every hour with the same archive; Mooring
+  raises a `backup` alert once per outage. An upload that stalls is stopped after an hour (plus a
+  minute per 64 MiB of archive) and counts as failed.
+- With versioning on, a deleted object stays in the bucket as a noncurrent version, so the bucket
+  holds more than 10 copies. Add a lifecycle rule that expires noncurrent versions under
+  `<prefix>mooring-state/` to keep it at 10.
+- An incomplete `backups.s3` block (missing bucket, region, endpoint or keys) turns the daily
+  backup off and is reported at startup and by `sudo mooring doctor`; with `backups.enabled` it
+  refuses to start, as before.
+
+The `backups.s3` credentials need `s3:PutObject`, `s3:ListBucket` and `s3:DeleteObject` on the
+bucket, and `s3:GetObject` to restore from it.
+
+To restore from S3, follow the steps above with step 3 replaced by:
+
+```bash
+mooring restore --from-s3 latest --force
+```
+
+`config.yaml` on the new server needs the same `encryption_key` and the same `backups.s3` block.
+`mooring restore --from-s3 list` prints the backups in the bucket, newest first; pass one of those
+names (or the start of one, such as `20261124`) instead of `latest` to restore an older one. The
+data dir needs about twice the backup's size free (the download plus the decrypted database);
+the restore checks this before downloading.
+
 ---
 
 ## Backing up your apps' data

@@ -1629,6 +1629,13 @@ func (c *Config) Validate() error {
 		if s := c.Backups.S3; s != nil {
 			validateS3("backups.s3", s, add)
 		}
+	} else if s := c.Backups.S3; s != nil {
+		// Intentional: with backups off, backups.s3 is used only by the daily Mooring-state backup. An
+		// incomplete block turns that off with a warning instead of refusing boot: before the state
+		// backup existed such a block was ignored, so an upgrade must not refuse to start on it.
+		if p := s.Problems("backups.s3"); len(p) > 0 {
+			c.LoadWarnings = append(c.LoadWarnings, "backups.s3: incomplete, so the daily Mooring-state backup to S3 is off: "+strings.Join(p, "; "))
+		}
 	}
 
 	// --- Security logs (on by default) ---
@@ -1638,6 +1645,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config: refusing to boot:\n  - %s", strings.Join(errs, "\n  - "))
 	}
 	return nil
+}
+
+// Problems lists what an S3 destination block named key is missing (none when it is complete).
+func (s *BackupS3) Problems(key string) []string {
+	var out []string
+	validateS3(key, s, func(format string, a ...any) { out = append(out, fmt.Sprintf(format, a...)) })
+	return out
 }
 
 // validateS3 checks an S3 destination block named key (backups.s3, security_logs.archive.s3).

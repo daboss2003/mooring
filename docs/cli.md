@@ -235,9 +235,10 @@ token 9c1e4b7a2d5f8e0b3a6c9d1e revoked — it is rejected at auth immediately; r
 ### `mooring restore`
 
 - **Purpose:** restore Mooring's database from an encrypted `.mbk` backup archive. This **replaces** the live database, so it is a deliberate CLI step rather than a dashboard button.
-- **Usage:** `mooring restore --from <archive.mbk> --force [--config PATH]`
+- **Usage:** `mooring restore --from <archive.mbk> --force [--config PATH]`, or `mooring restore --from-s3 latest|list|<name> --force [--config PATH]`
 - **Flags:**
   - `--from <archive.mbk>` — the encrypted backup to restore.
+  - `--from-s3 <which>` — restore a daily Mooring-state backup from the `backups.s3` bucket (see [Daily copies in S3](./backup-and-recovery.md#daily-copies-in-s3)). `latest` is the newest; `list` prints the backups in the bucket, newest first, and changes nothing; any other value is a name from that list, or the start of one (`20261124`) that matches exactly one backup. The archive is downloaded into the data dir, restored like `--from`, and removed afterwards; the data dir needs about twice its size free, which is checked before the download. Use either `--from` or `--from-s3`.
   - `--force` — confirm the replacement (without it the command refuses and tells you to stop the service first).
   - `--config PATH` — config file (default `/etc/mooring/config.yaml`).
 - **How it works:** the archive is decrypted with the configured master key (the **same** key the backup was made under — back up config and DB separately so they stay in sync), inspected to confirm it is a real Mooring database, opened (which also runs migrations and refuses a downgrade from a newer binary), and only then swapped in. The previous database is kept aside as `mooring.db.pre-restore-<ts>`.
@@ -248,6 +249,18 @@ $ systemctl stop mooring
 $ mooring restore --from /var/lib/mooring/backups/2026-06-15.mbk --force
 previous database kept at /var/lib/mooring/mooring.db.pre-restore-1718409600
 restored /var/lib/mooring/mooring.db from /var/lib/mooring/backups/2026-06-15.mbk
+start Mooring again: systemctl start mooring
+```
+
+```console
+$ mooring restore --from-s3 list
+20261124T030012Z-4f1c9a0e7b2d6c8a1e3f5b70.mbk  2026-11-24 03:00:12 UTC  46.0 MiB
+20261123T030009Z-a81d2e6f0c4b9a7e3d5c1f28.mbk  2026-11-23 03:00:09 UTC  45.9 MiB
+$ systemctl stop mooring
+$ mooring restore --from-s3 latest --force
+downloaded s3://my-bucket/mooring/mooring-state/20261124T030012Z-4f1c9a0e7b2d6c8a1e3f5b70.mbk (48230912 bytes)
+previous database kept at /var/lib/mooring/mooring.db.pre-restore-1795489200
+restored /var/lib/mooring/mooring.db from s3://my-bucket/mooring/mooring-state/20261124T030012Z-4f1c9a0e7b2d6c8a1e3f5b70.mbk
 start Mooring again: systemctl start mooring
 ```
 

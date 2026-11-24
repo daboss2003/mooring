@@ -249,7 +249,7 @@ func secLogsFetchCmd(ctx context.Context, args []string, stdout io.Writer) error
 	if sc == nil {
 		return fmt.Errorf("security_logs.archive.s3 is not set in %s", *configPath)
 	}
-	cl, err := secLogsS3Client(sc)
+	cl, err := s3ClientFor(sc)
 	if err != nil {
 		return err
 	}
@@ -425,8 +425,8 @@ func secLogsKeys(cfg *config.Config) ([][]byte, error) {
 	return keys, nil
 }
 
-// secLogsS3Client builds the client for an S3 block of config.yaml (path_style unset = true).
-func secLogsS3Client(sc *config.BackupS3) (*s3.Client, error) {
+// s3ClientFor builds the client for an S3 block of config.yaml (path_style unset = true).
+func s3ClientFor(sc *config.BackupS3) (*s3.Client, error) {
 	pathStyle := true
 	if sc.PathStyle != nil {
 		pathStyle = *sc.PathStyle

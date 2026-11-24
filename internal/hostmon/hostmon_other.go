@@ -12,3 +12,4 @@ func readSwapTotal() uint64                                { return 0 }
 func readLoad1() (float64, error)                          { return 0, ErrUnsupported }
 func readDisk(path string) (total, used uint64, err error) { return 0, 0, ErrUnsupported }
 func readProcesses(topN int) ([]Process, error)            { return nil, ErrUnsupported }
+func diskFree(path string) (uint64, error)                 { return 0, ErrUnsupported }

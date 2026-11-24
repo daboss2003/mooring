@@ -800,3 +800,31 @@ func alertingWarnings(cfg *Config) []string {
 	}
 	return out
 }
+
+// With backups off, backups.s3 is used only by the daily Mooring-state backup: an incomplete block
+// never refuses boot, it turns that backup off with a load warning. A complete one warns nothing.
+func TestBackupsS3WithoutBackupsWarnsWhenIncomplete(t *testing.T) {
+	warned := func(cfg *Config) bool {
+		for _, w := range cfg.LoadWarnings {
+			if strings.HasPrefix(w, "backups.s3:") {
+				return true
+			}
+		}
+		return false
+	}
+	cfg, err := Parse([]byte(validYAML(t, "backups:\n  s3:\n    bucket: b\n    region: r\n")))
+	if err != nil {
+		t.Fatalf("an incomplete backups.s3 with backups off refused boot: %v", err)
+	}
+	if !warned(cfg) {
+		t.Errorf("no backups.s3 warning: %q", cfg.LoadWarnings)
+	}
+	full := "backups:\n  s3:\n    bucket: b\n    region: r\n    endpoint: s3.example.com\n    access_key_id: a\n    secret_access_key: s\n"
+	cfg, err = Parse([]byte(validYAML(t, full)))
+	if err != nil || warned(cfg) {
+		t.Errorf("a complete block: err %v, warnings %q", err, cfg.LoadWarnings)
+	}
+	if p := cfg.Backups.S3.Problems("backups.s3"); len(p) != 0 {
+		t.Errorf("Problems on a complete block: %q", p)
+	}
+}

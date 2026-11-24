@@ -1,6 +1,8 @@
 package hostmon
 
 import (
+	"errors"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -170,5 +172,18 @@ func TestSamplersAreIndependent(t *testing.T) {
 	}
 	if cpu, _ := a.sampleCPU(); cpu != 50 {
 		t.Errorf("a second = %v, want 50 over a's own window", cpu)
+	}
+}
+
+func TestDiskFree(t *testing.T) {
+	free, err := DiskFree(t.TempDir())
+	if errors.Is(err, ErrUnsupported) {
+		t.Skip("not on this OS")
+	}
+	if err != nil || free == 0 {
+		t.Fatalf("DiskFree = %d, %v", free, err)
+	}
+	if _, err := DiskFree(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("a missing path has no free space to report")
 	}
 }

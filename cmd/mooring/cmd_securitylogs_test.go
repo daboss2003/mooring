@@ -424,7 +424,7 @@ func TestSecurityLogsDownloadBounds(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 	u, _ := url.Parse(ts.URL)
-	cl, err := secLogsS3Client(&config.BackupS3{Bucket: "logs", Endpoint: u.Host, Region: "r", AccessKeyID: "a", SecretAccessKey: "s", Insecure: true})
+	cl, err := s3ClientFor(&config.BackupS3{Bucket: "logs", Endpoint: u.Host, Region: "r", AccessKeyID: "a", SecretAccessKey: "s", Insecure: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -448,7 +448,7 @@ func TestSecurityLogsDownloadBounds(t *testing.T) {
 	}))
 	defer chunked.Close()
 	cu, _ := url.Parse(chunked.URL)
-	cl2, _ := secLogsS3Client(&config.BackupS3{Bucket: "logs", Endpoint: cu.Host, Region: "r", AccessKeyID: "a", SecretAccessKey: "s", Insecure: true})
+	cl2, _ := s3ClientFor(&config.BackupS3{Bucket: "logs", Endpoint: cu.Host, Region: "r", AccessKeyID: "a", SecretAccessKey: "s", Insecure: true})
 	p2 := filepath.Join(dir, "chunked")
 	if _, err := secLogsDownload(context.Background(), cl2, "k", p2, 50); err == nil {
 		t.Error("a chunked object over the cap was downloaded")

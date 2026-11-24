@@ -136,7 +136,7 @@ func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertsto
 	go func() { defer s.workers.Done(); s.follower.Run(wctx, s.pipe.HostLine) }()
 
 	if sc := cfg.SecurityLogs.Archive.S3; sc != nil {
-		cl, cerr := secLogsS3Client(sc)
+		cl, cerr := s3ClientFor(sc)
 		if cerr != nil {
 			log.Error("security logs: the S3 archive is off", "err", cerr)
 		} else {
