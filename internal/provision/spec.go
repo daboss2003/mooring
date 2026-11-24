@@ -35,6 +35,7 @@ type Port struct {
 	Public    bool   `json:"public"`
 	Protocol  string `json:"protocol,omitempty"`  // "" (=tcp) | "tcp" | "udp"
 	Published int    `json:"published,omitempty"` // host port (default = internal)
+	IPv4Only  bool   `json:"ipv4_only,omitempty"` // a public port bound on 0.0.0.0 only (no [::]); needs Publish + Public
 }
 
 // Volume is a named volume XOR a run_dir-confined bind. Exactly one of Name/Source.
@@ -208,6 +209,9 @@ func (svc Service) validate(siblings map[string]bool) error {
 		}
 		if p.Protocol != "" && p.Protocol != "tcp" && p.Protocol != "udp" {
 			return fmt.Errorf("port %d protocol %q must be tcp or udp", p.Internal, p.Protocol)
+		}
+		if p.IPv4Only && (!p.Publish || !p.Public) {
+			return fmt.Errorf("port %d: ipv4_only needs a public published port", p.Internal)
 		}
 		if p.Published != 0 {
 			if p.Published < 1 || p.Published > 65535 {

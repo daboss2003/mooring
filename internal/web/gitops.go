@@ -892,7 +892,17 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	for _, w := range catchAllWarns {
 		onLine(w)
 	}
-	composeBytes, gerr := definition.ComposeBytesAt(def, sha)
+	// A listener another app's L4 route holds fails the deploy here, before anything starts (applyRoutes
+	// stores the routes only after the rollout).
+	if err := s.checkL4Collisions(ctx, slug, def); err != nil {
+		s.gitStore.SetState(bg, slug, "update_blocked")
+		return nil, err
+	}
+	composeSrc, l4Dropped := s.composeDef(def)
+	if l4Dropped {
+		onLine("warning: edge.l4_routes are not served on this server: the L4 load balancer is off (it needs edge.mode: managed, edge.l4_enabled: true and nginx with the stream module)")
+	}
+	composeBytes, gerr := definition.ComposeBytesAt(composeSrc, sha)
 	if gerr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
 		return nil, fmt.Errorf("generate compose: %w", gerr)
@@ -1115,6 +1125,16 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 		changed = withoutServices(changed, rr.started)
 		relProblems, relStarted = rr.problems, rr.started
 		s.renewExpectedDown(bg, slug)
+	}
+	// Intentional: L4 routes are normally stored after the rollout (applyDefinition), but a proxy route this
+	// deploy turns into forward: kernel is still bound by nginx, and Docker can't publish a held port. So
+	// those routes are stored here, right before the first container of the new version starts (both start
+	// paths below), and the deploy waits until each port binds. If the start then fails, the port stays
+	// unserved until a deploy succeeds (owner decision, 2026-11-24).
+	if err := s.switchL4ToKernel(ctx, slug, def, onLine); err != nil {
+		// Nothing of the new version started: undo as for a rollout where nothing started.
+		s.rollbackVolumeOwnership(bg, volumesNotUsedBy(def, slug, reconciledVols, relStarted), onLine)
+		return nil, failed(err)
 	}
 	startedNew = true // from here on containers of the new version may run
 	if paced {

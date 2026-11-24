@@ -421,17 +421,7 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 	}
 
 	if s.l4Routes != nil {
-		routes := make([]l4.Route, 0, len(def.Spec.Edge.L4Routes))
-		for _, r := range def.Spec.Edge.L4Routes {
-			routes = append(routes, l4.Route{
-				Listen:   r.Listen,
-				Protocol: r.Protocol,
-				Service:  r.Service,
-				Port:     r.Port,
-				LB:       r.LB,
-			})
-		}
-		if err := s.l4Routes.ReplaceProject(ctx, project, routes); err != nil {
+		if err := s.l4Routes.ReplaceProject(ctx, project, l4RoutesOf(def)); err != nil {
 			return fmt.Errorf("apply l4 routes: %w", err)
 		}
 		if s.l4Reconcile != nil {
@@ -441,6 +431,223 @@ func (s *Server) applyRoutes(ctx context.Context, project string, def *definitio
 		}
 	}
 	return nil
+}
+
+// l4RoutesOf converts a definition's l4_routes to the L4 store's routes (TLS is passthrough-only, so it
+// changes nothing the LB renders).
+func l4RoutesOf(def *definition.Definition) []l4.Route {
+	routes := make([]l4.Route, 0, len(def.Spec.Edge.L4Routes))
+	for _, r := range def.Spec.Edge.L4Routes {
+		routes = append(routes, l4.Route{
+			Listen:   r.Listen,
+			Protocol: r.Protocol,
+			Service:  r.Service,
+			Port:     r.Port,
+			LB:       r.LB,
+			Forward:  r.Forward,
+		})
+	}
+	return routes
+}
+
+// publishedHostPorts lists the host ports def's services publish through their own ports[] entries
+// (protocol "" is tcp), in service-name order.
+func publishedHostPorts(def *definition.Definition) []l4.HostPort {
+	names := make([]string, 0, len(def.Spec.Compose.Services))
+	for name := range def.Spec.Compose.Services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var out []l4.HostPort
+	for _, name := range names {
+		out = append(out, servicePublishedPorts(def.Spec.Compose.Services[name])...)
+	}
+	return out
+}
+
+// servicePublishedPorts lists the host ports one service publishes through its ports[] entries: host =
+// published, else internal; protocol "" is tcp.
+func servicePublishedPorts(svc definition.Service) []l4.HostPort {
+	var out []l4.HostPort
+	for _, p := range svc.Ports {
+		if !p.Publish {
+			continue
+		}
+		host := p.Internal
+		if p.Published != 0 {
+			host = p.Published
+		}
+		proto := p.Protocol
+		if proto == "" {
+			proto = "tcp"
+		}
+		out = append(out, l4.HostPort{Port: host, Protocol: proto})
+	}
+	return out
+}
+
+// checkL4Collisions refuses a deploy whose l4_routes, or whose own published host ports, take a
+// listener another app's L4 route holds, and one whose l4_routes (kernel or proxy — neither Docker nor
+// nginx can bind a held port) listen on a port another app's service publishes itself. It runs before
+// anything is generated or started; with L4 off no route is stored or served, so there is nothing to check.
+func (s *Server) checkL4Collisions(ctx context.Context, project string, def *definition.Definition) error {
+	if s.l4Routes == nil {
+		return nil
+	}
+	if err := s.l4Routes.CheckProject(ctx, project, l4RoutesOf(def), publishedHostPorts(def)); err != nil {
+		return err
+	}
+	if s.defStore == nil || len(def.Spec.Edge.L4Routes) == 0 {
+		return nil
+	}
+	defs, err := s.defStore.CurrentAll(ctx)
+	if err != nil {
+		return fmt.Errorf("check l4_routes against other apps' published ports: %w", err)
+	}
+	type publisher struct{ app, service string }
+	published := map[string]publisher{} // "port/protocol" → the other app's service that publishes it
+	apps := make([]string, 0, len(defs))
+	for app := range defs {
+		apps = append(apps, app)
+	}
+	sort.Strings(apps) // deterministic owner when two apps publish one port
+	for _, app := range apps {
+		if app == project {
+			continue
+		}
+		svcs := make([]string, 0, len(defs[app].Spec.Compose.Services))
+		for name := range defs[app].Spec.Compose.Services {
+			svcs = append(svcs, name)
+		}
+		sort.Strings(svcs)
+		for _, name := range svcs {
+			for _, hp := range servicePublishedPorts(defs[app].Spec.Compose.Services[name]) {
+				key := strconv.Itoa(hp.Port) + "/" + hp.Protocol
+				if _, ok := published[key]; !ok {
+					published[key] = publisher{app, name}
+				}
+			}
+		}
+	}
+	for _, r := range def.Spec.Edge.L4Routes {
+		if p, ok := published[strconv.Itoa(r.Listen)+"/"+r.Protocol]; ok {
+			return fmt.Errorf("l4 route %d/%s is already in use by app %q, which publishes it on service %q — pick a different listen port", r.Listen, r.Protocol, p.app, p.service)
+		}
+	}
+	return nil
+}
+
+// Test seams for moving a listener from the L4 LB to Docker (switchL4ToKernel).
+var (
+	l4PortFree   = probePortFree
+	l4SwitchWait = 10 * time.Second
+	l4SwitchPoll = 200 * time.Millisecond
+)
+
+// probePortFree reports whether 0.0.0.0:port can be bound for proto ("udp", else tcp) right now: it binds
+// and closes at once. The service holds CAP_NET_BIND_SERVICE, so privileged ports probe too.
+func probePortFree(port int, proto string) bool {
+	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
+	if proto == "udp" {
+		c, err := net.ListenPacket("udp4", addr)
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	}
+	l, err := net.Listen("tcp4", addr)
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+
+// switchL4ToKernel prepares a deploy that turns this app's stored proxy routes into forward: kernel routes
+// on the same listen/protocol: nginx still holds those ports, so Docker couldn't publish them. It stores
+// def's L4 routes, reconciles the L4 LB so nginx lets go of the ports, and waits until each one binds. With
+// no such route it does nothing (routes are stored after the rollout, as for every other deploy). On a
+// failure the app's previous routes are put back, so the LB serves the running copy again.
+func (s *Server) switchL4ToKernel(ctx context.Context, project string, def *definition.Definition, onLine func(string)) error {
+	if s.l4Routes == nil {
+		return nil
+	}
+	all, err := s.l4Routes.List()
+	if err != nil {
+		return fmt.Errorf("read the app's L4 routes: %w", err)
+	}
+	var prev []l4.Route
+	proxied := map[string]bool{}
+	for _, r := range all {
+		if r.AppID == project {
+			prev = append(prev, r)
+			if !r.Kernel() {
+				proxied[l4.PoolKey(r)] = true
+			}
+		}
+	}
+	next := l4RoutesOf(def)
+	var moving []l4.Route
+	var names []string
+	for _, r := range next {
+		if r.Kernel() && proxied[l4.PoolKey(r)] {
+			moving = append(moving, r)
+			names = append(names, l4.PoolKey(r))
+		}
+	}
+	if len(moving) == 0 {
+		return nil
+	}
+	onLine("L4: moving " + strings.Join(names, ", ") + " from the L4 load balancer to Docker (forward: kernel)")
+	putBack := func() {
+		if err := s.l4Routes.ReplaceProject(context.WithoutCancel(ctx), project, prev); err != nil {
+			onLine("warning: could not put back the previous L4 routes: " + err.Error())
+			return
+		}
+		if s.l4Reconcile != nil {
+			if err := s.l4Reconcile(context.WithoutCancel(ctx)); err != nil {
+				onLine("warning: the L4 load balancer was not reconciled with the previous routes: " + err.Error())
+			}
+		}
+	}
+	if err := s.l4Routes.ReplaceProject(ctx, project, next); err != nil {
+		return fmt.Errorf("release the L4 listeners for forward: kernel: %w", err)
+	}
+	if s.l4Reconcile != nil {
+		if err := s.l4Reconcile(ctx); err != nil {
+			putBack()
+			return fmt.Errorf("release the L4 listeners for forward: kernel: the L4 load balancer was not reconciled: %w", err)
+		}
+	}
+	deadline := time.Now().Add(l4SwitchWait)
+	for _, r := range moving {
+		for !l4PortFree(r.Listen, r.Protocol) {
+			if !time.Now().Before(deadline) {
+				putBack()
+				return fmt.Errorf("port %d/%s is still held after the L4 load balancer released it", r.Listen, r.Protocol)
+			}
+			select {
+			case <-ctx.Done():
+				putBack()
+				return ctx.Err()
+			case <-time.After(l4SwitchPoll):
+			}
+		}
+	}
+	return nil
+}
+
+// composeDef is the definition a compose is generated from. With L4 off (s.l4Routes nil) no l4_route is
+// served, so a forward: kernel route must publish nothing either: it returns a copy without l4_routes
+// (dropped reports that it had some). def itself is never changed.
+func (s *Server) composeDef(def *definition.Definition) (_ *definition.Definition, dropped bool) {
+	if s.l4Routes != nil || len(def.Spec.Edge.L4Routes) == 0 {
+		return def, false
+	}
+	cp := *def // Spec and Edge are values: clearing the copy's slice leaves def's routes in place
+	cp.Spec.Edge.L4Routes = nil
+	return &cp, true
 }
 
 // applyScaling persists this app's mooring.yaml scaling policies (one per service)
@@ -467,13 +674,21 @@ func (s *Server) applyScaling(ctx context.Context, project string, def *definiti
 }
 
 // disableFixedScaling disables the enabled scaling policy of every service of def that declares a fixed
-// `replicas` count (validation keeps such a service out of spec.scaling, so a row left over from before
-// is the only way one exists). The row keeps its thresholds; a row that no longer passes validation is
-// replaced by a disabled default one.
+// `replicas` count or is the target of a forward: kernel l4_route (validation keeps such a service out of
+// an enabled spec.scaling entry, so a row left over from before is the only way one exists). The row keeps
+// its thresholds; a row that no longer passes validation is replaced by a disabled default one.
 func (s *Server) disableFixedScaling(ctx context.Context, project string, def *definition.Definition) error {
+	// The target of a forward: kernel l4_route runs one copy too (a second would collide on the published
+	// port); validation keeps it out of an enabled spec.scaling entry in the same way.
+	kernel := map[string]bool{}
+	for _, r := range def.Spec.Edge.L4Routes {
+		if r.Kernel() {
+			kernel[r.Service] = true
+		}
+	}
 	var fixed []string
 	for name, svc := range def.Spec.Compose.Services {
-		if svc.Replicas > 0 {
+		if svc.Replicas > 0 || kernel[name] {
 			fixed = append(fixed, name)
 		}
 	}
@@ -490,7 +705,7 @@ func (s *Server) disableFixedScaling(ctx context.Context, project string, def *d
 		pr.Enabled = false
 		if err := s.scaling.SavePolicy(ctx, k, pr); err != nil {
 			if err := s.scaling.SavePolicy(ctx, k, scalingPolicyRow(definition.Scaling{Service: name})); err != nil {
-				return fmt.Errorf("disable autoscaling for %q (it sets replicas): %w", name, err)
+				return fmt.Errorf("disable autoscaling for %q (it runs a fixed number of copies): %w", name, err)
 			}
 		}
 	}

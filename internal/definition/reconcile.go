@@ -76,12 +76,18 @@ func boundString(d time.Duration) string {
 // three front doors onto one trust path. Nothing here reaches `docker compose`
 // unvalidated.
 
-// toProvisionSpec maps a generated-compose definition onto the M8 typed app spec.
-// There is no host-publish field — ingress is only an edge.route — so a generated
-// service can never publish a port (Publish stays false).
+// toProvisionSpec maps a generated-compose definition onto the M8 typed app spec. A
+// service publishes a host port only through its own ports[] entries and the
+// forward: kernel l4_routes that target it.
 func toProvisionSpec(d *Definition) provision.Spec {
 	ps := provision.Spec{Slug: d.Metadata.Slug}
 	scheduled := d.Spec.ScheduledServiceSet()
+	kernel := map[string][]L4Route{} // service → its kernel routes, in definition order
+	for _, r := range d.Spec.Edge.L4Routes {
+		if r.Kernel() {
+			kernel[r.Service] = append(kernel[r.Service], r)
+		}
+	}
 	for _, name := range d.Spec.serviceNames() { // sorted → deterministic compose
 		svc := d.Spec.Compose.Services[name]
 		s := provision.Service{
@@ -101,6 +107,9 @@ func toProvisionSpec(d *Definition) provision.Spec {
 		}
 		for _, p := range svc.Ports {
 			s.Ports = append(s.Ports, provision.Port{Internal: p.Internal, Publish: p.Publish, Public: p.Public, Protocol: p.Protocol, Published: p.Published})
+		}
+		for _, r := range kernel[name] {
+			s.Ports = append(s.Ports, provision.Port{Internal: r.Port, Publish: true, Public: true, Protocol: r.Protocol, Published: r.Listen, IPv4Only: true})
 		}
 		for _, v := range svc.Volumes {
 			s.Volumes = append(s.Volumes, provision.Volume{Name: v.Name, Source: v.Source, Target: v.Target, ReadOnly: v.ReadOnly})

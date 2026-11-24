@@ -3,6 +3,7 @@ package definition
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/daboss2003/mooring/internal/store"
@@ -236,5 +237,46 @@ func TestStoreDeleteVersionKeepsTheDeployedRelease(t *testing.T) {
 	}
 	if id, _ := s.ReleaseVersionID("other"); id != 0 {
 		t.Errorf("an app with no versions has release id %d, want 0", id)
+	}
+}
+
+// CurrentAll returns each app's live canonical (its newest version) in one read, and fails closed when any
+// row doesn't verify.
+func TestStoreCurrentAll(t *testing.T) {
+	s, db := testStore(t)
+	ctx := context.Background()
+	if all, err := s.CurrentAll(ctx); err != nil || len(all) != 0 {
+		t.Fatalf("empty store: %v %v", all, err)
+	}
+	for _, slug := range []string{"shop", "blog"} {
+		d := base()
+		d.Metadata.Slug = slug
+		if _, err := s.SaveCanonical(ctx, d, "first", ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d2 := base()
+	d2.Spec.Scaling = []Scaling{{Service: "web", Max: 4}}
+	if _, err := s.SaveCanonical(ctx, d2, "second", ""); err != nil {
+		t.Fatal(err)
+	}
+	all, err := s.CurrentAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 || all["shop"] == nil || all["blog"] == nil {
+		t.Fatalf("want one definition per app, got %v", all)
+	}
+	if sc := all["shop"].Spec.Scaling; len(sc) != 1 || sc[0].Max != 4 {
+		t.Errorf("shop must be its newest version, got %+v", sc)
+	}
+	if len(all["blog"].Spec.Scaling) != 0 || all["blog"].Metadata.Slug != "blog" {
+		t.Errorf("blog = %+v", all["blog"])
+	}
+	if _, err := db.Exec(`UPDATE definition_versions SET yaml=replace(yaml,'web','evil') WHERE slug='blog'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CurrentAll(ctx); err == nil || !strings.Contains(err.Error(), "blog") {
+		t.Errorf("a tampered row must fail the read, naming the app, got %v", err)
 	}
 }

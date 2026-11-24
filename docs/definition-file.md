@@ -617,12 +617,59 @@ spec:
 | `port` | int | required | The service's **internal** container port. |
 | `lb` | enum | `round_robin` | `round_robin` \| `least_conn` \| `hash_client_ip` (client-IP affinity — useful for DNS/MQTT). |
 | `tls` | enum | `passthrough` | `passthrough` only for now — the LB forwards raw bytes and the **app** terminates TLS (issue its cert with a [`cert_binding`](#speccert_bindings)). `terminate` is not yet supported. |
+| `forward` | enum | `proxy` | `proxy` — the L4 LB (nginx) accepts the connection and opens its own to a replica; the app sees the LB's address, not the client's. `kernel` — Docker publishes `listen` on the service and forwards packets to it; the app sees the client's IP address. See [Kernel forwarding](#kernel-forwarding-forward-kernel). |
+
+A deploy fails before anything is built or started when:
+- an `l4_route` takes a `listen+protocol` another app's `l4_route` holds: `l4 route 53/udp is already in use by app "…"`;
+- a service's own published host port (`ports[].publish`) takes another app's `l4_route` listener: `published host port 853/tcp is already in use by an l4_route of app "…"`;
+- an `l4_route` (`proxy` or `kernel`) listens on a port another app's service publishes itself: `l4 route 53/udp is already in use by app "…", which publishes it on service "…"`.
+
+#### Kernel forwarding (`forward: kernel`)
+
+With `forward: kernel` the L4 LB serves nothing for the route. The generated compose publishes the port on the target service, bound to `0.0.0.0`:
+
+```yaml
+spec:
+  compose:
+    source: generated
+    services:
+      coredns:
+        image: coredns/coredns:1.11.1
+        ports:
+          - { internal: 5353 }
+          - { internal: 8853 }
+  edge:
+    l4_routes:
+      - { listen: 53,  protocol: udp, service: coredns, port: 5353, forward: kernel }
+      - { listen: 53,  protocol: tcp, service: coredns, port: 5353, forward: kernel }
+      - { listen: 853, protocol: tcp, service: coredns, port: 8853, tls: passthrough, forward: kernel }
+```
+
+The `coredns` service in the generated compose gets:
+
+```yaml
+ports:
+  - 0.0.0.0:53:5353/udp
+  - 0.0.0.0:53:5353/tcp
+  - 0.0.0.0:853:8853/tcp
+```
+
+Connections from other hosts reach the container with the client's own IPv4 address as the source.
+
+Limits:
+- The service runs **one copy**. `replicas` above 1 and an enabled [`spec.scaling`](#specscaling) entry for it are refused; a `spec.scaling` entry with `enabled: false` is allowed. An enabled policy left in the dashboard for the service is disabled on deploy.
+- `lb` is refused.
+- IPv4 only: the port is bound on `0.0.0.0`, never `[::]`.
+- It needs the L4 LB on the server (the prerequisites below, including `edge.l4_enabled: true`). With the L4 LB off, no `l4_route` is served and a `forward: kernel` route publishes nothing; the deploy log shows `warning: edge.l4_routes are not served on this server: the L4 load balancer is off (it needs edge.mode: managed, edge.l4_enabled: true and nginx with the stream module)`.
+- Ports Docker publishes are not filtered by `ufw`: Docker's iptables rules accept the traffic before ufw's rules run. Restrict access with your provider's firewall or Docker's `DOCKER-USER` chain.
+- PR previews drop every `l4_route`, so a preview never publishes the port.
+- Changing an existing route from `proxy` to `kernel` takes one deploy. Right before the service starts, the L4 LB lets go of the port and the deploy waits (up to 10s) until the port is free; the port is unavailable for a few seconds while it moves. A port still held after 10s fails the deploy before anything starts (`port 53/udp is still held after the L4 load balancer released it`) and the route stays on the L4 LB. If the service then fails to start, the port stays unserved until a deploy succeeds.
 
 > **Prerequisites (the L4 LB is opt-in and not bundled):**
 > 1. Install **nginx + its stream module** on the host yourself — on Debian/Ubuntu `sudo apt install nginx libnginx-mod-stream` (the `stream` module is a *separate* package there). Mooring's generated config already `include`s `/etc/nginx/modules-enabled/*.conf` so the module loads, but the package must be present or nginx rejects the config with `unknown directive "stream"`. Mooring does **not** ship or pull nginx; it's only needed for L4 routes.
 > 2. Set `edge.l4_enabled: true` in `config.yaml`, then **restart** Mooring (`sudo systemctl restart mooring`) — edge settings are read at startup, so a reload won't pick this up ([reload vs restart](./installation.md#editing-the-config-file-reload-vs-restart)).
 > 3. Binding privileged ports (53/853) needs `CAP_NET_BIND_SERVICE` — the shipped unit **already grants it** (the supervised nginx inherits it), so there's nothing to do. (Or map a privileged host port to a high container port and keep the service unprivileged.)
-> 4. **If you bind `:53` (DNS): free it from `systemd-resolved` first.** On a default systemd host the `systemd-resolved` stub listener already holds `127.0.0.53:53` (and `127.0.0.54:53` on systemd ≥ 249). The supervised nginx binds the wildcard `0.0.0.0:53`, which collides with that bind → nginx fails to start (`address already in use`) and the L4 reconcile fails closed. Disable the stub listener, then keep host DNS working by pointing `resolv.conf` at the real upstreams (not the now-dead stub):
+> 4. **If you bind `:53` (DNS): free it from `systemd-resolved` first.** On a default systemd host the `systemd-resolved` stub listener already holds `127.0.0.53:53` (and `127.0.0.54:53` on systemd ≥ 249). The supervised nginx binds the wildcard `0.0.0.0:53`, which collides with that bind → nginx fails to start (`address already in use`) and the L4 reconcile fails closed. A `forward: kernel` route on `:53` hits the same collision when Docker starts the container. Disable the stub listener, then keep host DNS working by pointing `resolv.conf` at the real upstreams (not the now-dead stub):
 >    ```bash
 >    printf '[Resolve]\nDNSStubListener=no\n' | sudo tee /etc/systemd/resolved.conf.d/no-stub.conf
 >    sudo systemctl restart systemd-resolved
@@ -1167,10 +1214,11 @@ spec:
 | `spec.edge.routes[].hsts` | bool | no | per-edge |
 | `spec.edge.routes[].security_headers` | bool | no | per-edge |
 | `spec.edge.routes[].lb` | `least_conn` \| `round_robin` \| `ip_hash` \| `cookie` | no | `least_conn` |
-| `spec.edge.l4_routes[]` | `{listen, protocol, service, port, lb, tls}` | no | — |
+| `spec.edge.l4_routes[]` | `{listen, protocol, service, port, lb, tls, forward}` | no | — |
 | `spec.edge.l4_routes[].protocol` | `tcp` \| `udp` | required | — |
-| `spec.edge.l4_routes[].lb` | `round_robin` \| `least_conn` \| `hash_client_ip` | no | `round_robin` |
+| `spec.edge.l4_routes[].lb` | `round_robin` \| `least_conn` \| `hash_client_ip` | no (refused with `forward: kernel`) | `round_robin` |
 | `spec.edge.l4_routes[].tls` | `passthrough` | no | `passthrough` |
+| `spec.edge.l4_routes[].forward` | `proxy` \| `kernel` | no | `proxy` |
 | `spec.release.service` | string (a declared service) | with `release` | — |
 | `spec.release.command` | exec array | with `release` | — |
 | `spec.release.timeout` | duration (`10s`–`1h`) | no | `10m` |

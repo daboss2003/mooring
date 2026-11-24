@@ -839,6 +839,15 @@ with no live replica is skipped rather than blackholed. You point at a **service
 literal address, and control-plane ports (80/443, 9000/2019/2375) are refused as listeners. For TLS
 you usually keep the certificate at the app and use `cert-only` sync; L4 just moves the raw stream.
 
+A route's `forward` sets who forwards the traffic:
+
+- `proxy` (default): nginx accepts each connection and opens its own to a replica. The app sees
+  nginx's address as the peer, never the client's.
+- `kernel`: nginx serves nothing for the route. The service's compose publishes the port on
+  `0.0.0.0` and Docker forwards the packets, so the app sees the client's IPv4 address. The service
+  runs one copy, `lb` is refused, there is no IPv6 listener, and `ufw` does not filter the port.
+  Details: [Kernel forwarding](./definition-file.md#kernel-forwarding-forward-kernel).
+
 ---
 
 ## Recovery & escape hatches

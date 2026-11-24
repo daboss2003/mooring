@@ -25,6 +25,8 @@ import (
 // target the operator types); Pool, when populated by the reconciler, lists the live
 // replica host:port endpoints. A route with an empty Pool is skipped (its listener isn't
 // bound): the host nginx can't resolve a compose service name, so it is never dialed.
+// A Forward "kernel" route is never rendered: Docker publishes its port on the service.
+// It is still stored, so the listener stays owned by its app.
 type Route struct {
 	AppID    string   // owning project — discovery scopes Service to it (two apps may share a service name)
 	Listen   int      // host port the L4 LB binds
@@ -32,8 +34,12 @@ type Route struct {
 	Service  string   // selector → the service whose replicas receive traffic
 	Port     int      // the service's INTERNAL container port
 	LB       string   // "" (round_robin) | "least_conn" | "hash_client_ip"
+	Forward  string   // "" or "proxy" (nginx) | "kernel" (Docker port publish; not rendered)
 	Pool     []string // host:port of each live replica; EMPTY → route is SKIPPED at render
 }
+
+// Kernel reports whether Docker, not nginx, forwards the route.
+func (r Route) Kernel() bool { return r.Forward == "kernel" }
 
 // PoolKey identifies a route's pool slot — one listener is one (port, protocol). The
 // reconciler keys discovered replica pools by this to merge them back onto the routes.
@@ -43,8 +49,9 @@ var (
 	// nameRe bounds a compose service name / upstream host so it can never carry a
 	// space or newline that would inject an nginx directive (the L4 analog of the
 	// edge's shell/upstream hygiene).
-	nameRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253})$`)
-	lbOK   = map[string]bool{"": true, "round_robin": true, "least_conn": true, "hash_client_ip": true}
+	nameRe    = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,253})$`)
+	lbOK      = map[string]bool{"": true, "round_robin": true, "least_conn": true, "hash_client_ip": true}
+	forwardOK = map[string]bool{"": true, "proxy": true, "kernel": true}
 )
 
 func controlPort(p int) bool { return p == 9000 || p == 2019 || p == 2375 }
@@ -73,6 +80,12 @@ func ValidateRoute(r Route) error {
 	}
 	if !lbOK[r.LB] {
 		return fmt.Errorf("l4 route on %d: lb %q must be round_robin, least_conn, or hash_client_ip", r.Listen, r.LB)
+	}
+	if !forwardOK[r.Forward] {
+		return fmt.Errorf("l4 route on %d: forward %q must be proxy or kernel", r.Listen, r.Forward)
+	}
+	if r.Kernel() && r.LB != "" {
+		return fmt.Errorf("l4 route on %d: forward: kernel serves one copy — remove lb", r.Listen)
 	}
 	for _, m := range r.Pool {
 		if err := validateMember(m); err != nil {
@@ -141,6 +154,11 @@ func Render(routes []Route) (string, error) {
 			return "", fmt.Errorf("l4 route listen %d/%s is declared twice", r.Listen, r.Protocol)
 		}
 		seen[key] = true
+
+		// Docker's port publish serves a kernel route; an nginx listener on it would collide.
+		if r.Kernel() {
+			continue
+		}
 
 		// No name fallback: the host nginx cannot resolve a compose service name, and a
 		// single unresolvable `server` makes `nginx -t` reject the WHOLE config — every

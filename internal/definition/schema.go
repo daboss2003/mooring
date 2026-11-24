@@ -654,14 +654,22 @@ type Edge struct {
 // selectors (never a literal dial target). Use it for non-HTTP stream services
 // (DNS 53, DoT 853, MQTTS 8883). TLS is passthrough only for now (the app terminates
 // with a cert_binding); `terminate` is reserved for a later phase.
+//
+// Forward "kernel" bypasses the LB: the generated compose publishes Listen on the
+// service (0.0.0.0, IPv4 only) and Docker's DNAT forwards it, so the app sees the
+// client's address. Such a service runs exactly one copy.
 type L4Route struct {
-	Listen   int    `yaml:"listen"`        // the host port the L4 LB binds
-	Protocol string `yaml:"protocol"`      // tcp | udp
-	Service  string `yaml:"service"`       // selector → the service whose replicas receive traffic
-	Port     int    `yaml:"port"`          // the service's internal container port
-	TLS      string `yaml:"tls,omitempty"` // "" | passthrough (terminate not yet supported)
-	LB       string `yaml:"lb,omitempty"`  // "" (round_robin) | least_conn | hash_client_ip
+	Listen   int    `yaml:"listen"`            // the host port the L4 LB binds
+	Protocol string `yaml:"protocol"`          // tcp | udp
+	Service  string `yaml:"service"`           // selector → the service whose replicas receive traffic
+	Port     int    `yaml:"port"`              // the service's internal container port
+	TLS      string `yaml:"tls,omitempty"`     // "" | passthrough (terminate not yet supported)
+	LB       string `yaml:"lb,omitempty"`      // "" (round_robin) | least_conn | hash_client_ip
+	Forward  string `yaml:"forward,omitempty"` // "" or "proxy" (nginx, the default) | "kernel" (Docker publishes the port; the app sees the client's IP)
 }
+
+// Kernel reports whether the route is forwarded by Docker's port publish instead of the L4 LB.
+func (r L4Route) Kernel() bool { return r.Forward == "kernel" }
 
 // Route is one managed edge vhost. Upstream is a SELECTOR — "service:port".
 type Route struct {
@@ -1724,6 +1732,24 @@ func (s *Spec) validateEdge() error {
 		case "", "round_robin", "least_conn", "hash_client_ip":
 		default:
 			return fmt.Errorf("edge l4_route on %d: lb %q must be round_robin, least_conn, or hash_client_ip", r.Listen, r.LB)
+		}
+		switch r.Forward {
+		case "", "proxy", "kernel":
+		default:
+			return fmt.Errorf("edge l4_route on %d: forward %q must be proxy or kernel", r.Listen, r.Forward)
+		}
+		if r.Kernel() {
+			if r.LB != "" {
+				return fmt.Errorf("edge l4_route on %d: forward: kernel serves one copy — remove lb", r.Listen)
+			}
+			if n := s.Compose.Services[r.Service].Replicas; n > 1 {
+				return fmt.Errorf("edge l4_route on %d: forward: kernel needs service %q to run one copy (it sets replicas %d)", r.Listen, r.Service, n)
+			}
+			for _, sc := range s.Scaling {
+				if sc.Service == r.Service && sc.Enabled {
+					return fmt.Errorf("edge l4_route on %d: forward: kernel needs service %q to run one copy (disable its spec.scaling entry)", r.Listen, r.Service)
+				}
+			}
 		}
 	}
 	// A service may not publish a host port the L4 LB already owns (collision): the

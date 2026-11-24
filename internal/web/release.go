@@ -164,7 +164,8 @@ func (s *Server) deployedCompose(slug, dir string, env compose.Env, onLine func(
 	case def == nil:
 		return nil, noPreviousRelease
 	}
-	if b, err = definition.ComposeBytesAt(def, commit); err != nil {
+	cdef, _ := s.composeDef(def) // generated as the deploy generates it: no kernel publish while L4 is off
+	if b, err = definition.ComposeBytesAt(cdef, commit); err != nil {
 		return nil, "the previous release's compose can't be generated: " + err.Error()
 	}
 	res := compose.ValidateBytes(b, env, dir, compose.Options{ProtectedPaths: s.protectedHostPaths()})

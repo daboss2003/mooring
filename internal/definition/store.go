@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/daboss2003/mooring/internal/store"
@@ -162,6 +163,44 @@ func (s *Store) Current(slug string) (*Definition, error) {
 		return nil, err
 	}
 	return s.verifyAndParse([]byte(yamlText), mac, commit)
+}
+
+// CurrentAll returns every app's live canonical definition (its latest version), keyed by slug,
+// HMAC-verified and re-parsed. All rows are read before any is verified (single DB connection); a row
+// that fails verification or parsing fails the whole read, naming its app.
+func (s *Store) CurrentAll(ctx context.Context) (map[string]*Definition, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT slug, yaml, hmac, commit_sha FROM definition_versions
+		WHERE id IN (SELECT MAX(id) FROM definition_versions GROUP BY slug)`)
+	if err != nil {
+		return nil, err
+	}
+	type row struct {
+		slug, yaml, commit string
+		mac                []byte
+	}
+	var all []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.slug, &r.yaml, &r.mac, &r.commit); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		all = append(all, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	out := make(map[string]*Definition, len(all))
+	for _, r := range all {
+		d, err := s.verifyAndParse([]byte(r.yaml), r.mac, r.commit)
+		if err != nil {
+			return nil, fmt.Errorf("definition of app %q: %w", r.slug, err)
+		}
+		out[r.slug] = d
+	}
+	return out, nil
 }
 
 // Version returns a specific past version for ROLLBACK — HMAC-verified and re-derived

@@ -119,6 +119,9 @@ func Generate(spec Spec) ([]byte, error) {
 			host := "127.0.0.1:"
 			if p.Public {
 				host = "" // bind all interfaces (operator-acked; §5.6 still judges it)
+				if p.IPv4Only {
+					host = "0.0.0.0:" // IPv4 only: Docker binds no [::] listener
+				}
 			}
 			// The host port defaults to the container port (host==container, the
 			// historical behavior); a distinct `published` maps host→container so a
