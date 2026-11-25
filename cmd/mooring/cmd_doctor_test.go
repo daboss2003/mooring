@@ -756,6 +756,16 @@ func TestCaddyMinNeeds(t *testing.T) {
 	if got, want := caddyMinNeeds(cfg), []string{"edge.trusted_proxies", "dns01", "catch_all"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("caddyMinNeeds = %v, want %v", got, want)
 	}
+	// Automated response refuses QUIC 0-RTT (Caddy 2.11); off (the default) needs nothing.
+	resp := &config.Config{}
+	resp.SecurityLogs.Response.Mode = "recommend"
+	if got := caddyMinNeeds(resp); !reflect.DeepEqual(got, []string{"security_logs.response"}) {
+		t.Errorf("response mode recommend: caddyMinNeeds = %v", got)
+	}
+	resp.SecurityLogs.Detection.Enabled = new(bool) // detection off: the mode can't act
+	if got := caddyMinNeeds(resp); len(got) != 0 {
+		t.Errorf("detection off: caddyMinNeeds = %v", got)
+	}
 }
 
 func TestCheckDNSPlugins(t *testing.T) {

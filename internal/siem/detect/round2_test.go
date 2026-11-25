@@ -205,7 +205,8 @@ func TestRollupNeverTakenForARealKey(t *testing.T) {
 		h2.feed(actorFail(time.Second+time.Duration(i)*time.Millisecond, fmt.Sprint("u", i)))
 	}
 	got := byDedupe(h2.alerts())
-	if got["siem:custom.act:*"] != 1 || got["siem-rollup:custom.act"] != 1 || len(got) != newPerHour+1 {
+	// actorRule pins no source: an account's detections are per system, and so is the alert's key.
+	if got["siem-acct:custom.act:host|*"] != 1 || got["siem-rollup:custom.act"] != 1 || len(got) != newPerHour+1 {
 		t.Fatalf("alerts by dedupe key: %v", got)
 	}
 
@@ -220,7 +221,7 @@ func TestRollupNeverTakenForARealKey(t *testing.T) {
 	h3.clk.set(t0.Add(time.Hour))
 	h3.e.sendCaps(false)
 	sum := h3.alerts()
-	if individual["siem:custom.act:cap"] != 1 || len(sum) != 1 || sum[0].DedupeKey != "siem-cap:custom.act" ||
+	if individual["siem-acct:custom.act:host|cap"] != 1 || len(sum) != 1 || sum[0].DedupeKey != "siem-cap:custom.act" ||
 		individual[sum[0].DedupeKey] != 0 {
 		t.Fatalf("individual %v, summary %+v", individual, sum)
 	}

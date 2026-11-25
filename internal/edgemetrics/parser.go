@@ -18,6 +18,7 @@ type accessEntry struct {
 		Method   string `json:"method"`
 		RemoteIP string `json:"remote_ip"`   // Caddy ≥ 2.5
 		RemoteAt string `json:"remote_addr"` // older Caddy ("ip:port")
+		ClientIP string `json:"client_ip"`   // Caddy ≥ 2.7: the address derived through trusted proxies
 	} `json:"request"`
 }
 
@@ -27,13 +28,17 @@ type AccessRecord struct {
 	Host     string
 	Path     string // URI with the query string stripped
 	Method   string
-	RemoteIP string
+	RemoteIP string // the TCP peer
+	// ClientIP is the client address the edge derived (request.client_ip): the TCP peer, or behind a
+	// trusted proxy the address it reported — what the edge's block list matches. RemoteIP when the
+	// line has none (Caddy before 2.7, which has no trusted proxies).
+	ClientIP string
 	Status   int
 	DurMs    float64
 }
 
 // ParseAccessFull parses one Caddy JSON access-log line into an AccessRecord. ok=false for any
-// non-access / malformed / host-less line (callers skip those). The client IP prefers request.
+// non-access / malformed / host-less line (callers skip those). The TCP peer prefers request.
 // remote_ip and falls back to the host part of request.remote_addr on older Caddy.
 func ParseAccessFull(line []byte) (AccessRecord, bool) {
 	var e accessEntry
@@ -56,7 +61,11 @@ func ParseAccessFull(line []byte) (AccessRecord, bool) {
 			ip = e.Request.RemoteAt
 		}
 	}
-	return AccessRecord{Host: host, Path: path, Method: e.Request.Method, RemoteIP: ip, Status: e.Status, DurMs: e.Duration * 1000.0}, true
+	client := e.Request.ClientIP
+	if client == "" {
+		client = ip
+	}
+	return AccessRecord{Host: host, Path: path, Method: e.Request.Method, RemoteIP: ip, ClientIP: client, Status: e.Status, DurMs: e.Duration * 1000.0}, true
 }
 
 // ParseAccess extracts (host, path, latency-ms, status) from one Caddy JSON access-log line. The

@@ -24,6 +24,7 @@ import (
 	"github.com/daboss2003/mooring/internal/apitoken"
 	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/backupstore"
+	"github.com/daboss2003/mooring/internal/blocklist"
 	"github.com/daboss2003/mooring/internal/cfgstore"
 	"github.com/daboss2003/mooring/internal/config"
 	"github.com/daboss2003/mooring/internal/cronstore"
@@ -152,6 +153,13 @@ type Deps struct {
 	Incidents siem.IncidentService
 	// Feeds reports the enrichment feeds' state (nil when security logs are off).
 	Feeds siem.FeedStatusSource
+	// Patterns serves the owner-only Patterns pages (nil when log patterns are off).
+	Patterns siem.PatternService
+	// Responses serves the owner-only Responses page (nil when automated response isn't running).
+	Responses siem.ResponseService
+	// Blocks is the edge block list of the owner-only Blocks page (nil when Mooring doesn't run the
+	// edge; leave the interface nil, not a typed nil pointer).
+	Blocks blocklist.Service
 	// AuditSink, when set, also receives every audit event this server records (security logs).
 	AuditSink func(time.Time, audit.Event)
 }
@@ -245,6 +253,9 @@ type Server struct {
 	detectReporter  siem.Reporter                     // where the app /ops alerts report (nil when detection is off)
 	incidentSvc     siem.IncidentService              // Incidents/entity pages (nil when detection is off)
 	feeds           siem.FeedStatusSource             // enrichment feed state (nil when security logs are off)
+	patterns        siem.PatternService               // Patterns pages (nil when log patterns are off)
+	responses       siem.ResponseService              // Responses page (nil when automated response isn't running)
+	blocks          blocklist.Service                 // edge block list (nil when the edge isn't Mooring's)
 	securityExports chan struct{}                     // concurrency cap on security-log exports
 	secParse        func(string) (query.Query, error) // test seam: replaces query.Parse on the Security logs page
 }
@@ -315,6 +326,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 	s.securityLogs = d.SecurityLogs
 	s.detections, s.detectReporter, s.feeds = d.Detections, d.DetectionReporter, d.Feeds
 	s.incidentSvc = d.Incidents
+	s.patterns, s.responses, s.blocks = d.Patterns, d.Responses, d.Blocks
 	s.audit.SetSink(d.AuditSink)
 	s.securityExports = make(chan struct{}, securityExportConcurrency)
 	s.sweepDiscoveryScratch() // clear any orphaned multi-file-connect scratch dirs from a prior run
@@ -673,6 +685,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /security/incidents/{id}/false-positive", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecIncidentFalsePositive))))
 	mux.HandleFunc("GET /security/entities", s.requirePerm("admin", s.withCSRFToken(s.handleSecEntity)))
 	mux.HandleFunc("POST /security/mutes/remove", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecMuteRemove))))
+	mux.HandleFunc("GET /security/patterns", s.requirePerm("admin", s.withCSRFToken(s.handleSecPatterns)))
+	mux.HandleFunc("GET /security/patterns/rows", s.requirePerm("admin", s.handleSecPatternRows))
+	mux.HandleFunc("GET /security/patterns/{id}", s.requirePerm("admin", s.withCSRFToken(s.handleSecPattern)))
+	mux.HandleFunc("POST /security/patterns/{id}/state", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecPatternState))))
+	mux.HandleFunc("GET /security/responses", s.requirePerm("admin", s.withCSRFToken(s.handleSecResponses)))
+	mux.HandleFunc("POST /security/responses/pause", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecResponsePause))))
+	mux.HandleFunc("POST /security/responses/{id}/apply", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecResponseApply))))
+	mux.HandleFunc("POST /security/responses/{id}/dismiss", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecResponseDismiss))))
+	mux.HandleFunc("GET /security/blocks", s.requirePerm("admin", s.withCSRFToken(s.handleSecBlocks)))
+	mux.HandleFunc("POST /security/blocks/add", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecBlockAdd))))
+	mux.HandleFunc("POST /security/blocks/remove", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecBlockRemove))))
 	// Operator UI prefs (M7): persisted tile order. UI-only, never Tier-1.
 	mux.HandleFunc("POST /settings/tile-order", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleTileOrder))))
 	// API tokens (M19): read-only view + revoke. Minting stays CLI-only by design.

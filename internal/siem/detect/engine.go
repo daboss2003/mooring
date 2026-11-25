@@ -52,6 +52,11 @@ type Options struct {
 	// nothing is forgotten before that; KnownHost("") must report ready too (the traffic baseline
 	// asks it that way on its tick). nil: no host is known.
 	KnownHost func(host string) (key string, known, ready bool)
+	// Patterns configures log-pattern mining (pattern_*.go); the zero value mines nothing.
+	Patterns PatternOptions
+	// Responder takes the response requests of the rules with a Response (respond_hooks.go); nil:
+	// none are made.
+	Responder siem.Responder
 	Log       *slog.Logger
 	Now       func() time.Time
 }
@@ -203,7 +208,7 @@ type Engine struct {
 	// counters: saved at the next write tick.
 	hourDirty bool
 
-	cooldown map[string]time.Time // mapKey (a rollup's rollupKey) → when the last sent alert was raised
+	cooldown map[string]time.Time // alertKey (a rollup's rollupKey) → when the last sent alert was raised
 	inflight map[string]time.Time // an alert queued or being retried → when it was raised
 	// Alert times of detections that left memory before their alert was reported back: detection
 	// ID → unix ns, stored by the next flush.
@@ -321,7 +326,11 @@ func New(opts Options) (*Engine, error) {
 	}
 	// The cooldowns of the alerts raised within the hour before a restart (findActive also takes
 	// a stored detection's alert time when it reads one back).
-	cds, err := d.alertedSince(context.Background(), e.now().Add(-alertCooldown), maxCooldowns)
+	set := e.rules.Load()
+	cds, err := d.alertedSince(context.Background(), e.now().Add(-alertCooldown), maxCooldowns, func(id string) bool {
+		c := set.byID[id]
+		return c != nil && c.split
+	})
 	if err != nil {
 		e.log.Error("security detection: recent alerts not read", "err", err)
 	}
@@ -331,6 +340,7 @@ func New(opts Options) (*Engine, error) {
 		e.pending = nil
 	}
 	e.loadBaselines()
+	e.loadPatterns()
 	if err := e.loadHour(); err != nil {
 		e.log.Error("security detection: hourly limits not read back", "err", err)
 	}
@@ -565,6 +575,8 @@ func (e *Engine) Subscriber() func(siem.Event) {
 		if ev.Src == siem.SrcSIEM || !timely(ev.TS, e.now()) {
 			return
 		}
+		// Before the copy: the miner takes what it needs without the fields (pattern_hooks.go).
+		e.offerPattern(&ev)
 		// The pipeline shares F with the other subscribers: copy it (values are immutable).
 		ev.F = maps.Clone(ev.F)
 		if ev.Geo != nil {
@@ -621,6 +633,8 @@ func (e *Engine) Run(ctx context.Context) {
 		<-workerDone
 	}()
 
+	// The log-pattern miner runs on its own goroutine beside this one and hands it its firings.
+	e.startPatterns()
 	write := time.NewTicker(writeTick)
 	defer write.Stop()
 	persist := time.NewTicker(persistEvery)
@@ -630,6 +644,8 @@ func (e *Engine) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// The miner stops first and its last firings are taken, so they are written below.
+			e.safe(e.stopPatterns)
 			e.safe(e.drain)
 			// Written first, so the incidents opened by the last events have an ID and their alerts
 			// go to the worker before it stops.
@@ -648,11 +664,14 @@ func (e *Engine) Run(ctx context.Context) {
 			e.safe(func() { e.finishAlert(r) })
 		case r := <-e.reqs:
 			e.serve(r)
+		case f := <-e.patternFires():
+			e.safe(func() { e.patternFire(f) })
 		case <-write.C:
 			e.safe(func() { e.flush(false) })
 			e.safe(func() { e.sendCaps(false) })
 			e.safe(e.saveHourIfDirty)
 			e.safe(e.baselineTick)
+			e.safe(e.patternTick)
 		case <-persist.C:
 			e.safe(e.persist)
 			e.safe(e.capSize)
@@ -766,6 +785,7 @@ func (e *Engine) persist() {
 	}
 	e.persistHour()
 	e.saveBaselines()
+	e.savePatterns()
 	e.syncRules()
 	keep := map[string]bool{}
 	var rows []stateWrite
@@ -894,7 +914,9 @@ func (e *Engine) process(ev *siem.Event) {
 	e.syncRules()
 	w := weight(ev)
 	for _, c := range e.cur.list {
-		if c.r.Enabled {
+		// Intentional: pattern rules are evaluated by the miner off this goroutine (pattern_hooks.go),
+		// so a flood of log lines can't slow the security rules down.
+		if c.r.Enabled && c.r.Baseline != siem.BaselinePattern {
 			e.applyRule(c, e.states[c.r.ID], ev, w)
 		}
 	}
@@ -922,7 +944,9 @@ func (e *Engine) applyRule(c *compiled, st *ruleState, ev *siem.Event, w uint32)
 		k.ring.add(t, w, c.r.Window, ringCap(c.r.Count))
 		k.ev.add(ev)
 		if k.ring.sum >= uint64(c.r.Count) {
-			e.fire(c, key, ev, firing{count: int(min(k.ring.sum, math.MaxInt32)), evidence: k.ev.list()})
+			f := firing{count: int(min(k.ring.sum, math.MaxInt32)), evidence: k.ev.list()}
+			f.browser, f.agent = k.ev.sent(t - int64(c.r.Window))
+			e.fire(c, key, ev, f)
 			k.ring.reset()
 			k.ev.reset()
 		}
@@ -939,7 +963,9 @@ func (e *Engine) applyRule(c *compiled, st *ruleState, ev *siem.Event, w uint32)
 		k.set.add(maphash.String(e.seed, val), t, c.r.Window)
 		k.ev.add(ev)
 		if n := len(k.set.m); n >= c.r.Count {
-			e.fire(c, key, ev, firing{count: n, evidence: k.ev.list()})
+			f := firing{count: n, evidence: k.ev.list()}
+			f.browser, f.agent = k.ev.sent(t - int64(c.r.Window))
+			e.fire(c, key, ev, f)
 			k.set.reset()
 			k.ev.reset()
 		}
@@ -971,7 +997,10 @@ func (e *Engine) applyRule(c *compiled, st *ruleState, ev *siem.Event, w uint32)
 		n := k.an.windowCount(t, c.r.Window)
 		if n >= uint64(c.r.Count) && t-st.anStart >= int64(c.r.Learn) {
 			if exp := k.an.expected(t, c.r.Window); float64(n) > c.r.Factor*exp {
-				e.fire(c, key, ev, firing{count: int(min(n, math.MaxInt32)), expected: exp, evidence: k.ev.list()})
+				f := firing{count: int(min(n, math.MaxInt32)), expected: exp, evidence: k.ev.list()}
+				// The window's count is to slot precision (windowCount): so is its start here.
+				f.browser, f.agent = k.ev.sent(t - int64(c.r.Window) - k.an.slotW)
+				e.fire(c, key, ev, f)
 				k.an.slots = [anomalySlots]slot{}
 				k.ev.reset()
 			}
@@ -1009,8 +1038,10 @@ func (e *Engine) applyRule(c *compiled, st *ruleState, ev *siem.Event, w uint32)
 			}
 			k.ring.expire(t - int64(c.r.Window))
 			if k.ring.sum >= uint64(c.r.Count) {
-				evid := append(k.ev.list(), evidenceOf(ev))
-				e.fire(c, key, ev, firing{count: int(min(k.ring.sum, math.MaxInt32)), evidence: evid})
+				f := firing{count: int(min(k.ring.sum, math.MaxInt32)), evidence: append(k.ev.list(), evidenceOf(ev))}
+				// The closing event's own sender is added by fire.
+				f.browser, f.agent = k.ev.sent(t - int64(c.r.Window))
+				e.fire(c, key, ev, f)
 			}
 			k.ring.reset()
 			k.ev.reset()

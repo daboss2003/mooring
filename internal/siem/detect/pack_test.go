@@ -28,7 +28,10 @@ func TestPackRulesAreValid(t *testing.T) {
 			t.Errorf("%s: duplicate or bad ID", r.ID)
 		}
 		seen[r.ID] = true
-		if !r.Enabled || !r.Builtin || len(r.MITRE) == 0 || r.Description == "" {
+		// Intentional: no MITRE ATT&CK technique fits a log-pattern anomaly (a new or spiking log
+		// template), so the pattern rules carry none; every other rule must.
+		noMITRE := len(r.MITRE) == 0 && r.Baseline != siem.BaselinePattern
+		if !r.Enabled || !r.Builtin || noMITRE || r.Description == "" {
 			t.Errorf("%s: enabled %v builtin %v mitre %v", r.ID, r.Enabled, r.Builtin, r.MITRE)
 		}
 		before, _ := json.Marshal(r)

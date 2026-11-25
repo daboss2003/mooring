@@ -44,6 +44,15 @@ const (
 	day    = 24 * time.Hour
 )
 
+// Default responses (owner decisions): an address on a block list the edge saw is blocked for a
+// day, a scanner for an hour (a repeat blocks longer); a Mooring user whose successful sign-in
+// looks taken over is signed out of every session.
+var signOut = siem.RuleResponse{Action: siem.ResponseRevoke}
+
+func blockFor(d time.Duration) siem.RuleResponse {
+	return siem.RuleResponse{Action: siem.ResponseBlock, Duration: d}
+}
+
 // The queries count each attempt once:
 //   - SSH: an attempt for an unknown user name yields ssh.invalid_user, an ssh.login failure (one
 //     per method tried: "none", then password) and ssh.disconnect. ssh.bruteforce counts the
@@ -137,22 +146,24 @@ var pack = []packRule{
 		Description: "A successful sign-in to the Mooring dashboard from an address that failed several times just before.",
 		Type:        siem.RuleSequence, Severity: siem.SevCritical, MITRE: []string{"T1110.001", "T1078"},
 		Query: "src:mooring kind:mooring.login out:failure", Then: "src:mooring kind:mooring.login out:success",
-		GroupBy: "ip", Count: 5, Window: hour},
+		GroupBy: "ip", Count: 5, Window: hour, Response: signOut},
 		packInfo{noun: "failed sign-ins", thenNoun: "a successful sign-in"}},
 	{siem.Rule{ID: "mooring.login_new_country", Name: "Mooring sign-in from a new country",
 		Description: "A Mooring user signed in from a country not seen for that user before.",
 		Type:        siem.RuleNewValue, Severity: siem.SevHigh, MITRE: []string{"T1078"},
-		Query: "src:mooring kind:mooring.login out:success", GroupBy: "actor", Field: "geo.cc", Learn: 7 * day},
+		Query: "src:mooring kind:mooring.login out:success", GroupBy: "actor", Field: "geo.cc", Learn: 7 * day,
+		Response: signOut},
 		packInfo{noun: "sign-ins", fieldNoun: "country"}},
 	{siem.Rule{ID: "mooring.login_tor", Name: "Mooring sign-in over Tor",
 		Description: "A successful sign-in to the Mooring dashboard from a Tor exit node.",
 		Type:        siem.RuleThreshold, Severity: siem.SevMedium, MITRE: []string{"T1078", "T1090.003"},
-		Query: "src:mooring kind:mooring.login out:success " + listTor, GroupBy: "ip", Count: 1, Window: hour},
+		Query: "src:mooring kind:mooring.login out:success " + listTor, GroupBy: "ip", Count: 1, Window: hour,
+		Response: signOut},
 		packInfo{noun: "sign-ins over Tor"}},
 	{siem.Rule{ID: "mooring.login_travel", Name: "Mooring sign-in impossible travel",
 		Description: "Two sign-ins of one Mooring user from places too far apart for the time between them.",
 		Type:        siem.RuleTravel, Severity: siem.SevHigh, MITRE: []string{"T1078"},
-		Query: "src:mooring kind:mooring.login out:success", GroupBy: "actor", SpeedKMH: 1000},
+		Query: "src:mooring kind:mooring.login out:success", GroupBy: "actor", SpeedKMH: 1000, Response: signOut},
 		packInfo{noun: "sign-ins"}},
 	{siem.Rule{ID: "mooring.lockout", Name: "Mooring account locked out",
 		Description: "Too many failed sign-ins locked a Mooring user out.",
@@ -252,17 +263,20 @@ var pack = []packRule{
 	{siem.Rule{ID: "edge.scan", Name: "Web scan",
 		Description: "Many requests answered 404 for one address: a scanner looking for files and paths.",
 		Type:        siem.RuleThreshold, Severity: siem.SevLow, MITRE: []string{"T1595.003"},
-		Query: "src:edge kind:http.request f.status:404", GroupBy: "ip", Count: 100, Window: 5 * minute},
+		Query: "src:edge kind:http.request f.status:404", GroupBy: "ip", Count: 100, Window: 5 * minute,
+		Response: blockFor(hour)},
 		packInfo{noun: "requests answered 404"}},
 	{siem.Rule{ID: "edge.spamhaus_ip", Name: "Requests from a Spamhaus DROP address",
 		Description: "Requests through the edge from an address on the Spamhaus DROP list.",
 		Type:        siem.RuleThreshold, Severity: siem.SevLow, MITRE: []string{"T1595"},
-		Query: "src:edge kind:http.request " + listSpamhaus, GroupBy: "ip", Count: 1, Window: hour},
+		Query: "src:edge kind:http.request " + listSpamhaus, GroupBy: "ip", Count: 1, Window: hour,
+		Response: blockFor(day)},
 		packInfo{noun: "requests from a Spamhaus DROP address"}},
 	{siem.Rule{ID: "edge.dshield_ip", Name: "Requests from a DShield address",
 		Description: "Requests through the edge from an address on the DShield block list.",
 		Type:        siem.RuleThreshold, Severity: siem.SevLow, MITRE: []string{"T1595"},
-		Query: "src:edge kind:http.request " + listDShield, GroupBy: "ip", Count: 1, Window: hour},
+		Query: "src:edge kind:http.request " + listDShield, GroupBy: "ip", Count: 1, Window: hour,
+		Response: blockFor(day)},
 		packInfo{noun: "requests from a DShield address"}},
 	{siem.Rule{ID: "edge.error_anomaly", Name: "Server error surge",
 		Description: "Far more 5xx responses for one host name than usual.",

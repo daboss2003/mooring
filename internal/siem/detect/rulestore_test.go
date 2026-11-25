@@ -322,7 +322,7 @@ func TestMigration0041OnExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`DROP TABLE security_rules; DROP TABLE security_mutes`); err != nil {
+	if _, err := db.Exec(`DROP TABLE security_rules; DROP TABLE security_mutes; ` + dropAfter42); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`DELETE FROM schema_meta WHERE version >= 41`); err != nil {
@@ -365,3 +365,7 @@ func TestMigration0041OnExistingDB(t *testing.T) {
 	}
 	_ = sql.ErrNoRows
 }
+
+// dropAfter42 drops the tables of the mooring.db migrations after 0042, so a test can rewind the
+// schema to an older version (with its DELETE FROM schema_meta).
+const dropAfter42 = `DROP TABLE edge_blocks; DROP TABLE edge_block_refusals; DROP TABLE security_responses; DROP TABLE security_response_pause;`

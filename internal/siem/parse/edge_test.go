@@ -159,3 +159,35 @@ func TestAudit(t *testing.T) {
 		t.Errorf("no target/ua → no F: %v", e.F)
 	}
 }
+
+// Sec-Fetch-Site is kept as f.fetch_site: the four values browsers send as written, anything else as
+// "other" (still a browser's request, no free text); no header, no field.
+func TestEdgeAccessFetchSite(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	ts := float64(now.Unix())
+	line := func(v string) []byte {
+		return []byte(strings.Replace(string(caddyLine(ts, "")), `"Accept":["*/*"]`, `"Accept":["*/*"],"Sec-Fetch-Site":[`+v+`]`, 1))
+	}
+	for v, want := range map[string]string{
+		`"cross-site"`: "cross-site", `"same-origin"`: "same-origin", `"same-site"`: "same-site", `"none"`: "none",
+		`" Cross-Site "`: "cross-site", `"evil<script>"`: "other", `"x"`: "other", `""`: "",
+	} {
+		e, ok := EdgeAccess(line(v), now)
+		if !ok {
+			t.Fatalf("%s: not parsed", v)
+		}
+		got, has := e.F["fetch_site"]
+		if want == "" {
+			if has {
+				t.Errorf("%s: fetch_site = %v, want none", v, got)
+			}
+			continue
+		}
+		if got != want {
+			t.Errorf("%s: fetch_site = %v, want %q", v, got, want)
+		}
+	}
+	if e, _ := EdgeAccess(caddyLine(ts, ""), now); e.F["fetch_site"] != nil {
+		t.Errorf("no header: fetch_site = %v", e.F["fetch_site"])
+	}
+}

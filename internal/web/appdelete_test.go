@@ -321,3 +321,48 @@ func TestAppDeleteRequiresTOTPWhenEnabled(t *testing.T) {
 		t.Error("app must survive a delete that lacked the required TOTP code")
 	}
 }
+
+// patternDeleter is the engine's DeleteAppPatterns beside a pattern service fake.
+type patternDeleter struct {
+	*incFake
+	mu    sync.Mutex
+	slugs []string
+	err   error
+}
+
+func (p *patternDeleter) DeleteAppPatterns(_ context.Context, slug string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.slugs = append(p.slugs, slug)
+	return p.err
+}
+
+// The teardown forgets the app's log patterns when the incident service can (the engine), also
+// with patterns switched off; a failure is a teardown error; without the engine nothing is called.
+func TestAppDeleteRemovesAppPatterns(t *testing.T) {
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	ctx := context.Background()
+	const slug = "shop"
+	seed := func() {
+		t.Helper()
+		if err := e.srv.gitStore.Save(ctx, gitstore.SaveInput{Project: slug, RepoURL: "https://github.com/o/r.git", Ref: "refs/heads/main", BuildPolicy: "never"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed()
+	if gateErr, errs := e.srv.teardownApp(ctx, slug); gateErr != nil || len(errs) != 0 {
+		t.Fatalf("no engine: teardown = %v, %v", gateErr, errs)
+	}
+	// Patterns switched off (no pattern service): the engine is still asked.
+	pd := &patternDeleter{incFake: &incFake{}}
+	e.srv.incidentSvc, e.srv.patterns = pd, nil
+	seed()
+	if gateErr, errs := e.srv.teardownApp(ctx, slug); gateErr != nil || len(errs) != 0 || !slices.Equal(pd.slugs, []string{slug}) {
+		t.Fatalf("teardown = %v, %v; DeleteAppPatterns calls %q", gateErr, errs, pd.slugs)
+	}
+	pd.err = errors.New("patterns table locked")
+	seed()
+	if _, errs := e.srv.teardownApp(ctx, slug); len(errs) != 1 || !strings.Contains(errs[0].Error(), "security log patterns: patterns table locked") {
+		t.Errorf("teardown errors = %v, want the patterns failure", errs)
+	}
+}

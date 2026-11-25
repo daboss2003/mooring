@@ -44,6 +44,7 @@
       <label class="check"><input type="checkbox" name="enabled"{{if .Enabled}} checked{{end}}> Enabled</label>
       {{template "secrulesev" .}}
       {{template "secruletunables" .}}
+      {{template "secruleresponse" .}}
       <div class="queue-actions">
         <button type="submit" class="btn btn-primary">Save rule</button>
         <a class="btn btn-ghost" href="/security/rules">Cancel</a>
@@ -86,6 +87,7 @@
       {{template "secruletunables" .}}
       <label>MITRE ATT&amp;CK® techniques <span class="muted">(optional, comma-separated, such as T1110.001)</span>
         <input type="text" name="mitre" value="{{.MITRE}}" class="mono" placeholder="T1595" autocomplete="off" spellcheck="false"></label>
+      {{template "secruleresponse" .}}
       <label class="check"><input type="checkbox" name="enabled"{{if .Enabled}} checked{{end}}> Enabled</label>
       <div class="queue-actions">
         <button type="submit" class="btn btn-primary">{{if .New}}Create rule{{else}}Save rule{{end}}</button>
@@ -97,6 +99,29 @@
   {{end}}{{end}}
 </main>
 {{template "bottom" .}}
+
+{{/* The rule's automated response (a ruleFormView): the choices when it may take one, else why not. */}}
+{{define "secruleresponse"}}
+{{if .RespShown}}
+<fieldset class="sec-fieldset">
+  <legend>Automated response</legend>
+  <p class="muted small">What Mooring does about this rule's detections when <code>security_logs.response.mode</code> is <code>recommend</code> (recorded for you to apply on the Responses page) or <code>enforce</code>.</p>
+  <label>Response
+    <select name="response">
+      {{range .RespActions}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+    </select></label>
+  <label>Block length <span class="muted">(blocks only; a repeat within 30 days blocks four times as long, up to <code>security_logs.response.max_block_duration</code>)</span>
+    <select name="response_duration">
+      {{range .RespDurations}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+    </select></label>
+  {{if .RespWhy}}<p class="muted small">{{.RespWhy}}</p>{{end}}
+</fieldset>
+{{else if .RespAfterSave}}
+<p class="muted small"><strong>Automated response:</strong> A response can be set after the rule is saved.</p>
+{{else if .RespWhy}}
+<p class="muted small"><strong>Automated response:</strong> {{.RespWhy}}</p>
+{{end}}
+{{end}}
 
 {{define "secrulesev"}}
 <label>Severity <span class="muted">(high and critical also alert)</span>

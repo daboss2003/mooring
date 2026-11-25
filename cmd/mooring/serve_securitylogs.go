@@ -59,18 +59,19 @@ const securityFeedsDelay = 2 * time.Minute
 // *securityLogs means security logs are off; every method is nil-safe. failed is set when they are on
 // but didn't start: the Security page then shows why instead of "off".
 type securityLogs struct {
-	store    *siemstore.Store
-	pipe     *pipeline.Pipeline
-	red      *redact.Redactor
-	follower *hostlog.Follower
-	arch     *archive.Archiver
-	enr      *enrich.Enricher // GeoIP + threat-intel enrichment (filled by feeds)
-	feeds    *feeds.Manager   // nil when it couldn't start
-	det      *detect.Engine   // nil when detection is off or didn't start
-	hosts    knownHosts       // the hosts the edge serves (the traffic baseline learns only those)
-	dir      string           // <data_dir>/security-logs
-	failed   string
-	log      *slog.Logger
+	store      *siemstore.Store
+	pipe       *pipeline.Pipeline
+	red        *redact.Redactor
+	follower   *hostlog.Follower
+	arch       *archive.Archiver
+	enr        *enrich.Enricher // GeoIP + threat-intel enrichment (filled by feeds)
+	feeds      *feeds.Manager   // nil when it couldn't start
+	det        *detect.Engine   // nil when detection is off or didn't start
+	hosts      knownHosts       // the hosts the edge serves (the traffic baseline learns only those)
+	patternsOn bool             // log patterns are mined (security_logs.detection.patterns)
+	dir        string           // <data_dir>/security-logs
+	failed     string
+	log        *slog.Logger
 
 	workerCtx   context.Context // the follower's, the archiver's, the prune's and the CLI poll's: ended by close
 	stopWorkers context.CancelFunc
@@ -85,7 +86,7 @@ type securityLogs struct {
 // openSecurityLogs builds and starts security-log collection when cfg turns it on (nil when off).
 // Intentional: a failure to start never refuses boot (an upgrade must not take the edge down): it is
 // logged, alerted and shown on the Security page, and Mooring runs without security logs.
-func openSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, db *store.DB, log *slog.Logger) *securityLogs {
+func openSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, db *store.DB, log *slog.Logger, more ...func(*detect.Options)) *securityLogs {
 	if !cfg.SecurityLogs.On() {
 		// Turned off instead of fixed: nothing that was failing runs any more.
 		resolveInfra(alerts, kindSecLogsNotRunning, "security-logs:not-running", "Security logs are turned off.")
@@ -93,7 +94,7 @@ func openSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstor
 		resolveInfra(alerts, kindFeedsNotRunning, "security-logs:feeds-not-running", "Security logs, and with them the enrichment feeds, are turned off.")
 		return nil
 	}
-	s, err := startSecurityLogs(ctx, cfg, alerts, db, log)
+	s, err := startSecurityLogs(ctx, cfg, alerts, db, log, more...)
 	if err != nil {
 		log.Error("security logs: not started; Mooring runs without them", "err", err)
 		if alerts != nil {
@@ -117,7 +118,7 @@ func openSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstor
 	return s
 }
 
-func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, db *store.DB, log *slog.Logger) (*securityLogs, error) {
+func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertstore.Store, db *store.DB, log *slog.Logger, more ...func(*detect.Options)) (*securityLogs, error) {
 	master, err := config.DecodeKey(cfg.EncryptionKey)
 	if err != nil {
 		return nil, err
@@ -179,13 +180,21 @@ func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertsto
 		if alerts != nil {
 			al = alerts
 		}
-		eng, derr := detect.New(detect.Options{
+		opts := detect.Options{
 			Dir: dir, MainDB: db, Alerter: al,
 			Emit:      func(e siem.Event) bool { p := pipeRef.Load(); return p != nil && p.Emit(e) },
 			MapValue:  detectMapValue(red),
 			KnownHost: s.hosts.lookup,
-			Log:       log.With("component", "detect"),
-		})
+			Patterns: detect.PatternOptions{Enabled: cfg.SecurityPatternsOn(),
+				MaxCPUPercent:   cfg.SecurityLogs.Detection.Patterns.MaxCPUPercentOrDefault(),
+				ExcludeApps:     cfg.SecurityLogs.Detection.Patterns.ExcludeApps,
+				SampleRetention: cfg.SecurityLogs.HotRetentionOrDefault()},
+			Log: log.With("component", "detect"),
+		}
+		for _, f := range more {
+			f(&opts)
+		}
+		eng, derr := detect.New(opts)
 		if derr != nil {
 			// Intentional: like security logs themselves, a detection that can't start never refuses
 			// boot; it is logged and alerted, and collection goes on without it.
@@ -199,6 +208,7 @@ func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertsto
 			}
 		} else {
 			s.det = eng
+			s.patternsOn = cfg.SecurityPatternsOn()
 			subscribers = append(subscribers, eng.Subscriber())
 			resolveInfra(alerts, kindDetectionNotRunning, "security-logs:detection-not-running", "Security detection is running again.")
 		}
@@ -504,7 +514,28 @@ func (s *securityLogs) detections() siem.DetectionService {
 var _ interface {
 	DeleteAppMutes(ctx context.Context, slug string) error
 	DeleteAppBaselines(ctx context.Context, slug string) error
+	DeleteAppPatterns(ctx context.Context, slug string) error
 } = (*detect.Engine)(nil)
+
+// patterns is what the Patterns pages use (nil when detection isn't running).
+func (s *securityLogs) patterns() siem.PatternService {
+	if s == nil || s.det == nil || !s.patternsOn {
+		return nil
+	}
+	return s.det
+}
+
+// emit hands an event (a siem.* one) to the pipeline; false when security logs aren't collecting
+// or the pipeline didn't take it.
+func (s *securityLogs) emit(e siem.Event) bool { return s.running() && s.pipe.Emit(e) }
+
+// noteResponse adds a response entry to an incident's timeline (nothing when detection is off).
+func (s *securityLogs) noteResponse(ctx context.Context, incidentID int64, ev siem.IncidentEvent) error {
+	if s == nil || s.det == nil {
+		return nil
+	}
+	return s.det.NoteResponse(ctx, incidentID, ev)
+}
 
 // incidents is what the Incidents and entity pages use (nil when detection isn't running).
 func (s *securityLogs) incidents() siem.IncidentService {
@@ -652,6 +683,9 @@ func (s *securityLogs) pruneDeletedApps(ctx context.Context, slugs []string) {
 	}
 	if err := s.det.KeepAppBaselines(ctx, slugs); err != nil {
 		s.logf("security logs: deleted apps' sign-in baselines not removed", err)
+	}
+	if err := s.det.KeepAppPatterns(ctx, slugs); err != nil {
+		s.logf("security logs: deleted apps' log patterns not removed", err)
 	}
 }
 

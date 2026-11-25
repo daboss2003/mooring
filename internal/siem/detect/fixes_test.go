@@ -954,8 +954,12 @@ func TestDetectionsOrderedByLastSeen(t *testing.T) {
 	if !strings.Contains(plan, "detections_last_id") || strings.Contains(plan, "TEMP B-TREE") {
 		t.Fatalf("query plan: %s", plan)
 	}
+	ms, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var v int
-	if err := h.e.db.w.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil || v != 6 {
-		t.Fatalf("schema version %d, %v", v, err)
+	if err := h.e.db.w.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil || v != len(ms) {
+		t.Fatalf("schema version %d, want %d, %v", v, len(ms), err)
 	}
 }

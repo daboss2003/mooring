@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -86,6 +87,11 @@ type Supervisor struct {
 	proc       *os.Process // running master, for a SIGHUP reload (nil when not running)
 	restarting bool        // the current master is being stopped by Restart
 
+	// dmu guards deny and denyErr (separately from mu, which is held while nginx -t runs).
+	dmu     sync.Mutex
+	deny    func() []netip.Prefix
+	denyErr string
+
 	// Seams (nil → real implementation): testConf runs `nginx -t`; sighup signals reload; command builds
 	// the master's command.
 	testConf func(ctx context.Context, configPath string) error
@@ -129,17 +135,86 @@ func (s *Supervisor) Validate(ctx context.Context) error {
 	return s.runTest(ctx, s.ConfigPath)
 }
 
-// Reconcile renders the routes, validates the rendered config, and atomically swaps
-// it in + reloads. It is fail-closed and serialized: a render error, an nginx that fails
-// the Digest pin or an `nginx -t` rejection leaves the live config untouched (last-good
-// keeps serving).
+// SetDeny sets the block list every Reconcile renders (RenderDeny): blocklist.Blocker.L4Snapshot.
+// fn must be quick and lock-free, and the slice it returns is never modified.
+func (s *Supervisor) SetDeny(fn func() []netip.Prefix) {
+	s.dmu.Lock()
+	s.deny = fn
+	s.dmu.Unlock()
+}
+
+// DenyErr is why the listeners serve without the block list: nginx -t refused the config with its
+// deny lines and accepted it without them ("" when the last Reconcile applied the block list, or had
+// none to apply).
+func (s *Supervisor) DenyErr() string {
+	s.dmu.Lock()
+	defer s.dmu.Unlock()
+	return s.denyErr
+}
+
+// setDenyErr sets DenyErr and returns what it was.
+func (s *Supervisor) setDenyErr(e string) (was string) {
+	s.dmu.Lock()
+	was, s.denyErr = s.denyErr, e
+	s.dmu.Unlock()
+	return was
+}
+
+// maxDenyErr bounds DenyErr (nginx -t output).
+const maxDenyErr = 512
+
+// Reconcile renders the routes and the block list (SetDeny), validates the rendered config, and
+// atomically swaps it in + reloads. It is fail-closed and serialized: a render error, an nginx that
+// fails the Digest pin or an `nginx -t` rejection leaves the live config untouched (last-good keeps
+// serving). When nginx -t refuses the config only with its deny lines, the config without them is
+// applied and DenyErr says why.
 func (s *Supervisor) Reconcile(ctx context.Context, routes []Route) error {
-	cfg, err := Render(routes) // bad routes → nothing changes
+	s.dmu.Lock()
+	denyFn := s.deny
+	s.dmu.Unlock()
+	var deny []netip.Prefix
+	if denyFn != nil {
+		deny = denyRanges(denyFn())
+	}
+	cfg, err := RenderDeny(routes, deny) // bad routes → nothing changes
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	err = s.applyLocked(ctx, cfg)
+	if err == nil || len(deny) == 0 {
+		if err == nil && s.setDenyErr("") != "" {
+			s.Log.Info("l4: nginx takes the block list again")
+		}
+		return err
+	}
+	if errors.Is(err, ErrPinRefused) {
+		return err
+	}
+	// Intentional: the listeners matter more than the block list (one bad line takes every listener
+	// down, :53 included), so a config nginx refuses only with its deny lines is applied without them.
+	plain, perr := Render(routes)
+	if perr != nil {
+		return err
+	}
+	if perr := s.applyLocked(ctx, plain); perr != nil {
+		return err
+	}
+	why := err.Error()
+	if len(why) > maxDenyErr {
+		why = strings.ToValidUTF8(why[:maxDenyErr], "")
+	}
+	// Logged when the reason changes, not on every reconcile (one runs every 15 s); DenyErr keeps it.
+	if s.setDenyErr(why) != why {
+		s.Log.Warn("l4: nginx refused the block list; the listeners serve without it", "err", why)
+	}
+	return nil
+}
+
+// applyLocked writes cfg next to the live config, tests it with nginx -t, swaps it in and reloads the
+// master. Called under s.mu.
+func (s *Supervisor) applyLocked(ctx context.Context, cfg string) error {
 	if err := os.MkdirAll(filepath.Dir(s.ConfigPath), 0o755); err != nil {
 		return err
 	}

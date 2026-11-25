@@ -465,6 +465,9 @@ source of truth. To add, change, or remove a public route you edit that file and
 the file's set is exactly what's live) and renders the proxy document. The dashboard's **Edge routes**
 page is **read-only**: it shows the deployed routes, not an editor.
 
+A request from an address on the [block list](./security-responses.md#what-a-blocked-client-gets)
+is answered `403` before any app route.
+
 Internally, the reconciled set is held in Mooring's database and applied idempotently. The schema is
 additive:
 
@@ -639,7 +642,8 @@ and `X-Forwarded-For` otherwise. A `client_ip_header` you set always applies.
 
 With `trusted_proxies` set, the edge refuses HTTP/3 0-RTT (early data): a client resuming an HTTP/3
 connection sends its first request after the handshake completes instead of with it. HTTP/3 itself
-stays on. After Mooring starts, the edge serves HTTP/1.1 and HTTP/2 only until it has applied the
+stays on. The edge refuses it too while [automated response](./security-responses.md#http3-early-data-and-caddy-211)
+is on (`security_logs.response.mode` `recommend` or `enforce`). After Mooring starts, the edge serves HTTP/1.1 and HTTP/2 only until it has applied the
 config with the app routes, normally within a few seconds.
 
 ### The `cloudflare` preset
@@ -655,6 +659,12 @@ from a header, and the dashboard receives the TCP peer address as `X-Forwarded-F
 hostname is proxied by the CDN, requests arrive from the CDN's addresses and are refused unless those
 addresses are in `ip_allowlist`. Point the admin hostname at the server with a DNS-only (not proxied)
 record.
+
+### Blocked addresses
+
+With `trusted_proxies` set, the edge's [block list](./security-responses.md#behind-a-cdn-or-proxy)
+matches the client address the trusted proxy reports; without it, the TCP peer address. Trusted
+proxies and Cloudflare's ranges are never blocked.
 
 ### Not affected
 
@@ -847,6 +857,10 @@ A route's `forward` sets who forwards the traffic:
   `0.0.0.0` and Docker forwards the packets, so the app sees the client's IPv4 address. The service
   runs one copy, `lb` is refused, there is no IPv6 listener, and `ufw` does not filter the port.
   Details: [Kernel forwarding](./definition-file.md#kernel-forwarding-forward-kernel).
+
+With `security_logs.blocking.l4: true`, `forward: proxy` listeners refuse new connections from the
+IPv4 addresses on the [block list](./security-responses.md#l4-listeners). `forward: kernel`
+listeners are not filtered.
 
 ---
 

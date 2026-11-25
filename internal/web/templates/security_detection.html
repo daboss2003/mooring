@@ -30,7 +30,12 @@
       <tr><td>Events</td><td class="mono">{{.Count}}</td></tr>
       <tr><td>Summary</td><td class="wrap-cell">{{if .Summary}}{{.Summary}}{{else}}<span class="muted">—</span>{{end}}</td></tr>
     </tbody></table></div>
-    {{if .RelatedURL}}
+    {{if .PatternURL}}
+    <div class="queue-actions mt1">
+      <a class="btn btn-sm" href="{{.PatternURL}}">View the log pattern</a>
+      <span class="muted small">Its template, sample line, lines per hour and a search for its events.</span>
+    </div>
+    {{else if .RelatedURL}}
     <div class="queue-actions mt1">
       <a class="btn btn-sm" href="{{.RelatedURL}}">Find related events</a>
       <span class="muted small">Every event with <code>{{.RelatedTerm}}</code>, from a minute before the first to a minute after the last.</span>
@@ -49,7 +54,7 @@
         {{range .Evidence}}
         <tr>
           <td class="mono"{{if .ISO}} title="{{.ISO}}"{{end}}>{{if .When}}{{.When}} <span class="muted small">{{.Ago}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
-          <td>{{if .Kind}}<code class="chip">{{.Kind}}</code>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .Kind}}<code class="chip">{{.Kind}}</code>{{else}}<span class="muted">—</span>{{end}}{{if .Agent}} <span class="badge badge-muted">{{.Agent}}</span>{{end}}</td>
           <td class="mono">{{if .IP}}{{.IP}}{{else}}<span class="muted">—</span>{{end}}</td>
           <td class="mono">{{if .Actor}}{{.Actor}}{{else}}<span class="muted">—</span>{{end}}</td>
           <td>{{if .App}}{{.App}}{{else}}<span class="muted">—</span>{{end}}</td>
@@ -58,10 +63,19 @@
         {{end}}
       </tbody>
     </table></div>
+    {{if .Browsers}}<p class="muted small mt1">Requests marked <em>browser</em> or <em>browser-like agent</em> don't count toward an automatic block.</p>{{end}}
     {{else}}
     <p class="muted">No events were kept with this detection.</p>
     {{end}}
   </section>
+
+  {{if or .Responses .RespErr}}
+  <section class="panel">
+    <h2>Responses</h2>
+    <p class="muted small">What automated response did or recommends about this detection. <a href="/security/responses">All responses</a></p>
+    {{if .RespErr}}<div class="error" role="alert">{{.RespErr}}</div>{{else}}{{template "secresptable" .Responses}}{{end}}
+  </section>
+  {{end}}
   {{end}}{{end}}
 </main>
 {{template "bottom" .}}

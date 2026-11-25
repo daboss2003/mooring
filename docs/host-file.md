@@ -209,6 +209,20 @@ security_logs:
     dshield_contact: ""               # an email address: also DShield's block list, daily
   detection:
     enabled: true                     # the detection rules
+    patterns:                         # log patterns (see docs/security-patterns.md)
+      enabled: true
+      max_cpu_percent: 5              # the miner's share of one CPU core (1–25)
+      exclude_apps: []                # app slugs whose lines are not mined
+  response:                           # automated response (see docs/security-responses.md)
+    mode: off                         # off | recommend | enforce
+    max_blocks_per_hour: 60           # automatic blocks placed in an hour (1–1000)
+    max_revokes_per_hour: 3           # automatic sign-outs in an hour (1–100)
+    max_block_duration: 24h           # the longest automatic block (1h–7d)
+  blocking:                           # the edge block list; applies with security logs off too
+    max_entries: 1000                 # automatic blocks in force (1–10000)
+    manual_max_duration: 30d          # the longest manual block (1h–30d)
+    l4: false                         # true: L4 forward: proxy listeners refuse blocked IPv4 addresses
+    never_block: []                   # IP addresses and CIDRs never blocked
 
 # --- Mode-3 setup-script sandbox (off by default, hard-gated) ---
 setup:
@@ -252,6 +266,26 @@ dashboard listener in external-edge mode.
 this server only, and Mooring logs a `config:` warning at startup. The `feeds` downloads connect to
 `download.db-ip.com`, `www.spamhaus.org`, `check.torproject.org` and, with `dshield_contact`,
 `feeds.dshield.org` over HTTPS ([Enrichment](./security-logs.md#outbound-connections)).
+
+| Key | Default | Accepted values |
+|---|---|---|
+| `security_logs.detection.patterns.enabled` | `true` | `false` turns [log patterns](./security-patterns.md) off. |
+| `security_logs.detection.patterns.max_cpu_percent` | `5` | `1`–`25`: the miner's share of one CPU core. |
+| `security_logs.detection.patterns.exclude_apps` | `[]` | Up to 256 app slugs whose lines are not mined. |
+| `security_logs.response.mode` | `off` | `off`, `recommend` or `enforce`: see [Automated response](./security-responses.md#turning-it-on). `recommend` and `enforce` need detection on, and Caddy 2.11 or later for automatic blocks. |
+| `security_logs.response.max_blocks_per_hour` | `60` | `1`–`1000`: automatic blocks placed in an hour. |
+| `security_logs.response.max_revokes_per_hour` | `3` | `1`–`100`: automatic sign-outs of Mooring accounts in an hour. |
+| `security_logs.response.max_block_duration` | `24h` | `1h`–`7d`: the longest automatic block. |
+| `security_logs.blocking.max_entries` | `1000` | `1`–`10000`: automatic blocks in force. |
+| `security_logs.blocking.manual_max_duration` | `30d` | `1h`–`30d`: the longest manual block. |
+| `security_logs.blocking.l4` | `false` | `true`: L4 `forward: proxy` listeners refuse new connections from blocked IPv4 addresses. Needs `edge.l4_enabled: true`. |
+| `security_logs.blocking.never_block` | `[]` | Up to 256 IP addresses and CIDRs that are never blocked, besides the [built-in ones](./security-responses.md#addresses-that-are-never-blocked). |
+
+A number or duration outside its range is clamped, with a `config:` warning at startup. Mooring
+also logs a `config:` warning for a `response.mode` of `recommend` or `enforce` with security logs
+or detection off, and for `blocking.l4: true` with `edge.l4_enabled` off. An unknown
+`mode`, a `never_block` entry that is no IP address or CIDR, and an `exclude_apps` entry that is no
+app slug refuse startup. The `blocking` keys apply with `security_logs.enabled: false` too.
 
 ## Acknowledging changes
 

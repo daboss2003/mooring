@@ -89,6 +89,14 @@
   </section>
   {{end}}
 
+  {{if or .Responses .RespErr}}
+  <section class="panel">
+    <h2>Responses</h2>
+    <p class="muted small">What automated response did or recommends about this incident. <a href="/security/responses">All responses</a></p>
+    {{if .RespErr}}<div class="error" role="alert">{{.RespErr}}</div>{{else}}{{template "secresptable" .Responses}}{{end}}
+  </section>
+  {{end}}
+
   <section class="panel">
     <h2>Add a note</h2>
     <form method="post" action="/security/incidents/{{.ID}}/note" class="stack">
@@ -126,4 +134,5 @@
 {{- else if eq .Kind "assigned"}}{{if .Text}}Assigned to <strong>{{.Text}}</strong>{{else}}Unassigned{{end}}
 {{- else if eq .Kind "note"}}<div class="sec-note">{{.Text}}</div>
 {{- else if eq .Kind "muted"}}Muted {{if .RuleURL}}<a href="{{.RuleURL}}">{{.Rule}}</a>{{else}}{{.Rule}}{{end}}{{if .Text}} <span class="muted">{{.Text}}</span>{{end}}
+{{- else if eq .Kind "response"}}<strong>Automated response</strong>{{if .Text}}<div class="sec-msg small">{{.Text}}</div>{{end}}
 {{- else}}{{if .Raw}}<code class="chip">{{.Raw}}</code> {{end}}{{.Text}}{{end}}{{end}}

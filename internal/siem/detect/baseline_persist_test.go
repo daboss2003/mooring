@@ -342,11 +342,12 @@ func TestBaselineRowsBounded(t *testing.T) {
 	}
 }
 
-// Migration 0006 applies on a detect.db an earlier release left at version 5.
+// Migration 0006 applies on a detect.db an earlier release left at version 5 (0007 is rewound too).
 func TestBaselineMigrationOnExistingDB(t *testing.T) {
 	h := newHarness(t, false)
 	w := h.e.db.w
-	if _, err := w.Exec(`DROP TABLE baselines; DROP TABLE baseline_kinds; DELETE FROM schema_version WHERE version = 6`); err != nil {
+	if _, err := w.Exec(`DROP TABLE baselines; DROP TABLE baseline_kinds; DROP TABLE patterns; DROP TABLE pattern_scopes; DROP TABLE pattern_marks;
+		DROP TABLE pattern_meta; DROP INDEX detections_key; DELETE FROM schema_version WHERE version >= 6`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := w.Exec(`INSERT INTO detections(source, rule_id, rule_name, severity, sev_rank, key, first_ns, last_ns,

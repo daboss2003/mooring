@@ -14,7 +14,9 @@ package l4
 
 import (
 	"fmt"
+	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -118,7 +120,54 @@ func validateMember(m string) error {
 // Render produces a complete, valid nginx `stream` config from the routes. It is
 // fail-closed: any invalid route, or two routes claiming the same listen+protocol,
 // is an error and nothing is emitted. Output is deterministic (routes are sorted).
-func Render(routes []Route) (string, error) {
+func Render(routes []Route) (string, error) { return RenderDeny(routes, nil) }
+
+// nonPublic4 are the IPv4 ranges never denied (the edge's and the block list's protected set):
+// this network, private, shared (CGNAT), loopback, link-local, multicast and reserved.
+var nonPublic4 = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
+// denyMinBits is the widest range denied: the block list's widest manual IPv4 block.
+const denyMinBits = 24
+
+// denyRanges is deny as RenderDeny writes it: IPv4 ranges only (the listeners are IPv4), canonical,
+// sorted, without duplicates. A range wider than /24 or in a non-public range is left out.
+func denyRanges(deny []netip.Prefix) []netip.Prefix {
+	var out []netip.Prefix
+	for _, p := range deny {
+		if !p.IsValid() || !p.Addr().Is4() || p.Bits() < denyMinBits {
+			continue
+		}
+		p = p.Masked()
+		public := true
+		for _, q := range nonPublic4 {
+			if p.Overlaps(q) {
+				public = false
+				break
+			}
+		}
+		if public {
+			out = append(out, p)
+		}
+	}
+	slices.SortFunc(out, func(a, b netip.Prefix) int {
+		if c := a.Addr().Compare(b.Addr()); c != 0 {
+			return c
+		}
+		return a.Bits() - b.Bits()
+	})
+	return slices.Compact(out)
+}
+
+// RenderDeny is Render with the block list: a `deny` line per range in the stream block before any
+// server, so every proxy listener refuses a new connection (or UDP session) from it. Entries are
+// netip values, never text, so they can't inject a directive.
+func RenderDeny(routes []Route, deny []netip.Prefix) (string, error) {
 	seen := map[string]bool{}
 	sorted := append([]Route(nil), routes...)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -145,6 +194,9 @@ func Render(routes []Route) (string, error) {
 	b.WriteString("error_log stderr;\n")
 	b.WriteString("events {}\n")
 	b.WriteString("stream {\n")
+	for _, p := range denyRanges(deny) {
+		b.WriteString("    deny " + p.String() + ";\n")
+	}
 	for _, r := range sorted {
 		if err := ValidateRoute(r); err != nil {
 			return "", err

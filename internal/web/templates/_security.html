@@ -1,11 +1,15 @@
-{{/* Shared by the owner-only security pages: Search (security.html), Detections, Incidents and Rules. */}}
+{{/* Shared by the owner-only security pages: Search (security.html), Detections, Incidents, Patterns,
+     Responses (and Blocks) and Rules. */}}
 
-{{/* The tabs; the argument is the active one: "search", "detections", "incidents" or "rules". */}}
+{{/* The tabs; the argument is the active one: "search", "detections", "incidents", "patterns",
+     "responses" or "rules". */}}
 {{define "security_subnav"}}
 <nav class="subnav" aria-label="Security logs">
   <a href="/security"{{if eq . "search"}} class="active" aria-current="page"{{end}}>Search</a>
   <a href="/security/detections"{{if eq . "detections"}} class="active" aria-current="page"{{end}}>Detections</a>
   <a href="/security/incidents"{{if eq . "incidents"}} class="active" aria-current="page"{{end}}>Incidents</a>
+  <a href="/security/patterns"{{if eq . "patterns"}} class="active" aria-current="page"{{end}}>Patterns</a>
+  <a href="/security/responses"{{if eq . "responses"}} class="active" aria-current="page"{{end}}>Responses</a>
   <a href="/security/rules"{{if eq . "rules"}} class="active" aria-current="page"{{end}}>Rules</a>
 </nav>
 {{end}}

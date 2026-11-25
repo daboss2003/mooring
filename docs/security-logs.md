@@ -18,7 +18,7 @@ See also: [Command-line reference](./cli.md#mooring-security-logs-fetch--verify-
 | `edge` | One event per request through the managed edge (`edge.mode: managed`). `ip` is the client address: behind [`edge.trusted_proxies`](./host-file.md#edge-trusted-proxies), the address the trusted proxy reports. | `http.request` |
 | `mooring` | Mooring's own audit events: sign-ins and failed sign-ins, lockouts, API token use, user, role and config changes, deploys and other operator actions. Events written by `mooring token` and `mooring secret import` (actor `cli:<user>`) are copied within 30 seconds while Mooring runs, and on its next start otherwise. | `mooring.<action>`, for example `mooring.login` |
 | `host` | `sshd`, `sudo`, `su` and user and group changes (`useradd`, `usermod`, `passwd`, `groupadd`, …) from `/var/log/auth.log`, else `/var/log/secure`, or from the systemd journal when neither file exists; Fail2Ban bans and unbans from `/var/log/fail2ban.log`. | `ssh.*`, `sudo.command`, `su.session`, `host.user_change`, `fail2ban.*`, `log` |
-| `siem` | The collector's own events, and detections. | `siem.dropped`, `siem.archive_failed`, `siem.detection` |
+| `siem` | The collector's own events, detections, incidents, responses and block list changes. | `siem.dropped`, `siem.archive_failed`, `siem.detection`, `siem.incident`, `siem.response`, `siem.block`, `siem.block_refused` |
 
 ## Event format
 
@@ -52,7 +52,7 @@ Limits: `msg` 8 KiB; `f` at most 64 fields, keys up to 64 bytes, string values u
 | Kind | Source | `out` | `f` |
 |---|---|---|---|
 | `log` | any | | Unclassified output. |
-| `http.request` | `edge` | | One access log entry. |
+| `http.request` | `edge` | | One access log entry: `method`, `host`, `path`, `query`, `proto`, `sni`, `status`, `dur_ms`, `size`, `bytes_read`, `ua` (the User-Agent), `user_id`; `fetch_site` when the request has a `Sec-Fetch-Site` header (a browser sent it): `cross-site`, `same-origin`, `same-site` or `none`, and `other` for any other value. `lvl` is `warn` for a status of 400 and above, `error` for 500 and above. |
 | `ssh.login` | `host` | `success` / `failure` | `method` (`password`, `publickey`, `keyboard-interactive`), `user`, `key_fp`, `port` |
 | `ssh.invalid_user` | `host` | | `user` |
 | `ssh.disconnect` | `host` | | `user`, `reason` (disconnects before authentication, "Too many authentication failures") |
@@ -64,6 +64,9 @@ Limits: `msg` 8 KiB; `f` at most 64 fields, keys up to 64 bytes, string values u
 | `siem.dropped` | `siem` | | `source`, `count`, `reason`: events dropped because the collector's queue was full, refused at the disk-pressure threshold (`reason` `disk`) or not stored after an error (`reason` `error`), or lost on this server. |
 | `siem.archive_failed` | `siem` | | `segment`, `error` |
 | `siem.detection` | `siem` | | A [detection](./security-detections.md): `rule`, `severity`, `count`, `mitre`, `key`, `detection_id`; `msg` is the detection's summary. |
+| `siem.incident` | `siem` | | An [incident](./security-incidents.md#incidents-as-security-events) change. |
+| `siem.response` | `siem` | | An [automated response](./security-responses.md#events): `action`, `target`, `state`, `rule`, `duration_s`, `response_id`, `automatic`. A sign-out's account is in its stored form (a keyed hash for a user name that is an email address). |
+| `siem.block`, `siem.block_refused` | `siem` | | A [block list](./security-responses.md#events) change (`action`, `prefix`, `source`, `until`), or a refused block (`prefix`, `code`, `source`). |
 
 ## Security events from your app
 
@@ -549,6 +552,20 @@ security_logs:
     dshield_contact: ""               # an email address: also DShield's block list, daily
   detection:
     enabled: true
+    patterns:
+      enabled: true                   # log patterns
+      max_cpu_percent: 5              # the miner's share of one CPU core (1–25)
+      exclude_apps: []                # app slugs whose lines are not mined
+  response:
+    mode: off                         # off, recommend or enforce
+    max_blocks_per_hour: 60           # automatic blocks placed in an hour (1–1000)
+    max_revokes_per_hour: 3           # automatic sign-outs in an hour (1–100)
+    max_block_duration: 24h           # the longest automatic block (1h–7d)
+  blocking:
+    max_entries: 1000                 # automatic blocks in force (1–10000)
+    manual_max_duration: 30d          # the longest manual block (1h–30d)
+    l4: false                         # true: L4 forward: proxy listeners refuse blocked IPv4 addresses
+    never_block: []                   # IP addresses and CIDRs never blocked
 ```
 
 | Key | Default | Range | Meaning |
@@ -568,11 +585,25 @@ security_logs:
 | `feeds.tor` | `true` | | `false`: no Tor exit list (`tor-exit`). |
 | `feeds.dshield_contact` | `""` | an email address | Set: download DShield's block list (`dshield`) daily, with this address in the User-Agent. `""`: not downloaded. |
 | `detection.enabled` | `true` | | `false`: no detection rules run. |
+| `detection.patterns.enabled` | `true` | | `false`: no [log patterns](./security-patterns.md). |
+| `detection.patterns.max_cpu_percent` | `5` | `1`–`25` | The log-pattern miner's share of one CPU core. |
+| `detection.patterns.exclude_apps` | `[]` | 256 app slugs | Apps whose lines are not mined for log patterns. |
+| `response.mode` | `off` | `off`, `recommend`, `enforce` | [Automated response](./security-responses.md#turning-it-on): record responses as recommendations, or apply the automatic ones. |
+| `response.max_blocks_per_hour` | `60` | `1`–`1000` | Automatic blocks placed in an hour. |
+| `response.max_revokes_per_hour` | `3` | `1`–`100` | Automatic sign-outs of Mooring accounts in an hour. |
+| `response.max_block_duration` | `24h` | `1h`–`7d` | The longest automatic block. |
+| `blocking.max_entries` | `1000` | `1`–`10000` | Automatic blocks in force in the [block list](./security-responses.md#the-block-list). |
+| `blocking.manual_max_duration` | `30d` | `1h`–`30d` | The longest manual block. |
+| `blocking.l4` | `false` | | `true`: L4 `forward: proxy` listeners refuse new connections from blocked IPv4 addresses. |
+| `blocking.never_block` | `[]` | 256 entries | IP addresses and CIDRs that are never blocked. |
 
 A value outside its range is clamped, and Mooring logs a `config:` warning at startup saying which
 value it used; `sudo mooring doctor` shows the same warnings. So does a `hot_retention` longer than
-`archive.retention`. An invalid `archive.s3`, path, `pii` name or `feeds.dshield_contact` refuses
-startup. With `enabled: false`, no feed is downloaded and no detection rule runs. Turning a feed off
+`archive.retention`, a `response.mode` of `recommend` or `enforce` with security logs or detection
+off, and `blocking.l4: true` with `edge.l4_enabled` off. An invalid `archive.s3`, path, `pii` name, `feeds.dshield_contact`,
+`response.mode`, `blocking.never_block` entry or `detection.patterns.exclude_apps` entry refuses
+startup. The `blocking` keys apply with `enabled: false` too: the block list works without security
+logs. With `enabled: false`, no feed is downloaded and no detection rule runs. Turning a feed off
 leaves its files in `feeds/`; they are not used.
 
 The block is read at startup: restart Mooring after a change (`sudo systemctl restart mooring`).

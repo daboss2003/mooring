@@ -1,0 +1,154 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <p><a href="/security/responses">← Responses</a></p>
+  <h1>Blocked addresses</h1>
+  <p class="muted">Addresses and ranges the managed edge answers with 403, each for a time: automatic blocks placed by automated response and manual blocks placed here. The block list works with security logs off.</p>
+  {{template "security_subnav" "responses"}}
+  {{if .NoBlocks}}
+  <section class="panel">
+    <h2>The block list is not available</h2>
+    <p class="muted">Blocks are applied by the edge Mooring runs (<code>edge.mode: managed</code>). {{if .NoEdgeWhy}}Mooring doesn't run the edge on this host: {{.NoEdgeWhy}}{{else}}Mooring's startup log says why the block list did not start.{{end}}</p>
+    <p class="muted small">Until then, block addresses in the host firewall or in the proxy in front of this server.</p>
+  </section>
+  {{else}}{{with .Blocks}}
+  {{if .Notice}}<div class="notice" role="status">{{.Notice}}</div>{{end}}
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+
+  {{with .Status}}
+  <div class="stat-grid sec-stats">
+    <div class="stat-card{{if or .AutoFull (not .Automatic)}} is-warn{{end}}">
+      <div class="stat-label">Automatic blocks</div>
+      <div class="stat-value sec-stat-value">{{.ActiveAuto}}<small> / {{.MaxAuto}}</small></div>
+      <div class="stat-sub">{{if not .Automatic}}Not placed{{if .AutomaticWhy}}: {{.AutomaticWhy}}{{end}}{{else if .AutoFull}}Full: new automatic blocks are refused{{else}}In force, of <code>max_entries</code>{{end}}</div>
+    </div>
+    <div class="stat-card{{if .ManualFull}} is-warn{{end}}">
+      <div class="stat-label">Manual blocks</div>
+      <div class="stat-value sec-stat-value">{{.ActiveManual}}<small> / {{.MaxManual}}</small></div>
+      <div class="stat-sub">{{if .ManualFull}}Full: remove one to add another{{else}}In force{{end}}</div>
+    </div>
+    <div class="stat-card{{if .ApplyErr}} is-down{{else if .Applied}} is-ok{{end}}">
+      <div class="stat-label">Edge</div>
+      <div class="stat-value sec-stat-value">{{if .ApplyErr}}Failing{{else if .Applied}}Applied{{else}}Pending{{end}}</div>
+      <div class="stat-sub">{{if .ApplyErr}}<code class="sec-src-err">{{.ApplyErr}}</code> Mooring retries every minute.{{else if .LastApplied}}Last applied {{.LastApplied}} UTC, {{.LastAppliedAgo}}{{else}}The edge takes changes within about a minute{{end}}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">L4 listeners</div>
+      <div class="stat-value sec-stat-value">{{if .L4}}Filtered{{else}}Not filtered{{end}}</div>
+      <div class="stat-sub">{{if .L4Why}}{{.L4Why}}{{else}}<code>security_logs.blocking.l4</code>{{end}}</div>
+    </div>
+  </div>
+  {{end}}
+
+  <section class="panel">
+    <h2>Block an address</h2>
+    <form method="post" action="/security/blocks/add" class="stack">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <label>Address or range <span class="muted">(an IP address, or a CIDR range up to /24 for IPv4 and /48 for IPv6)</span>
+        <input type="text" name="prefix" value="{{.Form.Prefix}}" class="mono" placeholder="203.0.113.7" required maxlength="64" autocomplete="off" spellcheck="false"></label>
+      <label>Length <span class="muted">(at most {{.ManualLongest}})</span>
+        <select name="duration">
+          {{range .Durations}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select></label>
+      <label>Reason <span class="muted">(optional, shown on this page; no secrets)</span>
+        <input type="text" name="reason" value="{{.Form.Reason}}" maxlength="{{.MaxReason}}" placeholder="Credential stuffing from this range" autocomplete="off"></label>
+      <div class="queue-actions"><button type="submit" class="btn btn-primary">Block address</button></div>
+    </form>
+    <p class="muted small">Never blocked: your own address, the addresses of signed-in dashboard sessions, <code>ip_allowlist</code>, API token addresses, trusted proxies, CDN ranges, loopback, private and other local addresses, this server's own addresses and <code>security_logs.blocking.never_block</code>.</p>
+  </section>
+
+  <section class="panel">
+    <h2>Blocks in force</h2>
+    <form method="get" action="/security/blocks" class="toolbar">
+      <div class="field">
+        <label for="blk-source">Source</label>
+        <select id="blk-source" name="source">
+          {{range .Sources}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </div>
+      <div class="toolbar-actions">
+        <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+        <a href="/security/blocks" class="btn btn-sm btn-ghost">Reset</a>
+      </div>
+    </form>
+    {{if .RowsErr}}<div class="error" role="alert">{{.RowsErr}}</div>
+    {{else if .Rows}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Address or range</th><th>State</th><th>Source</th><th class="wrap-cell">Reason</th><th>Until (UTC)</th><th class="num" title="Automatic blocks of it placed within 30 days of each other">Times blocked</th><th></th></tr></thead>
+      <tbody>
+        {{range .Rows}}
+        <tr>
+          <td class="mono">{{.Prefix}}</td>
+          <td><span class="pill{{if .StateClass}} {{.StateClass}}{{end}}">{{.StateLabel}}</span></td>
+          <td>{{if .Auto}}Automatic{{if .RuleID}}<div class="small"><a class="mono" href="{{.RuleURL}}">{{.RuleID}}</a></div>{{end}}{{else}}Manual{{if .By}}<div class="muted small">by {{.By}}</div>{{end}}{{end}}{{if .IncidentURL}}<div class="small"><a href="{{.IncidentURL}}">Incident #{{.IncidentID}}</a></div>{{else if .DetectionURL}}<div class="small"><a href="{{.DetectionURL}}">Detection</a></div>{{end}}</td>
+          <td class="wrap-cell">{{if .Reason}}{{.Reason}}{{else if not .SuspendedWhy}}<span class="muted">—</span>{{end}}{{if .SuspendedWhy}}<div class="muted small">Not applied: {{.SuspendedWhy}}</div>{{end}}</td>
+          <td class="mono"{{if .UntilISO}} title="{{.UntilISO}}"{{end}}>{{if .Until}}{{.Until}} <span class="muted small">{{.UntilIn}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="num">{{.Hits}}</td>
+          <td>
+            <form method="post" action="/security/blocks/remove" class="inline" data-confirm="Remove the block of {{.Prefix}}? Automatic blocks of it are paused for 24 hours.">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="prefix" value="{{.Prefix}}">
+              <button type="submit" class="link" aria-label="Remove the block of {{.Prefix}}">Remove</button>
+            </form>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{if .Capped}}<p class="muted small mt1">Showing the newest 1,000. Pick a source to see the others.</p>{{end}}
+    {{else if .Source}}
+    <p class="muted sec-empty">No {{if eq .Source "auto"}}automatic{{else}}manual{{end}} blocks are in force.</p>
+    {{else}}
+    <div class="sec-empty">
+      <p><strong>No blocks in force</strong></p>
+      <p class="muted">Blocks placed here, or by automated response, are listed until they end.</p>
+    </div>
+    {{end}}
+  </section>
+
+  <section class="panel">
+    <h2>Recent refusals</h2>
+    <p class="muted small">Blocks the list refused, counted per address and reason.</p>
+    {{if .RefusalsErr}}<div class="error" role="alert">{{.RefusalsErr}}</div>
+    {{else if .Refusals}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Address or range</th><th class="wrap-cell">Why</th><th>Source</th><th class="num">Times</th><th>Last (UTC)</th></tr></thead>
+      <tbody>
+        {{range .Refusals}}
+        <tr>
+          <td class="mono">{{.Prefix}}</td>
+          <td class="wrap-cell">{{if .Words}}{{.Words}}{{else}}<code class="chip">{{.Code}}</code>{{end}}{{if .Detail}}<div class="muted small">{{.Detail}}</div>{{end}}</td>
+          <td>{{if .Auto}}Automatic{{if .RuleID}} <span class="mono small">{{.RuleID}}</span>{{end}}{{else}}Manual{{end}}</td>
+          <td class="num">{{.Count}}</td>
+          <td class="mono"{{if .LastISO}} title="{{.LastISO}}"{{end}}>{{if .Last}}{{.Last}} <span class="muted small">{{.Ago}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="muted">No block was refused recently.</p>
+    {{end}}
+  </section>
+
+  <section class="panel">
+    <h2>Not filtered by Mooring</h2>
+    <p class="muted small">Blocks apply to the edge's HTTP and HTTPS routes{{if .Status.L4}} and, for IPv4 clients, to new connections on L4 <code>forward: proxy</code> listeners{{end}}. These are not filtered:</p>
+    <ul class="checks muted small">
+      <li>SSH and any other port the host opens itself: use Fail2Ban or the host firewall.</li>
+      {{if .Status.L4}}<li>IPv6 clients of L4 listeners, and L4 <code>forward: kernel</code> listeners (Docker forwards them).</li>{{else}}<li>Every L4 listener: {{if .Status.L4Why}}{{.Status.L4Why}}{{else}}<code>security_logs.blocking.l4</code> is off{{end}}.</li>{{end}}
+    </ul>
+    {{if .L4Err}}<div class="error" role="alert">{{.L4Err}}</div>{{end}}
+    {{if .NotFiltered}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Port</th><th>App</th><th>Service</th><th class="wrap-cell">Why</th></tr></thead>
+      <tbody>
+        {{range .NotFiltered}}
+        <tr><td class="mono">{{.Listen}}</td><td>{{.App}}</td><td>{{.Service}}</td><td class="wrap-cell">{{.Why}}</td></tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{end}}
+  </section>
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}

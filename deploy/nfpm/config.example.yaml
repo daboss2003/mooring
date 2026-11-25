@@ -71,3 +71,19 @@ data_dir: "/var/lib/mooring"
 #     auth_log: ""                    # "" = /var/log/auth.log, else /var/log/secure
 #     fail2ban_log: ""                # "" = /var/log/fail2ban.log
 #     journal:                        # unset = the journal only when there is no auth log file
+#   detection:
+#     enabled: true                   # false: events are collected but not checked
+#     patterns:
+#       enabled: true                 # false: log lines are not grouped into patterns
+#       max_cpu_percent: 5            # the pattern miner's share of one CPU core (1–25)
+#       exclude_apps: []              # app slugs whose log lines are not mined
+#   response:
+#     mode: "off"                     # "recommend": record what would be done; "enforce": do it
+#     max_blocks_per_hour: 60         # automatic blocks an hour (1–1000)
+#     max_revokes_per_hour: 3         # automatic sign-outs an hour (1–100)
+#     max_block_duration: 24h         # the longest automatic block a repeat reaches (1h–7d)
+#   blocking:
+#     max_entries: 1000               # active automatic blocks (1–10000)
+#     manual_max_duration: 30d        # the longest manual block (1h–30d)
+#     l4: false                       # true: L4 forward: proxy listeners refuse blocked IPv4 addresses
+#     never_block: []                 # addresses and CIDRs never blocked

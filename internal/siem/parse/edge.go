@@ -14,8 +14,8 @@ import (
 )
 
 // caddyAccess is the part of a Caddy access-log entry the SIEM keeps. Intentional: of the request
-// headers only User-Agent is decoded; Caddy logs them all (Cookie/Authorization as REDACTED), and
-// none of the others is stored.
+// headers only User-Agent and Sec-Fetch-Site are decoded; Caddy logs them all (Cookie/Authorization
+// as REDACTED), and none of the others is stored.
 type caddyAccess struct {
 	Logger  string  `json:"logger"`
 	TS      float64 `json:"ts"` // epoch seconds
@@ -27,7 +27,8 @@ type caddyAccess struct {
 		Host     string `json:"host"`
 		URI      string `json:"uri"`
 		Headers  struct {
-			UA []string `json:"User-Agent"`
+			UA        []string `json:"User-Agent"`
+			FetchSite []string `json:"Sec-Fetch-Site"`
 		} `json:"headers"`
 		TLS struct {
 			ServerName string `json:"server_name"`
@@ -75,6 +76,9 @@ func EdgeAccess(raw []byte, now time.Time) (siem.Event, bool) {
 	setStr(f, "user_id", a.UserID)
 	if len(r.Headers.UA) > 0 {
 		setStr(f, "ua", r.Headers.UA[0])
+	}
+	if len(r.Headers.FetchSite) > 0 {
+		setStr(f, "fetch_site", fetchSite(r.Headers.FetchSite[0]))
 	}
 	setNum(f, "status", a.Status)
 	setNum(f, "dur_ms", a.Duration*1000)
@@ -128,4 +132,17 @@ func Audit(ts time.Time, ev audit.Event) siem.Event {
 		}
 	}
 	return e
+}
+
+// fetchSite is a Sec-Fetch-Site value as stored in f.fetch_site: one of the four values browsers
+// send, or "other" for anything else (present, so the request still counts as a browser's; only
+// the four are kept as written so a client can't put free text there). "" for an empty header.
+func fetchSite(v string) string {
+	switch v = strings.ToLower(strings.TrimSpace(v)); v {
+	case "":
+		return ""
+	case "cross-site", "same-origin", "same-site", "none":
+		return v
+	}
+	return "other"
 }

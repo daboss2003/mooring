@@ -62,7 +62,7 @@
     <tr>
       <td class="wrap-cell"><a href="{{.EditURL}}">{{.Name}}</a> <div class="muted small"><span class="mono">{{.ID}}</span> · {{.TypeLabel}}</div>{{if .Description}}<div class="muted small">{{.Description}}</div>{{end}}</td>
       <td>{{template "sec_sev" .}}</td>
-      <td class="wrap-cell">{{.Condition}}</td>
+      <td class="wrap-cell">{{.Condition}}{{if .Response}}<div class="muted small">Response: {{.Response}}</div>{{end}}</td>
       <td>{{if .MITRE}}{{template "sec_mitre" .MITRE}}{{else}}<span class="muted">—</span>{{end}}</td>
       <td>{{if .Enabled}}<span class="pill pill-ok">On</span>{{else}}<span class="pill">Off</span>{{end}}{{if .Snoozed}}<div class="muted small" title="{{.SnoozedISO}} ({{.SnoozedIn}})">Snoozed until<br>{{.SnoozedUntil}} UTC</div>{{end}}</td>
       <td>

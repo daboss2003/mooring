@@ -9,14 +9,17 @@
 package edge
 
 import (
+	"cmp"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,6 +105,16 @@ type BaseConfig struct {
 	// NoHTTP3 renders the edge server with HTTP/1.1 and HTTP/2 only, so Caddy opens no QUIC
 	// listener. Only BootFloor sets it.
 	NoHTTP3 bool
+	// Blocked is the block list (internal/blocklist Snapshot): a request whose client address is in
+	// one of these ranges gets a 403 before any app route. Render re-checks every entry
+	// (BlockAllowed) and leaves out one that fails, without failing the render. Empty = no deny
+	// route. Never modified by Render.
+	Blocked []netip.Prefix
+	// Refuse0RTT refuses QUIC 0-RTT early data without trusted proxies too: in early data the client
+	// address is not verified yet, and automatic blocks act on the addresses the edge logs. Needs
+	// Caddy ≥ 2.11. Like the trusted proxies it is applied only when Caddy opens its QUIC listener
+	// (BootFloor), so it must be set when the edge starts.
+	Refuse0RTT bool
 }
 
 // defaultClientIPHeader is the client IP header when ClientIPHeader is empty and no listed preset
@@ -110,19 +123,20 @@ const defaultClientIPHeader = "X-Forwarded-For"
 
 // BootFloor returns the base the Caddy child boots on (Supervisor.InitialCfg). It leaves out what a
 // Caddy binary may not support, so a missing DNS module or a Caddy too old for trusted proxies fails
-// the first reconcile instead of the boot: the DNS-01 wildcards, and the trusted-proxy fields (the
-// floor has no app routes, so they would change nothing in it).
+// the first reconcile instead of the boot: the DNS-01 wildcards, the trusted-proxy fields and
+// Refuse0RTT, and the block list (the floor has no app routes, so they would change nothing in it).
 func BootFloor(base BaseConfig) BaseConfig {
 	floor := base
 	floor.Wildcards = nil
-	if len(base.TrustedProxies) > 0 {
+	if len(base.TrustedProxies) > 0 || base.Refuse0RTT {
 		// Intentional: Caddy keeps one QUIC listener across /load and applies allow_0rtt only when
 		// it opens it (Caddy 2.11.7 listeners.go ListenQUIC; reproduced: a reload to allow_0rtt
 		// false still accepted 0-RTT). A floor that served HTTP/3 would keep 0-RTT on for the life
 		// of the child, so it serves none and the first reconcile opens QUIC with 0-RTT refused.
 		floor.NoHTTP3 = true
 	}
-	floor.TrustedProxies, floor.ClientIPHeader = nil, ""
+	floor.TrustedProxies, floor.ClientIPHeader, floor.Refuse0RTT = nil, "", false
+	floor.Blocked = nil
 	return floor
 }
 
@@ -312,6 +326,176 @@ func unavailableHandler() caddyHandler {
 		},
 		Body: "503 Service Unavailable\n",
 	}
+}
+
+// blockedHandler is the response to a blocked client: a fixed 403 that names no rule, block or
+// address, and that no cache keeps (a block ends).
+func blockedHandler() caddyHandler {
+	return caddyHandler{
+		Handler:    "static_response",
+		StatusCode: 403,
+		StaticHeaders: map[string][]string{
+			"Content-Type":  {"text/plain; charset=utf-8"},
+			"Cache-Control": {"no-store"},
+		},
+		Body: "403 Forbidden\n",
+	}
+}
+
+const (
+	// maxBlocked bounds the deny route at the block list's caps (10 000 automatic + 1 000 manual):
+	// Caddy compares a request with the ranges one by one.
+	maxBlocked = 11000
+	// The widest range the edge blocks: the block list's widest manual block.
+	blockMinIPv4Bits = 24
+	blockMinIPv6Bits = 48
+)
+
+// nonPublic4 are the IPv4 ranges the edge never blocks: this network, private (RFC 1918), shared
+// (CGNAT), loopback, link-local, multicast and reserved. IPv6 is blockable only inside global
+// unicast 2000::/3 (so never loopback, ULA, link-local, multicast or unspecified). The block list
+// (internal/blocklist) refuses the same ranges. The documentation ranges stay blockable.
+var (
+	nonPublic4 = []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("127.0.0.0/8"),
+		netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("224.0.0.0/4"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+	}
+	globalUnicast6 = netip.MustParsePrefix("2000::/3")
+)
+
+// blockGuard is what BlockAllowed checks an entry against, parsed once per render.
+type blockGuard struct {
+	allow, proxies, cdn []netip.Prefix
+	err                 error // base can't be checked: every entry is left out
+}
+
+func newBlockGuard(base BaseConfig) blockGuard {
+	g := blockGuard{cdn: CDNRanges()}
+	for _, s := range base.AdminAllowlist {
+		p, err := parseAllowEntry(s)
+		if err != nil {
+			g.err = fmt.Errorf("ip_allowlist entry %q can't be checked", s)
+			return g
+		}
+		g.allow = append(g.allow, p)
+	}
+	for _, e := range base.TrustedProxies {
+		ps, err := ParseTrustedProxy(e)
+		if err != nil {
+			g.err = fmt.Errorf("edge.trusted_proxies: %w", err)
+			return g
+		}
+		g.proxies = append(g.proxies, ps...)
+	}
+	return g
+}
+
+// parseAllowEntry parses an ip_allowlist entry (a CIDR or an address) the way Caddy's remote_ip
+// compares it: masked, IPv4-mapped as IPv4. Unlike a trusted proxy, 0.0.0.0/0 is a valid entry (it
+// then protects every address).
+func parseAllowEntry(s string) (netip.Prefix, error) {
+	s = strings.TrimSpace(s)
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		a, aerr := netip.ParseAddr(s)
+		if aerr != nil {
+			return netip.Prefix{}, aerr
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	if p.Addr().Is4In6() {
+		if p.Bits() < 96 {
+			return netip.Prefix{}, fmt.Errorf("invalid IPv4-mapped CIDR")
+		}
+		p = netip.PrefixFrom(p.Addr().Unmap(), p.Bits()-96)
+	}
+	return p.Masked(), nil
+}
+
+func (g blockGuard) check(p netip.Prefix) error {
+	if g.err != nil {
+		return g.err
+	}
+	if !p.IsValid() {
+		return errors.New("not an address range")
+	}
+	a := p.Addr()
+	if a.Is4In6() || p != p.Masked() {
+		return errors.New("not in canonical form")
+	}
+	if (a.Is4() && p.Bits() < blockMinIPv4Bits) || (a.Is6() && p.Bits() < blockMinIPv6Bits) {
+		return fmt.Errorf("wider than /%d (IPv4) or /%d (IPv6)", blockMinIPv4Bits, blockMinIPv6Bits)
+	}
+	if (a.Is4() && overlapsAny(p, nonPublic4)) || (a.Is6() && !globalUnicast6.Contains(a)) {
+		return errors.New("not a public address range")
+	}
+	switch {
+	case overlapsAny(p, g.allow):
+		return errors.New("overlaps ip_allowlist")
+	case overlapsAny(p, g.proxies):
+		return errors.New("overlaps edge.trusted_proxies")
+	case overlapsAny(p, g.cdn):
+		return errors.New("overlaps a CDN's published ranges")
+	}
+	return nil
+}
+
+func overlapsAny(p netip.Prefix, set []netip.Prefix) bool {
+	for _, q := range set {
+		if p.Overlaps(q) {
+			return true
+		}
+	}
+	return false
+}
+
+// BlockAllowed reports why the edge leaves p out of its deny route (nil: it renders it). p must be
+// canonical (masked; IPv4, not IPv4-mapped), no wider than /24 (IPv4) or /48 (IPv6), and public (see
+// nonPublic4), and overlap none of base.AdminAllowlist (ip_allowlist), base.TrustedProxies and
+// CDNRanges.
+func BlockAllowed(base BaseConfig, p netip.Prefix) error { return newBlockGuard(base).check(p) }
+
+// blockDrop is a Blocked entry the render left out, and why.
+type blockDrop struct {
+	p   netip.Prefix
+	why string
+}
+
+// filterBlocked returns base.Blocked as the deny route renders it: sorted, without duplicates, only
+// entries BlockAllowed accepts, at most maxBlocked (the first in that order). The entries left out
+// are returned with the reason. The same set renders the same ranges in any order.
+func filterBlocked(base BaseConfig) ([]netip.Prefix, []blockDrop) {
+	if len(base.Blocked) == 0 {
+		return nil, nil
+	}
+	in := slices.Clone(base.Blocked)
+	slices.SortFunc(in, comparePrefix)
+	in = slices.Compact(in)
+	g := newBlockGuard(base)
+	var kept []netip.Prefix
+	var dropped []blockDrop
+	for _, p := range in {
+		err := g.check(p)
+		if err == nil && len(kept) >= maxBlocked {
+			err = fmt.Errorf("over the edge's %d blocked ranges", maxBlocked)
+		}
+		if err != nil {
+			dropped = append(dropped, blockDrop{p, err.Error()})
+			continue
+		}
+		kept = append(kept, p)
+	}
+	return kept, dropped
+}
+
+func comparePrefix(a, b netip.Prefix) int {
+	if c := a.Addr().Compare(b.Addr()); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Bits(), b.Bits())
 }
 
 // ValidateRoute enforces every route-level safety rule (SBD-4). Returns the first
@@ -511,6 +695,26 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		seen[ah] = true
 	}
 
+	// The block list: one deny route right after the admin vhost, so a block never reaches the
+	// dashboard (the allowlisted peer matches the admin route first) and covers every app route,
+	// cert-only shadow and catch-all after it. ACME HTTP-01 is answered before any route.
+	if blocked, _ := filterBlocked(base); len(blocked) > 0 {
+		ranges := make([]string, len(blocked))
+		for i, p := range blocked {
+			ranges[i] = p.String()
+		}
+		m := caddyMatch{RemoteIP: &caddyRemoteIP{Ranges: ranges}}
+		if trusted {
+			// Intentional: client_ip here, unlike the admin vhost's remote_ip. Behind a trusted proxy
+			// the TCP peer is the proxy, never the client being blocked; client_ip is the address the
+			// proxy reported (strict, right to left), and the TCP peer for an untrusted peer. A forged
+			// header can only name an address the trusted proxy let through, and the admin vhost
+			// above never consults it.
+			m = caddyMatch{ClientIP: &caddyRemoteIP{Ranges: ranges}}
+		}
+		httpRoutes = append(httpRoutes, caddyRoute{Match: []caddyMatch{m}, Handle: []caddyHandler{blockedHandler()}, Terminal: true})
+	}
+
 	// A host's certificate issuer comes from its first enabled route in the caller's order,
 	// independent of the specificity ordering below.
 	hostCA := map[string]string{}
@@ -675,9 +879,12 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		// wins. Non-strict takes the left-most address, which a client writes itself when the proxy
 		// appends to X-Forwarded-For.
 		edgeServer.TrustedProxiesStrict = 1
+	}
+	if trusted || base.Refuse0RTT {
 		// Intentional: refuse QUIC 0-RTT. In early data Caddy has not verified the source address,
 		// yet still derives {http.vars.client_ip} from it (remote.host is empty there), so a
-		// spoofed trusted source could hand an app any client address. Requires Caddy ≥ 2.11.0.
+		// spoofed trusted source could hand an app any client address, and a spoofed source could
+		// steer automatic blocks onto someone else's address. Requires Caddy ≥ 2.11.0.
 		refuse0RTT := false
 		edgeServer.Allow0RTT = &refuse0RTT
 	}

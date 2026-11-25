@@ -41,6 +41,40 @@
   </div>
   {{end}}
 
+  {{with .Block}}
+  <section class="panel">
+    <h2><span>Edge block</span>{{with .Live}} <span class="pill{{if .Class}} {{.Class}}{{end}}">{{.Label}}</span>{{end}}</h2>
+    {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{else}}
+    <p class="muted small">The edge answers 403 to every request from a blocked address. <span class="mono">{{.Shown}}</span>{{with .Live}}{{if .Text}} · {{.Text}}{{end}}{{end}}{{if .Auto}} · placed by automated response{{end}}{{if .WholeNet}}<br>IPv6 addresses are blocked as their whole /64 network.{{end}}</p>
+    {{if .Partly}}<p>Partly blocked by <a class="mono" href="/security/blocks">{{.CoveredBy}}</a>. The other addresses of <span class="mono">{{.Prefix}}</span> are not blocked.</p>
+    {{else if .CoveredBy}}<p>Blocked by <a class="mono" href="/security/blocks">{{.CoveredBy}}</a>. To unblock this address, remove that block on the Blocked addresses page.</p>{{end}}
+    <div class="queue-actions sec-actions sec-block-actions">
+      {{if and .CoveredBy (not .Partly)}}
+      {{else if .Blocked}}
+      <form method="post" action="/security/blocks/remove" class="inline" data-confirm="Remove the block of {{.Shown}}? Automatic blocks of it are paused for 24 hours.">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        <input type="hidden" name="prefix" value="{{.Prefix}}">
+        <input type="hidden" name="back" value="entity">
+        <input type="hidden" name="key" value="{{$.Ent.Key}}">
+        <button type="submit" class="btn btn-sm">Unblock</button>
+      </form>
+      {{else}}
+      <form method="post" action="/security/blocks/add" class="inline" data-confirm="Block {{.Shown}} at the edge for {{.Duration.Label}}?{{if .WholeNet}} IPv6 addresses are blocked as their whole /64 network.{{end}}">
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        <input type="hidden" name="prefix" value="{{.Prefix}}">
+        <input type="hidden" name="duration" value="{{.Duration.Value}}">
+        <input type="hidden" name="reason" value="Blocked from the address page">
+        <input type="hidden" name="back" value="entity">
+        <input type="hidden" name="key" value="{{$.Ent.Key}}">
+        <button type="submit" class="btn btn-sm">Block for {{.Duration.Label}}</button>
+      </form>
+      {{end}}
+      <a href="/security/blocks">Blocked addresses</a>
+    </div>
+    {{end}}
+  </section>
+  {{end}}
+
   <section class="panel">
     <h2>Incidents</h2>
     {{if .Rows}}{{template "secinctable" .Rows}}{{else}}<p class="muted">No incidents for this {{.Noun}}.</p>{{end}}

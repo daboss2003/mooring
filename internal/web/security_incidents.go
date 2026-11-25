@@ -354,6 +354,9 @@ type incDetailView struct {
 	AssignOpts          []sevOption
 	Mutes               []muteRow // the mutes it made that are still in force
 	ReopenUnmutes       bool      // Reopen is offered and would remove Mutes
+	RespOn              bool      // automated response is running: its responses about it are listed
+	Responses           []respRow
+	RespErr             string
 	MaxNote             int
 	Notice, Err         string
 	// A rejected change comes back with what was typed: the state form's note and mute box, the
@@ -398,7 +401,7 @@ type timelineRow struct {
 
 var timelineKinds = map[string]bool{
 	siem.TimelineOpened: true, siem.TimelineDetection: true, siem.TimelineEscalated: true, siem.TimelineState: true,
-	siem.TimelineAssigned: true, siem.TimelineNote: true, siem.TimelineMuted: true,
+	siem.TimelineAssigned: true, siem.TimelineNote: true, siem.TimelineMuted: true, siem.TimelineResponse: true,
 }
 
 func timelineRowOf(ev siem.IncidentEvent, now time.Time) timelineRow {
@@ -488,7 +491,30 @@ func (s *Server) handleSecIncident(w http.ResponseWriter, r *http.Request) {
 		s.renderInc(w, r, http.StatusNotFound, incDetailTmpl, "Incident", &incPage{Missing: "Incident not found."})
 		return
 	}
-	s.showIncident(w, r, http.StatusOK, id, incDoneText[r.URL.Query().Get("done")], "", nil)
+	q := r.URL.Query()
+	notice := incDoneText[q.Get("done")]
+	if notice != "" && strings.HasPrefix(q.Get("done"), "false_positive") {
+		notice += liftNotice(q)
+	}
+	s.showIncident(w, r, http.StatusOK, id, notice, "", nil)
+}
+
+// liftNotice is the false-positive notice's sentence about the incident's automatic blocks
+// (?lifted=<n> or ?lift=failed), "" for none.
+func liftNotice(q url.Values) string {
+	if q.Get("lift") == "failed" {
+		return " Its automatic blocks could not be lifted: Mooring's log has the details. Remove them on the Blocks page."
+	}
+	// Intentional: the count comes from the link (a crafted one can show another number); it is
+	// digits only, and the Blocks page has the list as it is.
+	n, err := strconv.Atoi(q.Get("lifted"))
+	switch {
+	case err != nil || n <= 0 || n > 1_000_000:
+		return ""
+	case n == 1:
+		return " 1 automatic block was lifted; its address is exempt from automatic blocks for 30 days."
+	}
+	return " " + groupDigits(n) + " automatic blocks were lifted; their addresses are exempt from automatic blocks for 30 days."
 }
 
 // showIncident renders incident id with a notice, or with a rejected change's message and status
@@ -508,6 +534,8 @@ func (s *Server) showIncident(w http.ResponseWriter, r *http.Request, status int
 	}
 	v := incDetailOf(&in, s.incidentOwners(), time.Now().UTC())
 	v.Notice, v.Err = notice, errMsg
+	v.RespOn = s.responses != nil
+	v.Responses, v.RespErr = s.incidentResponses(ctx, id)
 	if keep != nil {
 		keep(v)
 	}
@@ -561,8 +589,9 @@ func (s *Server) serviceError(err error, what, logMsg string, args ...any) (stat
 }
 
 // incChangeDone finishes a change the service was asked for: on err, the incident page with the
-// message (and what was typed); else the audit row and the redirect back with the notice.
-func (s *Server) incChangeDone(w http.ResponseWriter, r *http.Request, action string, id int64, detail string, err error, done string, keep func(*incDetailView)) {
+// message (and what was typed); else the audit row and the redirect back with the notice (and
+// extra, when set).
+func (s *Server) incChangeDone(w http.ResponseWriter, r *http.Request, action string, id int64, detail string, err error, done string, keep func(*incDetailView), extra url.Values) {
 	if err != nil {
 		status, msg, result := s.serviceError(err, "The change was not saved", "security incidents: "+action, "id", id)
 		s.detectAudit(r, action, incTarget(id), audit.Error, strings.TrimSpace(detail+" result="+result))
@@ -570,7 +599,11 @@ func (s *Server) incChangeDone(w http.ResponseWriter, r *http.Request, action st
 		return
 	}
 	s.detectAudit(r, action, incTarget(id), audit.OK, detail)
-	http.Redirect(w, r, withQuery("/security/incidents/"+strconv.FormatInt(id, 10), url.Values{"done": {done}}), http.StatusSeeOther)
+	q := url.Values{"done": {done}}
+	for k, v := range extra {
+		q[k] = v
+	}
+	http.Redirect(w, r, withQuery("/security/incidents/"+strconv.FormatInt(id, 10), q), http.StatusSeeOther)
 }
 
 // incReject answers a change refused before the service is asked (the input), with the message.
@@ -632,7 +665,7 @@ func (s *Server) handleSecIncidentState(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), detectTimeout)
 	defer cancel()
 	err := s.incidentSvc.SetState(ctx, id, state, sessionUser(r), note)
-	s.incChangeDone(w, r, action, id, "state="+state+" note="+yesNo(note != ""), err, done, keep)
+	s.incChangeDone(w, r, action, id, "state="+state+" note="+yesNo(note != ""), err, done, keep, nil)
 }
 
 // handleSecIncidentFalsePositive marks an incident a false positive, optionally muting its rules for
@@ -658,7 +691,23 @@ func (s *Server) handleSecIncidentFalsePositive(w http.ResponseWriter, r *http.R
 	if mute {
 		done = "false_positive_muted"
 	}
-	s.incChangeDone(w, r, action, id, "mute="+yesNo(mute)+" note="+yesNo(note != ""), err, done, keep)
+	detail := "mute=" + yesNo(mute) + " note=" + yesNo(note != "")
+	var extra url.Values
+	if err == nil && s.responses != nil {
+		// The incident's automatic blocks go too. Intentional: a failure here is logged and told, and
+		// never undoes or refuses the false-positive marking.
+		lctx, lcancel := context.WithTimeout(context.WithoutCancel(r.Context()), detectTimeout)
+		n, lerr := s.responses.LiftForIncident(lctx, id, sessionUser(r))
+		lcancel()
+		switch {
+		case lerr != nil:
+			s.log.Warn("security incidents: lifting the false positive's blocks failed", "id", id, "err", lerr)
+			detail, extra = detail+" lift=error", url.Values{"lift": {"failed"}}
+		case n > 0:
+			detail, extra = detail+" lifted="+strconv.Itoa(n), url.Values{"lifted": {strconv.Itoa(n)}}
+		}
+	}
+	s.incChangeDone(w, r, action, id, detail, err, done, keep, extra)
 }
 
 // handleSecIncidentAssign assigns an incident to an owner, or unassigns it
@@ -682,7 +731,7 @@ func (s *Server) handleSecIncidentAssign(w http.ResponseWriter, r *http.Request)
 	if assignee == "" {
 		detail, done = "assignee=none", "unassigned"
 	}
-	s.incChangeDone(w, r, action, id, detail, err, done, nil)
+	s.incChangeDone(w, r, action, id, detail, err, done, nil, nil)
 }
 
 // handleSecIncidentNote adds a note to an incident's timeline (POST /security/incidents/{id}/note).
@@ -703,5 +752,5 @@ func (s *Server) handleSecIncidentNote(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), detectTimeout)
 	defer cancel()
 	err := s.incidentSvc.AddNote(ctx, id, sessionUser(r), note)
-	s.incChangeDone(w, r, action, id, "", err, "note", keep)
+	s.incChangeDone(w, r, action, id, "", err, "note", keep, nil)
 }

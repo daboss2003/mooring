@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -37,6 +38,7 @@ type ruleRow struct {
 	MITRE                 []mitreLink
 	Enabled               bool
 	Condition             string
+	Response              string // the rule's automated response, in words ("" for none)
 	Snoozed               bool
 	SnoozedUntil          string
 	SnoozedISO, SnoozedIn string
@@ -230,7 +232,7 @@ func ruleRowOf(r siem.Rule, now time.Time) ruleRow {
 	row := ruleRow{
 		ID: r.ID, Name: r.Name, Description: r.Description, TypeLabel: ruleTypeLabel(r.Type),
 		Sev: string(r.Severity), SevClass: sevClass(r.Severity), MITRE: mitreLinks(r.MITRE), Enabled: r.Enabled,
-		Condition: ruleCondition(r), Builtin: r.Builtin,
+		Condition: ruleCondition(r), Response: ruleResponseText(r.Response), Builtin: r.Builtin,
 		EditURL: withQuery("/security/rules/edit", url.Values{"id": {r.ID}}),
 	}
 	if r.Type == siem.RuleBaseline {
@@ -388,6 +390,120 @@ type ruleFormView struct {
 	Severities   []sevOption
 	Kinds        map[string]string // type-specific field → the types that use it
 	Show         map[string]bool   // type-specific field → shown (and enabled) as rendered
+	// The automated response: shown when the rule may take one (RespActions beyond "None"), else
+	// RespWhy says why it may take none. Response and RespDuration are as typed.
+	RespShown     bool
+	RespAfterSave bool // a new rule: a response can be set once it is saved
+	RespWhy       string
+	RespActions   []sevOption
+	RespDurations []sevOption
+	Response      string
+	RespDuration  string
+	respPosted    bool // the form sent the response fields
+}
+
+// ruleResponseLabels are the response actions as the rule form offers them.
+var ruleResponseLabels = map[string]string{
+	siem.ResponseBlock:  "Block the address at the edge",
+	siem.ResponseRevoke: "Sign the Mooring account out of every session",
+}
+
+// ruleBlockLengths are the first-block lengths the rule form offers (values as fmtRuleDuration
+// writes them).
+var ruleBlockLengths = []blockDuration{
+	{"1h", "1 hour", time.Hour}, {"4h", "4 hours", 4 * time.Hour},
+	{"1d", "24 hours", 24 * time.Hour}, {"7d", "7 days", 7 * 24 * time.Hour},
+}
+
+// ruleResponseText is a rule's response in words, for the rules list ("" for none).
+func ruleResponseText(rr siem.RuleResponse) string {
+	switch rr.Action {
+	case "":
+		return ""
+	case siem.ResponseBlock:
+		if d := durText(rr.Duration); d != "" {
+			return "block the address for " + d
+		}
+		return "block the address"
+	case siem.ResponseRevoke:
+		return "sign the account out"
+	}
+	return rr.Action
+}
+
+// ruleResponseForm fills the form's Response section from what the detection service says rule
+// may do (siem.RuleResponder): the actions it may take, or why it may take none. stored, the action
+// the rule has now, stays offered, so a save never drops it unasked.
+func (s *Server) ruleResponseForm(f *ruleFormView, rule siem.Rule, stored string) {
+	rr, ok := s.detections.(siem.RuleResponder)
+	if !ok {
+		return
+	}
+	if f.New {
+		// Intentional: a new rule's form offers no response. Which responses a rule may take depends
+		// on its saved search and type; the form says a response can be set after the rule is saved.
+		f.RespAfterSave = true
+		return
+	}
+	actions, why := rr.RuleResponses(rule)
+	f.RespWhy = why
+	f.RespActions = []sevOption{{Value: "", Label: "None", Selected: f.Response == ""}}
+	offer := func(a, suffix string) {
+		label := ruleResponseLabels[a]
+		if label == "" || slices.ContainsFunc(f.RespActions, func(o sevOption) bool { return o.Value == a }) {
+			return
+		}
+		f.RespActions = append(f.RespActions, sevOption{Value: a, Label: label + suffix, Selected: a == f.Response})
+	}
+	for _, a := range actions {
+		offer(a, "")
+	}
+	if stored != "" {
+		offer(stored, " (not available for this rule)")
+	}
+	f.RespShown = len(f.RespActions) > 1
+	cur := f.RespDuration
+	if cur == "" {
+		cur = "1h"
+	}
+	d, err := parseRuleDuration(cur)
+	f.RespDurations = nil
+	found := false
+	for _, l := range ruleBlockLengths {
+		sel := err == nil && d == l.d
+		found = found || sel
+		f.RespDurations = append(f.RespDurations, sevOption{Value: l.Value, Label: l.Label, Selected: sel})
+	}
+	if !found {
+		// A length set before (or typed) that isn't one of the offered ones stays as it is.
+		f.RespDurations = append([]sevOption{{Value: cur, Label: cur, Selected: true}}, f.RespDurations...)
+	}
+}
+
+// ruleResponseFromForm sets rule's response from the form. A response the form didn't send is
+// kept as cur has it. A non-empty message is a problem with the input.
+func ruleResponseFromForm(f *ruleFormView, rule *siem.Rule, cur *siem.Rule) string {
+	if !f.respPosted {
+		if cur != nil {
+			rule.Response = cur.Response
+		}
+		return ""
+	}
+	switch {
+	case f.Response == "":
+		rule.Response = siem.RuleResponse{}
+	case !slices.ContainsFunc(f.RespActions, func(o sevOption) bool { return o.Value == f.Response }):
+		return "Pick a response this rule can take."
+	case f.Response == siem.ResponseBlock:
+		d, err := parseRuleDuration(f.RespDuration)
+		if err != nil || d <= 0 {
+			return "Block length must be a duration such as 1h, 24h or 7d."
+		}
+		rule.Response = siem.RuleResponse{Action: siem.ResponseBlock, Duration: d}
+	default:
+		rule.Response = siem.RuleResponse{Action: f.Response}
+	}
+	return ""
 }
 
 func ruleSeverityOptions(cur string) []sevOption {
@@ -440,7 +556,7 @@ func ruleFormOf(r siem.Rule, now time.Time) *ruleFormView {
 		Builtin: r.Builtin, ID: r.ID, Name: r.Name, Description: r.Description, Type: r.Type, Severity: string(r.Severity),
 		MITRE: strings.Join(r.MITRE, ", "), MITRELinks: mitreLinks(r.MITRE), Query: r.Query, Then: r.Then, GroupBy: r.GroupBy, Field: r.Field,
 		Window: fmtRuleDuration(r.Window), Factor: fmtNum(r.Factor), Learn: fmtRuleDuration(r.Learn), Speed: fmtNum(r.SpeedKMH),
-		Enabled: r.Enabled,
+		Enabled: r.Enabled, Response: r.Response.Action, RespDuration: fmtRuleDuration(r.Response.Duration),
 	}
 	if r.Count != 0 {
 		f.Count = strconv.Itoa(r.Count)
@@ -463,6 +579,7 @@ func (s *Server) handleSecurityRuleEdit(w http.ResponseWriter, r *http.Request) 
 	if r.URL.Path == "/security/rules/new" {
 		f := &ruleFormView{New: true, Type: siem.RuleThreshold, Severity: string(siem.SevMedium), Enabled: true}
 		f.finish(nil)
+		s.ruleResponseForm(f, siem.Rule{Type: f.Type, Severity: siem.SevMedium, Enabled: true}, "")
 		s.renderDetect(w, r, http.StatusOK, page, "New custom rule", &detectPage{Edit: f})
 		return
 	}
@@ -479,7 +596,9 @@ func (s *Server) handleSecurityRuleEdit(w http.ResponseWriter, r *http.Request) 
 		s.renderDetect(w, r, http.StatusNotFound, page, "Edit rule", &detectPage{Missing: "Rule not found."})
 		return
 	}
-	s.renderDetect(w, r, http.StatusOK, page, "Edit "+cur.Name, &detectPage{Edit: ruleFormOf(*cur, time.Now().UTC())})
+	f := ruleFormOf(*cur, time.Now().UTC())
+	s.ruleResponseForm(f, *cur, cur.Response.Action)
+	s.renderDetect(w, r, http.StatusOK, page, "Edit "+cur.Name, &detectPage{Edit: f})
 }
 
 // ruleFormFromPost is the submitted form, as typed, for a new rule (cur nil) or cur.
@@ -504,6 +623,12 @@ func ruleFormFromPost(r *http.Request, cur *siem.Rule, now time.Time) *ruleFormV
 		}
 	}
 	f.Severity, f.Enabled = v("severity"), r.PostFormValue("enabled") != ""
+	switch {
+	case r.PostForm.Has("response"):
+		f.respPosted, f.Response, f.RespDuration = true, v("response"), v("response_duration")
+	case cur != nil:
+		f.Response, f.RespDuration = cur.Response.Action, fmtRuleDuration(cur.Response.Duration)
+	}
 	for field, dst := range map[string]*string{"count": &f.Count, "window": &f.Window, "factor": &f.Factor, "learn": &f.Learn, "speed_kmh": &f.Speed} {
 		if r.PostForm.Has(field) {
 			*dst = v(field)
@@ -643,6 +768,15 @@ func (s *Server) handleSecurityRuleSave(w http.ResponseWriter, r *http.Request) 
 	}
 	f := ruleFormFromPost(r, cur, now)
 	rule, msg := ruleFromForm(f, cur)
+	// The response offered is the one the rule may take as it will be saved.
+	stored := ""
+	if cur != nil {
+		stored = cur.Response.Action
+	}
+	s.ruleResponseForm(f, rule, stored)
+	if msg == "" {
+		msg = ruleResponseFromForm(f, &rule, cur)
+	}
 	detail := ruleKind(rule.Builtin)
 	if cur == nil {
 		detail += " new=true"

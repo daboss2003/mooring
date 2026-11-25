@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"github.com/daboss2003/mooring/internal/alertengine"
 	"github.com/daboss2003/mooring/internal/alertstore"
 	"github.com/daboss2003/mooring/internal/apitoken"
+	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/backupsched"
 	"github.com/daboss2003/mooring/internal/backupstore"
 	"github.com/daboss2003/mooring/internal/cfgstore"
@@ -57,6 +59,7 @@ import (
 	"github.com/daboss2003/mooring/internal/selfheal"
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/setupstore"
+	"github.com/daboss2003/mooring/internal/siem"
 	"github.com/daboss2003/mooring/internal/socketproxy"
 	"github.com/daboss2003/mooring/internal/startgate"
 	"github.com/daboss2003/mooring/internal/store"
@@ -285,8 +288,24 @@ func cmdServe(args []string) error {
 	// audit events and the host's auth logs, redacted, kept on this host and archived to S3. Started
 	// before the edge and the web server, which feed it. Its deferred close runs at return, after the
 	// body's stop() + wg.Wait(), so it drains after every source has stopped (and before db.Close).
-	secLogs := openSecurityLogs(ctx, cfg, alertStore, db, log)
+	// The edge block list and automated response (docs/security-responses.md) are opened first: the
+	// detection engine gets the responder, and their closes run after the security logs' (defers run
+	// last-in first-out), so the engine's last requests are still taken at shutdown. What they need
+	// from things created later (the pipeline, the dashboard, the edge's 0-RTT refusal) is late-bound.
+	late := &lateBound{}
+	blocker := openBlocker(ctx, cfg, db, alertStore, late, log)
+	if blocker != nil {
+		defer blocker.Close()
+	}
+	respondAudit := audit.New(db, log)
+	responder := openResponder(ctx, cfg, db, alertStore, blockService(blocker), respondAudit, late, log)
+	if responder != nil {
+		defer responder.Close()
+	}
+	secLogs := openSecurityLogs(ctx, cfg, alertStore, db, log, withResponder(cfg, responder)...)
 	defer secLogs.close()
+	late.secLogs.Store(secLogs)
+	respondAudit.SetSink(secLogs.auditSink())
 	secLogs.followCLIAudit(db, log)
 	// Mutes and sign-in baselines of apps deleted while detection was off are removed once the app
 	// list reads (the container list waits for the socket-proxy); with an unreadable list nothing is
@@ -615,10 +634,7 @@ func cmdServe(args []string) error {
 		// that account. The edge runs only the system caddy, and a plugin it lacks is reported as
 		// unavailable (deploy gate, catch-all alert, Edge page) instead of being installed.
 		asRoot := os.Geteuid() == 0
-		ownedDir := cfg.DataDir
-		if asRoot {
-			ownedDir = "" // ResolveCaddy("") never picks the owned build
-		}
+		ownedDir := ownedCaddyDir(cfg) // "" as root: ResolveCaddy("") never picks the owned build
 		// Builds installed before the host scan existed are 0700; the scanner (root with no capabilities)
 		// can only read a world-readable file. data_dir/bin stay 0700, so no other account reaches it.
 		if err := edge.EnsureOwnedCaddyReadable(ownedDir); err != nil {
@@ -662,8 +678,35 @@ func cmdServe(args []string) error {
 				"providers", strings.Join(missing, ","), "path", edge.OwnedCaddyPath(cfg.DataDir))
 		}
 		if ok {
+			// Automated response refuses QUIC 0-RTT at the edge, so an address can't be spoofed in early
+			// data to get someone else blocked. Only a Caddy ≥ 2.11 takes the setting (an older one refuses
+			// the whole config), and it is read when the QUIC listener opens: fixed here, at boot.
+			if cfg.SecurityResponseMode() != siem.ResponseModeOff {
+				v, verr := edge.CaddyVersion(ctx, caddyBin())
+				switch {
+				case verr == nil && v.AtLeast(edge.MinCaddyVersion):
+					base.Refuse0RTT = true
+				case verr != nil:
+					why := "the running Caddy's version couldn't be read: " + verr.Error()
+					late.why0RTT.Store(&why)
+				default:
+					why := "the running Caddy is " + v.String() + ", older than " + edge.MinCaddyVersion.String() + "; run sudo mooring setup to upgrade it"
+					late.why0RTT.Store(&why)
+				}
+				if !base.Refuse0RTT {
+					log.Warn("automated response: automatic blocks are refused until the edge can refuse QUIC 0-RTT", "why", *late.why0RTT.Load())
+				}
+			}
+			// Trusted proxies refuse 0-RTT too (the edge needs Caddy ≥ 2.11 for them anyway).
+			late.set0RTT(base.Refuse0RTT || len(cfg.Edge.TrustedProxies) > 0, cfg.SecurityResponseMode())
 			admin := edge.NewAdmin(base.AdminListen)
 			edgeRecon = edge.NewReconciler(edgeRoutes, admin, base, log)
+			if blocker != nil {
+				edgeRecon.SetBlocklist(blocker.Snapshot)
+				edgeRecon.SetBlockDrop(func(p netip.Prefix, why string) {
+					log.Warn("edge: a blocked address isn't rendered (it is protected)", "prefix", p.String(), "why", why)
+				})
+			}
 			// cert_bindings: the edge issues a cert-only ACME subject per hostname, from
 			// the binding's chosen CA (default issuer when unset).
 			edgeRecon.SetCertHosts(func() []edge.CertHost {
@@ -840,7 +883,11 @@ func cmdServe(args []string) error {
 				errAlerts = alertStore
 			}
 			errColl := edgeerr.NewCollector(edgeErrStore, edgeIdx, errAlerts)
-			sup.AccessLine = edgeAccessLine(secLogs.edgeLine, metricsColl, errColl, cfg.Server.RouteErrorLogOn())
+			var blocked func(netip.Addr) bool
+			if blocker != nil {
+				blocked = blocker.Blocked
+			}
+			sup.AccessLine = edgeAccessLine(secLogs.edgeLine, metricsColl, errColl, cfg.Server.RouteErrorLogOn(), blocked)
 			// Turn Caddy's access log on/off per reconcile: on when any enabled policy uses a
 			// source:edge metric, the route error log is enabled (default) or security logs are
 			// collecting. Enabling either of the first two takes effect on the next cycle without a
@@ -882,12 +929,17 @@ func cmdServe(args []string) error {
 	} else {
 		edgeReason = "external edge mode — Mooring does not own the edge"
 	}
+	if edgeReason != "" {
+		late.noEdge(edgeReason) // why automatic blocks are refused
+	}
 
 	// Managed L4 (TCP/UDP) load balancer (opt-in via edge.l4_enabled): a supervised
 	// child nginx-stream fronting fixed public ports (DNS/DoT/MQTTS) for internal
 	// replica pools. Off by default; fail-closed if the host can't own it.
 	var l4Routes *l4.RouteStore
 	var l4Reconcile func(context.Context) error
+	var l4DenyErr func() string
+	l4Unavailable := ""
 	if cfg.Edge.Mode == config.EdgeManaged && cfg.Edge.L4Enabled {
 		if ok, why := l4.Available(); ok {
 			l4Routes = l4.NewRouteStore(db)
@@ -946,6 +998,10 @@ func cmdServe(args []string) error {
 				l4mu.Unlock()
 				return sup.Reconcile(c, rs)
 			}
+			if blocker != nil {
+				sup.SetDeny(blocker.L4Snapshot) // empty unless security_logs.blocking.l4
+				l4DenyErr = sup.DenyErr
+			}
 			if rerr := l4Reconcile(ctx); rerr != nil { // write the initial config from the store
 				log.Warn("l4: initial reconcile failed", "err", rerr)
 			}
@@ -962,7 +1018,16 @@ func cmdServe(args []string) error {
 			})
 			log.Info("managed L4 LB started")
 		} else {
+			l4Unavailable = why
 			log.Warn("managed L4 LB not owned on this host", "reason", why)
+		}
+	}
+	if blocker != nil {
+		// The Blocks page says L4 listeners are filtered only when an L4 load balancer takes the list.
+		on, why := l4BlockState(cfg, l4Reconcile != nil, l4Unavailable)
+		blocker.SetL4(on, why)
+		if cfg.SecurityLogs.Blocking.L4 && !on {
+			log.Warn("edge block list: security_logs.blocking.l4 is on, but no L4 load balancer takes the list", "why", why)
 		}
 	}
 
@@ -1018,11 +1083,28 @@ func cmdServe(args []string) error {
 		Detections:        secLogs.detections(),
 		DetectionReporter: secLogs.detectionReporter(),
 		Incidents:         secLogs.incidents(),
+		Patterns:          secLogs.patterns(),
+		Responses:         responseService(responder),
+		Blocks:            blockService(blocker),
 		Feeds:             secLogs.feedStatus(),
 		AuditSink:         secLogs.auditSink(),
 	})
 	if err != nil {
 		return err
+	}
+	// The block list and the responder start once the dashboard is up: the never-block set reads its
+	// live allowlist, API tokens' CIDRs and sessions, and revokes go through its sessions.
+	late.web.Store(srv)
+	if blocker != nil {
+		blocker.SetApply(blockApply(edgeRecon, l4Reconcile, l4DenyErr))
+		wg.Add(1)
+		go func() { defer wg.Done(); blocker.Run(ctx) }()
+	}
+	if responder != nil {
+		responder.SetRevoker(srv.AccountRevoker())
+		// Intentional: not stopped by ctx but by its deferred Close, after the security logs closed, so
+		// the requests of the detection engine's last flush are still handled.
+		go responder.Run(context.WithoutCancel(ctx))
 	}
 	busy := srv.ForegroundBusy
 	foregroundBusy.Store(&busy)
@@ -1497,12 +1579,19 @@ func removeStaleLogCursors(dataDir string, capturing bool) {
 // it never blocks), then the parsed record to the autoscaling metrics and, when routeErrors, the
 // route error log. The access log can be on for security logs alone, so route_error_log_enabled:
 // false must still mean no route error log.
-func edgeAccessLine(security func([]byte), metrics *edgemetrics.Collector, errs *edgeerr.Collector, routeErrors bool) func([]byte) {
+func edgeAccessLine(security func([]byte), metrics *edgemetrics.Collector, errs *edgeerr.Collector, routeErrors bool, blocked func(netip.Addr) bool) func([]byte) {
 	return func(line []byte) {
 		security(line)
 		rec, ok := edgemetrics.ParseAccessFull(line)
 		if !ok {
 			return
+		}
+		// A blocked address's requests (answered 403 by the edge's block route) are no traffic of the
+		// app's: they must not scale it up or fill its route error log. The security logs keep them.
+		if blocked != nil && rec.Status == 403 {
+			if a, perr := netip.ParseAddr(rec.ClientIP); perr == nil && blocked(a.Unmap()) {
+				return
+			}
 		}
 		metrics.IngestRecord(rec)
 		if routeErrors {

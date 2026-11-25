@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,7 +248,7 @@ func TestEdgeAccessLineHonoursRouteErrorLogOff(t *testing.T) {
 		errStore := edgeerr.New(filepath.Join(t.TempDir(), "edge-errors.jsonl"))
 		var sec int
 		h := edgeAccessLine(func([]byte) { sec++ }, edgemetrics.NewCollector(edgemetrics.New(30*time.Second), idx),
-			edgeerr.NewCollector(errStore, idx, nil), on)
+			edgeerr.NewCollector(errStore, idx, nil), on, nil)
 		h(line)
 		got := len(errStore.Errors("shop", "shop.example.com", "", "", 10))
 		if sec != 1 {
@@ -799,4 +801,36 @@ func TestPruneDeletedApps(t *testing.T) {
 	// Security logs off (s nil) or detection off: nothing to do, no panic.
 	var off *securityLogs
 	off.pruneDeletedApps(context.Background(), nil)
+}
+
+// The edge's answer to a blocked address (403 from the block route) is no traffic of the app's: it
+// neither feeds the route error log (nor autoscaling); the security logs still get it. A 403 to an
+// address not blocked, and a blocked address's other answers, count as before.
+func TestEdgeAccessLineSkipsBlockedRequests(t *testing.T) {
+	line := func(client string, status int) []byte {
+		return []byte(fmt.Sprintf(`{"level":"info","ts":1795430081.1,"logger":"http.log.access.mooring_access","msg":"handled request","request":{"remote_ip":"172.18.0.1","client_ip":%q,"method":"GET","host":"shop.example.com","uri":"/x"},"status":%d,"duration":0.01}`, client, status))
+	}
+	blocked := netip.MustParseAddr("203.0.113.9")
+	for _, tc := range []struct {
+		client string
+		status int
+		logged bool
+	}{
+		{"203.0.113.9", 403, false},
+		{"::ffff:203.0.113.9", 403, false},
+		{"203.0.113.10", 403, true},
+		{"203.0.113.9", 404, true},
+	} {
+		idx := edgemetrics.NewHostIndex()
+		idx.Set([]edgemetrics.Route{{Host: "shop.example.com", Key: edgemetrics.Key{App: "shop", Service: "web"}}})
+		errStore := edgeerr.New(filepath.Join(t.TempDir(), "edge-errors.jsonl"))
+		var sec int
+		h := edgeAccessLine(func([]byte) { sec++ }, edgemetrics.NewCollector(edgemetrics.New(30*time.Second), idx),
+			edgeerr.NewCollector(errStore, idx, nil), true, func(a netip.Addr) bool { return a == blocked })
+		h(line(tc.client, tc.status))
+		got := len(errStore.Errors("shop", "shop.example.com", "", "", 10)) > 0
+		if got != tc.logged || sec != 1 {
+			t.Errorf("%s %d: route error logged %v (want %v), security lines %d (want 1)", tc.client, tc.status, got, tc.logged, sec)
+		}
+	}
 }

@@ -278,6 +278,14 @@ func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) 
 	}); ok {
 		add("security baselines", b.DeleteAppBaselines(ctx, slug))
 	}
+	// The app's log patterns (its services' learned templates). Intentional: asked of the incident
+	// service (the engine), not s.patterns, which is nil while patterns are switched off: what was
+	// learned before must still go with the app.
+	if p, ok := s.incidentSvc.(interface {
+		DeleteAppPatterns(ctx context.Context, slug string) error
+	}); ok {
+		add("security log patterns", p.DeleteAppPatterns(ctx, slug))
+	}
 
 	// Identity rows LAST: while either of these survives, appExists() still finds the
 	// app, so an interrupted teardown can be retried to completion.

@@ -70,6 +70,80 @@ func (c *Config) validateSecurityLogs(add func(string, ...any)) {
 	if c := s.Feeds.DShieldContact; c != "" && !validSecurityContact(c) {
 		add("security_logs.feeds.dshield_contact: %q is not an email address (\"\" turns the DShield list off)", c)
 	}
+	switch s.Response.Mode {
+	case "", "off", "recommend", "enforce":
+	default:
+		add("security_logs.response.mode: %q: use off, recommend or enforce", s.Response.Mode)
+	}
+	if n := len(s.Blocking.NeverBlock); n > maxSecurityNeverBlock {
+		add("security_logs.blocking.never_block: at most %d entries, got %d", maxSecurityNeverBlock, n)
+	} else {
+		for _, e := range s.Blocking.NeverBlock {
+			if _, err := parsePrefix(e); err != nil {
+				add("security_logs.blocking.never_block: %q is not an IP address or CIDR", e)
+			}
+		}
+	}
+	if n := len(s.Detection.Patterns.ExcludeApps); n > maxSecurityPatternExcludeApps {
+		add("security_logs.detection.patterns.exclude_apps: at most %d apps, got %d", maxSecurityPatternExcludeApps, n)
+	} else {
+		for _, a := range s.Detection.Patterns.ExcludeApps {
+			if !securityAppSlugRe.MatchString(a) {
+				add("security_logs.detection.patterns.exclude_apps: %q is not an app slug", a)
+			}
+		}
+	}
+}
+
+// securityAppSlugRe is an app slug in security_logs lists.
+var securityAppSlugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// securityResponseWarnings are the load warnings of security_logs.detection.patterns,
+// security_logs.response and security_logs.blocking: values the accessors clamp, a response mode
+// that can't act, and an ip_allowlist that protects every address from automatic blocks.
+func securityResponseWarnings(c *Config) []string {
+	s := c.SecurityLogs
+	var w []string
+	clamped := func(key string, got, used int) {
+		if got != 0 && got != used {
+			w = append(w, fmt.Sprintf("security_logs.%s %d is out of range; using %d", key, got, used))
+		}
+	}
+	clampedDur := func(key string, got, used time.Duration) {
+		if got != 0 && got != used {
+			w = append(w, fmt.Sprintf("security_logs.%s %s is out of range; using %s", key, fmtSecurityDuration(got), fmtSecurityDuration(used)))
+		}
+	}
+	// The block list applies whether or not security logs are on.
+	clamped("blocking.max_entries", s.Blocking.MaxEntries, s.Blocking.MaxEntriesOrDefault())
+	clampedDur("blocking.manual_max_duration", time.Duration(s.Blocking.ManualMaxDuration), s.Blocking.ManualMaxDurationOrDefault())
+	if s.Blocking.L4 && !c.Edge.L4Enabled {
+		w = append(w, "security_logs.blocking.l4 is on but edge.l4_enabled is off: L4 listeners are not filtered")
+	}
+	if !s.On() {
+		if m := s.Response.Mode; m == "recommend" || m == "enforce" {
+			w = append(w, fmt.Sprintf("security_logs.response.mode is %s but security logs are off: nothing is recommended or done", m))
+		}
+		return w
+	}
+	clamped("detection.patterns.max_cpu_percent", s.Detection.Patterns.MaxCPUPercent, s.Detection.Patterns.MaxCPUPercentOrDefault())
+	clamped("response.max_blocks_per_hour", s.Response.MaxBlocksPerHour, s.Response.MaxBlocksPerHourOrDefault())
+	clamped("response.max_revokes_per_hour", s.Response.MaxRevokesPerHour, s.Response.MaxRevokesPerHourOrDefault())
+	clampedDur("response.max_block_duration", time.Duration(s.Response.MaxBlockDuration), s.Response.MaxBlockDurationOrDefault())
+	mode := s.Response.Mode
+	if mode != "recommend" && mode != "enforce" {
+		return w
+	}
+	if !c.SecurityDetectionOn() {
+		return append(w, fmt.Sprintf("security_logs.response.mode is %s but detection is off: nothing is recommended or done", mode))
+	}
+	for _, e := range c.IPAllowlist {
+		if p, err := parsePrefix(e); err == nil && p.Bits() == 0 {
+			w = append(w, fmt.Sprintf("ip_allowlist contains %s: every address is protected, so no automatic block can be placed", p))
+			break
+		}
+	}
+	return w
 }
 
 // validSecurityContact reports whether c is usable as feeds.dshield_contact.

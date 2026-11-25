@@ -919,7 +919,7 @@ func checkBinary(bin, what, fix string) result {
 const ownedCaddyMaxAge = 180 * 24 * time.Hour
 
 // caddyMinSettings names the settings that need edge.MinCaddyVersion (see caddyMinNeeds).
-const caddyMinSettings = "edge.trusted_proxies, dns01 and catch_all"
+const caddyMinSettings = "edge.trusted_proxies, dns01, catch_all and security_logs.response"
 
 // caddyMinNeeds lists the configured settings that need Caddy >= edge.MinCaddyVersion; empty when
 // none is set or cfg is nil.
@@ -940,6 +940,10 @@ func caddyMinNeeds(cfg *config.Config) []string {
 	}
 	if catchAll {
 		why = append(why, "catch_all")
+	}
+	// Automated response refuses QUIC 0-RTT at the edge (allow_0rtt), which needs Caddy 2.11.
+	if cfg.SecurityResponseMode() != "off" {
+		why = append(why, "security_logs.response")
 	}
 	return why
 }

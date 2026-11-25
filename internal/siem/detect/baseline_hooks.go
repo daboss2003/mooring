@@ -246,6 +246,8 @@ func validateBaseline(r *siem.Rule) error {
 		group = "ip"
 		err = errors.Join(count(minIPCount, maxCount), checkRange("the window", r.Window, minWindow, maxAnomalyWindow, showDur),
 			factor(), learn(hour, maxLearn))
+	case siem.BaselinePattern:
+		group, err = validatePatternRule(r) // pattern_hooks.go
 	default:
 		return invalid("unknown baseline %q", siem.Cut(r.Baseline, 32))
 	}

@@ -140,6 +140,7 @@ type entityView struct {
 	Mutes               []muteRow
 	SearchTerm          string
 	SearchURL           string
+	Block               *entityBlockView // an address's block (nil: the block list isn't available)
 	Notice, Err         string
 }
 
@@ -170,7 +171,11 @@ func muteRowOf(m siem.Mute, now time.Time) muteRow {
 }
 
 // entityDoneText are the fixed notices of the entity page's ?done=.
-var entityDoneText = map[string]string{"unmuted": "Mute removed."}
+var entityDoneText = map[string]string{
+	"unmuted":   "Mute removed.",
+	"blocked":   "Block placed. The edge takes the change within about a minute.",
+	"unblocked": "Block removed. Automatic blocks of this address are paused for 24 hours.",
+}
 
 const entityTmpl = "security_entity.html"
 
@@ -224,6 +229,7 @@ func (s *Server) showEntity(w http.ResponseWriter, r *http.Request, status int, 
 		v.Updated, v.UpdatedAgo = rs.Updated.UTC().Format("2006-01-02 15:04"), secAgo(now, rs.Updated)
 	}
 	v.SearchTerm, v.SearchURL = entitySearch(en)
+	v.Block = s.entityBlock(ctx, en)
 	for i := range incs {
 		v.Rows = append(v.Rows, incRowOf(&incs[i], owners, now))
 	}

@@ -13,7 +13,7 @@ var baselinePack = []packRule{
 	{siem.Rule{ID: "baseline.signin_unusual", Name: "Unusual sign-in",
 		Description: "A successful sign-in that departs from the account's usual pattern in at least two ways: a new place (a country or network (ASN) not seen for it), a new client, an hour of the day it rarely signs in at.",
 		Type:        siem.RuleBaseline, Baseline: siem.BaselineSignIn, Severity: siem.SevMedium, MITRE: []string{"T1078"},
-		Query: signinQuery, GroupBy: "actor", Count: 2, Learn: 14 * day},
+		Query: signinQuery, GroupBy: "actor", Count: 2, Learn: 14 * day, Response: signOut},
 		packInfo{noun: "sign-ins"}},
 	{siem.Rule{ID: "baseline.traffic_surge", Name: "Traffic surge",
 		Description: "Far more requests or server errors for a host name in an hour than in the same hour of the week in earlier weeks.",

@@ -16,6 +16,10 @@ import (
 // one of those kinds, at least Factor times that kind's usual share. The usual mix is counted over
 // the address's requests before the window; an address fires only once Learn has passed since its
 // first request and Count requests are in its usual mix.
+//
+// Each slot of the window also says whether a browser sent one of its requests, or a browser-like
+// agent (sentBy), so a firing knows that of every request it counted and its block follows the
+// same rules as the other counting rules' (responseFor).
 
 const (
 	ipSlots    = 5   // the window's slots (Window/ipSlots each)
@@ -37,6 +41,9 @@ type addrMix struct {
 type ipSlot struct {
 	idx                  int64
 	n, auth, admin, errs uint16
+	// browser, agent: a request of the slot came with browser fetch metadata, with a browser's agent
+	// and none (sentBy). Cleared with the slot's counts: only the window's requests say.
+	browser, agent bool
 }
 
 func (x *addrMix) foldSlot(s *ipSlot) {
@@ -99,6 +106,20 @@ func (x *addrMix) add(t int64, window time.Duration, auth, admin, isErr bool) (f
 	return folded
 }
 
+// mark records what sent the request add just counted at t (sentBy), in t's slot of the window.
+// A request add put into the usual mix at once (older than the window) is not one of the counted:
+// nothing is recorded for it. One a full slot couldn't count is recorded: erring toward no
+// automatic block.
+func (x *addrMix) mark(t int64, browser, agent bool) {
+	if x.slotW == 0 || (!browser && !agent) {
+		return
+	}
+	idx := t / x.slotW
+	if s := &x.win[((idx%ipSlots)+ipSlots)%ipSlots]; s.idx == idx && s.n > 0 {
+		s.browser, s.agent = s.browser || browser, s.agent || agent
+	}
+}
+
 func b16(v bool) uint16 {
 	if v {
 		return 1
@@ -106,9 +127,10 @@ func b16(v bool) uint16 {
 	return 0
 }
 
-// window sums the slots in the window ending at t. add has already folded the slots before it
-// (the lower bound is a guard).
-func (x *addrMix) window(t int64) (n, auth, admin, errs uint32) {
+// window sums the slots in the window ending at t, and reports whether a browser, or a browser-like
+// agent, sent one of the requests counted in them. add has already folded the slots before it (the
+// lower bound is a guard).
+func (x *addrMix) window(t int64) (n, auth, admin, errs uint32, browser, agent bool) {
 	if x.slotW == 0 {
 		return
 	}
@@ -116,6 +138,7 @@ func (x *addrMix) window(t int64) (n, auth, admin, errs uint32) {
 	for _, s := range x.win {
 		if s.n > 0 && s.idx > idx-ipSlots && s.idx <= idx {
 			n, auth, admin, errs = n+uint32(s.n), auth+uint32(s.auth), admin+uint32(s.admin), errs+uint32(s.errs)
+			browser, agent = browser || s.browser, agent || s.agent
 		}
 	}
 	return
@@ -180,6 +203,7 @@ func pct(p float64) string {
 func (b *baselines) ipEvent(e *Engine, c *compiled, key string, ev *siem.Event, add bool) {
 	t := ev.TS.UnixNano()
 	x := b.ip.get(key)
+	browser, agent := sentBy(ev)
 	if add {
 		if x == nil {
 			x = b.ip.add(key)
@@ -191,6 +215,7 @@ func (b *baselines) ipEvent(e *Engine, c *compiled, key string, ev *siem.Event, 
 		if x.v.add(t, c.r.Window, auth, admin, st >= 400) {
 			b.ip.touch(x)
 		}
+		x.v.mark(t, browser, agent)
 		if x.v.settled(t) {
 			b.ip.protect(x)
 		}
@@ -198,7 +223,7 @@ func (b *baselines) ipEvent(e *Engine, c *compiled, key string, ev *siem.Event, 
 	if x == nil || !x.v.learned(t, c.r.Learn, c.r.Count) {
 		return
 	}
-	n, auth, admin, errs := x.v.window(t)
+	n, auth, admin, errs, byBrowser, byAgent := x.v.window(t)
 	if n < uint32(c.r.Count) {
 		return
 	}
@@ -219,7 +244,10 @@ func (b *baselines) ipEvent(e *Engine, c *compiled, key string, ev *siem.Event, 
 	k := kinds[best]
 	reason := fmt.Sprintf("%d of %d requests in %s %s (usually %s)", k.k, n, fmtDur(c.r.Window), k.what,
 		pct(float64(k.usual)/float64(x.v.total)))
-	e.fire(c, key, ev, firing{count: int(n), evidence: []siem.Evidence{evidenceOf(ev)}, reasons: []string{reason}})
+	// What sent the requests counted (fire adds this event's own, which a rule that doesn't count it
+	// here still fires on).
+	e.fire(c, key, ev, firing{count: int(n), evidence: []siem.Evidence{evidenceOf(ev)}, reasons: []string{reason},
+		browser: byBrowser, agent: byAgent})
 	// The window it fired on becomes part of the usual mix: the next firing needs Count new requests.
 	x.v.foldAll()
 	b.ip.touch(x)
@@ -229,6 +257,9 @@ const ipVersion = 1
 
 // encode: the version, first, then the usual mix with the window's requests in it (a snapshot:
 // after a restart the window starts empty).
+// Intentional: what sent the window's requests (ipSlot.browser, agent) is not saved, as their
+// counts aren't kept as the window's either: the first firing after a restart needs Count new
+// requests, each recorded. Saving the window's counts would need its senders saved with them.
 func (x *addrMix) encode() []byte {
 	y := *x
 	y.foldAll()

@@ -407,7 +407,9 @@ func TestAlerts(t *testing.T) {
 	if got[0] != want {
 		t.Errorf("high alert %+v\nwant %+v", got[0], want)
 	}
-	if got[1].Level != alert.LevelCritical || got[1].DedupeKey != "siem:custom.crit:alice" {
+	// custom.crit's query pins no source, so alice's detections are kept apart per system: the
+	// alert's key says which (dedupeKey).
+	if got[1].Level != alert.LevelCritical || got[1].DedupeKey != "siem-acct:custom.crit:host|alice" {
 		t.Errorf("critical alert %+v", got[1])
 	}
 	if len(h.all(t)) != 4 {

@@ -291,17 +291,43 @@ type point struct {
 	place    string // "Lagos, NG"
 }
 
-// evidence keeps a key's most recent events for its next firing.
+// evidence keeps a key's most recent events for its next firing, and when it last counted an event
+// a browser sent (sentBy), so a firing knows that of every event behind it, not only of the few kept.
 type evidence struct {
 	e    [preEvidence]siem.Evidence
 	n    int
 	next int
+	// Unix ns of the end of the second of the newest counted event with browser fetch metadata, and
+	// of the newest one with a browser's agent (0: none since the last reset).
+	browserT, agentT int64
 }
 
 func (v *evidence) add(e *siem.Event) {
-	v.e[v.next] = evidenceOf(e)
+	x := evidenceOf(e)
+	v.e[v.next] = x
 	v.next = (v.next + 1) % preEvidence
 	v.n = min(v.n+1, preEvidence)
+	// Intentional: the last nanosecond of the event's second, not its own time. A key's window keeps
+	// one entry per second under the time of the first event counted in it (ring.add), so an event
+	// merged into that entry is counted until the entry leaves the window, which may be later than
+	// the event's own time. The end of the second is never before the entry's time.
+	const sec = int64(time.Second)
+	t := e.TS.UnixNano()
+	t += sec - 1 - (t%sec+sec)%sec
+	switch {
+	case x.Browser:
+		v.browserT = max(v.browserT, t)
+	case x.BrowserAgent:
+		v.agentT = max(v.agentT, t)
+	}
+}
+
+// sent reports whether an event counted after cut (unix ns, the start of the firing's window) was
+// sent by a browser, or came with a browser's agent.
+// Intentional: an event the key's window dropped early (a full ring) still counts here until it is
+// older than the window: erring toward no automatic block.
+func (v *evidence) sent(cut int64) (browser, agent bool) {
+	return v.browserT > cut, v.agentT > cut
 }
 
 func (v *evidence) list() []siem.Evidence {
@@ -317,8 +343,40 @@ func (v *evidence) reset() { *v = evidence{} }
 // evidenceOf copies what finds an event again; strings are cloned so a kept key never holds the
 // event's whole line in memory.
 func evidenceOf(e *siem.Event) siem.Evidence {
+	browser, agent := sentBy(e)
 	return siem.Evidence{TS: e.TS, Kind: strings.Clone(e.Kind), IP: strings.Clone(e.IP),
-		Actor: strings.Clone(e.Actor), App: strings.Clone(e.App)}
+		Actor: strings.Clone(e.Actor), App: strings.Clone(e.App), Browser: browser, BrowserAgent: agent}
+}
+
+// sentBy reports what sent an edge event's request (no other source's events say): browser when it
+// carried browser fetch metadata (Sec-Fetch-Site, parsed into f.fetch_site); else agent when its
+// User-Agent (f.ua) is a browser's ("Mozilla/…") or a mail client's (Office, Thunderbird), which
+// fetch what a page or an email tells them to.
+// Intentional: a User-Agent is whatever the client says, so agent only ever lowers a block to a
+// recommendation (responseFor): a scanner claiming to be a browser is shown, not hidden.
+func sentBy(e *siem.Event) (browser, agent bool) {
+	if e.Src != siem.SrcEdge {
+		return false, false
+	}
+	if v, _ := e.F["fetch_site"].(string); v != "" {
+		return true, false
+	}
+	ua, _ := e.F["ua"].(string)
+	if len(ua) >= len("Mozilla/") && strings.EqualFold(ua[:len("Mozilla/")], "Mozilla/") {
+		return false, true
+	}
+	return false, containsFold(ua, "ms-office") || containsFold(ua, "microsoft office") || containsFold(ua, "thunderbird")
+}
+
+// containsFold reports whether s contains sub (lower-case ASCII) in any ASCII case, without
+// allocating.
+func containsFold(s, sub string) bool {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if strings.EqualFold(s[i:i+len(sub)], sub) {
+			return true
+		}
+	}
+	return false
 }
 
 // keyState is one key's state in a rule; which part is used depends on the rule type.

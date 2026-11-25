@@ -1173,6 +1173,7 @@ func applyDefaults(c *Config) {
 		c.Setup.OutputCapKB = 256
 	}
 	c.LoadWarnings = append(c.LoadWarnings, securityLogsWarnings(c.SecurityLogs)...)
+	c.LoadWarnings = append(c.LoadWarnings, securityResponseWarnings(c)...)
 }
 
 // Load reads, parses, and fully validates the config at path. It is the only

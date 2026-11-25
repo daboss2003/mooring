@@ -524,7 +524,7 @@ func TestMigration0042OnExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`DROP TABLE security_mutes; DELETE FROM schema_meta WHERE version = 42;
+	if _, err := db.Exec(`DROP TABLE security_mutes; ` + dropAfter42 + ` DELETE FROM schema_meta WHERE version >= 42;
 		INSERT INTO security_rules(id, json, updated_at) VALUES ('custom.kept', '{}', 1)`); err != nil {
 		t.Fatal(err)
 	}

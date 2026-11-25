@@ -105,6 +105,9 @@ type caddyMatch struct {
 	Host     []string       `json:"host,omitempty"`
 	Path     []string       `json:"path,omitempty"`
 	RemoteIP *caddyRemoteIP `json:"remote_ip,omitempty"`
+	// ClientIP matches the client address Caddy derived through the server's trusted proxies (Caddy
+	// ≥ 2.7; the TCP peer when the peer isn't trusted). Same shape as remote_ip.
+	ClientIP *caddyRemoteIP `json:"client_ip,omitempty"`
 }
 
 type caddyRemoteIP struct {

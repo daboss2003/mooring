@@ -10,7 +10,7 @@ and change rules.
 
 Detection runs whenever security logs are on. It is **on by default**.
 
-See also: [Security logs](./security-logs.md) · [Alerts](./alerting.md) · [App Ops Interface alerts](./app-ops-interface.md#alerts)
+See also: [Security logs](./security-logs.md) · [Security incidents](./security-incidents.md) · [Log patterns](./security-patterns.md) · [Automated response](./security-responses.md) · [Alerts](./alerting.md) · [App Ops Interface alerts](./app-ops-interface.md#alerts)
 
 ---
 
@@ -45,7 +45,7 @@ address, per actor, …). An event without the group-by field is skipped.
 | `anomaly` | At least `count` matching events for one key within `window`, and more than `factor` times the key's usual count per `window`. The usual count is the key's average per hour over its last 7 days (before the current window), scaled to the window; a key without earlier events has a usual count of 0. The rule fires only once `learn` has passed since its first matching event. | `count` 1–100000, `window` 1m–24h, `factor` 1.5–1000, `learn` 0–30d |
 | `travel` | Two consecutive matching events of one key come from IP locations more than 500 km apart, at a speed above `speed_kmh` for the time between them. Events without a location are skipped. | `speed_kmh` 100–20000 |
 | `sequence` | At least `count` events matching the query, then one matching the closing query (`then`), for one key within `window`. A closing event starts the key's count again from zero, whether or not the rule fired. | `then`, `count` 1–1000, `window` 1m–7d |
-| `baseline` | Built-in rules only. Learns each key's usual behaviour and fires on a departure from it; see [Baselines](#baselines). | per rule, see [Baselines](#baselines) |
+| `baseline` | Built-in rules only. Learns each key's usual behaviour and fires on a departure from it; see [Baselines](#baselines) and, for the `pattern.*` rules, [Log patterns](#log-patterns). | per rule, see [Baselines](#baselines) and [Log patterns](./security-patterns.md#rules) |
 
 Group-by and field names: `ip`, `actor`, `app`, `kind`, `geo.cc`, `geo.asn`, `f.<name>` (a key of
 `f`), or empty for the whole rule (group-by only).
@@ -107,6 +107,10 @@ key starts again from zero.
 | `baseline.traffic_drop` | Far fewer requests for a host name in an hour than in the same hour of the week in earlier weeks: an outage, or traffic blocked before it reaches the server. | `baseline` | a fifth of usual or less, usual at least 200 requests, in an hour per `f.host`; learns 14d | medium | [T1489](https://attack.mitre.org/techniques/T1489/) |
 | `baseline.admin_unusual` | A server user's sudo or su with a program or target user not seen for them (root at an unusual hour is noted with it, never alone). | `baseline` | a new program or target user per `actor`; learns 14d | high | [T1548.003](https://attack.mitre.org/techniques/T1548/003/) |
 | `baseline.ip_behaviour` | Most of an address's recent requests go to sign-in endpoints or admin paths, or are answered with an error, far more than its usual share. | `baseline` | 50 requests in 10m, half or more of one kind and 5× its usual share, per `ip`; learns 1d | low | [T1110](https://attack.mitre.org/techniques/T1110/), [T1595](https://attack.mitre.org/techniques/T1595/) |
+| `pattern.new` | An app service's (or the host's) log lines below `warn` fall into a template not seen before, after its learning period. | `baseline` | 1 line, reported 5m after the first; learns 7d per app service | low | |
+| `pattern.new_error` | An app service's (or the host's) log lines at `warn` or above fall into a template not seen before, after its learning period. | `baseline` | 1 line, reported 5m after the first; learns 7d per app service | medium | |
+| `pattern.spike` | Far more lines of a known log template in a short time than usual at that time of day on the previous days. | `baseline` | 100 lines in 10m and 5× usual per template; the template is 3d old | medium | |
+| `pattern.churn` | An app service's (or the host's) logs make new templates faster than the limits allow. | `baseline` | 1 line past the limits per app service | medium | |
 
 All built-in rules are on by default. The `app.*` rules match the event names in
 [Security events from your app](./security-logs.md#security-events-from-your-app): `auth.login`,
@@ -182,6 +186,13 @@ The queries:
 | `baseline.traffic_drop` | `src:edge kind:http.request` |  |
 | `baseline.admin_unusual` | `src:host kind:su* out:success -f.sender_mismatch:true` |  |
 | `baseline.ip_behaviour` | `src:edge kind:http.request` |  |
+| `pattern.new` | `-src:edge -src:mooring` |  |
+| `pattern.new_error` | `-src:edge -src:mooring lvl>=warn` |  |
+| `pattern.spike` | `-src:edge -src:mooring` |  |
+| `pattern.churn` | `-src:edge -src:mooring` |  |
+
+The `pattern.*` rules are evaluated on the lines the log-pattern miner takes, not on their query
+(see [Log patterns](#log-patterns)); the query is what **Related events** searches.
 
 ## Baselines
 
@@ -363,12 +374,36 @@ account or server user with 3 events over a day or more, a host name with a coun
 address with 10 requests before its window, the first an hour ago or more. A dropped key learns
 again from the start.
 
+## Log patterns
+
+The `pattern.*` rules report on the templates that each app service's log lines, and the host's
+unclassified lines, fall into: a template first seen after its source's learning period
+(`pattern.new`, `pattern.new_error`), a spike of a known template (`pattern.spike`), and a source
+that makes new templates faster than the limits allow (`pattern.churn`). They are baseline rules of
+kind `pattern`. What is mined, the templates, the parameters and their ranges, the pattern states
+and the Patterns page are in [Log patterns](./security-patterns.md).
+
+A pattern detection's key is the pattern's ID (for `pattern.churn`, the source). Its summary holds
+no template text. Pattern detections join no incident, and with the default severities send no
+alert.
+
 ## Changing a built-in rule
 
 On a built-in rule's **Edit** page it can be switched off and on, and its severity, `count`,
 `window`, `factor`, `learn` and `speed_kmh` changed (within the ranges in [Rule types](#rule-types);
-for the baseline rules, in [Baselines](#baselines)).
+for the baseline rules, in [Baselines](#baselines); for the `pattern.*` rules, in
+[Log patterns](./security-patterns.md#rules)).
 Its query, type, group-by and field can't be changed. **Reset** puts it back to the defaults above.
+
+**Automated response** sets what [automated response](./security-responses.md) does about the
+rule's detections when `security_logs.response.mode` is `recommend` or `enforce`: nothing, block
+the detection's address at the edge for a length (5m–7d), or sign the Mooring account out of every
+session. The section offers only what the rule's query and group-by allow, and says why when they
+allow nothing. A block is automatic only when the rule's query lets through edge events only, and
+a sign-out needs a query that lets through Mooring's events only, and successful ones only. The
+default responses and the conditions are in
+[Which detections get a response](./security-responses.md#which-detections-get-a-response).
+**Reset** puts the default response back.
 
 **Snooze** (1 hour, 24 hours or 7 days; at most 30 days) keeps a rule's detections recorded but
 sends no alert for them until the snooze ends.
@@ -394,6 +429,7 @@ rule's type, query, closing query, group-by or field starts it again.
 | Group-by, field | `ip`, `actor`, `app`, `kind`, `geo.cc`, `geo.asn`, `f.<name>`; group-by may be empty. |
 | Severity | `low`, `medium`, `high` or `critical`. |
 | MITRE ATT&CK | Up to 8 technique IDs (`T1110`, `T1110.001`). |
+| Automated response | Set on the rule's **Edit** page after the rule is saved; the **New custom rule** form has no response setting. A block (group-by `ip`, a query that matches only `src:edge` or `src:app` events; automatic only with `src:edge` alone) or a sign-out (group-by `actor` or `ip`, a query that matches only Mooring's events, `src:mooring`, and only `out:success`; for a `sequence` rule both queries match only Mooring's events). See [Automated response](./security-responses.md#which-detections-get-a-response). |
 
 At most 100 custom rules. A rule that doesn't validate is refused with the reason.
 
@@ -407,6 +443,13 @@ A detection is one rule firing for one key. While the rule keeps firing for that
 detection is updated: a firing within the rule's `window` (or 1 hour, when that is longer) after the
 detection's last event adds its events to the count, moves its last time, and adds to its evidence
 (the 10 newest events behind it). A later firing starts a new detection.
+
+A rule whose query lets several sources through (for example Mooring's and the host's events)
+records one detection per source for the same account name: the Mooring user `alice`, the server
+user `alice` and an app's `alice` are different accounts (the
+[scope](./security-incidents.md#entities)). These detections have the same key. Each source's detection has its own alert (one per hour, see
+[Severities and alerts](#severities-and-alerts)); the rule's hourly alert cap covers them together. Detections keyed by an
+address are not split.
 
 A rule records at most 50 new detections per hour of the server clock. Past that, the hour's other
 keys are counted in one detection of the rule with key `*`, whose count is the number of those keys
@@ -449,7 +492,8 @@ A high or critical detection sends a `security_detection` alert to every enabled
   `<app>/<service>`.
 - The message is `<rule name>: <summary>`, at most 300 bytes. The dedupe key is
   `siem:<rule ID>:<key>`; for the rollup detection (key `*`, see [Detections](#detections)) it is
-  `siem-rollup:<rule ID>`.
+  `siem-rollup:<rule ID>`; for an account's detection of a rule that lets several sources through
+  it is `siem-acct:<rule ID>:<scope>|<key>`, and the one alert an hour is per rule, key and source.
 - At most one alert per rule and key per hour of the server clock, also when several detections of
   the key are made at once (a backlog of host log lines read after Mooring was stopped) and across
   a restart of Mooring. The alert is not resolved.
@@ -519,9 +563,15 @@ is recorded in Mooring's audit log.
 - **Detections** (`/security/detections`): detections, most recently seen first (by their last
   event), filtered by minimum severity, rule, app and the time of the last event. A detection's page shows its summary, key, location, MITRE ATT&CK techniques,
   first and last time, count and evidence; each evidence event links to the matching events on the
-  Security logs page, and **Related events** searches the rule's events for the detection's key
+  Security logs page. An evidence event of the edge is marked `browser` (the request had a
+  `Sec-Fetch-Site` header) or `browser-like agent` (a browser's or mail client's User-Agent):
+  see [Requests sent by a browser](./security-responses.md#requests-sent-by-a-browser).
+  **Related events** searches the rule's events for the detection's key
   (an address or /64, an account, a host name with or without a port; a roll-up or a rule without a
   group-by searches all the rule's events). The search used is shown on the Security logs page.
+  A log-pattern detection has **View the log pattern** instead (no link with
+  `detection.patterns.enabled: false`). The
+  [responses](./security-responses.md) about the detection, among the 200 newest, are listed.
 - **Rules** (`/security/rules`): every rule with whether it is on, its settings, **Edit** (switch it
   on or off and change its settings), **Snooze** (1 hour, 24 hours, 7 days) and **Reset** for
   built-in rules or **Delete** for custom ones, **New custom rule**, and the state of the enrichment
@@ -546,6 +596,8 @@ A report within an hour of the detection's last one updates it.
   a summary alert is sent or dropped, and when Mooring stops; after Mooring was killed, the counts are those
   of the last save. Counts saved in an earlier hour are not used, except a summary alert owed for
   the previous hour.
+- `detect.db` also holds the [log patterns](./security-patterns.md#storage): templates, their
+  states and counts, the states an owner set, and each scope's last line time.
 - `detect.db` also holds what the [baseline rules](#baselines) have learned, one row per key.
   Changed keys are saved every second (at most 128 a second), and all of them every 10 minutes
   and when Mooring stops; after Mooring was killed, a key is as it was at its last save. A row

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
 	"sync"
@@ -204,9 +205,13 @@ type Reconciler struct {
 	// SetRefusalCleared). Called after the lock is released.
 	onRefusalCleared func()
 	now              func() time.Time // test clock; nil = time.Now
+	// blocklist returns the block list to render this cycle (BaseConfig.Blocked); onBlockDrop is told
+	// about each entry the render leaves out (see SetBlocklist, SetBlockDrop).
+	blocklist   func() []netip.Prefix
+	onBlockDrop func(p netip.Prefix, why string)
 
-	// hooksMu guards poolFn and onStatus: they are wired after the Caddy supervisor has started, and a
-	// Caddy launch reconciles from its own goroutine.
+	// hooksMu guards poolFn, onStatus, blocklist and onBlockDrop: they are wired after the Caddy
+	// supervisor has started, and a Caddy launch reconciles from its own goroutine.
 	hooksMu sync.RWMutex
 
 	gen atomic.Uint64 // discovery generation, taken before each discovery starts
@@ -221,9 +226,10 @@ type Reconciler struct {
 	// refusedCfg is that render, byte for byte (nil when refused is "").
 	refused      string
 	refusedCfg   []byte
-	committedGen uint64                 // generation of the discovery behind the committed render
-	lkg          map[string]lkgPool     // PoolKey → last confirmed endpoints
-	status       map[string]RouteStatus // routeKey → served state
+	committedGen uint64                  // generation of the discovery behind the committed render
+	lkg          map[string]lkgPool      // PoolKey → last confirmed endpoints
+	status       map[string]RouteStatus  // routeKey → served state
+	blockDropped map[netip.Prefix]string // block list entries the last render left out, and why
 
 	dmu      sync.Mutex
 	draining map[string]time.Time // container id → exclusion expiry
@@ -460,6 +466,24 @@ func (r *Reconciler) keepCatchAlls(routes []Route) []Route {
 	return kept
 }
 
+// SetBlocklist registers the block list to render on every reconcile (BaseConfig.Blocked). fn is
+// called under the reconcile lock: it must be lock-free and quick (blocklist.Blocker.Snapshot), and
+// the slice it returns is never modified.
+func (r *Reconciler) SetBlocklist(fn func() []netip.Prefix) {
+	r.hooksMu.Lock()
+	r.blocklist = fn
+	r.hooksMu.Unlock()
+}
+
+// SetBlockDrop registers fn, told about each block list entry the render leaves out (BlockAllowed's
+// reason). An entry is reported once while it stays left out. fn runs after the reconcile lock is
+// released and must not call back into the Reconciler synchronously.
+func (r *Reconciler) SetBlockDrop(fn func(p netip.Prefix, why string)) {
+	r.hooksMu.Lock()
+	r.onBlockDrop = fn
+	r.hooksMu.Unlock()
+}
+
 // renderBase returns the base config for this reconcile, applying the reactive access-log decision.
 func (r *Reconciler) renderBase() BaseConfig {
 	base := r.base
@@ -469,7 +493,42 @@ func (r *Reconciler) renderBase() BaseConfig {
 	if r.wildcards != nil {
 		base.Wildcards = r.wildcards()
 	}
+	r.hooksMu.RLock()
+	bl := r.blocklist
+	r.hooksMu.RUnlock()
+	if bl != nil {
+		base.Blocked = bl()
+	}
 	return base
+}
+
+// newBlockDrops returns the block list entries base's render leaves out that the previous reconcile
+// didn't (or left out for another reason), and remembers the current set. Nothing is computed without
+// a drop hook. Called under r.mu.
+func (r *Reconciler) newBlockDrops(base BaseConfig) (func(netip.Prefix, string), []blockDrop) {
+	r.hooksMu.RLock()
+	fn := r.onBlockDrop
+	r.hooksMu.RUnlock()
+	if fn == nil {
+		return nil, nil
+	}
+	_, dropped := filterBlocked(base)
+	cur := make(map[netip.Prefix]string, len(dropped))
+	var fresh []blockDrop
+	for _, d := range dropped {
+		cur[d.p] = d.why
+		if why, ok := r.blockDropped[d.p]; !ok || why != d.why {
+			fresh = append(fresh, d)
+		}
+	}
+	r.blockDropped = cur
+	return fn, fresh
+}
+
+func reportBlockDrops(fn func(netip.Prefix, string), drops []blockDrop) {
+	for _, d := range drops {
+		fn(d.p, d.why)
+	}
 }
 
 // ReconcilePool satisfies scale.EdgeReconciler: after the auto-scaler changes a
@@ -526,9 +585,11 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	now := r.clock()
 	lkg, status, changes := r.plan(routes, disc, poolFn != nil, now)
 	base := r.renderBase()
+	dropFn, drops := r.newBlockDrops(base)
 	cfg, err := Render(base, routes, r.certOnly())
 	if err != nil {
 		r.mu.Unlock()
+		reportBlockDrops(dropFn, drops)
 		return fmt.Errorf("edge: render: %w", err) // unsafe route → never applied
 	}
 	// Idempotent: a render byte-identical to the last applied one (the common case for the periodic
@@ -543,6 +604,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 					r.refused, r.refusedCfg = lerr.Error(), cfg
 				}
 				r.mu.Unlock()
+				reportBlockDrops(dropFn, drops)
 				return lerr
 			}
 			rejected, cfg = rej, applied
@@ -563,6 +625,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 		}
 	}
 	r.mu.Unlock()
+	reportBlockDrops(dropFn, drops)
 	if refusalCleared && r.onRefusalCleared != nil {
 		r.onRefusalCleared()
 	}

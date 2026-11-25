@@ -1,0 +1,180 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Responses</h1>
+  <p class="muted">Edge blocks and dashboard sign-outs that automated response made or recommends for detections. Every block in force, and manual blocks, are on the <a href="/security/blocks">Blocked addresses</a> page.</p>
+  {{template "security_subnav" "responses"}}
+  {{if .Off}}{{template "secdetoff"}}{{else if .RespOff}}{{template "secrespoff"}}{{else}}{{with .Resp}}
+  {{if .Notice}}<div class="notice" role="status">{{.Notice}}</div>{{end}}
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+
+  <section class="panel">
+    {{if .StatusErr}}
+    <h2>Automated response</h2>
+    <div class="error" role="alert">{{.StatusErr}}</div>
+    {{else}}{{with .Status}}
+    <h2><span>Automated response</span> <span class="pill{{if eq .Effective "enforce"}} pill-ok{{else if eq .Effective "recommend"}} pill-warn{{end}}">{{.EffectiveLabel}}</span></h2>
+    {{if eq .Effective "off"}}
+      {{if .ConfigOff}}
+      <p>Automated response is off: detections are recorded, but no block or sign-out is recommended or made. To turn it on, set <code>security_logs.response.mode</code> to <code>recommend</code> or <code>enforce</code> in <code>/etc/mooring/config.yaml</code> and restart Mooring.</p>
+      <pre class="stream">security_logs:
+  response:
+    mode: recommend   # or enforce</pre>
+      {{else}}
+      <p>Paused{{if .PausedBy}} by {{.PausedBy}}{{end}}{{if .PausedAt}} on {{.PausedAt}}{{end}}: no block or sign-out is recommended or made. Lift the pause to go back to <strong>{{.ModeLabel}}</strong>.</p>
+      {{end}}
+    {{else if eq .Effective "recommend"}}
+      <p>Responses are recorded as recommendations for you to apply below.{{if .Paused}} Paused to recommend only{{if .PausedBy}} by {{.PausedBy}}{{end}}{{if .PausedAt}} on {{.PausedAt}}{{end}}; the configured mode is <strong>{{.ModeLabel}}</strong>.{{end}}</p>
+    {{else}}
+      <p>Automatic responses are applied within the hourly caps. Recommend-only ones, such as blocks for addresses an app reported, wait for you below.</p>
+    {{end}}
+    <div class="stat-grid sec-stats">
+      <div class="stat-card">
+        <div class="stat-label">Configured mode</div>
+        <div class="stat-value sec-stat-value">{{.ModeLabel}}</div>
+        <div class="stat-sub"><code>security_logs.response.mode</code></div>
+      </div>
+      <div class="stat-card{{if .BlocksFull}} is-warn{{end}}">
+        <div class="stat-label">Automatic blocks this hour</div>
+        <div class="stat-value sec-stat-value">{{.Blocks}}<small> / {{.MaxBlocks}}</small></div>
+        <div class="stat-sub">{{if .BlocksFull}}Cap reached: further blocks are refused this hour{{else}}<code>max_blocks_per_hour</code>{{end}}</div>
+      </div>
+      <div class="stat-card{{if .RevokesFull}} is-warn{{end}}">
+        <div class="stat-label">Sign-outs this hour</div>
+        <div class="stat-value sec-stat-value">{{.Revokes}}<small> / {{.MaxRevokes}}</small></div>
+        <div class="stat-sub">{{if .RevokesFull}}Cap reached: further sign-outs are refused this hour{{else}}<code>max_revokes_per_hour</code>{{end}}</div>
+      </div>
+      <div class="stat-card{{if not .Revoker}} is-warn{{end}}">
+        <div class="stat-label">Dashboard sign-outs</div>
+        <div class="stat-value sec-stat-value">{{if .Revoker}}Available{{else}}Not available{{end}}</div>
+        <div class="stat-sub">{{if .Revoker}}Sessions of a Mooring account can be ended{{else}}Sign-out responses are refused{{end}}</div>
+      </div>
+    </div>
+    {{if .Pauses}}
+    <div class="queue-actions sec-actions">
+      {{range .Pauses}}
+      <form method="post" action="/security/responses/pause" class="inline"{{if .Confirm}} data-confirm="{{.Confirm}}"{{end}}>
+        <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+        <input type="hidden" name="level" value="{{.Level}}">
+        <button type="submit" class="btn{{if .Primary}} btn-primary{{end}}">{{.Label}}</button>
+      </form>
+      {{end}}
+    </div>
+    <p class="muted small">A pause only lowers what responses do, until you lift it. Pausing all responses also removes every automatic block now.</p>
+    {{end}}
+    {{end}}{{end}}
+  </section>
+
+  <section class="panel">
+    <h2>Recommended</h2>
+    {{if .PendingErr}}<div class="error" role="alert">{{.PendingErr}}</div>
+    {{else if .Pending}}
+    <p class="muted small">Waiting for you. A recommendation nobody acts on expires after 7 days.</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Created (UTC)</th><th class="wrap-cell">Response</th><th>Block state</th><th>From</th><th></th></tr></thead>
+      <tbody>
+        {{range .Pending}}
+        <tr>
+          <td class="mono"{{if .CreatedISO}} title="{{.CreatedISO}}"{{end}}>{{if .Created}}{{.Created}} <span class="muted small">{{.Ago}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td class="wrap-cell">{{template "sec_respwhat" .}}</td>
+          <td>{{template "sec_blocklive" .Live}}</td>
+          <td>{{template "sec_respfrom" .}}</td>
+          <td>
+            <div class="queue-actions sec-actions">
+              <form method="post" action="/security/responses/{{.ID}}/apply" class="inline" data-confirm="{{.Confirm}}">
+                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                <button type="submit" class="btn btn-sm" aria-label="Apply: {{.What}}">Apply</button>
+              </form>
+              <form method="post" action="/security/responses/{{.ID}}/dismiss" class="inline">
+                <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+                <button type="submit" class="btn btn-sm" aria-label="Dismiss: {{.What}}">Dismiss</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{if .PendingMore}}<p class="muted small mt1">Showing the newest 50. <a href="{{.PendingURL}}">See every recommendation</a></p>{{end}}
+    {{else}}
+    <p class="muted">No recommendations are waiting.</p>
+    {{end}}
+  </section>
+
+  <section class="panel">
+    <h2>History</h2>
+    <form method="get" action="/security/responses" class="toolbar">
+      <div class="field">
+        <label for="resp-state">State</label>
+        <select id="resp-state" name="state">
+          {{range .States}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </div>
+      <div class="field">
+        <label for="resp-action">Action</label>
+        <select id="resp-action" name="action">
+          {{range .Actions}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+        </select>
+      </div>
+      <div class="toolbar-actions">
+        <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+        <a href="/security/responses" class="btn btn-sm btn-ghost">Reset</a>
+      </div>
+    </form>
+    {{if .HistErr}}<div class="error" role="alert">{{.HistErr}}</div>
+    {{else if .Rows}}{{template "secresptable" .Rows}}
+    {{else if .Filtered}}<p class="muted sec-empty">No responses match these filters.</p>
+    {{else}}
+    <div class="sec-empty">
+      <p><strong>No responses{{if .NewestURL}} before these{{end}}</strong></p>
+      <p class="muted">A response is recorded when a rule with one fires while automated response is on. <a href="/security/rules">Set a rule's response</a></p>
+    </div>
+    {{end}}
+    {{if or .NewestURL .OlderURL}}
+    <div class="pager mt1">
+      {{if .NewestURL}}<a class="btn btn-sm btn-ghost" href="{{.NewestURL}}">Newest responses</a>{{end}}
+      {{if .OlderURL}}<a class="btn btn-sm btn-ghost" href="{{.OlderURL}}">Older responses</a>{{end}}
+    </div>
+    {{end}}
+  </section>
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}
+
+{{/* A table of responses (respRows): the history, an incident's and a detection's. */}}
+{{define "secresptable"}}
+<div class="table-scroll"><table class="grid">
+  <thead><tr><th>Created (UTC)</th><th>State</th><th class="wrap-cell">Response</th><th>Block state</th><th>From</th></tr></thead>
+  <tbody>
+    {{range .}}
+    <tr id="{{.Anchor}}">
+      <td{{if .CreatedISO}} title="{{.CreatedISO}}"{{end}}><a class="mono" href="{{.URL}}">{{if .Created}}{{.Created}}{{else}}#{{.ID}}{{end}}</a> <span class="muted small">{{.Ago}}</span></td>
+      <td><span class="pill{{if .StateClass}} {{.StateClass}}{{end}}">{{.StateLabel}}</span>{{if .Reason}}<div class="muted small sec-cellnote">{{.Reason}}</div>{{end}}{{if .By}}<div class="muted small">by {{.By}}</div>{{end}}</td>
+      <td class="wrap-cell">{{template "sec_respwhat" .}}</td>
+      <td>{{template "sec_blocklive" .Live}}</td>
+      <td>{{template "sec_respfrom" .}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table></div>
+{{end}}
+
+{{/* What a response does (a respRow): the action, its rule and the detection's summary. */}}
+{{define "sec_respwhat"}}<strong class="sec-what">{{.What}}</strong> <span class="badge badge-muted">{{if .Automatic}}Automatic{{else}}Recommend only{{end}}</span>{{if .RuleID}}<div class="small"><a class="mono" href="{{.RuleURL}}">{{.RuleID}}</a></div>{{end}}{{if .Summary}}<div class="sec-msg small">{{.Summary}}</div>{{end}}{{end}}
+
+{{/* Where a response came from (a respRow): its detection and incident. */}}
+{{define "sec_respfrom"}}{{if .DetectionURL}}<a href="{{.DetectionURL}}">Detection</a>{{end}}{{if .IncidentURL}}{{if .DetectionURL}} · {{end}}<a href="{{.IncidentURL}}">Incident #{{.IncidentID}}</a>{{end}}{{if not (or .DetectionURL .IncidentURL)}}<span class="muted">—</span>{{end}}{{end}}
+
+{{/* An address's block now (a *blockLive; nil: not a block, or unknown). */}}
+{{define "sec_blocklive"}}{{if .}}<span class="pill{{if .Class}} {{.Class}}{{end}}">{{.Label}}</span>{{if .CoveredBy}}<div class="muted small">by <a class="mono" href="/security/blocks">{{.CoveredBy}}</a></div>{{end}}{{if .Text}}<div class="muted small sec-cellnote">{{.Text}}</div>{{end}}{{else}}<span class="muted">—</span>{{end}}{{end}}
+
+{{define "secrespoff"}}
+<section class="panel">
+  <h2>Automated response is not running</h2>
+  <p class="muted">Mooring is not running automated response on this host. It runs with detection; set <code>security_logs.response.mode</code> to <code>recommend</code> or <code>enforce</code> in <code>/etc/mooring/config.yaml</code> to have it recommend or make blocks and sign-outs, then restart Mooring. If detection is on, Mooring's startup log says why automated response did not start.</p>
+  <pre class="stream">security_logs:
+  response:
+    mode: recommend   # or enforce</pre>
+  <p class="muted small">Manual blocks work without it: <a href="/security/blocks">Blocked addresses</a>. Reference: <a href="https://github.com/daboss2003/mooring/blob/main/docs/security-responses.md">docs/security-responses.md</a></p>
+</section>
+{{end}}

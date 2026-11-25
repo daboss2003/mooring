@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"math/bits"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -74,16 +75,22 @@ type override struct {
 	Learn        time.Duration `json:"learn"`
 	SpeedKMH     float64       `json:"speed_kmh"`
 	SnoozedUntil time.Time     `json:"snoozed_until"`
+	// Response is nil in a setting stored before responses existed: the rule keeps the pack's.
+	Response *siem.RuleResponse `json:"response,omitempty"`
 }
 
 func tunables(r siem.Rule) override {
+	resp := r.Response
 	return override{Enabled: r.Enabled, Severity: r.Severity, Count: r.Count, Window: r.Window, Factor: r.Factor,
-		Learn: r.Learn, SpeedKMH: r.SpeedKMH, SnoozedUntil: r.SnoozedUntil}
+		Learn: r.Learn, SpeedKMH: r.SpeedKMH, SnoozedUntil: r.SnoozedUntil, Response: &resp}
 }
 
 func (o override) apply(r siem.Rule) siem.Rule {
 	r.Enabled, r.Severity, r.Count, r.Window, r.Factor = o.Enabled, o.Severity, o.Count, o.Window, o.Factor
 	r.Learn, r.SpeedKMH, r.SnoozedUntil = o.Learn, o.SpeedKMH, o.SnoozedUntil
+	if o.Response != nil {
+		r.Response = *o.Response
+	}
 	return r
 }
 
@@ -100,6 +107,11 @@ var tunableFields = []struct {
 	{"learn", func(r *siem.Rule, o override) { r.Learn = o.Learn }},
 	{"speed_kmh", func(r *siem.Rule, o override) { r.SpeedKMH = o.SpeedKMH }},
 	{"snoozed_until", func(r *siem.Rule, o override) { r.SnoozedUntil = o.SnoozedUntil }},
+	{"response", func(r *siem.Rule, o override) {
+		if o.Response != nil {
+			r.Response = *o.Response
+		}
+	}},
 }
 
 // applyStored applies a stored override to a built-in rule. When the whole override doesn't
@@ -272,6 +284,9 @@ func validate(r *siem.Rule, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	if err := validResponse(r); err != nil {
+		return err
+	}
 	switch {
 	case !r.SnoozedUntil.After(now):
 		r.SnoozedUntil = time.Time{}
@@ -388,10 +403,16 @@ type compiled struct {
 	q, then query.Query
 	group   extractor
 	field   extractor
-	sig     string // the matching definition: state is kept while it stays the same
+	sig     string   // the matching definition: state is kept while it stays the same
+	respOK  []string // the response actions its query and group-by allow (ruleResponses)
+	// From the sources its query lets through (a sequence's two queries together; respond_hooks.go):
+	// autoBlock, only the edge's, so its block may be automatic; split, several, so an account's
+	// detections are kept apart per scope (fire).
+	autoBlock, split bool
 }
 
-// signature identifies what a rule's state means; a change restarts the state.
+// signature identifies what a rule's state means; a change restarts the state. Intentional: the
+// response is not in it, so changing what a rule's detections ask for keeps what it learned.
 func signature(r siem.Rule) string {
 	h := sha256.Sum256([]byte(strings.Join([]string{r.Type, r.Query, r.Then, r.GroupBy, r.Field}, "\x00")))
 	return hex.EncodeToString(h[:8])
@@ -399,6 +420,7 @@ func signature(r siem.Rule) string {
 
 func compile(r siem.Rule, info packInfo, mapValue func(field, value string) string) (*compiled, error) {
 	c := &compiled{r: r, info: info, group: extract(r.GroupBy), sig: signature(r)}
+	c.respOK, _ = ruleResponses(r)
 	var err error
 	if c.q, err = parseMapped(r.Query, mapValue); err != nil {
 		return nil, err
@@ -408,6 +430,8 @@ func compile(r siem.Rule, info packInfo, mapValue func(field, value string) stri
 			return nil, err
 		}
 	}
+	srcs := ruleSources(c.q, c.then, r.Type == siem.RuleSequence)
+	c.autoBlock, c.split = srcs == srcEdgeBit, bits.OnesCount(uint(srcs)) > 1
 	if r.Field != "" {
 		c.field = extract(r.Field)
 	}

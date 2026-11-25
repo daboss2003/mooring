@@ -377,12 +377,15 @@ func (d *db) recentKeys(ctx context.Context, since time.Time, limit int) ([]stri
 }
 
 // alertedSince returns, per rule and key (mapKey, or rollupKey for a rollup), the newest time an
-// alert was raised at or after since, for at most limit of them (the newest).
-func (d *db) alertedSince(ctx context.Context, since time.Time, limit int) (map[string]time.Time, error) {
+// alert was raised at or after since, for at most limit of them (the newest). An account's
+// detections of a rule that keeps them apart per scope (split reports it, as compiled.split) are
+// per scope too (scopedKey), as fire keys them: the row's scope is the one it was kept under.
+// Every other row keeps its mapKey, whatever its scope.
+func (d *db) alertedSince(ctx context.Context, since time.Time, limit int, split func(ruleID string) bool) (map[string]time.Time, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	rows, err := d.w.QueryContext(ctx, `SELECT rule_id, key, rollup, MAX(alerted_ns) AS at FROM detections
-		WHERE alerted_ns > 0 AND alerted_ns >= ? GROUP BY rule_id, key, rollup ORDER BY at DESC LIMIT ?`,
+	rows, err := d.w.QueryContext(ctx, `SELECT rule_id, key, rollup, ent_kind, scope, MAX(alerted_ns) AS at FROM detections
+		WHERE alerted_ns > 0 AND alerted_ns >= ? GROUP BY rule_id, key, rollup, ent_kind, scope ORDER BY at DESC LIMIT ?`,
 		since.UnixNano(), limit)
 	if err != nil {
 		return nil, err
@@ -391,18 +394,24 @@ func (d *db) alertedSince(ctx context.Context, since time.Time, limit int) (map[
 	out := map[string]time.Time{}
 	for rows.Next() {
 		var (
-			id, key string
-			rollup  int
-			at      int64
+			id, key, entKind, scope string
+			rollup                  int
+			at                      int64
 		)
-		if err := rows.Scan(&id, &key, &rollup, &at); err != nil {
+		if err := rows.Scan(&id, &key, &rollup, &entKind, &scope, &at); err != nil {
 			return nil, err
 		}
 		mk := mapKey(id, key)
-		if rollup != 0 {
+		switch {
+		case rollup != 0:
 			mk = rollupKey(id)
+		case entKind == siem.EntityAccount && scope != "" && split(id):
+			mk = scopedKey(id, scope, key)
 		}
-		out[mk] = time.Unix(0, at)
+		// Rows of several scopes or kinds may share a key: the newest counts.
+		if t := time.Unix(0, at); t.After(out[mk]) {
+			out[mk] = t
+		}
 	}
 	return out, rows.Err()
 }
@@ -459,6 +468,9 @@ func (d *db) list(ctx context.Context, f siem.DetectionFilter) ([]siem.Detection
 	}
 	if f.App != "" {
 		where, args = append(where, "app = ?"), append(args, f.App)
+	}
+	if f.Key != "" {
+		where, args = append(where, "key = ?"), append(args, f.Key)
 	}
 	if !f.From.IsZero() {
 		where, args = append(where, "last_ns >= ?"), append(args, f.From.UnixNano())

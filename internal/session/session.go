@@ -16,6 +16,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"errors"
+	"net/netip"
 	"strconv"
 	"sync"
 	"time"
@@ -169,6 +170,46 @@ func (m *Manager) DeleteAllForUser(ctx context.Context, username string) (int64,
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ActivePeers returns the address each still-valid session signed in from, each once (the edge
+// block list never blocks these). A stored value that isn't an address is skipped.
+func (m *Manager) ActivePeers(ctx context.Context) ([]netip.Addr, error) {
+	now := m.effectiveNow()
+	// The same expiry as lookup: valid while now < absolute_exp and now - last_seen < idle.
+	rows, err := m.db.QueryContext(ctx,
+		`SELECT DISTINCT peer_ip FROM sessions WHERE absolute_exp > ? AND last_seen_at > ?`,
+		now.Unix(), now.Add(-m.idle).Unix())
+	if err != nil {
+		return nil, err
+	}
+	var raw []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		raw = append(raw, s)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[netip.Addr]bool, len(raw))
+	out := make([]netip.Addr, 0, len(raw))
+	for _, s := range raw {
+		a, err := netip.ParseAddr(s)
+		if err != nil || a.Zone() != "" {
+			continue
+		}
+		if a = a.Unmap(); !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 // DeleteAll revokes EVERY session (used when the auth config changes — password or

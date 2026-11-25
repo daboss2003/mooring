@@ -15,6 +15,15 @@ func TestParseAccessFull(t *testing.T) {
 	if r2, ok := ParseAccessFull([]byte(`{"status":500,"request":{"host":"a.com","uri":"/","remote_addr":"9.9.9.9:5555"}}`)); !ok || r2.RemoteIP != "9.9.9.9" {
 		t.Errorf("remote_addr fallback: %+v ok=%v", r2, ok)
 	}
+	// Behind a trusted proxy request.client_ip is the client, remote_ip the proxy.
+	r3, ok := ParseAccessFull([]byte(`{"status":403,"request":{"host":"a.com","uri":"/","remote_ip":"104.16.0.9","client_ip":"203.0.113.7"}}`))
+	if !ok || r3.ClientIP != "203.0.113.7" || r3.RemoteIP != "104.16.0.9" {
+		t.Errorf("client_ip: %+v ok=%v", r3, ok)
+	}
+	// Without client_ip (Caddy < 2.7) the client is the TCP peer.
+	if r.ClientIP != "1.2.3.4" {
+		t.Errorf("no client_ip: ClientIP = %q, want the remote_ip", r.ClientIP)
+	}
 	// junk / no host → not an access entry.
 	if _, ok := ParseAccessFull([]byte(`not json`)); ok {
 		t.Error("junk must not parse")

@@ -203,6 +203,9 @@ func floorDiv(a, b int64) int64 {
 
 // trafficTick closes the hours that ended trafficGrace ago or more (write tick).
 func (b *baselines) trafficTick(e *Engine, now time.Time) {
+	// Intentional: the wall clock only. A time.Now() reading also carries a monotonic one, which
+	// Before and Sub would use: a clock set back would never show.
+	now = now.Round(0)
 	rules := b.rulesOf(e, siem.BaselineTraffic)
 	ready := false
 	if e.opt.KnownHost != nil {

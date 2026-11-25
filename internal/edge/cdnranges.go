@@ -1,6 +1,7 @@
 package edge
 
 import (
+	"net/netip"
 	"sort"
 	"strings"
 )
@@ -33,6 +34,16 @@ var cloudflareRanges = []string{
 	"2405:8100::/32",
 	"2a06:98c0::/29",
 	"2c0f:f248::/32",
+}
+
+// CDNRanges returns the CDN address ranges Mooring ships (Cloudflare's), parsed. The edge never
+// blocks an address in them: blocking a CDN address would refuse every client behind it.
+func CDNRanges() []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(cloudflareRanges))
+	for _, s := range cloudflareRanges {
+		out = append(out, netip.MustParsePrefix(s))
+	}
+	return out
 }
 
 // trustedProxyPreset is what an edge.trusted_proxies preset name stands for: the ranges it expands

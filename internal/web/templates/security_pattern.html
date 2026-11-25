@@ -1,0 +1,97 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <p><a href="/security/patterns">← Patterns</a></p>
+  {{if .Off}}
+  <h1>Log pattern</h1>
+  {{template "security_subnav" "patterns"}}
+  {{template "secdetoff"}}
+  {{else if .PatOff}}
+  <h1>Log pattern</h1>
+  {{template "security_subnav" "patterns"}}
+  {{template "secpatoff"}}
+  {{else if .Missing}}
+  <h1>Log pattern</h1>
+  {{template "security_subnav" "patterns"}}
+  <section class="panel">
+    <h2>{{.Missing}}</h2>
+    <p class="muted"><a href="/security/patterns">Back to the patterns</a></p>
+  </section>
+  {{else}}{{with .Pat}}
+  <h1>Log pattern</h1>
+  <p class="muted">{{template "sec_patstate" .}} <span class="mono small">{{.ID}}</span> · {{if .ScopeURL}}<a href="{{.ScopeURL}}">{{.Scope}}</a>{{else}}{{.Scope}}{{end}}</p>
+  {{template "security_subnav" "patterns"}}
+  {{if .Notice}}<div class="notice" role="status">{{.Notice}}</div>{{end}}
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+
+  <section class="panel">
+    <h2>Template</h2>
+    <p class="muted small">Variable parts are shown as placeholders such as <code>&lt;NUM&gt;</code>, <code>&lt;IP&gt;</code> or <code>&lt;*&gt;</code>.</p>
+    <pre class="stream sec-tpl-block">{{.Template}}</pre>
+    <h3 class="sec-h3">Sample line</h3>
+    {{if .Sample}}<pre class="stream sec-tpl-block">{{.Sample}}</pre>
+    {{else}}<p class="muted small">No sample line. Samples are deleted along with older security logs.</p>{{end}}
+    <div class="table-scroll"><table class="grid"><tbody>
+      <tr><td>State</td><td>{{template "sec_patstate" .}}</td></tr>
+      <tr><td>Highest level</td><td>{{if .Lvl}}<span class="sec-lvl {{.LvlClass}}">{{.Lvl}}</span>{{else}}<span class="muted">—</span>{{end}}</td></tr>
+      <tr><td>Source</td><td>{{if .ScopeURL}}<a href="{{.ScopeURL}}">{{.Scope}}</a>{{else}}{{.Scope}}{{end}}</td></tr>
+      {{if .First}}<tr><td>First seen</td><td class="mono"{{if .FirstISO}} title="{{.FirstISO}}"{{end}}>{{.First}} UTC</td></tr>{{end}}
+      {{if .Last}}<tr><td>Last seen</td><td class="mono"{{if .LastISO}} title="{{.LastISO}}"{{end}}>{{.Last}} UTC <span class="muted">{{.Ago}}</span></td></tr>{{end}}
+      <tr><td>Lines since first seen</td><td class="mono">{{.Count}}</td></tr>
+    </tbody></table></div>
+    {{if .FindURL}}
+    <div class="queue-actions mt1">
+      <a class="btn btn-sm" href="{{.FindURL}}">Find events</a>
+      <span class="muted small sec-find">Searches the Security logs for <code>{{.FindTerm}}</code>, so lines of other patterns sharing that text show up too.</span>
+    </div>
+    {{end}}
+  </section>
+
+  <section class="panel">
+    <h2><span>Lines per hour</span> <span class="muted small">Last 7 days</span></h2>
+    {{if .Bars}}
+    <svg class="sec-bars" viewBox="0 0 168 40" preserveAspectRatio="none" role="img" aria-label="Lines per hour over the last 7 days, at most {{.Peak}} in an hour">
+      {{range .Bars}}<rect x="{{.X}}" y="{{.Y}}" width="0.8" height="{{.H}}"><title>{{.Title}}</title></rect>{{end}}
+    </svg>
+    <div class="sec-bars-axis muted small"><span>7 days ago</span><span>Now</span></div>
+    <p class="muted small">At most {{.Peak}} lines in one hour; {{.Last24}} in the last 24 hours.</p>
+    {{else}}
+    <p class="muted">No lines in the last 7 days.</p>
+    {{end}}
+  </section>
+
+  <section class="panel">
+    <h2>State</h2>
+    <p class="muted small">Mark expected: neither the new-pattern rule nor the spike rule reports it. Ignore spikes: only the spike rule stays silent. Watch again: both rules report it again.</p>
+    <form method="post" action="{{.URL}}/state" class="queue-actions sec-actions">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      {{range .Actions}}<button type="submit" name="state" value="{{.State}}" class="btn{{if .Primary}} btn-primary{{end}}">{{.Label}}</button>{{end}}
+    </form>
+  </section>
+
+  {{if .DetsOn}}
+  <section class="panel">
+    <h2>Detections</h2>
+    {{if .DetErr}}<div class="error" role="alert">{{.DetErr}}</div>
+    {{else if .Dets}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Last seen (UTC)</th><th>Severity</th><th class="wrap-cell">Rule and summary</th><th class="num">Count</th></tr></thead>
+      <tbody>
+        {{range .Dets}}
+        <tr>
+          <td><a class="mono" href="{{.URL}}">{{if .Last}}{{.Last}}{{else}}#{{.ID}}{{end}}</a> <span class="muted small">{{.Ago}}</span></td>
+          <td>{{template "sec_sev" .}}</td>
+          <td class="wrap-cell"><a href="{{.URL}}">{{.RuleName}}</a>{{if .Summary}}<div class="sec-msg small">{{.Summary}}</div>{{end}}</td>
+          <td class="num">{{.Count}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="muted">No detections for this pattern.</p>
+    {{end}}
+  </section>
+  {{end}}
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}

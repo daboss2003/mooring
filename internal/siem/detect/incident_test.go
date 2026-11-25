@@ -161,8 +161,9 @@ func TestIncidentScopesNotMixed(t *testing.T) {
 	}
 }
 
-// A rule without src: coalesces one key from two sources into one detection: its account stays in
-// the scope of the detection's first event.
+// A rule without src: keeps an account's detections of two sources apart (the same name there is
+// another account), each in its own scope; an address from two sources is one detection, in the
+// scope of its first event.
 func TestIncidentDetectionScopeIsTheFirstEvents(t *testing.T) {
 	h := incHarness(t, false)
 	h.only(t, incRule("custom.a", siem.SevLow, "actor", "kind:t.a"))
@@ -170,9 +171,24 @@ func TestIncidentDetectionScopeIsTheFirstEvents(t *testing.T) {
 	e := incEv(time.Minute, siem.SrcApp, "t.a", "", "alice", nil)
 	e.App = "shop"
 	h.feed(e)
+	incs := h.incList(t)
+	if len(incs) != 2 || len(incs[0].Entities) != 1 || incs[0].Entities[0] != acct("app:shop", "alice") ||
+		len(incs[1].Entities) != 1 || incs[1].Entities[0] != acct("mooring", "alice") {
+		t.Fatalf("incidents %+v", incs)
+	}
+
+	h = incHarness(t, false)
+	h.only(t, incRule("custom.a", siem.SevLow, "ip", "kind:t.a"))
+	h.feed(incEv(0, siem.SrcMooring, "t.a", addrX, "", nil))
+	e = incEv(time.Minute, siem.SrcApp, "t.a", addrX, "", nil)
+	e.App = "shop"
+	h.feed(e)
 	inc := h.only1(t)
-	if len(inc.Entities) != 1 || inc.Entities[0] != acct("mooring", "alice") {
-		t.Fatalf("entities %+v", inc.Entities)
+	if ds := h.detections(t, "custom.a"); len(ds) != 1 || ds[0].Count != 2 || inc.Detections != 1 {
+		t.Fatalf("detections %+v, incident %+v", ds, inc)
+	}
+	if s := h.e.active[mapKey("custom.a", addrX)].Value.(*activeDet).s.scope; s != "mooring" {
+		t.Fatalf("scope %q", s)
 	}
 }
 

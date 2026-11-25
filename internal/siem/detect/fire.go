@@ -6,7 +6,9 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"math"
@@ -38,12 +40,18 @@ type firing struct {
 	gap      time.Duration
 	evidence []siem.Evidence
 	reasons  []string // baseline: why it departs from the norm
+	// browser: an event counted in it was sent by a browser; agent: one came with a browser's agent
+	// and no fetch metadata (sentBy). fire adds the firing event's own.
+	browser, agent bool
 }
 
 // activeDet is a detection that later firings of its rule and key may still update.
 type activeDet struct {
-	s       stored // s.rollup: the rule's rollup detection for hour
-	mapKey  string // mapKey(rule ID, key); a rollup's is rollupKey(rule ID)
+	s stored // s.rollup: the rule's rollup detection for hour
+	// mapKey is its key in active and parked: mapKey(rule ID, key), scopedKey(rule ID, scope, key)
+	// when scoped (fire), a rollup's rollupKey(rule ID).
+	mapKey  string
+	scoped  bool
 	groupBy string
 	seq     uint64    // creation order (writes and emits keep it)
 	wrote   time.Time // last write attempt
@@ -58,6 +66,28 @@ type activeDet struct {
 	inc       *incident
 	linkDirty bool
 	own       *alertJob // its own alert in flight (nil: none), so its incident can count it (carryOwn)
+	// resp: its response requests waiting to be sent once it is written (respond_hooks.go).
+	resp []siem.ResponseRequest
+	// What it remembers of the requests it made, in memory only (respondCommit): when it last asked
+	// for a block, and the accounts it asked a sign-out for (at most maxSignOuts).
+	blockAsked time.Time
+	signedOut  []string
+	// byBrowser, byAgent: its last firing's (firing.browser, firing.agent).
+	byBrowser, byAgent bool
+}
+
+// alertKey is its key in the alert cooldown and the alerts in flight: its mapKey, so per rule and
+// key, and per scope too for a detection kept apart per account scope (owner decision: each
+// system's detection of an account name alerts on its own, see fire and dedupeKey).
+func (a *activeDet) alertKey() string { return a.mapKey }
+
+// knownKey is its key among the known keys (keyFilter), which are per rule and key whatever the
+// scope: findActive asks it before any lookup, scoped or not.
+func (a *activeDet) knownKey() string {
+	if a.scoped {
+		return mapKey(a.s.d.RuleID, a.s.d.Key)
+	}
+	return a.mapKey
 }
 
 // rolledSet is the keys counted in a rule's rollup detection for an hour, as 8-byte keyed hashes
@@ -115,7 +145,8 @@ func decodeRolled(b []byte, limit int) *rolledSet {
 	return s
 }
 
-// mapKey is a (rule, key) pair's key in the engine's maps (active, parked, cooldown, inflight).
+// mapKey is a (rule, key) pair's key in the engine's maps (active, parked, cooldown, inflight); a
+// detection kept apart per account scope has a scopedKey there instead.
 func mapKey(ruleID, key string) string { return ruleID + "\x00" + key }
 
 // rollupKey is a rule's rollup detection's key in those maps. It never equals a mapKey: a rule ID
@@ -123,20 +154,35 @@ func mapKey(ruleID, key string) string { return ruleID + "\x00" + key }
 // a mapKey's first control character is the "\x00" after the rule ID.
 func rollupKey(ruleID string) string { return ruleID + "\x01" }
 
+// scopedKey is the key in active, parked, cooldown and inflight of a detection kept apart per
+// account scope (fire). It never equals a mapKey or a rollupKey: the control character after the
+// rule ID differs.
+func scopedKey(ruleID, scope, key string) string { return ruleID + "\x02" + scope + "\x00" + key }
+
 // dedupeKey is a detection's alert dedupe key: "siem:<rule ID>:<key>", a rollup's
-// "siem-rollup:<rule ID>"; a rule's hourly summary alert's is "siem-cap:<rule ID>". A real key
-// can't produce either of the last two.
+// "siem-rollup:<rule ID>"; a rule's hourly summary alert's is "siem-cap:<rule ID>". A detection
+// kept apart per account scope has "siem-acct:<rule ID>:<scope>|<key>" (a scope holds no '|'), so
+// two systems' detections of one account name never share an alert row: the outbox skips an alert
+// whose key's newest row is the same one, unsent. A real key can't produce any of the last three.
 func dedupeKey(a *activeDet) string {
-	if a.s.rollup {
+	switch {
+	case a.s.rollup:
 		return "siem-rollup:" + a.s.d.RuleID
+	case a.scoped:
+		return "siem-acct:" + a.s.d.RuleID + ":" + a.s.scope + "|" + a.s.d.Key
 	}
 	return "siem:" + a.s.d.RuleID + ":" + a.s.d.Key
 }
 
 // findActive returns the detection a firing of (ruleID, key) may update: the one in memory (active
-// or parked unwritten), else the newest stored one (looked up only when one may exist).
-func (e *Engine) findActive(ruleID, key string) *activeDet {
-	mk := mapKey(ruleID, key)
+// or parked unwritten), else the newest stored one (looked up only when one may exist). With a
+// scope, only a detection of that account scope (see fire).
+func (e *Engine) findActive(ruleID, key, scope string) *activeDet {
+	plain := mapKey(ruleID, key)
+	mk := plain
+	if scope != "" {
+		mk = scopedKey(ruleID, scope, key)
+	}
 	if el, ok := e.active[mk]; ok {
 		e.actLRU.MoveToFront(el)
 		return el.Value.(*activeDet)
@@ -146,14 +192,23 @@ func (e *Engine) findActive(ruleID, key string) *activeDet {
 		e.track(a)
 		return a
 	}
-	if e.closed.Load() || !e.known.may(mk) {
+	if e.closed.Load() || !e.known.may(plain) {
 		return nil
 	}
 	now := e.now()
 	if !e.readFailAt.IsZero() && now.Sub(e.readFailAt) < readBackoff {
 		return nil
 	}
-	s, ok, err := e.db.latest(context.Background(), ruleID, key)
+	var (
+		s   stored
+		ok  bool
+		err error
+	)
+	if scope != "" {
+		s, ok, err = e.db.latestIn(context.Background(), ruleID, key, scope)
+	} else {
+		s, ok, err = e.db.latest(context.Background(), ruleID, key)
+	}
 	if err != nil {
 		e.readFailAt = now
 		e.writeErrors.Add(1)
@@ -163,13 +218,29 @@ func (e *Engine) findActive(ruleID, key string) *activeDet {
 	if !ok {
 		return nil
 	}
-	// The key's cooldown holds across its detections: the row's alert counts for a new one too.
+	// The key's cooldown (a scoped detection's: its scope's) holds across its detections: the row's
+	// alert counts for a new one too.
 	e.noteCooldown(mk, s.alerted)
-	a := &activeDet{s: s, mapKey: mk, emitted: true, wrote: now}
+	a := &activeDet{s: s, mapKey: mk, scoped: scope != "", emitted: true, wrote: now}
 	e.seq++
 	a.seq = e.seq
 	e.track(a)
 	return a
+}
+
+// latestIn is latest among the detections of one account scope.
+func (d *db) latestIn(ctx context.Context, ruleID, key, scope string) (stored, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, dbTimeout)
+	defer cancel()
+	s, err := scanDetection(d.w.QueryRowContext(ctx, `SELECT `+detCols+` FROM detections
+		WHERE rule_id = ? AND key = ? AND rollup = 0 AND scope = ? ORDER BY id DESC LIMIT 1`, ruleID, key, scope))
+	if errors.Is(err, sql.ErrNoRows) {
+		return stored{}, false, nil
+	}
+	if err != nil {
+		return stored{}, false, err
+	}
+	return s, true, nil
 }
 
 // putActive makes a new detection the active one of its key.
@@ -204,7 +275,7 @@ func (e *Engine) retire(el *list.Element) {
 		e.park(a)
 		return
 	}
-	e.known.add(a.mapKey)
+	e.known.add(a.knownKey())
 }
 
 // park keeps an unwritten detection until a flush writes it, at most maxParked of them: past that
@@ -218,6 +289,7 @@ func (e *Engine) park(a *activeDet) {
 		x := e.parkLRU.Front().Value.(*activeDet)
 		e.unpark(x)
 		delete(e.dirty, x)
+		e.respondDropped(x)
 		n := e.lost.Add(1)
 		e.logLimited("lost", "security detection: detections dropped unwritten (detect.db writes keep failing)", "lost_total", n)
 	}
@@ -238,7 +310,21 @@ func (e *Engine) unpark(a *activeDet) {
 // the rule's window (at least an hour) before.
 func (e *Engine) fire(c *compiled, key string, ev *siem.Event, f firing) {
 	now := e.now()
-	a := e.findActive(c.r.ID, key)
+	kind := incKeyKind(c.r.GroupBy, key, ev)
+	// Intentional: a rule whose query lets several sources through keeps an account's detections
+	// apart per scope (Mooring's alice, the host's, each app's): the same name there is another
+	// account. They share the key shown only; coalescing them made the first scope's detection take
+	// the later ones' place, so a Mooring account's sign-out was never asked for after an app's or
+	// the host's detection of the same name.
+	// Intentional (owner decision): each has its own alert cooldown, alert in flight and dedupe key
+	// too (alertKey, dedupeKey), so with incidents off the second system's detection isn't silent.
+	// The rule's hourly alert cap stays per rule. Every other detection keeps its mapKey and
+	// "siem:<rule ID>:<key>".
+	scope := ""
+	if c.split && kind == siem.EntityAccount {
+		scope = incScope(ev)
+	}
+	a := e.findActive(c.r.ID, key, scope)
 	isNew := a == nil || a.s.d.Source != siem.DetectionSIEM || ev.TS.Sub(a.s.d.Last) > max(c.r.Window, minCoalesce)
 	if isNew {
 		if !e.allowNew(c.r.ID) {
@@ -249,6 +335,9 @@ func (e *Engine) fire(c *compiled, key string, ev *siem.Event, f firing) {
 		}
 		a = &activeDet{mapKey: mapKey(c.r.ID, key), s: stored{d: siem.Detection{Source: siem.DetectionSIEM,
 			RuleID: c.r.ID, Key: strings.Clone(key), First: ev.TS, Last: ev.TS, Count: f.count}}}
+		if scope != "" {
+			a.mapKey, a.scoped = scopedKey(c.r.ID, scope, key), true
+		}
 		e.putActive(a)
 	} else {
 		a.s.d.Count = satInt(a.s.d.Count, f.count)
@@ -265,16 +354,23 @@ func (e *Engine) fire(c *compiled, key string, ev *siem.Event, f firing) {
 	// host.user_change detection keyed by a name a group line and a user line share (useradd logs
 	// both) would otherwise flip in and out of its incident and alert on its own too.
 	if a.s.entKind == "" {
-		a.s.entKind = incKeyKind(c.r.GroupBy, key, ev)
+		a.s.entKind = kind
 	}
-	// Intentional: the scope is the first event's. A rule without src: coalesces the same key from
-	// two sources into one detection; its account stays in the scope it was found in.
+	// Intentional: the scope is the first event's. A rule without src: coalesces the same address (or
+	// a key that is no entity) from two sources into one detection; an account's detections are kept
+	// apart per scope (above).
 	if a.s.scope == "" {
 		a.s.scope = incScope(ev)
 	}
+	// What sent the events behind this firing (respond_hooks.go), the firing event included.
+	browser, agent := sentBy(ev)
+	a.byBrowser, a.byAgent = f.browser || browser, f.agent || agent
 	d.RuleName, d.Severity, d.MITRE = c.r.Name, c.r.Severity, slices.Clone(c.r.MITRE)
 	if ev.App != "" {
 		d.App = strings.Clone(ev.App)
+	}
+	if ev.Svc != "" {
+		d.Service = strings.Clone(ev.Svc)
 	}
 	if ev.Geo != nil {
 		d.Geo = cloneGeo(ev.Geo)
@@ -379,7 +475,11 @@ func (e *Engine) rollUp(base siem.Detection, key string, evid []siem.Evidence, t
 func (e *Engine) commit(a *activeDet, target string) {
 	a.emitted = false
 	e.dirty[a] = struct{}{}
-	if e.correlate(a) {
+	joined := e.correlate(a)
+	// After correlate (Muted and the incident are known); a request goes out once the detection is
+	// written (respondWritten) or its writes fail (respond_hooks.go).
+	e.respondCommit(a)
+	if joined {
 		return
 	}
 	e.maybeAlert(a, target)
@@ -389,7 +489,7 @@ func (e *Engine) commit(a *activeDet, target string) {
 // rest when the result comes back.
 type alertJob struct {
 	o         alert.Outbox
-	mk        string     // the detection's mapKey (a rollup's rollupKey); "" for a summary alert
+	mk        string     // the detection's alertKey (its mapKey; a rollup's rollupKey); "" for a summary alert
 	rule      string     // the rule ID (its hourly cap)
 	det       *activeDet // the detection it is about (never touched by the worker)
 	at        time.Time  // when it was raised (engine time): the cooldown starts there
@@ -477,13 +577,13 @@ func (e *Engine) maybeAlert(a *activeDet, target string) {
 		return
 	}
 	now := e.now()
-	mk := a.mapKey
+	mk := a.alertKey()
 	if t, ok := e.inflight[mk]; ok && now.Sub(t) < inflightTTL && now.Sub(t) >= 0 {
 		return
 	}
-	// Intentional: the cooldown is per rule and key on the wall clock, across detections and
-	// restarts: a host-log backlog replayed after downtime can make several detections of one key
-	// at once.
+	// Intentional: the cooldown is per rule and key (and account scope, for a detection kept apart
+	// per scope) on the wall clock, across detections and restarts: a host-log backlog replayed
+	// after downtime can make several detections of one key at once.
 	// A recorded time in the future (the clock was ahead, then corrected) doesn't count: it would
 	// mute the key until that time + the cooldown.
 	if t, ok := e.cooldown[mk]; ok && now.Sub(t) < alertCooldown && now.Sub(t) >= 0 {
@@ -553,7 +653,7 @@ func ownAlertJob(a *activeDet, target string, now time.Time) *alertJob {
 	if d.Severity == siem.SevCritical {
 		level = alert.LevelCritical
 	}
-	return &alertJob{mk: a.mapKey, rule: d.RuleID, det: a, at: now, hour: now.UTC().Truncate(time.Hour),
+	return &alertJob{mk: a.alertKey(), rule: d.RuleID, det: a, at: now, hour: now.UTC().Truncate(time.Hour),
 		o: alert.Outbox{RuleID: 0, Target: target, Kind: AlertKind, Level: level, Transition: "firing",
 			Summary:   siem.Cut(clean(d.RuleName, maxRuleName)+": "+d.Summary, maxSummary),
 			DedupeKey: dedupeKey(a)}}
@@ -805,6 +905,7 @@ func (e *Engine) writeBatch(as []*activeDet, incs []*incident) bool {
 		e.writeFailAt = now
 		e.writeBackoff = min(max(2*e.writeBackoff, writeBackoffMin), writeBackoffMax)
 		e.logLimited("write", "security detection: detections not stored", "count", len(as), "err", err)
+		e.respondUnwritten()
 		return false
 	}
 	e.writeBackoff = 0
@@ -862,13 +963,14 @@ func (e *Engine) writeBatch(as []*activeDet, incs []*incident) bool {
 		if a.parkEl != nil {
 			e.unpark(a)
 			if !a.s.rollup {
-				e.known.add(a.mapKey)
+				e.known.add(a.knownKey())
 			}
 		}
 		if !a.emitted {
 			e.emit(a)
 			a.emitted = true
 		}
+		e.respondWritten(a) // the detection (and its incident) now have their IDs
 	}
 	for _, inc := range incs {
 		for _, ch := range inc.changes {
@@ -1163,7 +1265,7 @@ func (e *Engine) report(r siem.Detection) {
 		target = "ops"
 	}
 
-	a := e.findActive(r.RuleID, r.Key)
+	a := e.findActive(r.RuleID, r.Key, "")
 	if isNew := a == nil || a.s.d.Source != siem.DetectionOps || r.Last.Sub(a.s.d.Last) > minCoalesce; isNew {
 		if !e.allowNew(r.RuleID) {
 			e.rollUp(r, r.Key, r.Evidence, target)

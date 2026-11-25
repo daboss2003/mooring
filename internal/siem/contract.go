@@ -55,6 +55,9 @@ const (
 	BaselineTraffic = "traffic" // per edge host with a route: requests and errors per hour of the week vs previous weeks
 	BaselineAdmin   = "admin"   // per server user: usual sudo/su hours, programs and target users
 	BaselineIP      = "ip"      // per address: its usual request mix
+	// BaselinePattern (phase 4): per app service (and the host), the templates its log lines fall
+	// into and each template's hourly count; fires on a new template or a spike of a known one.
+	BaselinePattern = "pattern"
 )
 
 // Rule is one detection rule: a built-in one from the pack (Builtin true; only the fields marked
@@ -81,6 +84,9 @@ type Rule struct {
 	Builtin      bool          `json:"builtin"`
 	SnoozedUntil time.Time     `json:"snoozed_until,omitempty"` // tunable: detections are still recorded, but not sent to the alert channels before this
 	Baseline     string        `json:"baseline,omitempty"`      // RuleBaseline: one of the Baseline* kinds
+	// Response (phase 4, tunable) is what automated response does about the rule's detections when
+	// it is on (security_logs.response.mode recommend or enforce). Zero value: nothing.
+	Response RuleResponse `json:"response"`
 }
 
 // Evidence is one event behind a detection (enough to find it with the search).
@@ -90,6 +96,13 @@ type Evidence struct {
 	IP    string    `json:"ip,omitempty"`
 	Actor string    `json:"actor,omitempty"`
 	App   string    `json:"app,omitempty"`
+	// Browser: the request carried browser fetch metadata (an edge event with f.fetch_site), so a
+	// browser sent it. A web page can make its visitors' browsers send requests anywhere; such
+	// requests never count toward an automatic block.
+	Browser bool `json:"browser,omitempty"`
+	// BrowserAgent: an edge request whose User-Agent is a browser's or a mail client's (they fetch
+	// what a page or an email tells them to) without fetch metadata.
+	BrowserAgent bool `json:"browser_agent,omitempty"`
 }
 
 // Detection sources.
@@ -138,6 +151,7 @@ type DetectionFilter struct {
 	RuleID      string    // "": any
 	MinSeverity Severity  // "": any
 	App         string    // "": any
+	Key         string    // "": any; otherwise exactly this key (a pattern's ID, an address …)
 	// Keyset paging: with BeforeLast set, only detections last seen before BeforeLast, or at it with
 	// an ID below Before (the last row of the previous page). Zero BeforeLast: from the newest.
 	BeforeLast time.Time
@@ -211,6 +225,7 @@ const (
 	TimelineAssigned  = "assigned"
 	TimelineNote      = "note"
 	TimelineMuted     = "muted"
+	TimelineResponse  = "response" // an automated response about it (Text: what was done, or why not)
 )
 
 // IncidentEvent is one entry of an incident's timeline.
@@ -301,4 +316,222 @@ type IncidentService interface {
 	Entity(ctx context.Context, e Entity) (RiskScore, []Incident, []Mute, error) // the entity page
 	RemoveMute(ctx context.Context, ruleID string, e Entity, actor string) error
 	Risky(ctx context.Context, limit int) ([]RiskScore, error) // the highest-risk entities, 1–100
+}
+
+// Log patterns (phase 4): the templates an app service's log lines (and the host's unclassified
+// lines) fall into, learned per scope; the pattern.* rules (RuleBaseline, BaselinePattern) fire on
+// a template first seen after its scope's learning period and on a spike of a known one.
+
+// Pattern states.
+const (
+	PatternLearned  = "learned"  // seen while its scope was learning, or put back to watching by the owner
+	PatternNew      = "new"      // first seen after its scope's learning period (reported by pattern.new)
+	PatternExpected = "expected" // the owner marked it normal: pattern.new and pattern.spike stay silent for it
+	PatternIgnored  = "ignored"  // the owner switched its spikes off: pattern.spike stays silent for it
+)
+
+// MaxPatternText bounds Pattern.Template and Pattern.Sample (bytes).
+const MaxPatternText = 512
+
+// Pattern is one log template of one scope.
+type Pattern struct {
+	ID      string `json:"id"`    // "p" + 16 lowercase hex, stable for (scope, template)
+	Scope   string `json:"scope"` // "app:<slug>/<service>" or "host"
+	App     string `json:"app,omitempty"`
+	Service string `json:"service,omitempty"`
+	// Template is the masked token sequence: variable parts are <NUM>, <HEX>, <UUID>, <IP>, <TS>,
+	// <HASH>, <B64>, <STR>, <LONG> or <*>. Built from redacted text only. At most MaxPatternText.
+	Template string `json:"template"`
+	// Sample is one redacted line of it, kept until the security logs' hot_retention after it was
+	// seen; Pattern only (not Patterns). At most MaxPatternText.
+	Sample string    `json:"sample,omitempty"`
+	Level  string    `json:"lvl,omitempty"` // the highest level seen (an event Lvl)
+	State  string    `json:"state"`         // a Pattern* state
+	First  time.Time `json:"first"`
+	Last   time.Time `json:"last"`
+	Count  int64     `json:"count"` // lines since First
+	// Hourly is lines per hour for the last 168 hours, oldest first; Pattern only.
+	Hourly []uint32 `json:"hourly,omitempty"`
+}
+
+// PatternFilter selects patterns for the page. Sort "last" (default: most recently seen first),
+// "count" (most lines in the last 24 hours first) or "first" (newest first).
+type PatternFilter struct {
+	App      string   // "": any
+	Service  string   // "": any (with App)
+	Host     bool     // only the host's patterns (App must be "")
+	States   []string // empty: any
+	MinLevel string   // "": any; otherwise an event Lvl ("warn", "error" …)
+	Sort     string
+	Offset   int
+	Limit    int // 1–200 (default 50)
+}
+
+// PatternStats is the miner's state for the page header.
+type PatternStats struct {
+	Enabled    bool     `json:"enabled"`
+	Scopes     int      `json:"scopes"`
+	Patterns   int      `json:"patterns"`
+	Lines      int64    `json:"lines"`              // lines mined since start
+	Unmined    int64    `json:"unmined"`            // lines counted only (over the CPU budget, or a scope's new-template cap)
+	Dropped    int64    `json:"dropped"`            // lines not taken (the miner's queue was full)
+	Overflowed int64    `json:"overflowed"`         // lines past a scope's template cap
+	BudgetPct  float64  `json:"budget_pct"`         // share of the CPU budget used in the last minute (0–100)
+	Learning   []string `json:"learning,omitempty"` // scopes still in their learning period (at most 50)
+}
+
+// PatternService is what the owner-only Patterns pages use.
+type PatternService interface {
+	Patterns(ctx context.Context, f PatternFilter) ([]Pattern, error)
+	Pattern(ctx context.Context, id string) (Pattern, bool, error) // with Sample and Hourly
+	// SetPatternState sets expected, ignored or learned (watch again); ErrInvalidInput for another
+	// state or an unknown pattern. actor is recorded by the caller's audit event.
+	SetPatternState(ctx context.Context, id, state, actor string) error
+	PatternStats() PatternStats
+}
+
+// Automated response (phase 4): blocking a detection's address at the edge, or signing a Mooring
+// account out of every session, decided per rule (Rule.Response) and applied by the responder
+// (internal/siem/respond) according to security_logs.response.mode.
+
+// Response actions.
+const (
+	ResponseBlock  = "block"  // block the detection's address at the edge for a time
+	ResponseRevoke = "revoke" // sign the Mooring account out of every session
+)
+
+// RuleResponse is a rule's response. The zero value is none.
+type RuleResponse struct {
+	Action string `json:"action,omitempty"` // "", ResponseBlock or ResponseRevoke
+	// Duration: block only, the first block's length (5m–7d); a repeat within 30 days blocks four
+	// times as long, up to security_logs.response.max_block_duration. Revoke: 0.
+	Duration time.Duration `json:"duration,omitempty"`
+}
+
+// Response modes (security_logs.response.mode).
+const (
+	ResponseModeOff       = "off"       // no responses (default)
+	ResponseModeRecommend = "recommend" // responses are recorded as recommendations for the owner to apply
+	ResponseModeEnforce   = "enforce"   // automatic responses are applied; recommend-only ones are recorded
+)
+
+// Response states.
+const (
+	ResponseRecommended = "recommended" // waiting for the owner (recommend mode, or recommend-only)
+	ResponseApplied     = "applied"     // done: the block was placed / the sessions were revoked
+	ResponseRefused     = "refused"     // not done; Reason says why (a protected address, a cap …)
+	ResponseFailed      = "failed"      // tried and failed; Reason says why
+	ResponseDismissed   = "dismissed"   // the owner dismissed the recommendation
+	ResponseExpired     = "expired"     // a recommendation nobody acted on within 7 days
+)
+
+// ResponseRequest is one response the rule engine asks for, after the detection was stored.
+type ResponseRequest struct {
+	Action string
+	// Target: block, the detection's address key (an IPv4 address, or an IPv6 /64 such as
+	// "2001:db8:1:2::/64"); revoke, the Mooring account as the event stored it (the actor: the
+	// username, or its keyed hash when the username is personal data).
+	Target    string
+	Duration  time.Duration // block: the rule's first-block length
+	Automatic bool          // may be applied without the owner (enforce); false: recommend only
+	RuleID    string
+	RuleName  string
+	Severity  Severity
+	// DetectionID is 0 when the detection couldn't be stored; IncidentID 0 when it joined none.
+	DetectionID int64
+	IncidentID  int64
+	Summary     string // the detection's summary (no secrets, no message text)
+	At          time.Time
+}
+
+// Responder takes the rule engine's response requests. It must not block (false: not taken).
+type Responder interface {
+	Respond(r ResponseRequest) bool
+}
+
+// Response is one recorded response.
+type Response struct {
+	ID     int64  `json:"id"`
+	Action string `json:"action"`
+	// Target: block, the canonical prefix ("203.0.113.7/32", "2001:db8:1:2::/64"); revoke, the
+	// Mooring username.
+	Target      string        `json:"target"`
+	State       string        `json:"state"`            // a Response* state
+	Reason      string        `json:"reason,omitempty"` // refused / failed: a fixed code
+	Automatic   bool          `json:"automatic"`
+	RuleID      string        `json:"rule_id,omitempty"`
+	DetectionID int64         `json:"detection_id,omitempty"`
+	IncidentID  int64         `json:"incident_id,omitempty"`
+	Summary     string        `json:"summary,omitempty"`
+	Duration    time.Duration `json:"duration,omitempty"` // block: as applied (after a repeat's escalation)
+	Created     time.Time     `json:"created"`
+	Updated     time.Time     `json:"updated"`
+	By          string        `json:"by,omitempty"` // the owner who applied or dismissed it ("" for Mooring)
+}
+
+// ResponseFilter selects responses for the page, newest first (ID descending), keyset-paged.
+type ResponseFilter struct {
+	States      []string // empty: any
+	Action      string   // "": any
+	IncidentID  int64    // 0: any
+	DetectionID int64    // 0: any
+	Before      int64    // 0: from the newest; otherwise IDs below it
+	Limit       int      // 1–200 (default 50)
+}
+
+// ResponseStatus is the responder's state for the page header.
+type ResponseStatus struct {
+	Mode      string    `json:"mode"`                // security_logs.response.mode
+	Paused    string    `json:"paused,omitempty"`    // "" or the dashboard pause: ResponseModeRecommend / ResponseModeOff
+	PausedBy  string    `json:"paused_by,omitempty"` // who paused
+	PausedAt  time.Time `json:"paused_at,omitempty"`
+	Effective string    `json:"effective"` // the lower of Mode and Paused
+	// This hour's automatic actions against their caps (security_logs.response.max_*_per_hour).
+	BlocksThisHour    int  `json:"blocks_this_hour"`
+	MaxBlocksPerHour  int  `json:"max_blocks_per_hour"`
+	RevokesThisHour   int  `json:"revokes_this_hour"`
+	MaxRevokesPerHour int  `json:"max_revokes_per_hour"`
+	Revoker           bool `json:"revoker"` // false: session revokes are refused (not wired yet)
+}
+
+// ResponseService is what the owner-only Responses page uses. Every method that changes something
+// takes the acting user (actor).
+type ResponseService interface {
+	Status(ctx context.Context) (ResponseStatus, error)
+	Responses(ctx context.Context, f ResponseFilter) ([]Response, error)
+	Response(ctx context.Context, id int64) (Response, bool, error)
+	// Apply applies a recommended response now (ErrInvalidInput when it isn't one); a refusal is
+	// returned as an error whose message is safe to show and recorded on the response.
+	Apply(ctx context.Context, id int64, actor string) error
+	Dismiss(ctx context.Context, id int64, actor string) error // a recommended one
+	// SetPause lowers what responses do until lifted: "" lifts it, ResponseModeRecommend records
+	// recommendations only, ResponseModeOff also removes every automatic block now. It can never
+	// raise the configured mode.
+	SetPause(ctx context.Context, level, actor string) error
+	// LiftForIncident: the incident was marked a false positive. Its automatic blocks are removed
+	// and their addresses exempt from automatic blocks for 30 days; returns how many were removed.
+	LiftForIncident(ctx context.Context, incidentID int64, actor string) (int, error)
+}
+
+// ErrBlocksNotLifted is wrapped by the error ResponseService.SetPause returns when the pause WAS
+// stored and is in force, but removing the automatic blocks (level off) failed; the responder
+// retries the removal by itself.
+var ErrBlocksNotLifted = errors.New("the automatic blocks were not removed yet")
+
+// ErrUnknownAccount is returned by an AccountRevoker for an actor that is no Mooring user.
+var ErrUnknownAccount = errors.New("unknown account")
+
+// AccountRevoker signs Mooring accounts out (the dashboard implements it).
+type AccountRevoker interface {
+	// Revoke signs the account stored as actor (the username, or its keyed hash) out of every
+	// session; it returns the username and how many sessions ended. When several users are stored
+	// as that actor (email usernames differing only in case), all are signed out and username lists
+	// them, comma-separated.
+	Revoke(ctx context.Context, actor string) (username string, sessions int64, err error)
+}
+
+// RuleResponder is implemented by the DetectionService: which response actions a rule may take
+// (for the rule page), or why it may take none.
+type RuleResponder interface {
+	RuleResponses(r Rule) (actions []string, why string)
 }

@@ -51,16 +51,18 @@ const (
 	opFPPairs
 	opFP
 	opUnmuted
+	opResponse // the responder's timeline entry (NoteResponse)
 )
 
 type incReq struct {
 	op           incOp
 	id           int64
 	state, actor string
-	text         string    // the note (opState, opNote, opFP), the assignee (opAssign)
-	muted        int       // opFP: pairs muted; opState: the incident's mutes lifted
-	until        time.Time // opFP: when they end
-	rm           siem.Mute // opUnmuted
+	text         string             // the note (opState, opNote, opFP), the assignee (opAssign)
+	muted        int                // opFP: pairs muted; opState: the incident's mutes lifted
+	until        time.Time          // opFP: when they end
+	rm           siem.Mute          // opUnmuted
+	ev           siem.IncidentEvent // opResponse
 	reply        chan incReply
 	st           atomic.Int32 // reqQueued, reqTaken, reqAbandoned
 }
@@ -130,8 +132,12 @@ func (e *Engine) serve(r *incReq) {
 		return
 	}
 	e.emitUntil = time.Now().Add(reqEmitBudget)
-	if r.op == opUnmuted {
+	switch r.op {
+	case opUnmuted:
 		rep.err = e.unmuted(r)
+		return
+	case opResponse:
+		rep.err = e.noteResponse(r)
 		return
 	}
 	inc, found, err := e.incident(r.id)

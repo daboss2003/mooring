@@ -16,6 +16,8 @@
   - [Security logs](security-logs.md)
   - [Security detections](security-detections.md)
   - [Security incidents](security-incidents.md)
+  - [Log patterns](security-patterns.md)
+  - [Automated response & block list](security-responses.md)
   - [Backup & recovery](backup-and-recovery.md)
   - [Scaling & self-healing](scaling-and-self-healing.md)
   - [Per-service ops (rich monitoring)](app-ops-interface.md)

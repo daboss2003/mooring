@@ -1,0 +1,134 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Log patterns</h1>
+  <p class="muted">The templates that each app service's log lines, and the host's unclassified lines, fall into. After a source's 7-day learning period, a template seen for the first time is reported as new and a sharp rise of a known one as a spike.</p>
+  {{template "security_subnav" "patterns"}}
+  {{if .Off}}{{template "secdetoff"}}{{else if .PatOff}}{{template "secpatoff"}}{{else}}{{with .Pats}}
+  <form method="get" action="/security/patterns" class="toolbar">
+    <div class="field">
+      <label for="pat-app">App</label>
+      <input type="text" id="pat-app" name="app" value="{{.Form.App}}" placeholder="Any app" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="pat-svc">Service</label>
+      <input type="text" id="pat-svc" name="service" value="{{.Form.Service}}" placeholder="Any service" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="pat-state">State</label>
+      <select id="pat-state" name="state">
+        {{range .States}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="field">
+      <label for="pat-level">Level</label>
+      <select id="pat-level" name="level">
+        {{range .Levels}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="field">
+      <label for="pat-sort">Sort</label>
+      <select id="pat-sort" name="sort">
+        {{range .Sorts}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <label class="check sec-check-field"><input type="checkbox" name="host" value="1"{{if .Form.Host}} checked{{end}}> Host only</label>
+    <div class="toolbar-actions">
+      <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+      <a href="/security/patterns" class="btn btn-sm btn-ghost">Reset</a>
+    </div>
+  </form>
+  {{/* Live refresh: the first page reloads its numbers and list every 30 seconds (later pages don't). */}}
+  {{if .PollURL}}<div data-poll-url="{{.PollURL}}" data-poll-interval="{{.PollMS}}">{{template "secpatlist" $}}</div>
+  {{else}}{{template "secpatlist" $}}{{end}}
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}
+
+{{/* The miner's numbers and the list: rendered inline AND returned by /security/patterns/rows for the live refresh. */}}
+{{define "secpatlist"}}{{if .Off}}{{template "secdetoff"}}{{else if .PatOff}}{{template "secpatoff"}}{{else}}{{with .Pats}}
+{{with .Stats}}
+{{if not .Enabled}}<div class="notice notice-warn" role="status">Log pattern mining is off on this host: no new lines are grouped into patterns. The patterns below are what was learned before. Mining is on by default; see <code>security_logs.detection.patterns.enabled</code> in <code>/etc/mooring/config.yaml</code>.</div>{{end}}
+<div class="stat-grid sec-stats">
+  <div class="stat-card">
+    <div class="stat-label">Patterns</div>
+    <div class="stat-value sec-stat-value">{{.Patterns}}</div>
+    <div class="stat-sub">in {{.Scopes}} sources</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Lines mined</div>
+    <div class="stat-value sec-stat-value">{{.Lines}}</div>
+    <div class="stat-sub">since Mooring started</div>
+  </div>
+  <div class="stat-card{{if ge .BudgetPct 90.0}} is-warn{{end}}">
+    <div class="stat-label">CPU budget used</div>
+    <div class="stat-value sec-stat-value">{{.Budget}}</div>
+    <div class="stat-sub">in the last minute, of <code>max_cpu_percent</code></div>
+    {{template "meter" .BudgetPct}}
+  </div>
+  <div class="stat-card{{if .Lost}} is-warn{{end}}">
+    <div class="stat-label">Lines not mined</div>
+    {{if .Lost}}
+    <div class="stat-sub">{{if .HasUnmined}}<div><span class="sec-dropped">{{.Unmined}}</span> counted only (over budget or a template cap)</div>{{end}}{{if .HasDropped}}<div><span class="sec-dropped">{{.Dropped}}</span> dropped (queue full)</div>{{end}}{{if .HasOverflowed}}<div><span class="sec-dropped">{{.Overflowed}}</span> past a source's template cap</div>{{end}}</div>
+    {{else}}
+    <div class="stat-value sec-stat-value">0</div>
+    <div class="stat-sub">every line was mined</div>
+    {{end}}
+  </div>
+</div>
+{{if .Learning}}<p class="muted small">Still learning, so no new patterns are reported for them yet: {{range $i, $s := .Learning}}{{if $i}} {{end}}<span class="chip">{{$s}}</span>{{end}}{{if .LearningMore}} and more{{end}}</p>{{end}}
+{{end}}
+<section class="panel">
+  <h2><span>Patterns</span>{{if .PollURL}} <span class="muted small">Updates every 30 seconds</span>{{end}}</h2>
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>
+  {{else if .Rows}}
+  <div class="table-scroll"><table class="grid">
+    <thead><tr><th>Last seen (UTC)</th><th>Level</th><th>State</th><th class="wrap-cell">Template</th><th>Source</th><th class="num">Lines</th></tr></thead>
+    <tbody>
+      {{range .Rows}}
+      <tr>
+        <td><a class="mono" href="{{.URL}}">{{if .Last}}{{.Last}}{{else}}{{.ID}}{{end}}</a> <span class="muted small">{{.Ago}}</span></td>
+        <td>{{if .Lvl}}<span class="sec-lvl {{.LvlClass}}">{{.Lvl}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+        <td>{{template "sec_patstate" .}}</td>
+        <td class="wrap-cell"><a class="sec-tpl" href="{{.URL}}">{{.Template}}</a></td>
+        <td class="sec-scope">{{if .ScopeURL}}<a href="{{.ScopeURL}}">{{template "sec_patscope" .}}</a>{{else}}{{template "sec_patscope" .}}{{end}}</td>
+        <td class="num">{{.Count}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table></div>
+  {{else if .Filtered}}
+  <p class="muted sec-empty">No patterns match these filters.</p>
+  {{else}}
+  <div class="sec-empty">
+    <p><strong>No patterns yet</strong></p>
+    <p class="muted">Mooring groups log lines into patterns as apps and the host write them.</p>
+  </div>
+  {{end}}
+  {{if or .PrevURL .NextURL}}
+  <div class="pager mt1">
+    {{if .PrevURL}}<a class="btn btn-sm btn-ghost" href="{{.PrevURL}}">Previous page</a>{{end}}
+    {{if .NextURL}}<a class="btn btn-sm btn-ghost" href="{{.NextURL}}">Next page</a>{{end}}
+    {{if .FirstRow}}<span class="muted small">Patterns {{.FirstRow}} to {{.LastRow}}</span>{{end}}
+  </div>
+  {{end}}
+</section>
+{{end}}{{end}}{{end}}
+
+{{/* A pattern's source in the list (a patRow): an app's may wrap after the slash. */}}
+{{define "sec_patscope"}}{{if .ScopeSvc}}{{.ScopeApp}}/<wbr>{{.ScopeSvc}}{{else}}{{.Scope}}{{end}}{{end}}
+
+{{/* A pattern's state pill (a patRow; StateClass is from an allowlist). */}}
+{{define "sec_patstate"}}<span class="pill{{if .StateClass}} {{.StateClass}}{{end}}">{{.StateLabel}}</span>{{end}}
+
+{{define "secpatoff"}}
+<section class="panel">
+  <h2>Log patterns are off</h2>
+  <p class="muted">Mooring is not grouping log lines into patterns on this host. To turn them on, set <code>security_logs.detection.patterns.enabled</code> to <code>true</code> in <code>/etc/mooring/config.yaml</code> and restart Mooring. If it is already <code>true</code>, Mooring's startup log says why log patterns did not start.</p>
+  <pre class="stream">security_logs:
+  detection:
+    patterns:
+      enabled: true</pre>
+  <p class="muted small">Reference: <a href="https://github.com/daboss2003/mooring/blob/main/docs/security-patterns.md">docs/security-patterns.md</a></p>
+</section>
+{{end}}

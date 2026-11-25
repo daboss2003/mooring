@@ -463,14 +463,24 @@ type detectionView struct {
 	MoreURL     string // more detections of this rule
 	RelatedURL  string // a search for this key's events over the detection's span
 	RelatedTerm string
+	PatternURL  string // a log-pattern detection: its pattern's page (instead of RelatedURL)
 	Evidence    []evidenceRow
+	Browsers    bool // an evidence row is marked browser or browser-like agent
 	Credits     detectCredits
+	Responses   []respRow // automated responses about it
+	RespErr     string
 }
+
+// patternRulePrefix starts the IDs of the log-pattern rules, whose detections are keyed by pattern ID.
+const patternRulePrefix = "pattern."
 
 type evidenceRow struct {
 	When, ISO, Ago       string
 	Kind, IP, Actor, App string
 	SearchURL            string
+	// Agent marks a request that doesn't count toward an automatic block: "browser" (it carried
+	// browser fetch metadata) or "browser-like agent" (a browser's or mail client's User-Agent).
+	Agent string
 }
 
 // detectSearchURL is a Security logs search link for terms within [from, to).
@@ -631,6 +641,12 @@ func (s *Server) handleDetection(w http.ResponseWriter, r *http.Request) {
 	if d.RuleID != "" {
 		v.MoreURL = withQuery("/security/detections", url.Values{"rule": {d.RuleID}})
 	}
+	// A log-pattern detection is keyed by its pattern's ID: it links the pattern's page (when the
+	// Patterns pages run) and never a search for the ID, which matches no event.
+	isPattern := strings.HasPrefix(d.RuleID, patternRulePrefix) && patIDPattern.MatchString(d.Key)
+	if isPattern && s.patterns != nil {
+		v.PatternURL = "/security/patterns/" + d.Key
+	}
 	if !v.Ops {
 		rules, err := s.detections.Rules(ctx)
 		if err != nil {
@@ -641,6 +657,9 @@ func (s *Server) handleDetection(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			v.RuleURL = withQuery("/security/rules/edit", url.Values{"id": {ru.ID}})
+			if isPattern {
+				continue
+			}
 			if search := relatedSearch(ru, d.Key); search != "" && !d.First.IsZero() && !d.Last.IsZero() {
 				v.RelatedTerm = search
 				v.RelatedURL = detectSearchURL([]string{search}, d.First.Add(-detectSearchPad), d.Last.Add(detectSearchPad))
@@ -652,6 +671,13 @@ func (s *Server) handleDetection(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		row := evidenceRow{Kind: ev.Kind, IP: ev.IP, Actor: ev.Actor, App: ev.App}
+		switch {
+		case ev.Browser:
+			row.Agent = "browser"
+		case ev.BrowserAgent:
+			row.Agent = "browser-like agent"
+		}
+		v.Browsers = v.Browsers || row.Agent != ""
 		if !ev.TS.IsZero() {
 			row.When, row.ISO, row.Ago = ev.TS.UTC().Format(detectTimeFmt), ev.TS.UTC().Format(time.RFC3339Nano), secAgo(now, ev.TS)
 			if terms := evidenceTerms(ev); len(terms) > 0 {
@@ -660,5 +686,6 @@ func (s *Server) handleDetection(w http.ResponseWriter, r *http.Request) {
 		}
 		v.Evidence = append(v.Evidence, row)
 	}
+	v.Responses, v.RespErr = s.detectionResponses(ctx, d.ID)
 	s.renderDetect(w, r, http.StatusOK, page, v.RuleName, &detectPage{One: v})
 }

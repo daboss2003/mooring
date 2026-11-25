@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -85,6 +86,53 @@ func TestPeek(t *testing.T) {
 	_, _ = db.Exec(`UPDATE sessions SET last_seen_at = ?`, time.Now().Add(-time.Hour).Unix())
 	if _, err := m.Peek(ctx, raw); !errors.Is(err, ErrNotFound) {
 		t.Error("Peek must enforce idle expiry, not just read")
+	}
+}
+
+// ActivePeers lists the address of every session still valid (each address once), skipping
+// sessions past their idle or absolute expiry and peer values that aren't addresses.
+func TestActivePeers(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	m := New(db, 30*time.Minute, 12*time.Hour)
+	if got, err := m.ActivePeers(ctx); err != nil || len(got) != 0 {
+		t.Fatalf("no sessions: %v, %v", got, err)
+	}
+	// ::ffff:203.0.113.7 is 203.0.113.7: listed once.
+	for _, p := range []string{"203.0.113.7", "203.0.113.7", "::ffff:203.0.113.7", "2001:db8::1", "198.51.100.9", "198.51.100.10", "not-an-ip", "fe80::1%eth0", ""} {
+		if _, err := m.Create(ctx, "operator", p, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	// 198.51.100.9 idled out, 198.51.100.10 is past its absolute expiry: neither is listed.
+	if _, err := db.Exec(`UPDATE sessions SET last_seen_at = ? WHERE peer_ip = '198.51.100.9'`, now.Add(-31*time.Minute).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE sessions SET absolute_exp = ? WHERE peer_ip = '198.51.100.10'`, now.Add(-time.Second).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.ActivePeers(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var strs []string
+	for _, a := range got {
+		strs = append(strs, a.String())
+	}
+	slices.Sort(strs)
+	if want := []string{"2001:db8::1", "203.0.113.7"}; !slices.Equal(strs, want) {
+		t.Errorf("ActivePeers = %v, want %v", strs, want)
+	}
+	// A statement right after it works: the rows were closed before it returned (the DB has one
+	// connection, so rows left open would block it).
+	if _, err := m.ActivePeers(ctx); err != nil {
+		t.Fatal(err)
+	}
+	tctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if _, err := m.DeleteAll(tctx); err != nil {
+		t.Fatalf("a statement after ActivePeers: %v", err)
 	}
 }
 

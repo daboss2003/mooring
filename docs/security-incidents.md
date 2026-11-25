@@ -8,7 +8,7 @@ in Mooring's audit log.
 
 Incidents are on whenever [detection](./security-detections.md) is on.
 
-See also: [Security detections](./security-detections.md) · [Security logs](./security-logs.md) · [Alerts](./alerting.md)
+See also: [Security detections](./security-detections.md) · [Automated response](./security-responses.md) · [Log patterns](./security-patterns.md) · [Security logs](./security-logs.md) · [Alerts](./alerting.md)
 
 ---
 
@@ -181,8 +181,11 @@ An incident sends a `security_incident` alert to every enabled channel (see
 
 Timeline entries, oldest first: `opened`, `detection` (a detection joined, with its rule, severity
 and summary), `escalated` (the severity rose, and why), `state`, `assigned`, `note`, `muted` (a
-false positive muted its pairs, or a mute was removed). Each entry made on the dashboard names the
-user who made it.
+false positive muted its pairs, or a mute was removed), `response` (an
+[automated response](./security-responses.md) about the incident: a block or sign-out recommended,
+applied, refused, failed, dismissed or expired; a refusal for the same reason, action and target at
+most once an hour; at most 100 per incident). Each entry made on the
+dashboard names the user who made it.
 
 ## False positives and mutes
 
@@ -199,6 +202,14 @@ alerting. Until a mute ends, that rule's detections for that entity:
 
 A mute applies to the rule's detections keyed by that entity only: the same rule keeps firing for
 other addresses and accounts.
+
+Marking an incident a false positive, with or without a mute, also removes the automatic
+[edge blocks](./security-responses.md#false-positives-and-exemptions) placed for it, exempts their
+addresses from automatic blocks for 30 days, resets their repeat history (the next automatic block
+of each starts at the rule's block length), and dismisses its waiting recommendations. The
+timeline gets a `response` entry (`false positive: lifted 1 automatic block, dismissed 0
+recommendations`). Manual blocks stay. When the blocks can't be removed, the incident is still
+marked and the page says so: remove them on the Blocked addresses page.
 
 - The incident's page and the entity's page list its mutes in force; **Remove** on the entity page
   ends one at once and records it in its incident's timeline (`mute removed: <rule> for <entity>`).
@@ -277,9 +288,13 @@ All pages are for owners only. Every change is recorded in Mooring's audit log.
   page), and detections (each links to the detection). Actions: **Acknowledge**, **Resolve**,
   **Reopen**, **False positive** (with or without mute), **Assign** and **Add note**; a state change
   can carry a note. The mutes the incident made that are still in force are listed, each with
-  **Remove**; reopening the incident removes them.
+  **Remove**; reopening the incident removes them. The [responses](./security-responses.md) about
+  the incident are listed.
 - **Entity** (`/security/entities`): an account's or address's risk score and open incidents, its
-  incidents, and its mutes, each with **Remove**. **Find in Security logs** searches the address, or
+  incidents, and its mutes, each with **Remove**. An address's page shows its
+  [edge block](./security-responses.md#manual-blocks), with **Block** or **Unblock**; an address
+  inside another active block shows `Blocked by <prefix>` and neither button, and an IPv6 /64 with
+  a narrower active block inside it shows `Partly blocked by <prefix>` and **Block**. **Find in Security logs** searches the address, or
   the account in its own source (`src:host`, `src:mooring`, `src:edge`, `src:app`, plus `app:<slug>`
   for an app account).
 
