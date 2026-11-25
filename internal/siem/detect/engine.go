@@ -45,8 +45,15 @@ type Options struct {
 	// MapValue maps a clear value in a rule query to its stored form, like the search page does:
 	// field is "actor" or the full "f.<key>". nil keeps values as written.
 	MapValue func(field, value string) string
-	Log      *slog.Logger
-	Now      func() time.Time
+	// KnownHost reports whether host (lowercase, no port) is served by an edge route; the traffic
+	// baseline learns only those (the Host header is the client's to choose). key is the name its
+	// traffic is counted under: the host itself, or "*.<apex>" for a host a catch-all route serves
+	// (every label under it counts as one). ready is false until the edge's routes were read once:
+	// nothing is forgotten before that; KnownHost("") must report ready too (the traffic baseline
+	// asks it that way on its tick). nil: no host is known.
+	KnownHost func(host string) (key string, known, ready bool)
+	Log       *slog.Logger
+	Now       func() time.Time
 }
 
 // Tunables.
@@ -132,10 +139,14 @@ type limits struct {
 	dbBytes                   int64
 	alertBackoff              []time.Duration
 	alertTimeout              time.Duration // one outbox write, and the alert worker's shutdown pass
+	// incidents groups detections into incidents (on in production; the tests of the per-detection
+	// alerts switch it off).
+	incidents bool
 }
 
 // Engine evaluates the rules. Create it with New, start Run, hand it events with Subscriber.
 type Engine struct {
+	bl   *baselines // phase-3 baseline rules' learned state (baseline*.go)
 	opt  Options
 	log  *slog.Logger
 	now  func() time.Time
@@ -148,6 +159,8 @@ type Engine struct {
 	reports chan siem.Detection
 	alerts  chan *alertJob
 	results chan alertResult
+	reqs    chan *incReq  // the dashboard's incident changes (incident_service.go)
+	stopped chan struct{} // closed when Run returns
 	running atomic.Bool
 	closed  atomic.Bool
 
@@ -160,6 +173,10 @@ type Engine struct {
 	mu     sync.Mutex
 	ov     map[string]override
 	custom map[string]storedCustom
+	// False-positive mutes in force (mute.go): muteRows changes under mu, mutes is rebuilt from it.
+	ms       *muteStore
+	muteRows map[muteKey]siem.Mute
+	mutes    atomic.Pointer[muteSet]
 
 	// Evaluation state: owned by the Run goroutine (or a test calling process directly).
 	cur     *ruleSet
@@ -195,6 +212,18 @@ type Engine struct {
 	writeFailAt  time.Time
 	writeBackoff time.Duration // 0: the last write succeeded
 	readFailAt   time.Time
+
+	// Incidents (incident.go), the Run goroutine's.
+	incs      map[int64]*incident    // written incidents in memory
+	incNew    map[*incident]struct{} // not written yet
+	incDirty  map[*incident]struct{} // changed since written
+	incOwed   map[*incident]struct{} // may owe an alert
+	incRetry  map[int64]struct{}     // incidents to read back at a flush and check for an owed alert (oweLater)
+	entIdx    entIndex               // each key entity's incidents (at most maxEntIncs)
+	listIdx   entIndex               // the incidents listing each entity from a detection of a chain step
+	risk      map[incEnt]*riskEntry
+	riskDirty map[incEnt]struct{}
+	riskGone  map[incEnt]struct{}
 }
 
 // keyFilter tracks the (rule, key) pairs that may have a stored detection a firing could update,
@@ -233,10 +262,14 @@ func New(opts Options) (*Engine, error) {
 	}
 	e := &Engine{opt: opts, log: opts.Log, now: opts.Now, seed: maphash.MakeSeed(),
 		lim: limits{newPerHour: newPerHour, alertsPerHour: alertsPerHour, dbBytes: maxDBBytes,
-			alertBackoff: defaultAlertBackoff, alertTimeout: alertTimeout},
+			alertBackoff: defaultAlertBackoff, alertTimeout: alertTimeout, incidents: true},
 		in: make(chan siem.Event, queueSize), reports: make(chan siem.Detection, reportQueue),
 		alerts: make(chan *alertJob, alertQueue), results: make(chan alertResult, 2*alertQueue),
-		ov: map[string]override{}, custom: map[string]storedCustom{},
+		reqs: make(chan *incReq, reqQueue), stopped: make(chan struct{}),
+		ov: map[string]override{}, custom: map[string]storedCustom{}, muteRows: map[muteKey]siem.Mute{},
+		incs: map[int64]*incident{}, incNew: map[*incident]struct{}{}, incDirty: map[*incident]struct{}{},
+		incOwed: map[*incident]struct{}{}, incRetry: map[int64]struct{}{}, entIdx: entIndex{}, listIdx: entIndex{}, risk: map[incEnt]*riskEntry{},
+		riskDirty: map[incEnt]struct{}{}, riskGone: map[incEnt]struct{}{},
 		states: map[string]*ruleState{}, active: map[string]*list.Element{}, dirty: map[*activeDet]struct{}{},
 		parked: map[string]*activeDet{}, newRows: map[string]int{}, rollups: map[string]*activeDet{},
 		caps: map[capKey]*capState{}, cooldown: map[string]time.Time{},
@@ -263,6 +296,14 @@ func New(opts Options) (*Engine, error) {
 			e.log.Error("security detection: stored rule skipped", "err", err)
 		}
 		e.ov, e.custom = ov, custom
+		// Intentional: mutes that can't be read leave detection running without them (more alerts,
+		// never fewer).
+		e.ms = &muteStore{db: opts.MainDB.DB}
+		if rows, err := e.ms.load(context.Background(), e.now()); err != nil {
+			e.log.Error("security detection: false-positive mutes not read", "err", err)
+		} else {
+			e.muteRows = rows
+		}
 	}
 	if err := e.rebuild(); err != nil {
 		_ = d.close()
@@ -289,10 +330,40 @@ func New(opts Options) (*Engine, error) {
 		e.log.Error("security detection: learned state not loaded", "err", err)
 		e.pending = nil
 	}
+	e.loadBaselines()
 	if err := e.loadHour(); err != nil {
 		e.log.Error("security detection: hourly limits not read back", "err", err)
 	}
+	if err := e.loadIncidents(); err != nil {
+		e.log.Error("security detection: incidents not read back", "err", err)
+	}
 	return e, nil
+}
+
+// loadIncidents reads back the open and acknowledged incidents a detection can still join, or
+// that owe an alert (raised at the first flush), indexed by their key entities, and the risk
+// scores.
+func (e *Engine) loadIncidents() error {
+	now := e.now()
+	incs, err := e.db.activeIncidents(now.Add(-incJoinWindow-maxSkew), maxIncCache)
+	if err != nil {
+		return err
+	}
+	for _, inc := range incs {
+		e.seq++
+		inc.seq, inc.used = e.seq, now
+		e.incs[inc.id] = inc
+		if inc.alertSev >= rankHigh && (inc.alertSev > inc.alerted || inc.realert > 0) {
+			e.incOwed[inc] = struct{}{}
+		}
+		e.indexKey(inc)
+	}
+	risk, err := e.db.loadRisk(maxRisk)
+	if err != nil {
+		return err
+	}
+	e.risk = risk
+	return nil
 }
 
 // loadHour reads back the per-rule counters saved for the current wall-clock hour (new detections,
@@ -446,6 +517,7 @@ func (e *Engine) rebuild() error {
 		return errors.New("detect: no rule compiles")
 	}
 	e.rules.Store(rs)
+	e.rebuildMutes()
 	return nil
 }
 
@@ -536,6 +608,7 @@ func (e *Engine) Run(ctx context.Context) {
 	if !e.running.CompareAndSwap(false, true) {
 		return
 	}
+	defer close(e.stopped)
 	// The worker outlives ctx: the alerts of the last events are raised after it is done.
 	wctx, stopWorker := context.WithCancel(context.WithoutCancel(ctx))
 	workerDone := make(chan struct{})
@@ -558,6 +631,9 @@ func (e *Engine) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			e.safe(e.drain)
+			// Written first, so the incidents opened by the last events have an ID and their alerts
+			// go to the worker before it stops.
+			e.safe(func() { e.flush(true) })
 			e.safe(func() { e.sendCaps(true) })
 			stopWorker()
 			e.awaitWorker(workerDone)
@@ -570,13 +646,17 @@ func (e *Engine) Run(ctx context.Context) {
 			e.safe(func() { e.report(d) })
 		case r := <-e.results:
 			e.safe(func() { e.finishAlert(r) })
+		case r := <-e.reqs:
+			e.serve(r)
 		case <-write.C:
 			e.safe(func() { e.flush(false) })
 			e.safe(func() { e.sendCaps(false) })
 			e.safe(e.saveHourIfDirty)
+			e.safe(e.baselineTick)
 		case <-persist.C:
 			e.safe(e.persist)
 			e.safe(e.capSize)
+			e.safe(e.incMaintain)
 		case <-prune.C:
 			e.safe(e.prune)
 			e.safe(e.capSize)
@@ -685,6 +765,7 @@ func (e *Engine) persist() {
 		return
 	}
 	e.persistHour()
+	e.saveBaselines()
 	e.syncRules()
 	keep := map[string]bool{}
 	var rows []stateWrite
@@ -729,6 +810,49 @@ func (e *Engine) prune() {
 	} else if n > 0 {
 		e.log.Info("security detection: old detections removed", "count", n)
 	}
+	// Incidents whose last detection is as old (whatever their state) go with their timeline.
+	ids, err := e.db.pruneIncidents(context.Background(), e.now().Add(-keepFor))
+	if err != nil {
+		e.writeErrors.Add(1)
+		e.logLimited("prune", "security detection: incident prune failed", "err", err)
+	}
+	e.forgetIncidents(ids)
+	if len(ids) > 0 {
+		e.log.Info("security detection: old incidents removed", "count", len(ids))
+	}
+}
+
+// forgetIncidents drops removed incidents from memory (their entities' references too), marked
+// gone so an alert result coming back for one doesn't store it again.
+func (e *Engine) forgetIncidents(ids []int64) {
+	if len(ids) == 0 {
+		return
+	}
+	gone := map[int64]bool{}
+	for _, id := range ids {
+		gone[id] = true
+		if inc := e.incs[id]; inc != nil {
+			inc.gone = true
+			delete(e.incs, id)
+			delete(e.incDirty, inc)
+			delete(e.incOwed, inc)
+		}
+	}
+	e.entIdx.forget(gone)
+	e.listIdx.forget(gone)
+	// The detections in memory of those incidents are in none now: a write of one mustn't store the
+	// removed incident's ID.
+	unlink := func(a *activeDet) {
+		if (a.s.incID != 0 && gone[a.s.incID]) || (a.inc != nil && a.inc.id != 0 && gone[a.inc.id]) {
+			a.s.incID, a.inc = 0, nil
+		}
+	}
+	for _, el := range e.active {
+		unlink(el.Value.(*activeDet))
+	}
+	for a := range e.dirty {
+		unlink(a)
+	}
 }
 
 // capSize keeps detect.db's pages in use within lim.dbBytes: past it, the oldest low and medium
@@ -737,7 +861,8 @@ func (e *Engine) capSize() {
 	if e.closed.Load() {
 		return
 	}
-	n, err := e.db.trimTo(context.Background(), e.lim.dbBytes, e.lim.dbBytes/10*9)
+	n, gone, err := e.db.trimTo(context.Background(), e.lim.dbBytes, e.lim.dbBytes/10*9)
+	e.forgetIncidents(gone)
 	if err != nil {
 		e.writeErrors.Add(1)
 		e.logLimited("size", "security detection: size cap failed", "err", err)
@@ -872,6 +997,8 @@ func (e *Engine) applyRule(c *compiled, st *ruleState, ev *siem.Event, w uint32)
 		}
 		k.last = cur
 		st.charge(k)
+	case siem.RuleBaseline:
+		e.applyBaseline(c, key, ev, w)
 	case siem.RuleSequence:
 		if isThen {
 			// A closing event ends the sequence for its key whether or not it fired: the preceding

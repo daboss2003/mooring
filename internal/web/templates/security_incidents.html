@@ -1,0 +1,85 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <h1>Security incidents</h1>
+  <p class="muted">Detections that share an account or an address within 24 hours, grouped into one incident with a timeline. High and critical incidents are also sent to your alert channels.</p>
+  {{template "security_subnav" "incidents"}}
+  {{if .Off}}{{template "secdetoff"}}{{else}}{{with .List}}
+  <form method="get" action="/security/incidents" class="toolbar">
+    <div class="field">
+      <label for="inc-state">State</label>
+      <select id="inc-state" name="state">
+        {{range .States}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="field">
+      <label for="inc-sev">Severity</label>
+      <select id="inc-sev" name="severity">
+        {{range .Severities}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="field">
+      <label for="inc-assignee">Assignee</label>
+      <select id="inc-assignee" name="assignee">
+        {{range .Assignees}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </div>
+    <div class="toolbar-actions">
+      <button type="submit" class="btn btn-primary btn-sm">Filter</button>
+      <a href="/security/incidents" class="btn btn-sm btn-ghost">Reset</a>
+    </div>
+  </form>
+  {{/* Live refresh: the newest page reloads its list and the risk panel every 30 seconds (older pages don't). */}}
+  {{if .PollURL}}<div data-poll-url="{{.PollURL}}" data-poll-interval="{{.PollMS}}">{{template "secinclist" $}}</div>
+  {{else}}{{template "secinclist" $}}{{end}}
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}
+
+{{/* The list and the risk panel: rendered inline AND returned by /security/incidents/rows for the live refresh. */}}
+{{define "secinclist"}}{{if .Off}}{{template "secdetoff"}}{{else}}{{with .List}}
+<section class="panel">
+  <h2><span>Incidents</span>{{if .PollURL}} <span class="muted small">Updates every 30 seconds</span>{{end}}</h2>
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>
+  {{else if .Rows}}
+  {{template "secinctable" .Rows}}
+  {{if .Default}}<p class="muted small mt1">Resolved and false-positive incidents are not listed. <a href="{{.AllURL}}">Show all states</a></p>{{end}}
+  {{else if .Filtered}}
+  <p class="muted sec-empty">No incidents match these filters.</p>
+  {{else}}
+  <div class="sec-empty">
+    <p><strong>{{if .Default}}No open incidents{{else}}No incidents{{end}}</strong></p>
+    <p class="muted">Detections that share an account or an address within 24 hours open an incident here. <a href="/security/detections">See the detections</a>{{if .Default}} · <a href="{{.AllURL}}">Show all states</a>{{end}}</p>
+  </div>
+  {{end}}
+  {{if or .NewestURL .OlderURL}}
+  <div class="pager mt1">
+    {{if .NewestURL}}<a class="btn btn-sm btn-ghost" href="{{.NewestURL}}">Newest incidents</a>{{end}}
+    {{if .OlderURL}}<a class="btn btn-sm btn-ghost" href="{{.OlderURL}}">Older incidents</a>{{end}}
+  </div>
+  {{end}}
+</section>
+
+<section class="panel">
+  <h2>Highest risk</h2>
+  <p class="muted small">Each detection raises the risk score of its account or address, more for a higher severity. The score fades over the following days; 100 is the highest.</p>
+  {{if .RiskyErr}}<div class="error" role="alert">{{.RiskyErr}}</div>
+  {{else if .Risky}}
+  <div class="table-scroll"><table class="grid">
+    <thead><tr><th class="wrap-cell">Account or address</th><th>Risk score</th><th class="num">Open incidents</th><th>Updated (UTC)</th></tr></thead>
+    <tbody>
+      {{range .Risky}}
+      <tr>
+        <td class="wrap-cell">{{template "sec_entity" .Entity}}</td>
+        <td><span class="sec-risk"><strong>{{.Score}}</strong><span class="sec-risk-bar">{{template "meter" .Pct}}</span></span></td>
+        <td class="num">{{.Open}}</td>
+        <td class="mono"{{if .UpdatedISO}} title="{{.UpdatedISO}}"{{end}}>{{if .Updated}}{{.Updated}} <span class="muted small">{{.Ago}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+      </tr>
+      {{end}}
+    </tbody>
+  </table></div>
+  {{else}}
+  <p class="muted">No entity has a risk score yet.</p>
+  {{end}}
+</section>
+{{end}}{{end}}{{end}}

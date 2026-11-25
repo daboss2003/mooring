@@ -19,7 +19,7 @@
   <section class="panel">
     <h2>Summary</h2>
     <div class="table-scroll"><table class="grid"><tbody>
-      <tr><td>Severity</td><td>{{template "sec_sev" .}}{{if .Snoozed}} <span class="badge badge-muted">Snoozed</span> <span class="muted small">The rule was snoozed: this detection was recorded, not sent to the alert channels.</span>{{end}}</td></tr>
+      <tr><td>Severity</td><td>{{template "sec_sev" .}}{{if .Snoozed}} <span class="badge badge-muted">Snoozed</span> <span class="muted small">The rule was snoozed: this detection was recorded, not sent to the alert channels.</span>{{end}}{{if .Muted}} <span class="badge badge-muted">Muted</span> <span class="muted small">A false-positive mute of this rule for this key: this detection was recorded, sent no alert and opened no incident.</span>{{end}}</td></tr>
       <tr><td>Rule</td><td>{{if .RuleURL}}<a href="{{.RuleURL}}">{{.RuleName}}</a>{{else}}{{.RuleName}}{{end}} <span class="mono muted small">{{.RuleID}}</span>{{if .MoreURL}} <span class="muted">·</span> <a class="small" href="{{.MoreURL}}">All detections of this rule</a>{{end}}</td></tr>
       <tr><td>Source</td><td>{{.Source}}</td></tr>
       {{if .MITRE}}<tr><td>MITRE ATT&amp;CK®</td><td>{{template "sec_mitre" .MITRE}}</td></tr>{{end}}

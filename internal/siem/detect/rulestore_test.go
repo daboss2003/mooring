@@ -322,10 +322,10 @@ func TestMigration0041OnExistingDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`DROP TABLE security_rules`); err != nil {
+	if _, err := db.Exec(`DROP TABLE security_rules; DROP TABLE security_mutes`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`DELETE FROM schema_meta WHERE version = 41`); err != nil {
+	if _, err := db.Exec(`DELETE FROM schema_meta WHERE version >= 41`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO events(ts, action) VALUES (1, 'kept')`); err != nil {

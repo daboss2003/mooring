@@ -45,6 +45,7 @@ address, per actor, …). An event without the group-by field is skipped.
 | `anomaly` | At least `count` matching events for one key within `window`, and more than `factor` times the key's usual count per `window`. The usual count is the key's average per hour over its last 7 days (before the current window), scaled to the window; a key without earlier events has a usual count of 0. The rule fires only once `learn` has passed since its first matching event. | `count` 1–100000, `window` 1m–24h, `factor` 1.5–1000, `learn` 0–30d |
 | `travel` | Two consecutive matching events of one key come from IP locations more than 500 km apart, at a speed above `speed_kmh` for the time between them. Events without a location are skipped. | `speed_kmh` 100–20000 |
 | `sequence` | At least `count` events matching the query, then one matching the closing query (`then`), for one key within `window`. A closing event starts the key's count again from zero, whether or not the rule fired. | `then`, `count` 1–1000, `window` 1m–7d |
+| `baseline` | Built-in rules only. Learns each key's usual behaviour and fires on a departure from it; see [Baselines](#baselines). | per rule, see [Baselines](#baselines) |
 
 Group-by and field names: `ip`, `actor`, `app`, `kind`, `geo.cc`, `geo.asn`, `f.<name>` (a key of
 `f`), or empty for the whole rule (group-by only).
@@ -101,6 +102,11 @@ key starts again from zero.
 | `edge.spamhaus_ip` | Requests through the edge from an address on the Spamhaus DROP list. | `threshold` | 1 in 1h per `ip` | low | [T1595](https://attack.mitre.org/techniques/T1595/) |
 | `edge.dshield_ip` | Requests through the edge from an address on the DShield block list. | `threshold` | 1 in 1h per `ip` | low | [T1595](https://attack.mitre.org/techniques/T1595/) |
 | `edge.error_anomaly` | Far more 5xx responses for one host name than usual. | `anomaly` | 50 and 5× usual in 10m per `f.host`; learns 3d | medium | [T1499](https://attack.mitre.org/techniques/T1499/) |
+| `baseline.signin_unusual` | A successful sign-in that departs from the account's usual pattern in at least two ways: a new place (country or network), a new client, an unusual hour of the day. | `baseline` | 2 of 3 departures per `actor`; learns 14d | medium | [T1078](https://attack.mitre.org/techniques/T1078/) |
+| `baseline.traffic_surge` | Far more requests or server errors for a host name in an hour than in the same hour of the week in earlier weeks. | `baseline` | 5× usual and at least 200 requests (or 50 server errors) in an hour per `f.host`; learns 14d | medium | [T1498](https://attack.mitre.org/techniques/T1498/), [T1499](https://attack.mitre.org/techniques/T1499/) |
+| `baseline.traffic_drop` | Far fewer requests for a host name in an hour than in the same hour of the week in earlier weeks: an outage, or traffic blocked before it reaches the server. | `baseline` | a fifth of usual or less, usual at least 200 requests, in an hour per `f.host`; learns 14d | medium | [T1489](https://attack.mitre.org/techniques/T1489/) |
+| `baseline.admin_unusual` | A server user's sudo or su with a program or target user not seen for them (root at an unusual hour is noted with it, never alone). | `baseline` | a new program or target user per `actor`; learns 14d | high | [T1548.003](https://attack.mitre.org/techniques/T1548/003/) |
+| `baseline.ip_behaviour` | Most of an address's recent requests go to sign-in endpoints or admin paths, or are answered with an error, far more than its usual share. | `baseline` | 50 requests in 10m, half or more of one kind and 5× its usual share, per `ip`; learns 1d | low | [T1110](https://attack.mitre.org/techniques/T1110/), [T1595](https://attack.mitre.org/techniques/T1595/) |
 
 All built-in rules are on by default. The `app.*` rules match the event names in
 [Security events from your app](./security-logs.md#security-events-from-your-app): `auth.login`,
@@ -171,11 +177,197 @@ The queries:
 | `edge.spamhaus_ip` | `src:edge kind:http.request list:spamhaus-drop` |  |
 | `edge.dshield_ip` | `src:edge kind:http.request list:dshield` |  |
 | `edge.error_anomaly` | `src:edge kind:http.request f.status>=500` |  |
+| `baseline.signin_unusual` | `out:success kind~.login -kind~.login_ -f.sender_mismatch:true` |  |
+| `baseline.traffic_surge` | `src:edge kind:http.request` |  |
+| `baseline.traffic_drop` | `src:edge kind:http.request` |  |
+| `baseline.admin_unusual` | `src:host kind:su* out:success -f.sender_mismatch:true` |  |
+| `baseline.ip_behaviour` | `src:edge kind:http.request` |  |
+
+## Baselines
+
+The `baseline.*` rules learn what is usual for each key and fire when an event, or an hour,
+departs from it. Type `baseline` is for the built-in rules only: a custom rule can't use it. Like
+the other built-in rules they can be switched off, snoozed and tuned (the parameters below).
+
+- Hours are in the server's local time zone. The sign-in and sudo/su baselines learn the hour of
+  the day, weekdays (Monday to Friday) and weekend days (Saturday and Sunday) apart; the traffic
+  baselines learn the hour of the week, Sunday to Saturday. `03:00 Tue` is Tuesday 03:00–04:00.
+- When the server's time zone changes, what was learned per hour is cleared and learned again; the
+  countries, networks, clients, programs and target users learned are kept. Zones with the same
+  UTC offsets from 2025 to 2035 (`Europe/Berlin` and `Europe/Paris`) count as one zone.
+- Nothing fires while a key is learning.
+- What the rules have learned survives a restart (see [Storage and retention](#storage-and-retention)).
+  After an upgrade that changes how a baseline reads events (for example how client families are
+  named), what that baseline learned is discarded and learned again.
+
+### Unusual sign-in
+
+`baseline.signin_unusual` learns per account from its successful sign-ins: SSH logins, Mooring
+sign-ins and an app's `auth.login` and `admin.login` events (any kind containing `.login`, except
+kinds containing `.login_` such as `mooring.login_lockout`).
+Accounts of different systems are learned apart: the server user `alice` (SSH), the Mooring user
+`alice` and an app's account `alice` each have their own pattern, an app's accounts per app.
+
+Each sign-in is compared with the account's pattern in three ways:
+
+| Departure | When |
+|---|---|
+| new place | The address's country (`geo.cc`), its network (`geo.asn`), or both, were not seen for the account. A new country and a new network in one sign-in are one departure; the reasons name both (`new country NG, new network AS37148`). |
+| new client | The client family of the event's `ua` field was not seen for the account. |
+| unusual hour | The account has at least 20 sign-ins counted by hour, and the local hour before, the hour and the hour after hold together less than 1 in 50 of the sign-ins, each hour's counted as a share of its own kind of day's: weekdays' or weekend days'. While a kind of day has fewer than 20 sign-ins, its hour counts as the same hour on both kinds of day, as a share of all sign-ins: a 10:00 habit on weekdays is usual on a Saturday until the weekend has 20 sign-ins of its own. At midnight the next or previous hour can be of the other kind of day: Friday 23:00 is next to Saturday 00:00, Sunday 23:00 to Monday 00:00. An hour that a clock change repeats has the same neighbours both times. |
+
+The rule fires when a sign-in departs in at least `count` ways, once the account has signed in
+at least 3 times and its first sign-in is `learn` ago or more. A country, network or client is
+compared only when the account has one learned: a sign-in without a location (no GeoIP database)
+or without a `ua` field departs in none of those ways, and an account's first country, network or
+client never departs. The 20 sign-ins for the hour are counted again from 0 after a time-zone
+change. Every sign-in is learned, including the ones that fire. When an app is deleted, what the
+rule learned of the app's accounts is deleted with it, and the app's sign-ins are not learned for
+10 minutes after. After a start, what it learned of apps that no longer exist is deleted, as for
+[mutes](./security-incidents.md#false-positives-and-mutes).
+
+The client family is the User-Agent's client and system, without versions: `Chrome on Windows`,
+`Firefox on Linux`, `Safari on iOS`, `okhttp on Android`, `curl`, `Python`, `Go`; any other client
+is its first product name (`myapp on iOS`), or `other`. Mooring's sign-ins carry the browser's
+User-Agent; SSH logins have none. An app can log a `ua` field with the User-Agent on its
+`auth.login` and `admin.login` events.
+
+```
+alice — unusual sign-in: new country NG, new network AS37148 (Example ISP), unusual hour (03:00 Tue)
+```
+
+| Parameter | Default | Range |
+|---|---|---|
+| `count` | 2 | 1–3 departures |
+| `learn` | 14d | 1d–30d |
+
+Limits: 2,000 Mooring and SSH accounts, and 20,000 app accounts (all apps together), kept apart
+so app accounts never take the places of Mooring's or the server's; per account 16 countries,
+32 networks and 16 clients (past that, the one seen least recently is forgotten).
+
+### Traffic surge and drop
+
+`baseline.traffic_surge` and `baseline.traffic_drop` learn per host name an edge route serves
+(`f.host`; requests with any other `Host` header are not counted) the requests and the server
+errors (status 500 and above) in each hour. Every host name a catch-all route (`subdomain: "*"`)
+serves counts as one, `*.<apex>`: `a.example.com` and `b.example.com` under a catch-all route for
+`example.com` are both counted as `*.example.com`. For each hour of the week, the counts of the
+last 4 weeks are kept. When an hour has ended (2 minutes after, so late access log lines still
+count), its counts are compared with the median of the earlier weeks' counts for the same hour of
+the week; of an even number of weeks (2 or 4), `baseline.traffic_drop` compares with the lower of
+the two middle counts and `baseline.traffic_surge` with the higher:
+
+- `baseline.traffic_surge` fires when the hour had at least `count` requests and at least
+  `factor` times the usual requests, or at least `count` ÷ 4 server errors (at least 1) and at
+  least `factor` times the usual server errors.
+- `baseline.traffic_drop` fires when the usual requests are at least `count` and the hour had at
+  most the usual requests ÷ `factor`.
+
+An hour of the week is compared once it has counts for `learn` ÷ 7 days earlier weeks (rounded
+up; 2 by default). Only hours Mooring watched whole are counted: not the hour Mooring started in
+or the hour a host name was first seen in, not hours Mooring was stopped, not hours before
+the edge's routes were first read after a start, and not hours both rules were switched off. In
+an hour in which events were dropped before the rules saw them (the detection queue was full),
+the counts are a lower bound: `baseline.traffic_surge` still compares it, `baseline.traffic_drop`
+doesn't, and it is not learned. A host name is forgotten when the next hour ends after its route
+is removed or a catch-all route serves it instead, and after 672 watched hours (4 weeks) in a row
+without a request; until the edge's routes are read after a start, none is forgotten. A
+departure in consecutive hours updates one detection. Both rules count the same requests.
+
+Hours are counted from UTC and shown in the server's local time with their start and end:
+`10:00–11:00 Tue`, or `09:30–10:30 Tue` in a zone half an hour off UTC.
+
+```
+host shop.example.com — 2400 requests (usually about 300) and 180 server errors (usually about 2) in the hour 10:00–11:00 Tue
+host shop.example.com — 12 requests (usually about 900) in the hour 10:00–11:00 Tue
+```
+
+| Parameter | Default | Range |
+|---|---|---|
+| `count` | 200 | 1–100000 requests |
+| `factor` | 5 | 1.5–1000 |
+| `learn` | 14d | 7d–28d |
+
+Limits: 1,000 host names (about 7 KB each).
+
+### Unusual sudo or su
+
+`baseline.admin_unusual` learns per server user from their successful `sudo` commands and `su`
+sessions in the host logs (lines with `f.sender_mismatch: true` are left out): the hours of the
+day, weekdays and weekend days apart, the programs (the command's first word without its
+directory: `/usr/bin/systemctl restart web` is `systemctl`) and the target users. Once the user
+has run sudo or su at least 3 times and the first is `learn` ago or more, a sudo or su fires when:
+
+- its program was not seen for the user (`new program nc`);
+- its target user was not seen for the user (`new target user postgres`).
+
+When it fires and its target user is `root`, `root at an unusual hour (03:00 Tue)` is added to
+the reasons if the user has at least 20 sudo and su counted by hour and the hour is unusual for
+them as an unusual hour is for a sign-in (see [Unusual sign-in](#unusual-sign-in)). Root at an
+unusual hour never fires alone.
+
+A program or target user is compared only when the user has one learned. An `su` session has no
+program; a sudo line whose fields can't be told apart (`f.ambiguous: true`) has neither a program
+nor a target user. Every sudo and su is learned, including the ones that fire. A program or user
+name with characters other than letters, digits, `.`, `_`, `+` and `-` (or longer than 32 bytes)
+is not shown in the summary (`new program`).
+
+```
+server user alice — unusual sudo or su: new program nc, root at an unusual hour (03:00 Tue)
+```
+
+| Parameter | Default | Range |
+|---|---|---|
+| `learn` | 14d | 1d–30d |
+
+Limits: 2,000 server users; per user 128 programs and 16 target users.
+
+### Address behaviour change
+
+`baseline.ip_behaviour` learns per address (an IPv6 address as its /64) the mix of its edge
+requests: how many went to sign-in endpoints, to admin paths, and were answered with an error. A
+request's path is split at `/`, and each part lowercased, without a trailing `.ext`:
+
+| Kind | When |
+|---|---|
+| sign-in | A part contains `login`, `logon`, `signin`, `sign-in`, `sign_in` or `password`, or is `auth`, `oauth`, `oauth2`, `authorize`, `authenticate`, `token`, `tokens`, `session`, `sessions`, `mfa`, `2fa`, `otp` or `sso`. |
+| admin | A part contains `admin`, or is `manager`, `console` or `actuator`. |
+| error | The status is 400 or above. |
+
+The rule fires when, in the last `window`, the address made at least `count` requests and half
+or more of them were of one kind, at least `factor` times that kind's usual share. The usual share
+is the kind's share of the address's requests before the window. An address fires only once its
+first request is `learn` ago or more and at least `count` of its requests are before the window.
+After it fires, the window's requests are added to the usual mix and the window starts again.
+
+```
+203.0.113.7 (Lagos, NG; AS37148 Example) — 41 of 50 requests in 10m to sign-in endpoints (usually 2%)
+```
+
+Many clients behind one address (a mobile carrier's, an office's) share one mix.
+
+| Parameter | Default | Range |
+|---|---|---|
+| `count` | 50 | 10–100000 requests |
+| `window` | 10m | 1m–24h |
+| `factor` | 5 | 1.5–1000 |
+| `learn` | 1d | 1h–30d |
+
+Limits: 50,000 addresses (about 300 bytes each).
+
+### Keys kept
+
+Past a baseline's limit of keys, the key used least recently is dropped. Keys with a learned
+history take at most three quarters of the places and are dropped only after every other key: an
+account or server user with 3 events over a day or more, a host name with a counted hour, an
+address with 10 requests before its window, the first an hour ago or more. A dropped key learns
+again from the start.
 
 ## Changing a built-in rule
 
 On a built-in rule's **Edit** page it can be switched off and on, and its severity, `count`,
-`window`, `factor`, `learn` and `speed_kmh` changed (within the ranges in [Rule types](#rule-types)).
+`window`, `factor`, `learn` and `speed_kmh` changed (within the ranges in [Rule types](#rule-types);
+for the baseline rules, in [Baselines](#baselines)).
 Its query, type, group-by and field can't be changed. **Reset** puts it back to the defaults above.
 
 **Snooze** (1 hour, 24 hours or 7 days; at most 30 days) keeps a rule's detections recorded but
@@ -287,6 +479,15 @@ A high or critical detection sends a `security_detection` alert to every enabled
 - At most 256 alerts wait to be recorded; when more are raised at once, the extra ones are dropped
   and the next firing of the same rule and key sends its alert.
 
+### Incidents
+
+Detections that concern the same account or address within 24 hours are grouped in one
+[incident](./security-incidents.md), with a timeline, a workflow state and one
+`security_incident` alert in place of the detections' own alerts. A rollup detection, an App Ops
+Interface alert and a detection whose key is no account or address join no incident and keep the
+alerts above. A detection muted as a [false positive](./security-incidents.md#false-positives-and-mutes)
+is recorded, marked muted, and sends no alert.
+
 ### Detections as security events
 
 Every new or updated detection is also written to the security logs as a `siem.detection` event,
@@ -303,7 +504,7 @@ every 10 seconds.
 | `app`, `svc` | The app (and service, for an App Ops Interface alert) the detection concerns. |
 | `geo` | The location of the last event's address, when known. |
 | `msg` | The summary. |
-| `f` | `rule`, `severity`, `count`, `mitre` (comma-separated technique IDs), `key` (an IPv6 key is the /64, a rollup's is `*`), `detection_id` |
+| `f` | `rule`, `severity`, `count`, `mitre` (comma-separated technique IDs), `key` (an IPv6 key is the /64, a rollup's is `*`), `detection_id`; `incident_id` when it is part of an [incident](./security-incidents.md); `muted` (`true`) when a false-positive mute covers its rule and key |
 
 ```
 kind:siem.detection f.severity:critical
@@ -345,6 +546,11 @@ A report within an hour of the detection's last one updates it.
   a summary alert is sent or dropped, and when Mooring stops; after Mooring was killed, the counts are those
   of the last save. Counts saved in an earlier hour are not used, except a summary alert owed for
   the previous hour.
+- `detect.db` also holds what the [baseline rules](#baselines) have learned, one row per key.
+  Changed keys are saved every second (at most 128 a second), and all of them every 10 minutes
+  and when Mooring stops; after Mooring was killed, a key is as it was at its last save. A row
+  that can't be read is dropped. A key dropped from memory (see [Keys kept](#keys-kept)) is
+  deleted with the next save.
 - `detect.db` holds at most 512 MiB of data (checked every 10 minutes). Past it, the detections
   with the oldest last event are removed, low and medium ones first and then any, until it holds
   at most 90% of that. The file itself doesn't shrink; the space freed is used again. A detection
@@ -369,6 +575,7 @@ Limits:
 | Values per key of a `distinct` rule | 1,000 |
 | Learned values of a `new_value` rule | 100,000 (key and value pairs, and keys), and 1,000 values per key. A key past 1,000 values drops its own values seen least recently until it holds 900; a dropped value fires again when it comes back. When the rule is full, the keys seen least recently are dropped with all their values until a tenth is free. A dropped key is learned again without firing. |
 | History of an `anomaly` key | 7 days of hourly counts. |
+| Keys of a baseline rule | 2,000 Mooring and SSH accounts, 20,000 app accounts, 1,000 host names, 2,000 server users, 50,000 addresses; see [Baselines](#baselines). |
 | Events waiting to be evaluated | 8,192; more are not evaluated (they are still stored). |
 | App alerts waiting to be recorded | 256 |
 | New detections per rule per hour | 50, then one detection with key `*`; also across a restart within the hour |

@@ -171,6 +171,7 @@ type detectionRow struct {
 	Count              string
 	Summary            string
 	Snoozed            bool
+	Muted              bool // a false-positive mute for this rule and key
 }
 
 type mitreLink struct{ ID, URL string }
@@ -316,7 +317,7 @@ func detectionRowOf(d *siem.Detection, now time.Time) detectionRow {
 		Sev: string(d.Severity), SevClass: sevClass(d.Severity),
 		RuleID: d.RuleID, RuleName: d.RuleName, Ops: d.Source == siem.DetectionOps,
 		MITRE: mitreLinks(d.MITRE), Key: d.Key, Geo: geoViewOf(d.Geo),
-		App: d.App, Service: d.Service, Count: groupDigits(d.Count), Summary: d.Summary, Snoozed: d.Snoozed,
+		App: d.App, Service: d.Service, Count: groupDigits(d.Count), Summary: d.Summary, Snoozed: d.Snoozed, Muted: d.Muted,
 	}
 	if row.RuleName == "" {
 		row.RuleName = d.RuleID
@@ -533,6 +534,11 @@ func relatedSearch(ru siem.Rule, key string) string {
 			v := quoteSecurityValue(key, false)
 			fields[pair.second], fields["kind"] = true, true
 			tries = append(tries, pair.events+" -"+pair.first+"!="+v+" -"+pair.second+"!="+v)
+		case field == "f.host" && strings.HasPrefix(key, "*."):
+			// Intentional: a catch-all route's key ("*.<apex>": the traffic baseline counts every label
+			// under it as one). No event's host starts with "*.", and the search has no suffix match:
+			// f.host~.<apex> would also find hosts under other apexes (x.<apex>munity,
+			// a.<apex>.evil.org), so the rule's own events are searched instead.
 		case field == "f.host":
 			// Intentional: the key is the Host header lowercased without its port or trailing dot, and
 			// the search compares without regard to case, so a prefix finds it stored with a port or a

@@ -172,21 +172,29 @@ type stored struct {
 	alerted time.Time // when an alert was last handed to the alert queue (zero: never)
 	rollup  bool      // the rule's rollup detection for an hour (key RollupKey, never a real key's)
 	capHour time.Time // the hour it is counted in its rule's summary alert for (zero: none)
+	incID   int64     // its incident (0: none, or one not written yet: activeDet.inc)
+	entKind string    // the kind of entity its key is (siem.EntityAccount, siem.EntityAddress, "": neither)
+	scope   string    // the account scope of its events ("mooring", "host", "app:<slug>", "edge")
 }
 
 const detCols = `id, source, rule_id, rule_name, severity, mitre, key, app, service, first_ns, last_ns, count,
-	summary, geo, evidence, snoozed, alerted_ns, rollup, cap_hour`
+	summary, geo, evidence, snoozed, alerted_ns, rollup, cap_hour, incident_id, ent_kind, scope, muted`
 
 func scanDetection(sc interface{ Scan(...any) error }) (stored, error) {
 	var (
 		s                             stored
 		sev, mitre, geo, evid         string
 		first, last, alerted, capHour int64
-		snoozed, rollup               int
+		snoozed, rollup, muted        int
 	)
 	if err := sc.Scan(&s.d.ID, &s.d.Source, &s.d.RuleID, &s.d.RuleName, &sev, &mitre, &s.d.Key, &s.d.App,
-		&s.d.Service, &first, &last, &s.d.Count, &s.d.Summary, &geo, &evid, &snoozed, &alerted, &rollup, &capHour); err != nil {
+		&s.d.Service, &first, &last, &s.d.Count, &s.d.Summary, &geo, &evid, &snoozed, &alerted, &rollup, &capHour,
+		&s.incID, &s.entKind, &s.scope, &muted); err != nil {
 		return stored{}, err
+	}
+	s.d.Muted = muted != 0
+	if s.entKind != siem.EntityAccount && s.entKind != siem.EntityAddress {
+		s.entKind = ""
 	}
 	if capHour > 0 {
 		s.capHour = time.Unix(capHour, 0).UTC()
@@ -257,12 +265,12 @@ func boolInt(b bool) int {
 
 const (
 	insertSQL = `INSERT INTO detections(source, rule_id, rule_name, severity, sev_rank, mitre, key, app, service,
-		first_ns, last_ns, count, summary, geo, evidence, snoozed, alerted_ns, rollup, cap_hour)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		first_ns, last_ns, count, summary, geo, evidence, snoozed, alerted_ns, rollup, cap_hour, incident_id, ent_kind,
+		scope, muted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	// alerted_ns never goes back: a copy read before markAlerted recorded an alert keeps it.
 	updateSQL = `UPDATE detections SET rule_name = ?, severity = ?, sev_rank = ?, mitre = ?, app = ?, service = ?,
 		first_ns = ?, last_ns = ?, count = ?, summary = ?, geo = ?, evidence = ?, snoozed = ?,
-		alerted_ns = MAX(alerted_ns, ?), cap_hour = ? WHERE id = ?`
+		alerted_ns = MAX(alerted_ns, ?), cap_hour = ?, incident_id = ?, ent_kind = ?, scope = ?, muted = ? WHERE id = ?`
 )
 
 func unixSec(t time.Time) int64 {
@@ -272,40 +280,54 @@ func unixSec(t time.Time) int64 {
 	return t.Unix()
 }
 
-// writeBatch inserts the detections without an ID and updates the others, in one transaction,
-// and returns every detection's ID (in order). A detection whose row is gone (the size cap removed
-// it while it was still being updated) is inserted again: its ID is then a new one.
-func (d *db) writeBatch(ctx context.Context, ss []*stored) ([]int64, error) {
+// writeBatch inserts the detections without an ID and updates the others, in one transaction
+// with what b holds of incidents (inserted or updated first, so a detection can name a new one, and
+// their entities, timeline entries and risk scores after), and returns every detection's ID and
+// every incident's (in order). A detection whose row is gone (the size cap removed it while it was
+// still being updated) is inserted again: its ID is then a new one. b may be nil.
+func (d *db) writeBatch(ctx context.Context, ss []*stored, b *incBatch) ([]int64, []int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, batchTimeout)
 	defer cancel()
+	if b == nil {
+		b = &incBatch{}
+	}
 	tx, err := d.w.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	incIDs, err := writeIncidents(ctx, tx, b)
+	if err != nil {
+		return nil, nil, err
+	}
 	ins, err := tx.PrepareContext(ctx, insertSQL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer ins.Close()
 	upd, err := tx.PrepareContext(ctx, updateSQL)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer upd.Close()
 	ids := make([]int64, len(ss))
 	for i, s := range ss {
 		mitre, geo, evid := strings.Join(s.d.MITRE, ","), encodeGeo(s.d.Geo), encodeEvidence(s.d.Evidence)
+		incID := s.incID
+		if i < len(b.detInc) && b.detInc[i] >= 0 {
+			incID = incIDs[b.detInc[i]]
+		}
 		if s.d.ID != 0 {
 			res, err := upd.ExecContext(ctx, s.d.RuleName, string(s.d.Severity), siem.SeverityRank(s.d.Severity),
 				mitre, s.d.App, s.d.Service, nanos(s.d.First), nanos(s.d.Last), s.d.Count, s.d.Summary, geo, evid,
-				boolInt(s.d.Snoozed), nanos(s.alerted), unixSec(s.capHour), s.d.ID)
+				boolInt(s.d.Snoozed), nanos(s.alerted), unixSec(s.capHour), incID, s.entKind, s.scope, boolInt(s.d.Muted),
+				s.d.ID)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			n, err := res.RowsAffected()
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			if n > 0 {
 				ids[i] = s.d.ID
@@ -314,18 +336,22 @@ func (d *db) writeBatch(ctx context.Context, ss []*stored) ([]int64, error) {
 		}
 		res, err := ins.ExecContext(ctx, s.d.Source, s.d.RuleID, s.d.RuleName, string(s.d.Severity),
 			siem.SeverityRank(s.d.Severity), mitre, s.d.Key, s.d.App, s.d.Service, nanos(s.d.First), nanos(s.d.Last),
-			s.d.Count, s.d.Summary, geo, evid, boolInt(s.d.Snoozed), nanos(s.alerted), boolInt(s.rollup), unixSec(s.capHour))
+			s.d.Count, s.d.Summary, geo, evid, boolInt(s.d.Snoozed), nanos(s.alerted), boolInt(s.rollup), unixSec(s.capHour),
+			incID, s.entKind, s.scope, boolInt(s.d.Muted))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if ids[i], err = res.LastInsertId(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
+	if err := writeIncidentRest(ctx, tx, b, incIDs, ids); err != nil {
+		return nil, nil, err
 	}
-	return ids, nil
+	if err := tx.Commit(); err != nil {
+		return nil, nil, err
+	}
+	return ids, incIDs, nil
 }
 
 // recentKeys returns mapKey(rule ID, key) of the detections (rollups aside) whose last event is at
@@ -514,28 +540,64 @@ func (d *db) used(ctx context.Context) (int64, error) {
 }
 
 // trimTo removes detections while the pages in use are above limit, until they are at most
-// target: the oldest low and medium ones first, then (none left) the oldest of any severity. It
-// stops after pruneBudget and returns how many it removed.
-func (d *db) trimTo(ctx context.Context, limit, target int64) (int64, error) {
+// target: of the detections in no open or acknowledged incident, the oldest low and medium ones
+// first, then the oldest of any severity; then the oldest resolved and false-positive incidents
+// (with their entities and timeline; their detections go in the passes before, unlinked); and only
+// when nothing else is left, the oldest open and acknowledged incidents whole, with their
+// detections. It stops after pruneBudget and returns how many detections and incidents it removed,
+// and the incidents' IDs.
+func (d *db) trimTo(ctx context.Context, limit, target int64) (int64, []int64, error) {
 	used, err := d.used(ctx)
 	if err != nil || used <= limit {
-		return 0, err
+		return 0, nil, err
 	}
+	var gone []int64
 	deadline := time.Now().Add(pruneBudget)
 	var total int64
+	del := func(q string) func() (int64, error) {
+		return func() (int64, error) {
+			cctx, cancel := context.WithTimeout(ctx, dbTimeout)
+			defer cancel()
+			res, err := d.w.ExecContext(cctx, q, d.chunk)
+			if err != nil {
+				return 0, err
+			}
+			return res.RowsAffected()
+		}
+	}
+	incidents := func(where string, n int, withDets bool) func() (int64, error) {
+		return func() (int64, error) {
+			ids, err := d.incidentIDs(ctx, `SELECT id FROM incidents WHERE `+where+` ORDER BY last_ns, id LIMIT ?`, n)
+			if err != nil {
+				return 0, err
+			}
+			dets, err := d.deleteIncidents(ctx, ids, withDets)
+			if err != nil {
+				return 0, err
+			}
+			gone = append(gone, ids...)
+			return dets + int64(len(ids)), nil
+		}
+	}
+	notActive := `incident_id NOT IN (` + activeSQL + `)`
+	passes := []func() (int64, error){
+		del(`DELETE FROM detections WHERE id IN (SELECT id FROM detections WHERE sev_rank <= 2 AND ` + notActive +
+			` ORDER BY last_ns, id LIMIT ?)`),
+		del(`DELETE FROM detections WHERE id IN (SELECT id FROM detections WHERE ` + notActive + ` ORDER BY last_ns, id LIMIT ?)`),
+		incidents(`id NOT IN (`+activeSQL+`)`, d.chunk, false),
+		// Intentional (owner decision): an open or acknowledged incident is never closed on its own,
+		// and its records are the last to go, but the cap holds: once only they are left, the oldest
+		// of them are removed whole (with their detections, entities and timeline), a few at a time,
+		// so incidents left open for months can't grow detect.db without a bound.
+		incidents(`state IN ('open', 'acknowledged')`, max(d.chunk/10, 1), true),
+	}
 	for used > target && time.Now().Before(deadline) {
 		var n int64
-		for _, q := range []string{
-			`DELETE FROM detections WHERE id IN (SELECT id FROM detections WHERE sev_rank <= 2 ORDER BY last_ns, id LIMIT ?)`,
-			`DELETE FROM detections WHERE id IN (SELECT id FROM detections ORDER BY last_ns, id LIMIT ?)`,
-		} {
-			cctx, cancel := context.WithTimeout(ctx, dbTimeout)
-			res, err := d.w.ExecContext(cctx, q, d.chunk)
-			cancel()
-			if err != nil {
-				return total, err
+		for _, pass := range passes {
+			if n, err = pass(); err != nil {
+				return total, gone, err
 			}
-			if n, _ = res.RowsAffected(); n > 0 {
+			if n > 0 {
 				break
 			}
 		}
@@ -544,10 +606,10 @@ func (d *db) trimTo(ctx context.Context, limit, target int64) (int64, error) {
 		}
 		total += n
 		if used, err = d.used(ctx); err != nil {
-			return total, err
+			return total, gone, err
 		}
 	}
-	return total, nil
+	return total, gone, nil
 }
 
 type stateRow struct {

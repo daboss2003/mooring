@@ -3,19 +3,26 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/alertstore"
 	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/config"
+	"github.com/daboss2003/mooring/internal/definition"
+	"github.com/daboss2003/mooring/internal/docker"
+	"github.com/daboss2003/mooring/internal/edge"
 	"github.com/daboss2003/mooring/internal/edgeerr"
 	"github.com/daboss2003/mooring/internal/edgemetrics"
+	"github.com/daboss2003/mooring/internal/gitstore"
+	"github.com/daboss2003/mooring/internal/provstore"
 	"github.com/daboss2003/mooring/internal/secret"
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/siem"
@@ -579,4 +586,217 @@ func TestDetectMapValueFullKey(t *testing.T) {
 			t.Errorf("%s:%s → %q, want it unchanged", field, v, got)
 		}
 	}
+}
+
+// The traffic baseline learns only hosts an edge route serves: exact names (any case), and for a
+// catch-all `*.<apex>` route every single label under the apex; disabled routes don't count, and
+// before the first refresh nothing is known.
+func TestKnownHosts(t *testing.T) {
+	var kh knownHosts
+	if _, known, ready := kh.lookup("shop.example.com"); known || ready {
+		t.Fatalf("before any refresh: known=%v ready=%v, want false, false", known, ready)
+	}
+	kh.refresh(func() ([]edge.Route, error) {
+		return []edge.Route{
+			{Hostname: "Shop.Example.com", Enabled: true},
+			{Hostname: "*.tenants.example.com", Enabled: true, CatchAll: true},
+			{Hostname: "old.example.com", Enabled: false},
+		}, nil
+	})
+	for host, want := range map[string]bool{
+		"shop.example.com": true, "acme.tenants.example.com": true, "a.b.tenants.example.com": false,
+		"tenants.example.com": false, "old.example.com": false, "evil.example.net": false,
+	} {
+		if _, got, _ := kh.lookup(host); got != want {
+			t.Errorf("lookup(%q) known = %v, want %v", host, got, want)
+		}
+	}
+	// Every label a catch-all serves is counted under one key; an exact host under itself.
+	for host, want := range map[string]string{"acme.tenants.example.com": "*.tenants.example.com", "zz.tenants.example.com": "*.tenants.example.com", "*.tenants.example.com": "*.tenants.example.com", "shop.example.com": "shop.example.com"} {
+		if key, known, ready := kh.lookup(host); key != want || !known || !ready {
+			t.Errorf("lookup(%q) = %q, %v, %v; want %q, true, true", host, key, known, ready, want)
+		}
+	}
+	if _, known, ready := kh.lookup("evil.example.net"); known || !ready {
+		t.Errorf("unknown host after a refresh: known=%v ready=%v", known, ready)
+	}
+	// A failed refresh keeps what was known.
+	kh.refresh(func() ([]edge.Route, error) { return nil, errors.New("db busy") })
+	if _, known, _ := kh.lookup("shop.example.com"); !known {
+		t.Error("a failed refresh dropped the known hosts")
+	}
+}
+
+// The apps a start-up cleanup keeps are the ones the app delete page counts: the connected repos,
+// the stored definitions, the provisioned apps and every Compose project with a container (running
+// or stopped) together; a read error of any means no list at all (a cleanup on a partial list
+// would delete live apps' mutes and baselines).
+func TestExistingApps(t *testing.T) {
+	src := appSources{
+		repos: func() ([]gitstore.Config, error) {
+			return []gitstore.Config{{Project: "shop"}, {Project: "blog"}}, nil
+		},
+		defs: func(context.Context) (map[string]*definition.Definition, map[string]error, error) {
+			return map[string]*definition.Definition{"shop": nil, "api": nil}, map[string]error{"broken": errors.New("bad hmac")}, nil
+		},
+		// A wizard-provisioned app has a registry row and no repo.
+		provisioned: func() ([]provstore.App, error) { return []provstore.App{{Slug: "wizard"}, {Slug: "shop"}}, nil },
+		// An app with containers and no rows; a stopped container counts; a non-Compose one doesn't.
+		containers: func(context.Context) ([]docker.Container, error) {
+			return []docker.Container{
+				{Labels: map[string]string{docker.LabelProject: "running-only"}, State: "running"},
+				{Labels: map[string]string{docker.LabelProject: "stopped-only"}, State: "exited"},
+				{Labels: map[string]string{}},
+			}, nil
+		},
+	}
+	got, ok := existingApps(context.Background(), src)
+	if want := "api,blog,broken,running-only,shop,stopped-only,wizard"; !ok || strings.Join(got, ",") != want {
+		t.Fatalf("existingApps = %q, %v; want %s (an unverifiable definition, a provisioned app without a repo and an app with only containers still exist)", got, ok, want)
+	}
+	busy := errors.New("db busy")
+	for name, broken := range map[string]func(*appSources){
+		"repo": func(s *appSources) { s.repos = func() ([]gitstore.Config, error) { return nil, busy } },
+		"definition": func(s *appSources) {
+			s.defs = func(context.Context) (map[string]*definition.Definition, map[string]error, error) {
+				return nil, nil, busy
+			}
+		},
+		"provision registry": func(s *appSources) { s.provisioned = func() ([]provstore.App, error) { return nil, busy } },
+		"container": func(s *appSources) {
+			s.containers = func(context.Context) ([]docker.Container, error) { return nil, busy }
+		},
+	} {
+		s := src
+		broken(&s)
+		if _, ok := existingApps(context.Background(), s); ok {
+			t.Errorf("a %s read error still gave a list", name)
+		}
+	}
+}
+
+// The start-up cleanup runs in the background: it waits (retrying) until the app list can be read
+// — the socket-proxy may still be starting — then prunes once; if the list never reads it gives up
+// and removes nothing. Either way it ends with the security logs.
+func TestPruneDeletedAppsAtStart(t *testing.T) {
+	oldRetry, oldWait := pruneAppsRetry, pruneAppsWait
+	pruneAppsRetry, pruneAppsWait = 5*time.Millisecond, 2*time.Second
+	defer func() { pruneAppsRetry, pruneAppsWait = oldRetry, oldWait }()
+
+	cfg := serveSecLogsConfig(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "mooring.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	until := time.Now().Add(24 * time.Hour).Unix()
+	for _, scope := range []string{"app:shop", "app:gone"} {
+		if _, err := db.Exec(`INSERT INTO security_mutes(rule_id, kind, scope, key, until_at, created_at) VALUES('app.auth_bruteforce', 'account', ?, 'alice', ?, ?)`,
+			scope, until, time.Now().Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scopes := func() string {
+		var n []string
+		rows, err := db.Query(`SELECT scope FROM security_mutes ORDER BY scope`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var sc string
+			_ = rows.Scan(&sc)
+			n = append(n, sc)
+		}
+		rows.Close()
+		return strings.Join(n, ",")
+	}
+
+	s := openSecurityLogs(context.Background(), cfg, nil, db, serveQuietLog())
+	if s.det == nil {
+		t.Fatalf("detection didn't start: %q", s.failed)
+	}
+	var calls atomic.Int32
+	s.pruneDeletedAppsAtStart(func(context.Context) ([]string, bool) {
+		if calls.Add(1) < 3 {
+			return nil, false // the socket-proxy isn't up yet
+		}
+		return []string{"shop"}, true
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for scopes() != "app:shop" && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := scopes(); got != "app:shop" {
+		t.Fatalf("after the list read on the 3rd try, mutes left = %q, want app:shop", got)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if n := calls.Load(); n != 3 {
+		t.Errorf("list read %d times, want 3 (once it reads, the cleanup is done)", n)
+	}
+	s.close()
+
+	// A list that never reads: nothing removed, the worker gives up, close doesn't hang.
+	if _, err := db.Exec(`INSERT INTO security_mutes(rule_id, kind, scope, key, until_at, created_at) VALUES('app.auth_bruteforce', 'account', 'app:gone', 'alice', ?, ?)`,
+		until, time.Now().Unix()); err != nil {
+		t.Fatal(err)
+	}
+	pruneAppsWait = 50 * time.Millisecond
+	s2 := openSecurityLogs(context.Background(), cfg, nil, db, serveQuietLog())
+	var tries atomic.Int32
+	s2.pruneDeletedAppsAtStart(func(context.Context) ([]string, bool) { tries.Add(1); return nil, false })
+	time.Sleep(200 * time.Millisecond)
+	if got := scopes(); got != "app:gone,app:shop" {
+		t.Errorf("an unreadable list still removed mutes: left %q", got)
+	}
+	n := tries.Load()
+	time.Sleep(50 * time.Millisecond)
+	if tries.Load() != n || n < 2 {
+		t.Errorf("tries = %d then %d: want at least 2, and none after giving up", n, tries.Load())
+	}
+	s2.close()
+
+	// Security logs off: nothing starts, no panic.
+	var off *securityLogs
+	off.pruneDeletedAppsAtStart(func(context.Context) ([]string, bool) { t.Error("listed with security logs off"); return nil, false })
+}
+
+// At start the saved mutes (and sign-in baselines) of apps that no longer exist are removed: an app
+// deleted while detection was off left them behind. Existing apps' and other scopes' are kept.
+func TestPruneDeletedApps(t *testing.T) {
+	cfg := serveSecLogsConfig(t)
+	db, err := store.Open(filepath.Join(t.TempDir(), "mooring.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	until := time.Now().Add(24 * time.Hour).Unix()
+	for _, scope := range []string{"app:shop", "app:gone", "mooring"} {
+		if _, err := db.Exec(`INSERT INTO security_mutes(rule_id, kind, scope, key, until_at, created_at) VALUES('app.auth_bruteforce', 'account', ?, 'alice', ?, ?)`,
+			scope, until, time.Now().Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := openSecurityLogs(context.Background(), cfg, nil, db, serveQuietLog())
+	defer s.close()
+	if s.det == nil {
+		t.Fatalf("detection didn't start: %q", s.failed)
+	}
+	s.pruneDeletedApps(context.Background(), []string{"shop"})
+	rows, err := db.Query(`SELECT scope FROM security_mutes ORDER BY scope`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	for rows.Next() {
+		var sc string
+		_ = rows.Scan(&sc)
+		left = append(left, sc)
+	}
+	rows.Close()
+	if strings.Join(left, ",") != "app:shop,mooring" {
+		t.Fatalf("mutes left = %q, want app:shop,mooring", left)
+	}
+	// Security logs off (s nil) or detection off: nothing to do, no panic.
+	var off *securityLogs
+	off.pruneDeletedApps(context.Background(), nil)
 }

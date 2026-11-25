@@ -65,7 +65,33 @@ var ruleTypes = []struct{ Value, Label string }{
 	{siem.RuleSequence, "Sequence: N events, then a closing event"},
 }
 
+// baselineKinds are the baseline rules' kinds (Rule.Baseline): a label and what the rule learns.
+// Baseline rules are built in only, so the custom form never offers the type.
+var baselineKinds = map[string]struct{ Label, Learns string }{
+	siem.BaselineSignIn:  {"sign-in pattern", "usual sign-in hours, countries, networks and clients"},
+	siem.BaselineTraffic: {"traffic volume", "requests and errors per hour of the week"},
+	siem.BaselineAdmin:   {"admin activity", "usual sudo and su hours, programs and target users"},
+	siem.BaselineIP:      {"address behavior", "usual request mix"},
+}
+
+// baselineLabel is a baseline rule's type label with its kind ("Baseline: sign-in pattern").
+func baselineLabel(kind string) string {
+	if k, ok := baselineKinds[kind]; ok {
+		return "Baseline: " + k.Label
+	}
+	if kind != "" {
+		return "Baseline: " + kind
+	}
+	return "Baseline"
+}
+
+// baselineTunables are the tunables a baseline rule can have; the form shows those the rule sets.
+var baselineTunables = map[string]bool{"count": true, "window": true, "factor": true, "learn": true}
+
 func ruleTypeLabel(t string) string {
+	if t == siem.RuleBaseline {
+		return "Baseline"
+	}
 	for _, rt := range ruleTypes {
 		if rt.Value == t {
 			return rt.Label[:strings.IndexByte(rt.Label, ':')]
@@ -188,6 +214,11 @@ func ruleCondition(r siem.Rule) string {
 		add("faster than " + fmtNum(r.SpeedKMH) + " km/h")
 	case siem.RuleSequence:
 		add("at least " + strconv.Itoa(r.Count) + ", then a closing event" + in())
+	case siem.RuleBaseline:
+		if k, ok := baselineKinds[r.Baseline]; ok {
+			add(k.Learns)
+		}
+		learning()
 	}
 	if r.GroupBy != "" {
 		add("per " + r.GroupBy)
@@ -201,6 +232,9 @@ func ruleRowOf(r siem.Rule, now time.Time) ruleRow {
 		Sev: string(r.Severity), SevClass: sevClass(r.Severity), MITRE: mitreLinks(r.MITRE), Enabled: r.Enabled,
 		Condition: ruleCondition(r), Builtin: r.Builtin,
 		EditURL: withQuery("/security/rules/edit", url.Values{"id": {r.ID}}),
+	}
+	if r.Type == siem.RuleBaseline {
+		row.TypeLabel = baselineLabel(r.Baseline)
 	}
 	if r.SnoozedUntil.After(now) {
 		row.Snoozed = true
@@ -335,6 +369,7 @@ type ruleFormView struct {
 	Description  string
 	Type         string
 	TypeLabel    string
+	Learns       string // a baseline rule: what it learns
 	Severity     string
 	MITRE        string // comma list
 	MITRELinks   []mitreLink
@@ -386,8 +421,17 @@ func (f *ruleFormView) finish(cur *siem.Rule) {
 		set := map[string]bool{"count": cur.Count != 0, "window": cur.Window != 0, "factor": cur.Factor != 0, "learn": cur.Learn != 0, "speed_kmh": cur.SpeedKMH != 0}
 		for _, field := range ruleTunables {
 			f.Show[field] = f.Show[field] || set[field]
+			if cur.Type == siem.RuleBaseline {
+				f.Show[field] = set[field] && baselineTunables[field]
+			}
 		}
 		f.Show["field"], f.Show["then"] = false, false
+		if cur.Type == siem.RuleBaseline {
+			f.TypeLabel = baselineLabel(cur.Baseline)
+			if l := baselineKinds[cur.Baseline].Learns; l != "" {
+				f.Learns = strings.ToUpper(l[:1]) + l[1:]
+			}
+		}
 	}
 }
 
@@ -493,6 +537,9 @@ func ruleFromForm(f *ruleFormView, cur *siem.Rule) (siem.Rule, string) {
 		}
 		if typeUses(f.Type, "then") {
 			rule.Then = f.Then
+		}
+		if rule.Type == siem.RuleBaseline {
+			return rule, "Baseline rules are built in. Pick another type for a custom rule."
 		}
 	}
 	rule.Severity, rule.Enabled = siem.Severity(f.Severity), f.Enabled

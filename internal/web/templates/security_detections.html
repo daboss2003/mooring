@@ -54,7 +54,7 @@
       {{range .Rows}}
       <tr>
         <td{{if .First}} title="First seen {{.First}} UTC"{{end}}><a class="mono" href="{{.URL}}">{{if .Last}}{{.Last}}{{else}}Open{{end}}</a> <span class="muted small">{{.Ago}}</span></td>
-        <td>{{template "sec_sev" .}}{{if .Snoozed}} <span class="badge badge-muted" title="The rule was snoozed: recorded, not sent to the alert channels">Snoozed</span>{{end}}</td>
+        <td>{{template "sec_sev" .}}{{if .Snoozed}} <span class="badge badge-muted" title="The rule was snoozed: recorded, not sent to the alert channels">Snoozed</span>{{end}}{{if .Muted}} <span class="badge badge-muted" title="A false-positive mute of this rule for this key: recorded, no alert and no incident">Muted</span>{{end}}</td>
         <td class="wrap-cell"><a href="{{.URL}}">{{.RuleName}}</a>{{if .MITRE}} <span class="small">{{template "sec_mitre" .MITRE}}</span>{{end}}{{if .Summary}}<div class="sec-msg small">{{.Summary}}</div>{{end}}</td>
         <td class="wrap-cell">{{if .Key}}<span class="mono">{{.Key}}</span>{{else}}<span class="muted">—</span>{{end}}{{with .Geo}}{{template "sec_geo" .}}{{end}}</td>
         <td>{{if .Where}}{{.Where}}{{else}}<span class="muted">—</span>{{end}}</td>

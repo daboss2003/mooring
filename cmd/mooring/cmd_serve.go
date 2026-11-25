@@ -288,6 +288,22 @@ func cmdServe(args []string) error {
 	secLogs := openSecurityLogs(ctx, cfg, alertStore, db, log)
 	defer secLogs.close()
 	secLogs.followCLIAudit(db, log)
+	// Mutes and sign-in baselines of apps deleted while detection was off are removed once the app
+	// list reads (the container list waits for the socket-proxy); with an unreadable list nothing is
+	// removed (a partial list would delete live apps' state).
+	secLogs.pruneDeletedAppsAtStart(func(c context.Context) ([]string, bool) {
+		return existingApps(c, appSources{
+			repos: gitStore.List,
+			defs: func(c context.Context) (map[string]*definition.Definition, map[string]error, error) {
+				if defStore == nil {
+					return nil, nil, nil // no definition store: no definitions
+				}
+				return defStore.CurrentEach(c)
+			},
+			provisioned: provStore.List,
+			containers:  func(c context.Context) ([]docker.Container, error) { return dockerCli.ListContainers(c, true) },
+		})
+	})
 
 	// If a Mooring-hosted ntfy alert channel is configured, reconcile its protected
 	// container to running at boot (best-effort, ungated). restart:unless-stopped covers
@@ -486,6 +502,7 @@ func cmdServe(args []string) error {
 	// the edge (non-Linux / no caddy), the edge isn't started — routes still save
 	// and apply once the edge is up. The supervisor is joined before db.Close.
 	edgeRoutes := edge.NewRouteStore(db)
+	secLogs.followEdgeHosts(edgeRoutes.List) // the traffic baseline learns the hosts the edge serves
 	selfHealStore := selfheal.NewStore(db)
 	scalingStore := scale.NewStore(db)
 	apiTokenStore := apitoken.NewStore(db)
@@ -1000,6 +1017,7 @@ func cmdServe(args []string) error {
 		SecurityLogs:      secLogs.webSource(),
 		Detections:        secLogs.detections(),
 		DetectionReporter: secLogs.detectionReporter(),
+		Incidents:         secLogs.incidents(),
 		Feeds:             secLogs.feedStatus(),
 		AuditSink:         secLogs.auditSink(),
 	})

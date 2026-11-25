@@ -264,6 +264,8 @@ func validate(r *siem.Rule, now time.Time) error {
 		}
 		err = errors.Join(count(maxSequenceCount), window(maxWindow))
 		r.Field, r.Factor, r.Learn, r.SpeedKMH = "", 0, 0, 0
+	case siem.RuleBaseline:
+		err = validateBaseline(r)
 	default:
 		return invalid("unknown rule type %q", siem.Cut(r.Type, 32))
 	}

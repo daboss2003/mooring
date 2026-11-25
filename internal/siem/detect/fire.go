@@ -37,6 +37,7 @@ type firing struct {
 	dist     float64 // travel: km
 	gap      time.Duration
 	evidence []siem.Evidence
+	reasons  []string // baseline: why it departs from the norm
 }
 
 // activeDet is a detection that later firings of its rule and key may still update.
@@ -52,6 +53,11 @@ type activeDet struct {
 	hour    time.Time
 	mixed   bool       // rollup: its events concern several apps
 	keys    *rolledSet // rollup: the keys counted in it this hour (nil once its hour is over)
+	// inc is its incident while that is not written yet (else s.incID); linkDirty: its incident
+	// changed since it was written (it is written at the next flush).
+	inc       *incident
+	linkDirty bool
+	own       *alertJob // its own alert in flight (nil: none), so its incident can count it (carryOwn)
 }
 
 // rolledSet is the keys counted in a rule's rollup detection for an hour, as 8-byte keyed hashes
@@ -255,6 +261,17 @@ func (e *Engine) fire(c *compiled, key string, ev *siem.Event, f firing) {
 	}
 	d := &a.s.d
 	a.groupBy = c.r.GroupBy
+	// Intentional: once the key is an account or an address, it stays one, like the scope. A
+	// host.user_change detection keyed by a name a group line and a user line share (useradd logs
+	// both) would otherwise flip in and out of its incident and alert on its own too.
+	if a.s.entKind == "" {
+		a.s.entKind = incKeyKind(c.r.GroupBy, key, ev)
+	}
+	// Intentional: the scope is the first event's. A rule without src: coalesces the same key from
+	// two sources into one detection; its account stays in the scope it was found in.
+	if a.s.scope == "" {
+		a.s.scope = incScope(ev)
+	}
 	d.RuleName, d.Severity, d.MITRE = c.r.Name, c.r.Severity, slices.Clone(c.r.MITRE)
 	if ev.App != "" {
 		d.App = strings.Clone(ev.App)
@@ -357,10 +374,14 @@ func (e *Engine) rollUp(base siem.Detection, key string, evid []siem.Evidence, t
 }
 
 // commit marks a new or updated detection for writing (flush writes a new detection at its next
-// run, an updated one at most every writeEvery) and alerts on it when due.
+// run, an updated one at most every writeEvery), puts it in its incident, and alerts on it when
+// due: a detection in an incident (or muted) has no alert of its own, the incident alerts.
 func (e *Engine) commit(a *activeDet, target string) {
 	a.emitted = false
 	e.dirty[a] = struct{}{}
+	if e.correlate(a) {
+		return
+	}
 	e.maybeAlert(a, target)
 }
 
@@ -376,8 +397,15 @@ type alertJob struct {
 	capped    bool       // a high detection's: counted in its rule's alerts this hour (given back if it fails)
 	uncounted bool       // the detection was counted in this hour's summary before (counted again if it fails)
 	more      int        // a summary alert's: the detections it counts
-	tries     int        // the worker's
-	next      time.Time  // the worker's: when to try again
+	inc       *incident  // an incident's alert: the incident (never touched by the worker)
+	incRank   int        // an incident's alert, or settles: the severity rank it alerts
+	realert   int        // an incident's alert: the re-alerts owed it covers (chainJoined)
+	// settles: a detection's own alert that counts for this incident (alertOnOwn, carryOwn); the
+	// engine goroutine may set it (and incRank) while the job is queued, as the worker never reads
+	// either.
+	settles *incident
+	tries   int       // the worker's
+	next    time.Time // the worker's: when to try again
 }
 
 type alertResult struct {
@@ -490,17 +518,12 @@ func (e *Engine) maybeAlert(a *activeDet, target string) {
 			return
 		}
 	}
-	level := alert.LevelWarning
-	if crit {
-		level = alert.LevelCritical
-	}
-	j := &alertJob{mk: mk, rule: d.RuleID, det: a, at: now, hour: hour, capped: !crit,
-		o: alert.Outbox{RuleID: 0, Target: target, Kind: AlertKind, Level: level, Transition: "firing",
-			Summary:   siem.Cut(clean(d.RuleName, maxRuleName)+": "+d.Summary, maxSummary),
-			DedupeKey: dedupeKey(a)}}
+	j := ownAlertJob(a, target, now)
+	j.capped = !crit
 	if !e.enqueueAlert(j) {
 		return
 	}
+	a.own = j
 	if !crit {
 		cs.sent++
 	}
@@ -520,6 +543,20 @@ func (e *Engine) maybeAlert(a *activeDet, target string) {
 			}
 		}
 	}
+}
+
+// ownAlertJob is a detection's own alert (security_detection): critical for a critical detection,
+// else a warning.
+func ownAlertJob(a *activeDet, target string, now time.Time) *alertJob {
+	d := &a.s.d
+	level := alert.LevelWarning
+	if d.Severity == siem.SevCritical {
+		level = alert.LevelCritical
+	}
+	return &alertJob{mk: a.mapKey, rule: d.RuleID, det: a, at: now, hour: now.UTC().Truncate(time.Hour),
+		o: alert.Outbox{RuleID: 0, Target: target, Kind: AlertKind, Level: level, Transition: "firing",
+			Summary:   siem.Cut(clean(d.RuleName, maxRuleName)+": "+d.Summary, maxSummary),
+			DedupeKey: dedupeKey(a)}}
 }
 
 // sendCaps queues the summary alert (a warning) of each rule that went past its cap in a finished
@@ -583,6 +620,10 @@ func (e *Engine) finishAlert(r alertResult) {
 	if j == nil {
 		return
 	}
+	if j.inc != nil {
+		e.finishIncidentAlert(j, r.ok)
+		return
+	}
 	if j.mk == "" {
 		// A summary alert. One that failed while its hour's counters are still kept (sent at
 		// shutdown, see sendCaps) is owed again: its count goes back for the last save.
@@ -595,6 +636,12 @@ func (e *Engine) finishAlert(r alertResult) {
 		// and detect.db can't commit together, so a kill within that tick can still send it twice.
 		e.hourDirty = true
 		return
+	}
+	if j.det != nil && j.det.own == j {
+		j.det.own = nil
+	}
+	if j.settles != nil {
+		defer e.settleOwn(j, r.ok)
 	}
 	if t, ok := e.inflight[j.mk]; ok && t.Equal(j.at) {
 		delete(e.inflight, j.mk)
@@ -661,19 +708,40 @@ func (e *Engine) flush(force bool) {
 	e.emitUntil = time.Now().Add(emitBudget)
 	now := e.now()
 	if !force && e.writeBackoff > 0 && now.Sub(e.writeFailAt) < e.writeBackoff {
+		// Incidents not written meanwhile alert their detections on their own (alertOnOwn); the
+		// cache stays bounded meanwhile too.
+		e.raiseIncidentAlerts(now)
+		if len(e.incs) > maxIncCache {
+			e.evictIncidents(now)
+		}
 		return
 	}
 	due := make([]*activeDet, 0, len(e.dirty))
 	for a := range e.dirty {
-		if force || a.s.d.ID == 0 || now.Sub(a.wrote) >= writeEvery {
+		if force || a.s.d.ID == 0 || a.linkDirty || now.Sub(a.wrote) >= writeEvery {
 			due = append(due, a)
 		}
 	}
 	slices.SortFunc(due, func(x, y *activeDet) int { return cmpInt(int64(x.seq), int64(y.seq)) })
+	var incs []*incident
+	for inc := range e.incDirty {
+		if force || inc.id == 0 || inc.urgent || now.Sub(inc.wrote) >= writeEvery {
+			incs = append(incs, inc)
+		}
+	}
+	slices.SortFunc(incs, func(x, y *incident) int { return cmpInt(int64(x.seq), int64(y.seq)) })
 	ok := true
-	for len(due) > 0 {
+	// The incidents (and risk scores) go with the first batch, so its detections can name them; a
+	// later batch takes the ones with timeline entries of its detections still to write.
+	for first := true; first || len(due) > 0; first = false {
+		if !first {
+			incs = slices.DeleteFunc(incs, func(inc *incident) bool { return len(inc.tl) == 0 })
+		}
 		n := min(len(due), maxBatch)
-		ok = e.writeBatch(due[:n])
+		if n == 0 && len(incs) == 0 && len(e.riskDirty)+len(e.riskGone) == 0 {
+			break
+		}
+		ok = e.writeBatch(due[:n], incs)
 		due = due[n:]
 		if !force || !ok {
 			break // the rest waits for the next run
@@ -681,6 +749,10 @@ func (e *Engine) flush(force bool) {
 	}
 	if ok && len(e.alertedRows) > 0 {
 		e.markAlerted(now)
+	}
+	e.raiseIncidentAlerts(now)
+	if len(e.incs) > maxIncCache {
+		e.evictIncidents(now)
 	}
 }
 
@@ -700,24 +772,33 @@ func (e *Engine) markAlerted(now time.Time) {
 	clear(e.alertedRows)
 }
 
-// writeBatch stores detections (insert or update) in one transaction, then emits each as an
-// event once per change. After a failed write they stay dirty (and findable) and nothing is
-// emitted: a detection is emitted only once stored, with its ID.
-func (e *Engine) writeBatch(as []*activeDet) bool {
+// writeBatch stores detections (insert or update) and the given incidents (with their entities,
+// timeline entries and the risk scores changed) in one transaction, then emits each detection as
+// an event once per change, and each incident change. After a failed write they stay dirty (and
+// findable) and nothing is emitted: a detection is emitted only once stored, with its ID.
+func (e *Engine) writeBatch(as []*activeDet, incs []*incident) bool {
 	now := e.now()
 	var (
-		ids []int64
-		err = errClosed
+		ids, incIDs []int64
+		b           *incBatch
+		err         = errClosed
 	)
 	if !e.closed.Load() {
 		ss := make([]*stored, len(as))
 		for i, a := range as {
+			if a.inc != nil && a.inc.id != 0 {
+				a.s.incID, a.inc = a.inc.id, nil
+			}
 			ss[i] = &a.s
 		}
-		ids, err = e.db.writeBatch(context.Background(), ss)
+		b = e.incBatch(as, incs)
+		ids, incIDs, err = e.db.writeBatch(context.Background(), ss, b)
 	}
 	for _, a := range as {
 		a.wrote = now
+	}
+	for _, inc := range incs {
+		inc.wrote = now
 	}
 	if err != nil {
 		e.writeErrors.Add(1)
@@ -727,11 +808,56 @@ func (e *Engine) writeBatch(as []*activeDet) bool {
 		return false
 	}
 	e.writeBackoff = 0
+	written := make(map[*activeDet]bool, len(as))
+	for _, a := range as {
+		written[a] = true
+	}
+	for i, inc := range incs {
+		if inc.id != incIDs[i] {
+			delete(e.incs, inc.id)
+			inc.id = incIDs[i]
+		}
+		delete(e.incNew, inc)
+		e.incs[inc.id] = inc
+		inc.urgent = false
+		clear(inc.entDirty)
+		// Entries of detections not written yet stay for a later write (one that will never be
+		// written, dropped unwritten, goes).
+		left := inc.tl[:0]
+		for _, t := range inc.tl {
+			if t.det != nil && t.det.s.d.ID == 0 && !written[t.det] {
+				if _, dirty := e.dirty[t.det]; dirty {
+					left = append(left, t)
+				}
+			}
+		}
+		clear(inc.tl[len(left):])
+		inc.tl = left
+		if len(inc.tl) == 0 {
+			delete(e.incDirty, inc)
+		}
+	}
+	if len(b.risk) > 0 || len(b.riskDel) > 0 {
+		for _, r := range b.risk {
+			if x := e.risk[r.k]; x != nil && x.at.Equal(r.at) && x.score == r.score {
+				delete(e.riskDirty, r.k)
+			}
+		}
+		for _, k := range b.riskDel {
+			delete(e.riskGone, k)
+		}
+	}
 	for i, a := range as {
 		if a.s.d.ID != 0 && ids[i] != a.s.d.ID {
 			a.emitted = false // stored again under a new ID (its row was removed): emitted with it
 		}
 		a.s.d.ID = ids[i]
+		if b.detInc[i] >= 0 {
+			a.s.incID, a.inc = incIDs[b.detInc[i]], nil
+		}
+		if a.inc == nil {
+			a.linkDirty = false
+		}
 		delete(e.dirty, a)
 		if a.parkEl != nil {
 			e.unpark(a)
@@ -744,7 +870,64 @@ func (e *Engine) writeBatch(as []*activeDet) bool {
 			a.emitted = true
 		}
 	}
+	for _, inc := range incs {
+		for _, ch := range inc.changes {
+			e.emitIncident(inc, ch)
+		}
+		inc.changes = nil
+	}
 	return true
+}
+
+// incBatch is what a write stores of incidents (see writeBatch); the detections' indexes are as's.
+func (e *Engine) incBatch(as []*activeDet, incs []*incident) *incBatch {
+	b := &incBatch{detInc: make([]int, len(as))}
+	idx := make(map[*incident]int, len(incs))
+	for i, inc := range incs {
+		idx[inc] = i
+		b.incs = append(b.incs, inc.row())
+		for k := range inc.entDirty {
+			if t := inc.entTimes[k]; t != nil {
+				b.ents = append(b.ents, incEntRow{inc: i, k: k, first: nanos(t.first), last: nanos(t.last)})
+			}
+		}
+	}
+	det := make(map[*activeDet]int, len(as))
+	for i, a := range as {
+		det[a] = i
+		b.detInc[i] = -1
+		if a.inc != nil {
+			if j, ok := idx[a.inc]; ok {
+				b.detInc[i] = j
+			}
+		}
+	}
+	for i, inc := range incs {
+		for _, t := range inc.tl {
+			r := incTLRow{inc: i, det: -1, ev: t.ev}
+			if t.det != nil {
+				if t.det.s.d.ID != 0 {
+					r.detID = t.det.s.d.ID
+				} else if k, ok := det[t.det]; ok {
+					r.det = k
+				} else {
+					continue // its detection isn't written yet
+				}
+			}
+			b.tl = append(b.tl, r)
+		}
+	}
+	for k := range e.riskDirty {
+		if r := e.risk[k]; r != nil {
+			b.risk = append(b.risk, riskRow{k: k, score: r.score, at: r.at})
+		} else {
+			delete(e.riskDirty, k)
+		}
+	}
+	for k := range e.riskGone {
+		b.riskDel = append(b.riskDel, k)
+	}
+	return b
 }
 
 // emit hands a detection to the pipeline as a siem.detection event.
@@ -763,6 +946,15 @@ func (e *Engine) emit(a *activeDet) {
 	if d.Key != "" {
 		ev.F["key"] = d.Key
 	}
+	if id := a.s.incID; id != 0 || (a.inc != nil && a.inc.id != 0) {
+		if id == 0 {
+			id = a.inc.id
+		}
+		ev.F["incident_id"] = float64(id)
+	}
+	if d.Muted {
+		ev.F["muted"] = true
+	}
 	if !a.s.rollup {
 		switch a.groupBy {
 		case "ip":
@@ -776,6 +968,11 @@ func (e *Engine) emit(a *activeDet) {
 			ev.Actor = d.Key
 		}
 	}
+	e.emitEvent(ev)
+}
+
+// emitEvent hands an event to the pipeline.
+func (e *Engine) emitEvent(ev siem.Event) {
 	// Intentional: a full emit lane is waited on (the pipeline drains it), within emitBudget per
 	// flush, instead of dropping at once: a burst — the final flush at shutdown — would otherwise lose
 	// the searchable events of detections whose rows are stored. A stalled pipeline costs at most the
@@ -1169,6 +1366,8 @@ func summarize(c *compiled, d *siem.Detection, f firing) string {
 			to = f.to.place
 		}
 		what = fmt.Sprintf("%s from %s and %s %s apart (%d km)", noun, from, to, fmtDur(f.gap), int(math.Round(f.dist)))
+	case siem.RuleBaseline:
+		what = baselineWhat(c, d, f)
 	case siem.RuleSequence:
 		then := c.info.thenNoun
 		if then == "" {

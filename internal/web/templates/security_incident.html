@@ -1,0 +1,129 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <p><a href="/security/incidents">← Incidents</a></p>
+  {{if .Off}}
+  <h1>Incident</h1>
+  {{template "security_subnav" "incidents"}}
+  {{template "secdetoff"}}
+  {{else if .Missing}}
+  <h1>Incident</h1>
+  {{template "security_subnav" "incidents"}}
+  <section class="panel">
+    <h2>{{.Missing}}</h2>
+    <p class="muted"><a href="/security/incidents">Back to the incidents</a></p>
+  </section>
+  {{else}}{{with .One}}
+  <h1 class="sec-title">{{if .Title}}{{.Title}}{{else}}Incident {{.ID}}{{end}}</h1>
+  {{template "security_subnav" "incidents"}}
+  {{if .Notice}}<div class="notice" role="status">{{.Notice}}</div>{{end}}
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+
+  <section class="panel">
+    <h2><span>Summary</span> <span class="muted small mono">#{{.ID}}</span></h2>
+    <div class="table-scroll"><table class="grid"><tbody>
+      <tr><td>State</td><td>{{template "sec_incstate" .}}</td></tr>
+      <tr><td>Severity</td><td>{{template "sec_sev" .}}{{if .Chain}} <span class="badge badge-warn">Known chain</span> {{.Chain}}{{end}}</td></tr>
+      <tr><td>Accounts and addresses</td><td class="wrap-cell">{{range .Entities}}<div class="sec-ent">{{template "sec_entity" .}}</div>{{else}}<span class="muted">—</span>{{end}}</td></tr>
+      {{if .First}}<tr><td>First seen</td><td class="mono">{{.First}} UTC</td></tr>{{end}}
+      {{if .Last}}<tr><td>Last active</td><td class="mono">{{.Last}} UTC <span class="muted">{{.Ago}}</span></td></tr>{{end}}
+      <tr><td>Detections</td><td class="mono">{{.Detections}}</td></tr>
+      {{if .Rules}}<tr><td>Rules</td><td class="wrap-cell">{{range $i, $r := .Rules}}{{if $i}}, {{end}}<a class="mono" href="{{$r.URL}}">{{$r.ID}}</a>{{end}}</td></tr>{{end}}
+      <tr><td>Assignee</td><td>
+        <form method="post" action="/security/incidents/{{.ID}}/assign" class="sec-assign sec-actions">
+          <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+          <select name="assignee" aria-label="Assignee">
+            {{range .AssignOpts}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+          </select>
+          <button type="submit" class="btn btn-sm">Assign</button>
+        </form>
+        {{if .AssigneeNotOwner}}<div class="muted small">Assigned to {{.Assignee}} (no longer an owner)</div>{{end}}
+      </td></tr>
+      {{if .Updated}}<tr><td>Updated</td><td class="mono">{{.Updated}} UTC <span class="muted">{{.UpdatedAgo}}</span></td></tr>{{end}}
+    </tbody></table></div>
+  </section>
+
+  <section class="panel">
+    <h2>Status</h2>
+    <form method="post" action="/security/incidents/{{.ID}}/state" class="stack">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <label>Note <span class="muted">(optional, added to the timeline)</span>
+        <textarea name="note" rows="3" maxlength="{{.MaxNote}}" placeholder="What you found or did">{{.StateNote}}</textarea></label>
+      {{if .CanFP}}<label class="check"><input type="checkbox" name="mute"{{if .Mute}} checked{{end}}> When marking a false positive, also mute this incident's rules for its accounts and addresses for 30 days (reopening the incident removes them)</label>{{end}}
+      <div class="queue-actions sec-actions">
+        {{range .Actions}}<button type="submit" name="state" value="{{.State}}" class="btn{{if .Primary}} btn-primary{{end}}">{{.Label}}</button>{{end}}
+        {{if .CanFP}}<button type="submit" formaction="/security/incidents/{{.ID}}/false-positive" class="btn">Mark as false positive</button>{{end}}
+      </div>
+      {{if .ReopenUnmutes}}<p class="muted small">Reopening the incident removes its mutes.</p>{{end}}
+    </form>
+  </section>
+
+  {{if .Mutes}}
+  <section class="panel">
+    <h2>Mutes in force</h2>
+    <p class="muted small">Marking this incident as a false positive muted these rules for these accounts and addresses: their detections are still recorded, but they send no alert and open no incident. Reopening the incident removes them.</p>
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Rule</th><th class="wrap-cell">Account or address</th><th>Until (UTC)</th><th>By</th><th></th></tr></thead>
+      <tbody>
+        {{range .Mutes}}
+        <tr>
+          <td><a class="mono" href="{{.RuleURL}}">{{.RuleID}}</a></td>
+          <td class="wrap-cell">{{template "sec_entity" .Entity}}</td>
+          <td class="mono"{{if .UntilISO}} title="{{.UntilISO}}"{{end}}>{{if .Until}}{{.Until}} <span class="muted small">{{if .Ended}}ended{{else}}{{.Remain}}{{end}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .By}}{{.By}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>
+            <form method="post" action="/security/mutes/remove" class="inline" data-confirm="Remove the mute of {{.RuleID}} for {{.Entity.Key}}? Its detections will alert and open incidents again.">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="rule" value="{{.RuleID}}">
+              <input type="hidden" name="kind" value="{{.Entity.Kind}}">
+              <input type="hidden" name="key" value="{{.Entity.Key}}">
+              <input type="hidden" name="scope" value="{{.Entity.Scope}}">
+              <input type="hidden" name="incident" value="{{$.One.ID}}">
+              <button type="submit" class="link">Remove</button>
+            </form>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+  </section>
+  {{end}}
+
+  <section class="panel">
+    <h2>Add a note</h2>
+    <form method="post" action="/security/incidents/{{.ID}}/note" class="stack">
+      <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+      <label>Note <span class="muted">(up to 4,096 bytes)</span>
+        <textarea name="note" rows="4" maxlength="{{.MaxNote}}" required>{{.NoteDraft}}</textarea></label>
+      <div class="queue-actions sec-actions"><button type="submit" class="btn">Add note</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <h2><span>Timeline</span> <span class="muted small">Oldest first</span></h2>
+    {{if .Timeline}}
+    <ol class="sec-timeline">
+      {{range .Timeline}}
+      <li>
+        <div class="muted small">{{if .When}}<span class="mono"{{if .ISO}} title="{{.ISO}}"{{end}}>{{.When}} UTC</span> · {{.Ago}} · {{end}}{{if .By}}{{.By}}{{else}}Mooring{{end}}</div>
+        <div class="sec-tl-entry">{{template "secincentry" .}}</div>
+      </li>
+      {{end}}
+    </ol>
+    {{else}}
+    <p class="muted">Nothing in the timeline yet.</p>
+    {{end}}
+  </section>
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}
+
+{{/* One timeline entry (a timelineRow). Kind is a known Timeline* kind, or "" (Raw and Text). */}}
+{{define "secincentry"}}{{if eq .Kind "opened"}}<strong>Incident opened</strong>{{if .Text}}<div class="sec-msg small">{{.Text}}</div>{{end}}
+{{- else if eq .Kind "detection"}}{{if .Sev}}{{template "sec_sev" .}} {{end}}{{if .DetectionURL}}<a href="{{.DetectionURL}}">{{.Rule}}</a>{{else}}{{.Rule}}{{end}}{{if .Text}}<div class="sec-msg small">{{.Text}}</div>{{end}}
+{{- else if eq .Kind "escalated"}}Severity raised{{if .Sev}} to {{template "sec_sev" .}}{{end}}{{if .Text}}<div class="sec-msg small">{{.Text}}</div>{{end}}
+{{- else if eq .Kind "state"}}State set to <strong>{{.StateLabel}}</strong>
+{{- else if eq .Kind "assigned"}}{{if .Text}}Assigned to <strong>{{.Text}}</strong>{{else}}Unassigned{{end}}
+{{- else if eq .Kind "note"}}<div class="sec-note">{{.Text}}</div>
+{{- else if eq .Kind "muted"}}Muted {{if .RuleURL}}<a href="{{.RuleURL}}">{{.Rule}}</a>{{else}}{{.Rule}}{{end}}{{if .Text}} <span class="muted">{{.Text}}</span>{{end}}
+{{- else}}{{if .Raw}}<code class="chip">{{.Raw}}</code> {{end}}{{.Text}}{{end}}{{end}}

@@ -2,10 +2,14 @@ package web
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +18,7 @@ import (
 	"github.com/daboss2003/mooring/internal/envstore"
 	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/secret"
+	"github.com/daboss2003/mooring/internal/siem"
 )
 
 // A correct password tears the app down completely: every per-app store row, the run
@@ -124,6 +129,164 @@ func TestAppDeleteGateAbortsWhenLockHeld(t *testing.T) {
 	}
 	if _, ok, _ := e.srv.gitStore.Get(slug); !ok {
 		t.Error("the app must remain intact when the teardown gate aborts")
+	}
+}
+
+// incMuteFake is the incident service with the engine's DeleteAppMutes.
+type incMuteFake struct {
+	*incFake
+	delMu sync.Mutex
+	slugs []string
+	err   error
+}
+
+func (f *incMuteFake) DeleteAppMutes(_ context.Context, slug string) error {
+	f.delMu.Lock()
+	defer f.delMu.Unlock()
+	f.slugs = append(f.slugs, slug)
+	return f.err
+}
+
+func (f *incMuteFake) calledFor() []string {
+	f.delMu.Lock()
+	defer f.delMu.Unlock()
+	return slices.Clone(f.slugs)
+}
+
+// The teardown removes the app's false-positive mutes when the incident service can (the engine); a
+// failure is a teardown error like any other store's. Its incidents and detections are kept.
+func TestAppDeleteRemovesAppMutes(t *testing.T) {
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	ctx := context.Background()
+	const slug = "shop"
+	seed := func() {
+		t.Helper()
+		if err := e.srv.gitStore.Save(ctx, gitstore.SaveInput{Project: slug, RepoURL: "https://github.com/o/r.git", Ref: "refs/heads/main", BuildPolicy: "never"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f := &incMuteFake{incFake: &incFake{}}
+	e.srv.incidentSvc = f
+	seed()
+	if gateErr, errs := e.srv.teardownApp(ctx, slug); gateErr != nil || len(errs) != 0 {
+		t.Fatalf("teardown = %v, %v", gateErr, errs)
+	}
+	if got := f.calledFor(); !slices.Equal(got, []string{slug}) {
+		t.Errorf("DeleteAppMutes calls = %q, want [%s]", got, slug)
+	}
+	if f.calls() != 0 {
+		t.Error("the teardown changed or read incidents")
+	}
+
+	// A failure is reported with the other teardown errors, and in the delete's audit row.
+	f.delMu.Lock()
+	f.err = errors.New("security_mutes locked")
+	f.delMu.Unlock()
+	seed()
+	_, errs := e.srv.teardownApp(ctx, slug)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "security mutes: security_mutes locked") {
+		t.Errorf("teardown errors = %v, want the mutes failure", errs)
+	}
+	seed()
+	sess, csrf := e.authed(t)
+	resp := e.req(t, "POST", "/apps/"+slug+"/delete", "127.0.0.1:1", map[string]string{"Origin": "https://example.com"},
+		[]*http.Cookie{sess, csrf}, url.Values{"csrf_token": {csrf.Value}, "password": {testPassword}})
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("delete = %d, want 303", resp.StatusCode)
+	}
+	rows := secAuditRows(t, e, "app_delete")
+	if len(rows) == 0 || rows[len(rows)-1].Outcome != "error" || !strings.Contains(rows[len(rows)-1].Detail, "security mutes") {
+		t.Errorf("app_delete audit = %+v, want the mutes failure", rows)
+	}
+
+	// A service without the method, or none: nothing to call, no error.
+	for _, svc := range []siem.IncidentService{&incFake{}, nil} {
+		e.srv.incidentSvc = svc
+		seed()
+		if gateErr, errs := e.srv.teardownApp(ctx, slug); gateErr != nil || len(errs) != 0 {
+			t.Errorf("teardown with %T = %v, %v", svc, gateErr, errs)
+		}
+	}
+}
+
+// baselineDeleter is the engine's DeleteAppBaselines, to embed in an incident service fake.
+type baselineDeleter struct {
+	mu    sync.Mutex
+	slugs []string
+	err   error
+}
+
+func (b *baselineDeleter) DeleteAppBaselines(_ context.Context, slug string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.slugs = append(b.slugs, slug)
+	return b.err
+}
+
+func (b *baselineDeleter) calledFor() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.slugs)
+}
+
+// The teardown clears the app's sign-in baselines when the incident service can (the engine),
+// with or without DeleteAppMutes; a failure is a teardown error like any other store's.
+func TestAppDeleteRemovesAppBaselines(t *testing.T) {
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	ctx := context.Background()
+	const slug = "shop"
+	seed := func() {
+		t.Helper()
+		if err := e.srv.gitStore.Save(ctx, gitstore.SaveInput{Project: slug, RepoURL: "https://github.com/o/r.git", Ref: "refs/heads/main", BuildPolicy: "never"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mutes, bl := &incMuteFake{incFake: &incFake{}}, &baselineDeleter{}
+	e.srv.incidentSvc = struct {
+		*incMuteFake
+		*baselineDeleter
+	}{mutes, bl}
+	seed()
+	if gateErr, errs := e.srv.teardownApp(ctx, slug); gateErr != nil || len(errs) != 0 {
+		t.Fatalf("teardown = %v, %v", gateErr, errs)
+	}
+	if got := bl.calledFor(); !slices.Equal(got, []string{slug}) {
+		t.Errorf("DeleteAppBaselines calls = %q, want [%s]", got, slug)
+	}
+	if got := mutes.calledFor(); !slices.Equal(got, []string{slug}) {
+		t.Errorf("DeleteAppMutes calls = %q, want [%s]", got, slug)
+	}
+
+	// A failure is reported with the other teardown errors, and in the delete's audit row.
+	bl.mu.Lock()
+	bl.err = errors.New("baselines table locked")
+	bl.mu.Unlock()
+	seed()
+	_, errs := e.srv.teardownApp(ctx, slug)
+	if len(errs) != 1 || !strings.Contains(errs[0].Error(), "security baselines: baselines table locked") {
+		t.Errorf("teardown errors = %v, want the baselines failure", errs)
+	}
+	seed()
+	sess, csrf := e.authed(t)
+	resp := e.req(t, "POST", "/apps/"+slug+"/delete", "127.0.0.1:1", map[string]string{"Origin": "https://example.com"},
+		[]*http.Cookie{sess, csrf}, url.Values{"csrf_token": {csrf.Value}, "password": {testPassword}})
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("delete = %d, want 303", resp.StatusCode)
+	}
+	rows := secAuditRows(t, e, "app_delete")
+	if len(rows) == 0 || rows[len(rows)-1].Outcome != "error" || !strings.Contains(rows[len(rows)-1].Detail, "security baselines") {
+		t.Errorf("app_delete audit = %+v, want the baselines failure", rows)
+	}
+
+	// A service with DeleteAppBaselines only.
+	only := &baselineDeleter{}
+	e.srv.incidentSvc = struct {
+		*incFake
+		*baselineDeleter
+	}{&incFake{}, only}
+	seed()
+	if gateErr, errs := e.srv.teardownApp(ctx, slug); gateErr != nil || len(errs) != 0 || !slices.Equal(only.calledFor(), []string{slug}) {
+		t.Errorf("baselines only: teardown %v, %v, calls %q", gateErr, errs, only.calledFor())
 	}
 }
 

@@ -1,0 +1,82 @@
+{{template "top" .}}
+{{template "nav" .}}
+<main class="wrap">
+  <p><a href="/security/incidents">← Incidents</a></p>
+  {{if .Off}}
+  <h1>Account or address</h1>
+  {{template "security_subnav" "incidents"}}
+  {{template "secdetoff"}}
+  {{else if .Missing}}
+  <h1>Account or address</h1>
+  {{template "security_subnav" "incidents"}}
+  <section class="panel">
+    <h2>{{.Missing}}</h2>
+    <p class="muted"><a href="/security/incidents">Back to the incidents</a></p>
+  </section>
+  {{else}}{{with .Ent}}
+  <h1 class="sec-title">{{.Key}}</h1>
+  <p class="muted"><span class="badge badge-muted">{{.Label}}</span>{{if and (eq .Kind "account") .Scope}} <span class="mono small">{{.Scope}}</span>{{end}}</p>
+  {{template "security_subnav" "incidents"}}
+  {{if .Notice}}<div class="notice" role="status">{{.Notice}}</div>{{end}}
+  {{if .Err}}<div class="error" role="alert">{{.Err}}</div>{{end}}
+
+  <div class="stat-grid">
+    <div class="stat-card{{if .ScoreClass}} {{.ScoreClass}}{{end}}">
+      <div class="stat-label">Risk score</div>
+      <div class="stat-value">{{.Score}}<small> / 100</small></div>
+      <div class="stat-sub">{{if .Updated}}Updated {{.Updated}} UTC, {{.UpdatedAgo}}{{else}}No recent detections{{end}}</div>
+      {{template "meter" .Pct}}
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Open incidents</div>
+      <div class="stat-value">{{.Open}}</div>
+      <div class="stat-sub">Open or acknowledged</div>
+    </div>
+  </div>
+  <p class="muted small">The risk score rises with each detection of this {{.Noun}}, more for a higher severity, and fades over the following days.</p>
+  {{if .SearchURL}}
+  <div class="queue-actions">
+    <a class="btn btn-sm" href="{{.SearchURL}}">Find in Security logs</a>
+    <span class="muted small">Every event with <code>{{.SearchTerm}}</code> in the last 14 days.</span>
+  </div>
+  {{end}}
+
+  <section class="panel">
+    <h2>Incidents</h2>
+    {{if .Rows}}{{template "secinctable" .Rows}}{{else}}<p class="muted">No incidents for this {{.Noun}}.</p>{{end}}
+  </section>
+
+  <section class="panel">
+    <h2>Mutes</h2>
+    <p class="muted small">While a rule is muted for this {{.Noun}}, its detections are still recorded, but they send no alert and open no incident. Marking an incident as a false positive can add mutes for 30 days.</p>
+    {{if .Mutes}}
+    <div class="table-scroll"><table class="grid">
+      <thead><tr><th>Rule</th><th>Until (UTC)</th><th>By</th><th>From</th><th></th></tr></thead>
+      <tbody>
+        {{range .Mutes}}
+        <tr>
+          <td><a class="mono" href="{{.RuleURL}}">{{.RuleID}}</a></td>
+          <td class="mono"{{if .UntilISO}} title="{{.UntilISO}}"{{end}}>{{if .Until}}{{.Until}} <span class="muted small">{{if .Ended}}ended{{else}}{{.Remain}}{{end}}</span>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .By}}{{.By}}{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>{{if .IncidentURL}}<a href="{{.IncidentURL}}">Incident #{{.IncidentID}}</a>{{else}}<span class="muted">—</span>{{end}}</td>
+          <td>
+            <form method="post" action="/security/mutes/remove" class="inline" data-confirm="Remove the mute of {{.RuleID}}? Its detections for this {{$.Ent.Noun}} will alert and open incidents again.">
+              <input type="hidden" name="csrf_token" value="{{$.CSRFToken}}">
+              <input type="hidden" name="rule" value="{{.RuleID}}">
+              <input type="hidden" name="kind" value="{{$.Ent.Kind}}">
+              <input type="hidden" name="key" value="{{$.Ent.Key}}">
+              <input type="hidden" name="scope" value="{{$.Ent.Scope}}">
+              <button type="submit" class="link">Remove</button>
+            </form>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table></div>
+    {{else}}
+    <p class="muted">No mutes for this {{.Noun}}.</p>
+    {{end}}
+  </section>
+  {{end}}{{end}}
+</main>
+{{template "bottom" .}}

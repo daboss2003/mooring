@@ -148,6 +148,8 @@ type Deps struct {
 	Detections siem.DetectionService
 	// DetectionReporter takes the app /ops alerts' detections (nil when detection is off).
 	DetectionReporter siem.Reporter
+	// Incidents serves the owner-only Incidents and entity pages (nil when detection is off).
+	Incidents siem.IncidentService
 	// Feeds reports the enrichment feeds' state (nil when security logs are off).
 	Feeds siem.FeedStatusSource
 	// AuditSink, when set, also receives every audit event this server records (security logs).
@@ -241,6 +243,7 @@ type Server struct {
 	securityLogs    SecurityLogs                      // security-log search/export/status (nil when off)
 	detections      siem.DetectionService             // Detections/Rules pages (nil when detection is off)
 	detectReporter  siem.Reporter                     // where the app /ops alerts report (nil when detection is off)
+	incidentSvc     siem.IncidentService              // Incidents/entity pages (nil when detection is off)
 	feeds           siem.FeedStatusSource             // enrichment feed state (nil when security logs are off)
 	securityExports chan struct{}                     // concurrency cap on security-log exports
 	secParse        func(string) (query.Query, error) // test seam: replaces query.Parse on the Security logs page
@@ -311,6 +314,7 @@ func New(cfg *config.Config, d Deps) (*Server, error) {
 	s.edgeDNSPlugins = d.EdgeDNSPlugins
 	s.securityLogs = d.SecurityLogs
 	s.detections, s.detectReporter, s.feeds = d.Detections, d.DetectionReporter, d.Feeds
+	s.incidentSvc = d.Incidents
 	s.audit.SetSink(d.AuditSink)
 	s.securityExports = make(chan struct{}, securityExportConcurrency)
 	s.sweepDiscoveryScratch() // clear any orphaned multi-file-connect scratch dirs from a prior run
@@ -660,6 +664,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /security/rules/delete", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecurityRuleDelete))))
 	mux.HandleFunc("POST /security/rules/reset", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecurityRuleReset))))
 	mux.HandleFunc("POST /security/rules/snooze", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecurityRuleSnooze))))
+	mux.HandleFunc("GET /security/incidents", s.requirePerm("admin", s.withCSRFToken(s.handleSecIncidents)))
+	mux.HandleFunc("GET /security/incidents/rows", s.requirePerm("admin", s.handleSecIncidentRows))
+	mux.HandleFunc("GET /security/incidents/{id}", s.requirePerm("admin", s.withCSRFToken(s.handleSecIncident)))
+	mux.HandleFunc("POST /security/incidents/{id}/state", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecIncidentState))))
+	mux.HandleFunc("POST /security/incidents/{id}/assign", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecIncidentAssign))))
+	mux.HandleFunc("POST /security/incidents/{id}/note", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecIncidentNote))))
+	mux.HandleFunc("POST /security/incidents/{id}/false-positive", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecIncidentFalsePositive))))
+	mux.HandleFunc("GET /security/entities", s.requirePerm("admin", s.withCSRFToken(s.handleSecEntity)))
+	mux.HandleFunc("POST /security/mutes/remove", capBody(loginBodyLimit, s.requirePerm("admin", s.requireCSRF(s.handleSecMuteRemove))))
 	// Operator UI prefs (M7): persisted tile order. UI-only, never Tier-1.
 	mux.HandleFunc("POST /settings/tile-order", capBody(64<<10, s.requirePerm("deploy", s.requireCSRF(s.handleTileOrder))))
 	// API tokens (M19): read-only view + revoke. Minting stays CLI-only by design.

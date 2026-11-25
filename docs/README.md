@@ -30,6 +30,7 @@ That's the whole on-ramp. After that, you live in the dashboard.
 - **[Errors](./errors.md)** — every route that returned a 4xx/5xx at the edge in the last 24h, grouped by app and filterable, with an alert when a route keeps erroring.
 - **[Service trends & logs](./service-trends-and-logs.md)** — per-service CPU/memory/error-rate charts over time, and searchable log history with a link from any Errors entry to the service's own output.
 - **[Security detections](./security-detections.md)** — built-in and custom rules over the security logs (brute force, password spraying, new countries, impossible travel, threat-intel hits, app /ops alerts), tagged with MITRE ATT&CK®, on an owner-only Detections page, with high and critical detections sent to your alert channels.
+- **[Security incidents](./security-incidents.md)** — related detections of one account or address grouped into incidents with a timeline, known attack chains raised to critical, one alert per incident, a workflow (acknowledge, resolve, false positive, notes, assignee) and a risk score per account and address.
 - **[Security logs](./security-logs.md)** — app, edge, Mooring and host security events in one searchable log, with secrets and personal data removed, 14 days on the server and an encrypted S3 archive.
 - **[An app's ops interface](./app-ops-interface.md)** — richer health, queues, and metrics for apps that expose them.
 

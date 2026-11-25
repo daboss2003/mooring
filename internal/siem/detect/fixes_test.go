@@ -955,7 +955,7 @@ func TestDetectionsOrderedByLastSeen(t *testing.T) {
 		t.Fatalf("query plan: %s", plan)
 	}
 	var v int
-	if err := h.e.db.w.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil || v != 4 {
+	if err := h.e.db.w.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&v); err != nil || v != 6 {
 		t.Fatalf("schema version %d, %v", v, err)
 	}
 }

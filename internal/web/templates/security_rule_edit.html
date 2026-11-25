@@ -25,7 +25,8 @@
     <div class="table-scroll"><table class="grid"><tbody>
       <tr><td>ID</td><td class="mono">{{.ID}}</td></tr>
       <tr><td>Type</td><td>{{.TypeLabel}}</td></tr>
-      <tr><td>Search</td><td class="wrap-cell"><code>{{.Query}}</code></td></tr>
+      {{if .Learns}}<tr><td>Learns</td><td class="wrap-cell">{{.Learns}}, for each {{if .GroupBy}}<span class="mono">{{.GroupBy}}</span>{{else}}rule{{end}}</td></tr>{{end}}
+      {{if .Query}}<tr><td>Search</td><td class="wrap-cell"><code>{{.Query}}</code></td></tr>{{end}}
       {{if .Then}}<tr><td>Then</td><td class="wrap-cell"><code>{{.Then}}</code></td></tr>{{end}}
       <tr><td>Group by</td><td class="mono">{{if .GroupBy}}{{.GroupBy}}{{else}}<span class="muted">all events together</span>{{end}}</td></tr>
       {{if .Field}}<tr><td>Field</td><td class="mono">{{.Field}}</td></tr>{{end}}

@@ -71,6 +71,9 @@ type harness struct {
 	dir   string
 	main  *store.DB
 	mopts func(*Options)
+	// incidents keeps incident grouping on (production's default). Off, the harness tests the
+	// per-detection alerts: a detection that joins an incident has none (the incident alerts).
+	incidents bool
 }
 
 // newHarness builds an engine on a fresh directory with a fake alerter and event sink. With
@@ -107,6 +110,7 @@ func (h *harness) open(t testing.TB) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.lim.incidents = h.incidents
 	h.e = e
 	t.Cleanup(func() { e.Close() })
 }

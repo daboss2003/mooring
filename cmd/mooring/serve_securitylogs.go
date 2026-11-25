@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,7 +18,12 @@ import (
 	"github.com/daboss2003/mooring/internal/alertstore"
 	"github.com/daboss2003/mooring/internal/audit"
 	"github.com/daboss2003/mooring/internal/config"
+	"github.com/daboss2003/mooring/internal/definition"
+	"github.com/daboss2003/mooring/internal/docker"
+	"github.com/daboss2003/mooring/internal/edge"
+	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/hostmon"
+	"github.com/daboss2003/mooring/internal/provstore"
 	"github.com/daboss2003/mooring/internal/servicelog"
 	"github.com/daboss2003/mooring/internal/siem"
 	"github.com/daboss2003/mooring/internal/siem/archive"
@@ -61,6 +67,7 @@ type securityLogs struct {
 	enr      *enrich.Enricher // GeoIP + threat-intel enrichment (filled by feeds)
 	feeds    *feeds.Manager   // nil when it couldn't start
 	det      *detect.Engine   // nil when detection is off or didn't start
+	hosts    knownHosts       // the hosts the edge serves (the traffic baseline learns only those)
 	dir      string           // <data_dir>/security-logs
 	failed   string
 	log      *slog.Logger
@@ -174,9 +181,10 @@ func startSecurityLogs(ctx context.Context, cfg *config.Config, alerts *alertsto
 		}
 		eng, derr := detect.New(detect.Options{
 			Dir: dir, MainDB: db, Alerter: al,
-			Emit:     func(e siem.Event) bool { p := pipeRef.Load(); return p != nil && p.Emit(e) },
-			MapValue: detectMapValue(red),
-			Log:      log.With("component", "detect"),
+			Emit:      func(e siem.Event) bool { p := pipeRef.Load(); return p != nil && p.Emit(e) },
+			MapValue:  detectMapValue(red),
+			KnownHost: s.hosts.lookup,
+			Log:       log.With("component", "detect"),
 		})
 		if derr != nil {
 			// Intentional: like security logs themselves, a detection that can't start never refuses
@@ -488,6 +496,228 @@ func (s *securityLogs) detections() siem.DetectionService {
 		return nil
 	}
 	return s.det
+}
+
+// The app teardown (internal/web appdelete.go) finds these methods by type assertions on the
+// incidents service: pin them here so a rename can't silently stop an app's mutes and sign-in
+// baselines being removed.
+var _ interface {
+	DeleteAppMutes(ctx context.Context, slug string) error
+	DeleteAppBaselines(ctx context.Context, slug string) error
+} = (*detect.Engine)(nil)
+
+// incidents is what the Incidents and entity pages use (nil when detection isn't running).
+func (s *securityLogs) incidents() siem.IncidentService {
+	if s == nil || s.det == nil {
+		return nil
+	}
+	return s.det
+}
+
+// knownHosts is the set of hosts the edge serves, refreshed from its routes: exact host names, and
+// the apexes of catch-all routes (`*.<apex>` serves every single label under it). The detection
+// engine asks it for every edge event, so lookups are a map read behind an atomic pointer.
+type knownHosts struct {
+	set atomic.Pointer[hostSet]
+}
+
+type hostSet struct{ exact, apex map[string]bool }
+
+// lookup is detect.Options.KnownHost: the name host's traffic is counted under (the host, or
+// "*.<apex>" for every label a catch-all route serves, so a client inventing labels can't make
+// a baseline per label), whether it is served, and whether the routes were read yet.
+func (k *knownHosts) lookup(host string) (key string, known, ready bool) {
+	hs := k.set.Load()
+	if hs == nil {
+		return "", false, false
+	}
+	host = strings.ToLower(host)
+	if host == "" {
+		return "", false, true
+	}
+	if hs.exact[host] {
+		return host, true, true
+	}
+	if strings.HasPrefix(host, "*.") && hs.apex[host[2:]] {
+		return host, true, true // the catch-all key itself
+	}
+	if i := strings.IndexByte(host, '.'); i > 0 && hs.apex[host[i+1:]] {
+		return "*." + host[i+1:], true, true
+	}
+	return "", false, true
+}
+
+// refresh reloads the set from the edge routes; on an error it keeps what it had.
+func (k *knownHosts) refresh(list func() ([]edge.Route, error)) {
+	routes, err := list()
+	if err != nil {
+		return
+	}
+	hs := &hostSet{exact: map[string]bool{}, apex: map[string]bool{}}
+	for _, r := range routes {
+		if !r.Enabled {
+			continue
+		}
+		h := strings.ToLower(strings.TrimSuffix(r.Hostname, "."))
+		if r.CatchAll {
+			hs.apex[strings.TrimPrefix(h, "*.")] = true
+		} else if h != "" {
+			hs.exact[h] = true
+		}
+	}
+	k.set.Store(hs)
+}
+
+// followEdgeHosts keeps the known hosts current from the edge's routes (every 30 s), on the
+// security logs' worker context.
+func (s *securityLogs) followEdgeHosts(list func() ([]edge.Route, error)) {
+	if !s.running() || s.det == nil || list == nil {
+		return
+	}
+	s.hosts.refresh(list)
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-s.workerCtx.Done():
+				return
+			case <-t.C:
+				s.hosts.refresh(list)
+			}
+		}
+	}()
+}
+
+// The start-up cleanup's app list includes the containers, read through the socket-proxy, which
+// serve starts in the background (up to 90 s with an image pull): the list is retried this often,
+// for this long.
+var (
+	pruneAppsRetry = 5 * time.Second
+	pruneAppsWait  = 3 * time.Minute
+)
+
+// pruneDeletedAppsAtStart runs pruneDeletedApps once, in the background, as soon as list reads every
+// source of the app list; until then nothing is removed, and after pruneAppsWait it gives up (the
+// next start tries again).
+// Intentional: it runs after the web server may be up, so an app connected in the moment between
+// the list read and the prune could lose what was learned in that moment; a new app has no mutes
+// and its sign-ins take far longer than that to arrive.
+func (s *securityLogs) pruneDeletedAppsAtStart(list func(context.Context) ([]string, bool)) {
+	if s == nil || s.det == nil || !s.running() {
+		return
+	}
+	retry, wait := pruneAppsRetry, pruneAppsWait
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		giveUp := time.NewTimer(wait)
+		defer giveUp.Stop()
+		t := time.NewTicker(retry)
+		defer t.Stop()
+		for {
+			ctx, cancel := context.WithTimeout(s.workerCtx, 30*time.Second)
+			slugs, ok := list(ctx)
+			if ok {
+				s.pruneDeletedApps(ctx, slugs)
+				cancel()
+				return
+			}
+			cancel()
+			select {
+			case <-s.workerCtx.Done():
+				return
+			case <-giveUp.C:
+				if s.log != nil {
+					s.log.Warn("security logs: the app list couldn't be read; deleted apps' mutes and baselines are kept until the next start")
+				}
+				return
+			case <-t.C:
+			}
+		}
+	}()
+}
+
+// pruneDeletedApps removes the saved false-positive mutes and sign-in baselines of apps not in slugs
+// (the apps that exist): an app deleted while detection was off left them behind, and a new app
+// with the same name must not inherit them. Once, at start; errors are logged.
+func (s *securityLogs) pruneDeletedApps(ctx context.Context, slugs []string) {
+	if s == nil || s.det == nil {
+		return
+	}
+	if err := s.det.KeepAppMutes(ctx, slugs); err != nil {
+		s.logf("security logs: deleted apps' mutes not removed", err)
+	}
+	if err := s.det.KeepAppBaselines(ctx, slugs); err != nil {
+		s.logf("security logs: deleted apps' sign-in baselines not removed", err)
+	}
+}
+
+func (s *securityLogs) logf(msg string, err error) {
+	if s.log != nil {
+		s.log.Warn(msg, "err", err)
+	}
+}
+
+// appSources are where existingApps reads the apps from.
+type appSources struct {
+	repos       func() ([]gitstore.Config, error)                                                  // connected repos, PR previews included
+	defs        func(context.Context) (map[string]*definition.Definition, map[string]error, error) // stored definitions
+	provisioned func() ([]provstore.App, error)                                                    // wizard apps (no repo)
+	containers  func(context.Context) ([]docker.Container, error)                                  // every container, stopped too
+}
+
+// existingApps lists the apps that exist, as the app delete page's appExists counts them: the
+// connected repos, the stored definitions (one that fails to verify still names an app), the
+// provisioned apps and every Compose project with a container, running or stopped. ok is false
+// when any can't be read: a cleanup must never run on a partial list.
+func existingApps(ctx context.Context, src appSources) ([]string, bool) {
+	cfgs, err := src.repos()
+	if err != nil {
+		return nil, false
+	}
+	good, bad, err := src.defs(ctx)
+	if err != nil {
+		return nil, false
+	}
+	prov, err := src.provisioned()
+	if err != nil {
+		return nil, false
+	}
+	cs, err := src.containers(ctx)
+	if err != nil {
+		return nil, false
+	}
+	set := map[string]bool{}
+	for _, c := range cfgs {
+		if c.Project != "" {
+			set[c.Project] = true
+		}
+	}
+	for _, a := range prov {
+		if a.Slug != "" {
+			set[a.Slug] = true
+		}
+	}
+	for _, c := range cs {
+		if p := c.Project(); p != "" {
+			set[p] = true
+		}
+	}
+	for slug := range good {
+		set[slug] = true
+	}
+	for slug := range bad {
+		set[slug] = true
+	}
+	out := make([]string, 0, len(set))
+	for slug := range set {
+		out = append(out, slug)
+	}
+	sort.Strings(out)
+	return out, true
 }
 
 // detectionReporter is where the app /ops alerts report (nil when detection isn't running).

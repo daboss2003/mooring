@@ -265,6 +265,19 @@ func (s *Server) teardownApp(ctx context.Context, slug string) (error, []error) 
 		_, e3 := s.db.ExecContext(ctx, `DELETE FROM deploys WHERE project=?`, slug)
 		add("deploy ledger", e3)
 	}
+	// The app's false-positive mutes (its accounts' app:<slug> scope). Its incidents and detections
+	// stay: they are security records.
+	if m, ok := s.incidentSvc.(interface {
+		DeleteAppMutes(ctx context.Context, slug string) error
+	}); ok {
+		add("security mutes", m.DeleteAppMutes(ctx, slug))
+	}
+	// The app's sign-in baselines (its accounts' learned habits).
+	if b, ok := s.incidentSvc.(interface {
+		DeleteAppBaselines(ctx context.Context, slug string) error
+	}); ok {
+		add("security baselines", b.DeleteAppBaselines(ctx, slug))
+	}
 
 	// Identity rows LAST: while either of these survives, appExists() still finds the
 	// app, so an interrupted teardown can be retried to completion.

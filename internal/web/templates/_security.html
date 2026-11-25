@@ -1,10 +1,11 @@
-{{/* Shared by the owner-only security pages: Search (security.html), Detections and Rules. */}}
+{{/* Shared by the owner-only security pages: Search (security.html), Detections, Incidents and Rules. */}}
 
-{{/* The tabs; the argument is the active one: "search", "detections" or "rules". */}}
+{{/* The tabs; the argument is the active one: "search", "detections", "incidents" or "rules". */}}
 {{define "security_subnav"}}
 <nav class="subnav" aria-label="Security logs">
   <a href="/security"{{if eq . "search"}} class="active" aria-current="page"{{end}}>Search</a>
   <a href="/security/detections"{{if eq . "detections"}} class="active" aria-current="page"{{end}}>Detections</a>
+  <a href="/security/incidents"{{if eq . "incidents"}} class="active" aria-current="page"{{end}}>Incidents</a>
   <a href="/security/rules"{{if eq . "rules"}} class="active" aria-current="page"{{end}}>Rules</a>
 </nav>
 {{end}}
@@ -33,4 +34,32 @@
     enabled: true</pre>
   <p class="muted small">Reference: <a href="https://github.com/daboss2003/mooring/blob/main/docs/security-logs.md">docs/security-logs.md</a></p>
 </section>
+{{end}}
+
+{{/* An account or address (an entityRef), linked to its page. */}}
+{{define "sec_entity"}}<a class="sec-entity" href="{{.URL}}"><span class="badge badge-muted">{{.Label}}</span> <span class="mono">{{.Key}}</span></a>{{end}}
+
+{{/* An incident's state pill (an incRow; StateClass is from an allowlist). */}}
+{{define "sec_incstate"}}<span class="pill{{if .StateClass}} {{.StateClass}}{{end}}">{{.StateLabel}}</span>{{end}}
+
+{{/* An incident's assignee (an incRow). */}}
+{{define "sec_assignee"}}{{if .AssigneeNotOwner}}<span class="muted">{{.Assignee}} (no longer an owner)</span>{{else if .Assignee}}{{.Assignee}}{{else}}<span class="muted">Unassigned</span>{{end}}{{end}}
+
+{{/* A table of incidents (incRows): the Incidents list and an entity's incidents. */}}
+{{define "secinctable"}}
+<div class="table-scroll"><table class="grid">
+  <thead><tr><th>Last active (UTC)</th><th>Severity</th><th>State</th><th class="wrap-cell">Incident</th><th class="wrap-cell">Accounts and addresses</th><th>Assignee</th></tr></thead>
+  <tbody>
+    {{range .}}
+    <tr>
+      <td{{if .First}} title="First seen {{.First}} UTC"{{end}}><a class="mono" href="{{.URL}}">{{if .Last}}{{.Last}}{{else}}#{{.ID}}{{end}}</a> <span class="muted small">{{.Ago}}</span></td>
+      <td>{{template "sec_sev" .}}</td>
+      <td>{{template "sec_incstate" .}}</td>
+      <td class="wrap-cell"><a href="{{.URL}}">{{if .Title}}{{.Title}}{{else}}Incident {{.ID}}{{end}}</a>{{if .Chain}}<div class="small"><span class="badge badge-warn">Known chain</span> {{.Chain}}</div>{{end}}<div class="muted small">#{{.ID}} · {{.DetectionsText}}{{if .First}} · first seen {{.First}}{{end}}</div></td>
+      <td class="wrap-cell">{{range .Entities}}<div class="sec-ent">{{template "sec_entity" .}}</div>{{else}}<span class="muted">—</span>{{end}}</td>
+      <td>{{template "sec_assignee" .}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table></div>
 {{end}}

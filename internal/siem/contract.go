@@ -44,6 +44,17 @@ const (
 	RuleAnomaly   = "anomaly"   // matching events per GroupBy key within Window above Factor × the usual rate, and at least Count
 	RuleTravel    = "travel"    // two matching events of one GroupBy key whose IP locations are farther apart than SpeedKMH allows
 	RuleSequence  = "sequence"  // at least Count events matching Query, then one matching Then, same GroupBy key, within Window
+	// RuleBaseline learns each GroupBy key's normal behaviour and fires on a departure from it;
+	// Baseline names what it learns (Baseline* below). Built-in rules only.
+	RuleBaseline = "baseline"
+)
+
+// Baseline kinds (Rule.Baseline).
+const (
+	BaselineSignIn  = "signin"  // per account: usual sign-in hours of the week, countries, networks (ASN), clients
+	BaselineTraffic = "traffic" // per edge host with a route: requests and errors per hour of the week vs previous weeks
+	BaselineAdmin   = "admin"   // per server user: usual sudo/su hours, programs and target users
+	BaselineIP      = "ip"      // per address: its usual request mix
 )
 
 // Rule is one detection rule: a built-in one from the pack (Builtin true; only the fields marked
@@ -69,6 +80,7 @@ type Rule struct {
 	Enabled      bool          `json:"enabled"`             // tunable
 	Builtin      bool          `json:"builtin"`
 	SnoozedUntil time.Time     `json:"snoozed_until,omitempty"` // tunable: detections are still recorded, but not sent to the alert channels before this
+	Baseline     string        `json:"baseline,omitempty"`      // RuleBaseline: one of the Baseline* kinds
 }
 
 // Evidence is one event behind a detection (enough to find it with the search).
@@ -109,6 +121,7 @@ type Detection struct {
 	Geo      *Geo       `json:"geo,omitempty"`
 	Evidence []Evidence `json:"evidence,omitempty"` // at most MaxEvidence
 	Snoozed  bool       `json:"snoozed,omitempty"`  // the rule was snoozed: recorded, not sent
+	Muted    bool       `json:"muted,omitempty"`    // a false-positive mute for this rule and entity: recorded, no alert, no incident
 }
 
 // Reporter takes detections from a source that evaluates its own condition (the app /ops alerts).
@@ -163,4 +176,129 @@ type FeedStatus struct {
 // FeedStatusSource reports the feeds' state.
 type FeedStatusSource interface {
 	FeedStatus() []FeedStatus
+}
+
+// Incidents (phase 3): related detections of one entity grouped, with a timeline and a workflow.
+
+// Incident states.
+const (
+	IncidentOpen          = "open"
+	IncidentAcknowledged  = "acknowledged"
+	IncidentResolved      = "resolved"
+	IncidentFalsePositive = "false_positive"
+)
+
+// Entity kinds.
+const (
+	EntityAccount = "account" // an actor: a Mooring user, an app account (often a keyed hash), a server user
+	EntityAddress = "address" // an IP address (IPv6 as its /64)
+)
+
+// Entity is what incidents and risk are kept per. Scope separates accounts of different systems
+// ("mooring", "host", "app:<slug>"; "" for an address), so a server user alice isn't app account alice.
+type Entity struct {
+	Kind  string `json:"kind"`
+	Key   string `json:"key"`
+	Scope string `json:"scope,omitempty"`
+}
+
+// Incident timeline entry kinds.
+const (
+	TimelineOpened    = "opened"
+	TimelineDetection = "detection"
+	TimelineEscalated = "escalated"
+	TimelineState     = "state"
+	TimelineAssigned  = "assigned"
+	TimelineNote      = "note"
+	TimelineMuted     = "muted"
+)
+
+// IncidentEvent is one entry of an incident's timeline.
+type IncidentEvent struct {
+	TS          time.Time `json:"ts"`
+	Kind        string    `json:"kind"`                   // a Timeline* kind
+	DetectionID int64     `json:"detection_id,omitempty"` // detection entries
+	RuleID      string    `json:"rule_id,omitempty"`
+	RuleName    string    `json:"rule_name,omitempty"`
+	Severity    Severity  `json:"severity,omitempty"`
+	Actor       string    `json:"actor,omitempty"` // who did it (state, assigned, note, muted); "" for Mooring
+	Text        string    `json:"text,omitempty"`  // the summary, the new state, the assignee, the note (≤ MaxNote)
+}
+
+// MaxNote bounds a note's text (bytes).
+const MaxNote = 4 << 10
+
+// Incident is related detections of one or more entities, most often one account or address.
+type Incident struct {
+	ID         int64     `json:"id"`
+	State      string    `json:"state"`           // an Incident* state
+	Severity   Severity  `json:"severity"`        // the highest detection's, raised for a known chain
+	Title      string    `json:"title"`           // one line, like a detection summary (≤ 300 bytes)
+	Chain      string    `json:"chain,omitempty"` // the name of the known chain it matched ("" for none)
+	Entities   []Entity  `json:"entities"`
+	First      time.Time `json:"first"`
+	Last       time.Time `json:"last"`
+	Detections int       `json:"detections"`      // detections in it
+	Rules      []string  `json:"rules,omitempty"` // rule IDs in it (≤ 20)
+	Assignee   string    `json:"assignee,omitempty"`
+	Updated    time.Time `json:"updated"`
+	// Timeline is filled by IncidentService.Incident only, oldest first (≤ 500 entries).
+	Timeline []IncidentEvent `json:"timeline,omitempty"`
+	// Mutes is filled by IncidentService.Incident only: the false-positive mutes this incident made
+	// that are still in force.
+	Mutes []Mute `json:"mutes,omitempty"`
+}
+
+// IncidentFilter selects incidents for the page, most recently active first (Last, then ID, both
+// descending), keyset-paged like DetectionFilter.
+type IncidentFilter struct {
+	States      []string  // empty: any
+	MinSeverity Severity  // "": any
+	Entity      *Entity   // nil: any
+	Assignee    string    // "": any
+	BeforeLast  time.Time // keyset paging with Before (zero: from the newest)
+	Before      int64
+	Limit       int // 1–200 (default 50)
+}
+
+// RiskScore is an entity's current risk: it rises with each detection (by severity) and fades over
+// days.
+type RiskScore struct {
+	Entity        Entity    `json:"entity"`
+	Score         float64   `json:"score"` // 0–100
+	Updated       time.Time `json:"updated"`
+	OpenIncidents int       `json:"open_incidents"`
+}
+
+// Mute is a false-positive mute: the rule's detections for the entity are still recorded (marked
+// muted) but alert nothing and open no incident until Until.
+type Mute struct {
+	RuleID     string    `json:"rule_id"`
+	Entity     Entity    `json:"entity"`
+	Until      time.Time `json:"until"`
+	By         string    `json:"by"`
+	IncidentID int64     `json:"incident_id,omitempty"`
+	Created    time.Time `json:"created"`
+}
+
+// ErrInvalidInput is wrapped by every validation error IncidentService returns; such an error's
+// message describes the problem and is safe to show the owner. Any other error is internal.
+var ErrInvalidInput = errors.New("invalid input")
+
+// IncidentService is what the owner-only Incidents and entity pages use. Every method that changes
+// something takes the acting user (actor) and records the change in the incident's timeline.
+type IncidentService interface {
+	Incidents(ctx context.Context, f IncidentFilter) ([]Incident, error)
+	Incident(ctx context.Context, id int64) (Incident, bool, error) // with its Timeline
+	// SetState moves an incident to open, acknowledged or resolved (not false_positive: see
+	// MarkFalsePositive); note ("" for none) is added to the timeline.
+	SetState(ctx context.Context, id int64, state, actor, note string) error
+	Assign(ctx context.Context, id int64, assignee, actor string) error // "" unassigns; assignee must be a Mooring user (the caller checks)
+	AddNote(ctx context.Context, id int64, actor, text string) error    // text 1–MaxNote bytes
+	// MarkFalsePositive sets the false_positive state; with mute, every (rule, entity) pair of the
+	// incident is muted for 30 days.
+	MarkFalsePositive(ctx context.Context, id int64, actor string, mute bool, note string) error
+	Entity(ctx context.Context, e Entity) (RiskScore, []Incident, []Mute, error) // the entity page
+	RemoveMute(ctx context.Context, ruleID string, e Entity, actor string) error
+	Risky(ctx context.Context, limit int) ([]RiskScore, error) // the highest-risk entities, 1–100
 }
