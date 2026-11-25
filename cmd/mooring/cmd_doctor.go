@@ -68,10 +68,15 @@ func cmdDoctor(args []string) error {
 		fmt.Println("mooring doctor: host checks run on Linux only.")
 		return nil
 	}
-	cfg, cfgWarn := loadDoctorConfig(*configPath)
+	cfg, cfgErr := config.Load(*configPath)
+	if cfgErr != nil {
+		cfg = nil
+	}
 	rep := preflight(*l4, cfg, true)
-	if cfgWarn != "" {
-		rep.add(result{"config", "warn", cfgWarn, "pass --config, or run where /etc/mooring/config.yaml is readable (runtime checks fall back to defaults)"})
+	if x, ok := doctorConfigResult(*configPath, cfgErr); ok {
+		rep.add(x)
+	} else if x, ok := doctorServiceViewResult(*configPath, serviceView(*configPath)); ok {
+		rep.add(x)
 	}
 	rep.print(os.Stdout)
 	if rep.hasFail() {
@@ -80,6 +85,46 @@ func cmdDoctor(args []string) error {
 		fmt.Println("\nRequired prerequisites are present.")
 	}
 	printGuidance(rep, *l4)
+	return doctorExit(rep)
+}
+
+// doctorConfigResult is doctor's line for a config.yaml that didn't load (ok=false: it loaded).
+// A file that is there and refused is a fail, shown with the offending lines: the service will
+// not start with it. A file that isn't there yet, or that this user may not read, is a warn: the
+// runtime checks then use the defaults.
+func doctorConfigResult(path string, err error) (result, bool) {
+	switch {
+	case err == nil:
+		return result{}, false
+	// Intentional: a warn, not a fail. The group rule is about the caller's primary group; only the
+	// service user (and root, who is exempt) can judge the file by it.
+	case errors.Is(err, config.ErrOtherGroup):
+		return result{"config", "warn", otherGroupAdvice(path) + "; runtime checks use the defaults", "run: " + checkCommand + " (and doctor with sudo)"}, true
+	case errors.Is(err, fs.ErrNotExist):
+		return result{"config", "warn", "there is no " + path + " yet (runtime checks use the defaults)", "write it (template: /usr/share/mooring/config.example.yaml), or pass --config"}, true
+	case configUnreadable(err):
+		return result{"config", "warn", "could not read " + path + " (" + err.Error() + "); runtime checks use the defaults", "run doctor with sudo, or pass --config"}, true
+	}
+	return result{"config", "fail", path + " is refused; the service will not start with it:\n" + strings.TrimRight(refusalText(err), "\n"),
+		"fix the file, then check it again: " + checkCommand + " (doctor's other checks used the defaults)"}, true
+}
+
+// doctorServiceViewResult is doctor's line for a config.yaml that loads for root and that the
+// service can't use (verr, from serviceView; nil: no line): a fail, like a refused file, because
+// the service will not start with it. Root's own load can't see it.
+func doctorServiceViewResult(path string, verr error) (result, bool) {
+	if verr == nil {
+		return result{}, false
+	}
+	_, hint := serviceViewFix(path, verr)
+	return result{"config", "fail", verr.Error() + "; the service will not start with it (what is in the file is valid)", hint}, true
+}
+
+// doctorExit is doctor's exit status: 1 when any check failed. The report is already printed.
+func doctorExit(rep report) error {
+	if rep.hasFail() {
+		return &exitError{code: 1, err: errors.New("one or more checks failed"), printed: true}
+	}
 	return nil
 }
 
@@ -800,7 +845,8 @@ func printGuidance(rep report, l4 bool) {
 func (r report) print(w io.Writer) {
 	icon := map[string]string{"ok": "✓", "warn": "!", "fail": "✗", "skip": "-"}
 	for _, x := range r.results {
-		fmt.Fprintf(w, "  %s %-16s %s\n", icon[x.state], x.name, x.detail)
+		// A detail of several lines (a refused config.yaml's diagnostics) keeps its lines indented.
+		fmt.Fprintf(w, "  %s %-16s %s\n", icon[x.state], x.name, strings.ReplaceAll(x.detail, "\n", "\n      "))
 		if x.state != "ok" && x.fix != "" {
 			fmt.Fprintf(w, "      → %s\n", x.fix)
 		}

@@ -2,9 +2,9 @@ package imagescan
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -368,45 +368,55 @@ func (s *Scanner) ScanHost(ctx context.Context, plan HostPlan) (HostScan, error)
 	if len(seen) == 0 {
 		return HostScan{skipped: skipped}, errors.New("imagescan: nothing on the host can be scanned")
 	}
-	args := append(s.trivyArgs(s.runArgs(mounts...), "rootfs"), hostRoot)
-	out, err := s.exec(ctx, args)
+	name, err := newScanName()
 	if err != nil {
 		return HostScan{skipped: skipped}, err
 	}
-	h, err := parseHostReport(out, plan.Binaries, binErr, hasPkgDB)
+	args := append(s.trivyArgs(s.runArgs(name, mounts...), "rootfs"), hostRoot)
+	var h HostScan
+	err = s.scan(ctx, name, args, func(r io.Reader) (err error) {
+		h, err = readHostReport(r, s.limits(), plan.Binaries, binErr, hasPkgDB)
+		return err
+	})
+	if err != nil {
+		h = HostScan{}
+	}
 	h.skipped = skipped
 	return h, err
 }
 
-// parseHostReport turns one `trivy rootfs` JSON into the OS-package report plus one report per
-// binary (in plan order). A binary Trivy reported nothing for is clean; a lang-pkgs result that maps
-// to no planned binary is kept under its host path so no finding is dropped.
-func parseHostReport(data []byte, bins []HostBinary, binErr map[int]string, hasPkgDB bool) (HostScan, error) {
-	var out trivyOutput
-	if err := json.Unmarshal(data, &out); err != nil {
+// readHostReport turns one `trivy rootfs` JSON read from r into the OS-package report plus one report
+// per binary (in plan order). A binary Trivy reported nothing for is clean; a lang-pkgs result that
+// maps to no planned binary is kept under its host path so no finding is dropped.
+func readHostReport(r io.Reader, lim limits, bins []HostBinary, binErr map[int]string, hasPkgDB bool) (HostScan, error) {
+	kept := newBudget(lim)
+	osVulns := newReportBuilder(kept)
+	byPath := map[string]*reportBuilder{}
+	var order []string
+	osInfo, err := decodeTrivy(r, lim, kept, func(res trivyResult) error {
+		if res.Class == "os-pkgs" {
+			osVulns.merge(res.vulns)
+			return nil
+		}
+		p := hostPathOf(res.Target)
+		if b, ok := byPath[p]; ok {
+			b.merge(res.vulns)
+			return nil
+		}
+		order = append(order, p)
+		byPath[p] = res.vulns
+		return nil
+	})
+	if err != nil {
 		return HostScan{}, err
 	}
 	var h HostScan
 	// Trivy reports Family "none" when the release files don't identify the OS.
-	if o := out.Metadata.OS; o != nil && strings.TrimSpace(o.Family) != "" && !strings.EqualFold(strings.TrimSpace(o.Family), "none") {
+	if o := osInfo; o != nil && strings.TrimSpace(o.Family) != "" && !strings.EqualFold(strings.TrimSpace(o.Family), "none") {
 		h.OS = strings.TrimSpace(o.Family + " " + o.Name)
 		h.EOSL = o.EOSL
 	}
-	var osVulns []trivyVuln
-	byPath := map[string][]trivyVuln{}
-	var order []string
-	for _, r := range out.Results {
-		if r.Class == "os-pkgs" {
-			osVulns = append(osVulns, r.Vulnerabilities...)
-			continue
-		}
-		p := hostPathOf(r.Target)
-		if _, ok := byPath[p]; !ok {
-			order = append(order, p)
-		}
-		byPath[p] = append(byPath[p], r.Vulnerabilities...)
-	}
-	osRep := buildReport(OSReportTarget, osVulns)
+	osRep := osVulns.report(OSReportTarget)
 	switch {
 	case h.OS == "":
 		osRep.Error = "not scanned: the operating system was not detected"
@@ -422,14 +432,18 @@ func parseHostReport(data []byte, bins []HostBinary, binErr map[int]string, hasP
 			h.Reports = append(h.Reports, Report{Target: b.Label, Role: b.Role, Error: e})
 			continue
 		}
-		rep := buildReport(b.Label, byPath[b.Path])
+		vulns := byPath[b.Path]
+		if vulns == nil {
+			vulns = newReportBuilder(nil)
+		}
+		rep := vulns.report(b.Label)
 		rep.Role = b.Role
 		used[b.Path] = true
 		h.Reports = append(h.Reports, rep)
 	}
 	for _, p := range order {
 		if !used[p] {
-			h.Reports = append(h.Reports, buildReport(p, byPath[p]))
+			h.Reports = append(h.Reports, byPath[p].report(p))
 		}
 	}
 	h.sum()

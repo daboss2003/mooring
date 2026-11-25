@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 
+	"github.com/daboss2003/mooring/internal/yamldiag"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,13 +24,33 @@ const maxDefBytes = 512 << 10
 //   - reject unknown keys (KnownFields — additionalProperties:false everywhere);
 //   - reject any Tier-1 security field (the 3-tier boundary, §7.8);
 //   - exact apiVersion + kind + immutable-slug shape, fail-closed.
-func Parse(raw []byte) (*Definition, error) {
+//
+// A refusal is returned as (or wrapping) a *yamldiag.Diagnostics that says where in the file it is
+// (diag.go); the checks above alone decide what is accepted.
+func Parse(raw []byte) (*Definition, error) { return ParseNamed(raw, "mooring.yaml") }
+
+// ParseNamed is Parse with the file's name for its messages ("mooring.yaml",
+// "mooring.staging.yaml").
+func ParseNamed(raw []byte, file string) (*Definition, error) {
 	var d Definition
 	if err := hardenAndDecode(raw, &d); err != nil {
-		return nil, err
+		return nil, explainRefusal(raw, file, reflect.TypeOf(d), err)
 	}
 	if err := d.validateEnvelope(); err != nil {
-		return nil, err
+		return nil, explainRefusal(raw, file, reflect.TypeOf(d), err)
+	}
+	return &d, nil
+}
+
+// ParseStored is Parse for a canonical Mooring rendered and stored itself. A refusal names no line
+// and shows no excerpt: the operator never wrote that text, so its positions would point nowhere.
+func ParseStored(raw []byte) (*Definition, error) {
+	var d Definition
+	if err := hardenAndDecode(raw, &d); err != nil {
+		return nil, storedRefusal(err)
+	}
+	if err := d.validateEnvelope(); err != nil {
+		return nil, storedRefusal(err)
 	}
 	return &d, nil
 }
@@ -41,7 +63,9 @@ func Kind(raw []byte) (string, error) {
 		Kind string `yaml:"kind"`
 	}
 	if err := yaml.Unmarshal(raw, &env); err != nil {
-		return "", fmt.Errorf("invalid YAML: %w", err)
+		// Intentional: no target type — this read looks at one key only, so the file's other keys
+		// are not this refusal's to judge.
+		return "", explainRefusal(raw, "", nil, &decodeError{prefix: "invalid YAML: ", err: err})
 	}
 	return env.Kind, nil
 }
@@ -74,7 +98,7 @@ func hardenAndDecode(raw []byte, target any) error {
 	// must run BEFORE the typed decode, which would silently resolve aliases.
 	var node yaml.Node
 	if err := yaml.Unmarshal(raw, &node); err != nil {
-		return fmt.Errorf("invalid YAML: %w", err)
+		return &decodeError{prefix: "invalid YAML: ", err: err}
 	}
 	if err := harden(&node); err != nil {
 		return err
@@ -84,7 +108,7 @@ func hardenAndDecode(raw []byte, target any) error {
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	dec.KnownFields(true)
 	if err := dec.Decode(target); err != nil {
-		return fmt.Errorf("definition rejected (unknown or mistyped field): %w", err)
+		return &decodeError{prefix: "definition rejected (unknown or mistyped field): ", err: err}
 	}
 	// A second document is not allowed (a parser-differential / smuggle vector).
 	if err := dec.Decode(new(yaml.Node)); err != io.EOF {
@@ -109,24 +133,24 @@ var tier1Keys = map[string]bool{
 // attacks (anchors, aliases, merge keys, duplicate keys) AND any Tier-1 field.
 func harden(n *yaml.Node) error {
 	if n.Kind == yaml.AliasNode {
-		return errors.New("YAML aliases (*ref) are not allowed in a definition")
+		return refusedAt(n, yamldiag.KindSyntax, "YAML aliases (*ref) are not allowed in a definition")
 	}
 	if n.Anchor != "" {
-		return errors.New("YAML anchors (&ref) are not allowed in a definition")
+		return refusedAt(n, yamldiag.KindSyntax, "YAML anchors (&ref) are not allowed in a definition")
 	}
 	if n.Kind == yaml.MappingNode {
 		seen := map[string]bool{}
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			key := n.Content[i]
 			if key.Tag == "!!merge" || key.Value == "<<" {
-				return errors.New("YAML merge keys (<<) are not allowed in a definition")
+				return refusedAt(key, yamldiag.KindSyntax, "YAML merge keys (<<) are not allowed in a definition")
 			}
 			if seen[key.Value] {
-				return fmt.Errorf("duplicate key %q in a definition", key.Value)
+				return refusedAt(key, yamldiag.KindDuplicate, "duplicate key %q in a definition", key.Value)
 			}
 			seen[key.Value] = true
 			if tier1Keys[key.Value] {
-				return fmt.Errorf("%q is a Tier-1 security field — it lives only in /etc/mooring/config.yaml (SSH-edit), never a host/app definition", key.Value)
+				return refusedAt(key, yamldiag.KindSemantic, "%q is a Tier-1 security field — it lives only in /etc/mooring/config.yaml (SSH-edit), never a host/app definition", key.Value)
 			}
 		}
 	}

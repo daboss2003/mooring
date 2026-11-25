@@ -1,14 +1,18 @@
 package main
 
 import (
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/daboss2003/mooring/internal/compose"
 	"github.com/daboss2003/mooring/internal/definition"
+	"github.com/daboss2003/mooring/internal/yamldiag"
 )
 
 // cmdValidate is the read-plane `mooring validate` — parse + reconcile a
@@ -20,39 +24,103 @@ func cmdValidate(args []string) error {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	from := fs.String("from", "mooring.yaml", "path to the definition file")
 	runDir := fs.String("run-dir", "", "app run directory bind mounts must stay under (optional)")
+	asJSON := fs.Bool("json", false, "print the result as JSON")
 	if err := fs.Parse(args); err != nil {
+		return &exitError{code: 2, err: err, printed: true} // a wrong invocation, as `config check`; flag already printed it
+	}
+	return runValidate(*from, *runDir, *asJSON, os.Stdout, os.Stderr)
+}
+
+// validateReport is `validate --json` for a file that is valid. A refused file prints the
+// diagnostics' own JSON; the exit status tells the two apart.
+type validateReport struct {
+	OK   bool   `json:"ok"`
+	File string `json:"file"`
+	Kind string `json:"kind"`
+	Slug string `json:"slug,omitempty"`
+	Apps *int   `json:"apps,omitempty"`
+}
+
+// validateUnreadable is `validate --json` for a file that can't be read (exit 2).
+type validateUnreadable struct {
+	OK    bool   `json:"ok"`
+	File  string `json:"file"`
+	Error string `json:"error"`
+}
+
+// runValidate checks the definition at from. A refusal is printed with the offending line (or as
+// JSON) and exits 1. A file that is missing or can't be read exits 2, as `config check` does: the
+// file was not judged.
+func runValidate(from, runDir string, asJSON bool, stdout, stderr io.Writer) error {
+	raw, err := os.ReadFile(from)
+	if err != nil {
+		err = fmt.Errorf("read %s: %w", from, err)
+		if !asJSON {
+			return &exitError{code: 2, err: err}
+		}
+		b, jerr := json.Marshal(validateUnreadable{File: from, Error: err.Error()})
+		if jerr != nil {
+			return jerr
+		}
+		fmt.Fprintf(stdout, "%s\n", b)
+		return &exitError{code: 2, err: err, printed: true}
+	}
+	refused := func(err error) error {
+		if asJSON {
+			fmt.Fprintf(stdout, "%s\n", refusalJSON(from, err, ""))
+			return &exitError{code: 1, err: err, printed: true}
+		}
+		var d *yamldiag.Diagnostics
+		if errors.As(err, &d) && strings.TrimSpace(d.Terminal()) != "" {
+			fmt.Fprintln(stderr, strings.TrimRight(d.Terminal(), "\n"))
+			return &exitError{code: 1, err: err, printed: true}
+		}
 		return err
 	}
-	raw, err := os.ReadFile(*from)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", *from, err)
+	ok := func(rep validateReport, text string) error {
+		if asJSON {
+			rep.OK, rep.File = true, from
+			b, jerr := json.Marshal(rep)
+			if jerr != nil {
+				return jerr
+			}
+			fmt.Fprintf(stdout, "%s\n", b)
+			return nil
+		}
+		fmt.Fprintln(stdout, text)
+		return nil
 	}
 	kind, err := definition.Kind(raw)
 	if err != nil {
-		return err
+		// Kind doesn't know the file's name: a syntax error it finds is shown under it too.
+		var d *yamldiag.Diagnostics
+		if errors.As(err, &d) && d.File == "" {
+			d.File = from
+		}
+		return refused(err)
 	}
 	if kind == "Host" {
-		h, err := definition.ParseHost(raw)
+		h, err := definition.ParseHostNamed(raw, from)
 		if err != nil {
-			return err // envelope + Tier-1 + registry + deploy-order cycle checks
+			return refused(err) // envelope + Tier-1 + registry + deploy-order cycle checks
 		}
-		fmt.Printf("OK: host definition is valid (%d apps registered)\n", len(h.Spec.Apps))
-		return nil
+		n := len(h.Spec.Apps)
+		return ok(validateReport{Kind: "Host", Apps: &n}, fmt.Sprintf("OK: host definition is valid (%d apps registered)", n))
 	}
-	d, err := definition.Parse(raw)
+	d, err := definition.ParseNamed(raw, from)
 	if err != nil {
-		return err // parse + envelope + parser-differential rejections
+		return refused(err) // parse + envelope + parser-differential rejections
 	}
 	// Resolve ${VAR} for an inline compose from a sibling .env, never Mooring's env.
 	env := compose.Env{}
-	if data, derr := os.ReadFile(filepath.Join(filepath.Dir(*from), ".env")); derr == nil {
+	if data, derr := os.ReadFile(filepath.Join(filepath.Dir(from), ".env")); derr == nil {
 		env = compose.ParseEnvFile(data)
 	}
-	if err := definition.Validate(d, *runDir, env, nil); err != nil {
-		return err
+	if err := definition.Validate(d, runDir, env, nil); err != nil {
+		return refused(err)
 	}
-	fmt.Printf("OK: %s (kind=%s, compose.source=%s) is valid\n", d.Metadata.Slug, d.Kind, d.Spec.Compose.Source)
-	return nil
+	return ok(validateReport{Kind: d.Kind, Slug: d.Metadata.Slug},
+		fmt.Sprintf("OK: %s (kind=%s, compose.source=%s) is valid", d.Metadata.Slug, d.Kind, d.Spec.Compose.Source))
 }
 
 // relPath rejects an absolute or parent-traversing path (a CLI fail-fast guard so a
@@ -102,7 +170,7 @@ func cmdInit(args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := definition.Parse(canon); err != nil {
+	if _, err := definition.ParseStored(canon); err != nil {
 		return fmt.Errorf("scaffold invalid: %w", err)
 	}
 	if _, err := os.Stat(*out); err == nil {

@@ -13,6 +13,7 @@ import (
 
 type fakeScanner struct {
 	img     map[string]Report
+	imgErr  map[string]error
 	fs      map[string]Report
 	host    HostScan
 	hostErr error
@@ -21,7 +22,7 @@ type fakeScanner struct {
 
 func (f *fakeScanner) ScanImage(_ context.Context, ref string) (Report, error) {
 	f.calls = append(f.calls, "image:"+ref)
-	return f.img[ref], nil
+	return f.img[ref], f.imgErr[ref]
 }
 func (f *fakeScanner) ScanFS(_ context.Context, dir, label string) (Report, error) {
 	f.calls = append(f.calls, "fs:"+dir)

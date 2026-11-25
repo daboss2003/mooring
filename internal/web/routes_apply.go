@@ -62,7 +62,7 @@ func (s *Server) applyDefinition(ctx context.Context, project string, def *defin
 		if err != nil {
 			return fmt.Errorf("render canonical: %w", err)
 		}
-		if _, err := definition.Parse(canon); err != nil { // re-validate before it becomes the truth
+		if _, err := definition.ParseStored(canon); err != nil { // re-validate before it becomes the truth
 			return fmt.Errorf("invalid definition: %w", err)
 		}
 		if _, err := s.defStore.SaveCanonical(ctx, def, note, commit); err != nil {

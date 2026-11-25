@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -30,12 +31,12 @@ const WarnSecurityLogsNoArchive = "security_logs: no archive.s3 configured"
 
 // validateSecurityLogs checks the security_logs block for Validate. A malformed block refuses boot
 // whether or not collection is on.
-func (c *Config) validateSecurityLogs(add func(string, ...any)) {
+func (c *Config) validateSecurityLogs(add addFn) {
 	s := c.SecurityLogs
 	if s3 := s.Archive.S3; s3 != nil {
 		validateS3("security_logs.archive.s3", s3, add)
 		if err := validateSecurityArchivePrefix(s3.Prefix); err != nil {
-			add("security_logs.archive.s3.prefix: %v", err)
+			add("security_logs.archive.s3.prefix", "security_logs.archive.s3.prefix: %v", err)
 		}
 	}
 	for _, p := range []struct{ key, path string }{
@@ -46,7 +47,7 @@ func (c *Config) validateSecurityLogs(add func(string, ...any)) {
 			continue
 		}
 		if err := validateHostLogPath(p.path); err != nil {
-			add("%s: %v", p.key, err)
+			add(p.key, "%s: %v", p.key, err)
 		}
 	}
 	for _, l := range []struct {
@@ -58,38 +59,38 @@ func (c *Config) validateSecurityLogs(add func(string, ...any)) {
 		{"security_logs.pii.keep_fields", s.PII.KeepFields},
 	} {
 		if len(l.names) > maxSecurityPIINames {
-			add("%s: at most %d names, got %d", l.key, maxSecurityPIINames, len(l.names))
+			add(l.key, "%s: at most %d names", l.key, maxSecurityPIINames)
 			continue
 		}
-		for _, n := range l.names {
+		for i, n := range l.names {
 			if !securityPIINameRe.MatchString(n) {
-				add("%s: %q: use letters, digits, '_', '-' and '.' (at most 64 characters)", l.key, n)
+				add(fmt.Sprintf("%s[%d]", l.key, i), "%s[%d]: use letters, digits, '_', '-' and '.' (at most 64 characters)", l.key, i)
 			}
 		}
 	}
 	if c := s.Feeds.DShieldContact; c != "" && !validSecurityContact(c) {
-		add("security_logs.feeds.dshield_contact: %q is not an email address (\"\" turns the DShield list off)", c)
+		add("security_logs.feeds.dshield_contact", "security_logs.feeds.dshield_contact: must be an email address (\"\" turns the DShield list off)")
 	}
 	switch s.Response.Mode {
 	case "", "off", "recommend", "enforce":
 	default:
-		add("security_logs.response.mode: %q: use off, recommend or enforce", s.Response.Mode)
+		add("security_logs.response.mode", "security_logs.response.mode: use off, recommend or enforce")
 	}
 	if n := len(s.Blocking.NeverBlock); n > maxSecurityNeverBlock {
-		add("security_logs.blocking.never_block: at most %d entries, got %d", maxSecurityNeverBlock, n)
+		add("security_logs.blocking.never_block", "security_logs.blocking.never_block: at most %d entries", maxSecurityNeverBlock)
 	} else {
-		for _, e := range s.Blocking.NeverBlock {
+		for i, e := range s.Blocking.NeverBlock {
 			if _, err := parsePrefix(e); err != nil {
-				add("security_logs.blocking.never_block: %q is not an IP address or CIDR", e)
+				add(fmt.Sprintf("security_logs.blocking.never_block[%d]", i), "security_logs.blocking.never_block[%d]: must be an IP address or a CIDR", i)
 			}
 		}
 	}
 	if n := len(s.Detection.Patterns.ExcludeApps); n > maxSecurityPatternExcludeApps {
-		add("security_logs.detection.patterns.exclude_apps: at most %d apps, got %d", maxSecurityPatternExcludeApps, n)
+		add("security_logs.detection.patterns.exclude_apps", "security_logs.detection.patterns.exclude_apps: at most %d apps", maxSecurityPatternExcludeApps)
 	} else {
-		for _, a := range s.Detection.Patterns.ExcludeApps {
+		for i, a := range s.Detection.Patterns.ExcludeApps {
 			if !securityAppSlugRe.MatchString(a) {
-				add("security_logs.detection.patterns.exclude_apps: %q is not an app slug", a)
+				add(fmt.Sprintf("security_logs.detection.patterns.exclude_apps[%d]", i), "security_logs.detection.patterns.exclude_apps[%d]: must be an app slug (lowercase letters, digits, '_' and '-')", i)
 			}
 		}
 	}
@@ -159,6 +160,9 @@ func validSecurityContact(c string) bool {
 	return true
 }
 
+// The errors of the two checks below are validation messages (see addFn): they never quote the
+// value.
+
 // validateSecurityArchivePrefix checks the object-key prefix of the security-log archive: "" or
 // letters, digits, '/', '-', '_' and '.', not starting with '/', ending with '/', every element
 // passing siem.SafeName (1–128 characters, not starting with '.'; `mooring security-logs fetch`
@@ -168,21 +172,21 @@ func validateSecurityArchivePrefix(p string) error {
 		return nil
 	}
 	if len(p) > maxSecurityArchivePrefix {
-		return fmt.Errorf("at most %d characters, got %d", maxSecurityArchivePrefix, len(p))
+		return fmt.Errorf("at most %d characters", maxSecurityArchivePrefix)
 	}
 	if strings.Trim(p, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-_.") != "" {
-		return fmt.Errorf("%q: only letters, digits, '/', '-', '_' and '.' are allowed", p)
+		return errors.New("only letters, digits, '/', '-', '_' and '.' are allowed")
 	}
 	if p[0] == '/' {
-		return fmt.Errorf("%q must not start with '/'", p)
+		return errors.New("must not start with '/'")
 	}
 	if !strings.HasSuffix(p, "/") {
-		return fmt.Errorf("%q must end with '/' (use %q)", p, p+"/")
+		return errors.New("must end with '/'")
 	}
 	// The archiver's own rule (archive.checkPrefix), so a prefix accepted here is never refused there.
 	for _, el := range strings.Split(strings.TrimSuffix(p, "/"), "/") {
 		if !siem.SafeName(el) {
-			return fmt.Errorf("%q has a path element %q that is empty, longer than 128 characters or starts with '.'", p, el)
+			return errors.New("has a path element that is empty, longer than 128 characters or starts with '.'")
 		}
 	}
 	return nil
@@ -192,14 +196,14 @@ func validateSecurityArchivePrefix(p string) error {
 func validateHostLogPath(p string) error {
 	for _, r := range p {
 		if r < 0x20 || r == 0x7f {
-			return fmt.Errorf("%q contains a control character", p)
+			return errors.New("contains a control character")
 		}
 	}
 	if !filepath.IsAbs(p) {
-		return fmt.Errorf("%q must be an absolute path", p)
+		return errors.New("must be an absolute path")
 	}
-	if clean := filepath.Clean(p); clean != p {
-		return fmt.Errorf("%q is not a clean path (use %q)", p, clean)
+	if filepath.Clean(p) != p {
+		return errors.New(`must be a clean path (no "..", "." or doubled or trailing "/")`)
 	}
 	return nil
 }

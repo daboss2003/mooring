@@ -40,6 +40,7 @@ That's the whole on-ramp. After that, you live in the dashboard.
 
 - **[The `mooring.yaml` file](./definition-file.md)** — the file that describes an app: services, domains, secrets, scaling, self-healing, scheduled tasks, backups, and preview environments. The single source of truth.
 - **[Server settings & many apps](./host-file.md)** — server-wide settings and running several apps on one server.
+- **[Checking and editing `config.yaml`](./config-editing.md)** — `mooring config check` and `mooring config edit`, reading a config or `mooring.yaml` error, reload or restart, and what happens with a refused file at start, reload and upgrade.
 - **[The HTTP API](./api.md)** — the scoped, token-authenticated `/api/v1` for automation and scripts.
 - **[Command-line reference](./cli.md)** — for installation and the occasional power-user task. You rarely need it.
 - **[How it works & why it's safe](./architecture.md)** · **[Security](./security.md)** — the engineering details, if you're curious or evaluating.

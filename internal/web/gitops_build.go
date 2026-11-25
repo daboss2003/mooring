@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -21,6 +22,7 @@ import (
 	"github.com/daboss2003/mooring/internal/git"
 	"github.com/daboss2003/mooring/internal/secret"
 	"github.com/daboss2003/mooring/internal/secretgen"
+	"github.com/daboss2003/mooring/internal/yamldiag"
 )
 
 // configBindingResolver resolves {{hm.KEY}} tokens in one config file against its
@@ -101,6 +103,33 @@ func (s *Server) configBindingResolver(project, service string, svc definition.S
 	}
 }
 
+// refusedFile is the error for a mooring file the parser refused. Diagnostics name the file (and the
+// line) themselves; any other error gets the file name in front, as before.
+func refusedFile(file string, err error) error {
+	var d *yamldiag.Diagnostics
+	if errors.As(err, &d) && d.File != "" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", file, err)
+}
+
+// definitionDetail is the multi-line form of a refused definition — each problem's position, the
+// offending line and a caret — for plain-text output (a 422 body, the deploy stream). "" when err
+// has no located problem: its one line already says everything. The excerpt is the file's own text
+// (hostile repo content): show it as text only, never as HTML.
+func definitionDetail(err error) string {
+	var d *yamldiag.Diagnostics
+	if !errors.As(err, &d) {
+		return ""
+	}
+	for _, p := range d.Problems {
+		if p.Line > 0 {
+			return strings.TrimRight(d.Terminal(), "\n")
+		}
+	}
+	return ""
+}
+
 // loadRepoDefinition reads this app's mooring file at the pinned commit and parses it
 // (Mooring generates the compose from it — the repo never supplies a compose). The file
 // is mooring.yaml by default, or a variant (mooring.staging.yaml / mooring.prod.yaml)
@@ -114,9 +143,9 @@ func (s *Server) loadRepoDefinition(ctx context.Context, repo *git.Repo, sha, sl
 		mooringFile = "mooring.yaml"
 	}
 	if b, err := repo.CatFile(ctx, sha, mooringFile); err == nil {
-		d, perr := definition.Parse(b)
+		d, perr := definition.ParseNamed(b, mooringFile)
 		if perr != nil {
-			return nil, false, fmt.Errorf("%s: %w", mooringFile, perr)
+			return nil, false, refusedFile(mooringFile, perr)
 		}
 		d.Metadata.Slug = slug
 		return d, false, nil

@@ -248,7 +248,7 @@ func (s *Store) verifyAndParse(yamlText, mac []byte, commit string) (*Definition
 	if !hmac.Equal(mac, s.rowMAC(yamlText, commit)) {
 		return nil, ErrTampered
 	}
-	return Parse(yamlText) // re-derive: a stored def is re-validated, never trusted blindly
+	return ParseStored(yamlText) // re-derive: a stored def is re-validated, never trusted blindly
 }
 
 // List returns a slug's version history, newest first.

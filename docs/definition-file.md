@@ -97,14 +97,32 @@ A deploy reads the mooring file from the **root of the repository** at the deplo
 
 The file is parsed into one typed definition before anything is validated.
 
+A refused file's error names the file, the line and the column, and shows the line with a caret
+and a hint:
+
+```console
+$ mooring validate
+mooring.yaml:17:9: unknown key "servce" in spec.edge.routes[0]
+  16 |       - hostname: app.example.com
+  17 |         servce: web
+     |         ^
+   hint: did you mean service?
+```
+
+`mooring validate`, the deploy output and the setup upload show this form. The deploy error and
+logs carry it on one line: `mooring.yaml:17:9: unknown key "servce" in spec.edge.routes[0] (hint: did you mean service?)`.
+Every YAML, unknown-key and type problem in the file is listed. Of the values the validation
+refuses, the first is listed; fix it and validate again for the next. The forms and messages are
+in [reading the errors](./config-editing.md#reading-the-errors).
+
 Hard rejections at parse time (fail-closed, every one is a stop, not a warning):
 
 | Rejected | Why |
 |---|---|
 | **Unknown key**, anywhere | `DisallowUnknownFields` **plus** an independent JSON-Schema gate with `additionalProperties: false` at every level. A typo is an error, not an ignored field. |
-| **YAML anchors / merge keys (`<<`)** | They are a classic way to make two parsers disagree. Banned. |
-| **Duplicate keys** | A duplicate is a parser-differential vector. Hard reject. |
-| **Implicitly-typed scalars that flip meaning** | Scalars are read as explicitly typed; a `yes`/`on`/`1` cannot quietly become a boolean. |
+| **YAML anchors (`&ref`), aliases (`*ref`) / merge keys (`<<`)** | They are a classic way to make two parsers disagree. Banned. The error names the line: `YAML anchors (&ref) are not allowed in a definition`, `YAML merge keys (<<) are not allowed in a definition`. |
+| **Duplicate keys** | A duplicate is a parser-differential vector. Hard reject. The error names the line of the second key: `duplicate key "image" in a definition`. |
+| **A quoted boolean** | A boolean is `true` or `false` without quotes. `"true"` and `"false"` are refused: `… must be true or false without quotes (found "true")`. A number (`1`) is refused too. |
 | Wrong `apiVersion` | See the version gate above. |
 | A changed `metadata.slug` after connect | Ignored — the connect-time slug always wins (the app is never renamed or re-homed by an edit to the file). |
 

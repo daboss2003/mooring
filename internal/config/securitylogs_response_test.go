@@ -79,8 +79,7 @@ func TestSecurityNeverBlockParsed(t *testing.T) {
 		t.Errorf("never_block = %v, want %v", got, want)
 	}
 	for _, bad := range []string{`"example.com"`, `"203.0.113.300"`, `"10.0.0.0/33"`, `""`} {
-		mustReject(t, validYAML(t, list("203.0.113.7", bad)), "security_logs.blocking.never_block: ")
-		mustReject(t, validYAML(t, list("203.0.113.7", bad)), "is not an IP address or CIDR")
+		mustReject(t, validYAML(t, list("203.0.113.7", bad)), "security_logs.blocking.never_block[1]: must be an IP address or a CIDR")
 	}
 	many := make([]string, 257)
 	for i := range many {
@@ -89,7 +88,7 @@ func TestSecurityNeverBlockParsed(t *testing.T) {
 	if _, err := Parse([]byte(validYAML(t, list(many[:256]...)))); err != nil {
 		t.Errorf("256 entries refused: %v", err)
 	}
-	mustReject(t, validYAML(t, list(many...)), "security_logs.blocking.never_block: at most 256 entries, got 257")
+	mustReject(t, validYAML(t, list(many...)), "security_logs.blocking.never_block: at most 256 entries")
 }
 
 func TestSecurityPatternExcludeAppsValidated(t *testing.T) {
@@ -104,14 +103,13 @@ func TestSecurityPatternExcludeAppsValidated(t *testing.T) {
 		t.Errorf("exclude_apps = %q", got)
 	}
 	for _, bad := range []string{`"Shop"`, `"-shop"`, `"shop/web"`, `""`, `"sh op"`, strings.Repeat("a", 65)} {
-		mustReject(t, validYAML(t, apps("shop", bad)), "security_logs.detection.patterns.exclude_apps: ")
-		mustReject(t, validYAML(t, apps("shop", bad)), "is not an app slug")
+		mustReject(t, validYAML(t, apps("shop", bad)), "security_logs.detection.patterns.exclude_apps[1]: must be an app slug")
 	}
 	many := make([]string, 257)
 	for i := range many {
 		many[i] = fmt.Sprintf("app%d", i)
 	}
-	mustReject(t, validYAML(t, apps(many...)), "exclude_apps: at most 256 apps, got 257")
+	mustReject(t, validYAML(t, apps(many...)), "exclude_apps: at most 256 apps")
 }
 
 // Out-of-range numbers are clamped by the accessors with a load warning naming what is used; the

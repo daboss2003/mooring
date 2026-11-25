@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -121,7 +122,17 @@ func e2eScanner(t *testing.T, root, cache string, raw *[]byte) *Scanner {
 				args[i] = cache + ":/root/.cache/trivy"
 			}
 		}
-		out, err := sc.run(ctx, args)
+		name := ""
+		for i := range args {
+			if i > 0 && args[i-1] == "--name" {
+				name = args[i]
+			}
+		}
+		var out []byte
+		err := sc.run(ctx, name, args, func(r io.Reader) (err error) {
+			out, err = io.ReadAll(r)
+			return err
+		})
 		if raw != nil {
 			*raw = out
 		}

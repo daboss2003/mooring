@@ -9,15 +9,18 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/daboss2003/mooring/internal/crypto"
+	"github.com/daboss2003/mooring/internal/yamldiag"
 	"gopkg.in/yaml.v3"
 )
 
@@ -272,30 +275,36 @@ func (s ServerConfig) StartGateSettings() StartGateSettings {
 	return out
 }
 
-// validate rejects out-of-range server.start_gate values (unset = default).
-func (g StartGateConfig) validate() error {
+// validate reports out-of-range server.start_gate values (unset = default).
+func (g StartGateConfig) validate(add addFn) {
+	const at = "server.start_gate."
 	if s := (ServerConfig{StartGate: g}).StartGateSettings(); s.SettleGrace > s.MaxSettle {
-		return fmt.Errorf("server.start_gate.settle_grace %s must not exceed max_settle %s", s.SettleGrace, s.MaxSettle)
+		add(at+"settle_grace", "server.start_gate.settle_grace: must not exceed max_settle")
 	}
-	switch {
-	case g.CPUBusyPct != 0 && (g.CPUBusyPct < 10 || g.CPUBusyPct > 100):
-		return fmt.Errorf("server.start_gate.cpu_busy_pct %d must be between 10 and 100", g.CPUBusyPct)
-	case g.CPUSettlePct != 0 && (g.CPUSettlePct < 1 || g.CPUSettlePct > 1000):
-		return fmt.Errorf("server.start_gate.cpu_settle_pct %d must be between 1 and 1000", g.CPUSettlePct)
-	case g.SettleGrace < 0 || g.SettleGrace.D() > 10*time.Minute:
-		return fmt.Errorf("server.start_gate.settle_grace %s must be between 0s and 10m", g.SettleGrace.D())
-	case g.MaxSettle != 0 && (g.MaxSettle.D() < 10*time.Second || g.MaxSettle.D() > 30*time.Minute):
-		return fmt.Errorf("server.start_gate.max_settle %s must be between 10s and 30m", g.MaxSettle.D())
-	case g.MaxWait != 0 && (g.MaxWait.D() < time.Minute || g.MaxWait.D() > 2*time.Hour):
-		return fmt.Errorf("server.start_gate.max_wait %s must be between 1m and 2h", g.MaxWait.D())
-	case g.DeployWait != nil && (*g.DeployWait < 0 || g.DeployWait.D() > 30*time.Minute):
-		return fmt.Errorf("server.start_gate.deploy_wait %s must be between 0s and 30m", g.DeployWait.D())
-	case g.ServiceSettle != 0 && (g.ServiceSettle.D() < 30*time.Second || g.ServiceSettle.D() > time.Hour):
-		return fmt.Errorf("server.start_gate.service_settle %s must be between 30s and 1h", g.ServiceSettle.D())
-	case g.RolloutBudget != 0 && (g.RolloutBudget.D() < time.Minute || g.RolloutBudget.D() > 3*time.Hour):
-		return fmt.Errorf("server.start_gate.rollout_budget %s must be between 1m and 3h", g.RolloutBudget.D())
+	if g.CPUBusyPct != 0 && (g.CPUBusyPct < 10 || g.CPUBusyPct > 100) {
+		add(at+"cpu_busy_pct", "server.start_gate.cpu_busy_pct: must be between 10 and 100")
 	}
-	return nil
+	if g.CPUSettlePct != 0 && (g.CPUSettlePct < 1 || g.CPUSettlePct > 1000) {
+		add(at+"cpu_settle_pct", "server.start_gate.cpu_settle_pct: must be between 1 and 1000")
+	}
+	if g.SettleGrace < 0 || g.SettleGrace.D() > 10*time.Minute {
+		add(at+"settle_grace", "server.start_gate.settle_grace: must be between 0s and 10m")
+	}
+	if g.MaxSettle != 0 && (g.MaxSettle.D() < 10*time.Second || g.MaxSettle.D() > 30*time.Minute) {
+		add(at+"max_settle", "server.start_gate.max_settle: must be between 10s and 30m")
+	}
+	if g.MaxWait != 0 && (g.MaxWait.D() < time.Minute || g.MaxWait.D() > 2*time.Hour) {
+		add(at+"max_wait", "server.start_gate.max_wait: must be between 1m and 2h")
+	}
+	if g.DeployWait != nil && (*g.DeployWait < 0 || g.DeployWait.D() > 30*time.Minute) {
+		add(at+"deploy_wait", "server.start_gate.deploy_wait: must be between 0s and 30m")
+	}
+	if g.ServiceSettle != 0 && (g.ServiceSettle.D() < 30*time.Second || g.ServiceSettle.D() > time.Hour) {
+		add(at+"service_settle", "server.start_gate.service_settle: must be between 30s and 1h")
+	}
+	if g.RolloutBudget != 0 && (g.RolloutBudget.D() < time.Minute || g.RolloutBudget.D() > 3*time.Hour) {
+		add(at+"rollout_budget", "server.start_gate.rollout_budget: must be between 1m and 3h")
+	}
 }
 
 // BuildsOneAtATime reports whether a deploy should build its services one at a time on a host with
@@ -381,18 +390,17 @@ func (s ServerConfig) ServiceLogLimits() ServiceLogLimits {
 	return out
 }
 
-// validateServiceLogLimits rejects out-of-range ceilings (0 / unset = default).
-func (s ServerConfig) validateServiceLogLimits() error {
+// validateServiceLogLimits reports out-of-range ceilings (0 / unset = default).
+func (s ServerConfig) validateServiceLogLimits(add addFn) {
 	if d := s.ServiceLogMaxRetain.D(); d != 0 && (d < serviceLogMaxRetainMin || d > serviceLogMaxRetainMax) {
-		return fmt.Errorf("server.service_log_max_retain %s must be between 1h and 365d", d)
+		add("server.service_log_max_retain", "server.service_log_max_retain: must be between 1h and 365d")
 	}
 	if n := s.ServiceLogMaxLines; n != 0 && (n < serviceLogMaxLinesMin || n > serviceLogMaxLinesMax) {
-		return fmt.Errorf("server.service_log_max_lines %d must be between %d and %d", n, serviceLogMaxLinesMin, serviceLogMaxLinesMax)
+		add("server.service_log_max_lines", "server.service_log_max_lines: must be between %d and %d", serviceLogMaxLinesMin, serviceLogMaxLinesMax)
 	}
 	if n := s.ServiceLogMaxDiskMB; n != 0 && (n < serviceLogMaxDiskMBMin || n > serviceLogMaxDiskMBMax) {
-		return fmt.Errorf("server.service_log_max_disk_mb %d must be between %d and %d", n, serviceLogMaxDiskMBMin, serviceLogMaxDiskMBMax)
+		add("server.service_log_max_disk_mb", "server.service_log_max_disk_mb: must be between %d and %d", serviceLogMaxDiskMBMin, serviceLogMaxDiskMBMax)
 	}
-	return nil
 }
 
 // DiskGCOn reports whether disk-pressure auto-reclaim is enabled (default ON). When disk
@@ -507,36 +515,35 @@ type ServerFileRoot struct {
 // serverRootNameRe constrains a file-root name to a safe slug (URL/UI key).
 var serverRootNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
 
-// validateServer checks the Server-tab config shape. Existence/containment of the
+// validateServer reports problems in the Server-tab config shape. Existence/containment of the
 // paths is enforced at use time in internal/web (fail-closed), so this only
 // rejects obviously-malformed config: bad root names, duplicates, and
 // non-absolute paths.
-func (c *Config) validateServer() error {
+func (c *Config) validateServer(add addFn) {
 	seen := map[string]bool{}
-	for _, r := range c.Server.FileRoots {
+	for i, r := range c.Server.FileRoots {
+		at := fmt.Sprintf("server.file_roots[%d]", i)
 		if !serverRootNameRe.MatchString(r.Name) {
-			return fmt.Errorf("server.file_roots: name %q must match [a-z0-9][a-z0-9-]{0,30}", r.Name)
+			add(at+".name", "%s.name: must match [a-z0-9][a-z0-9-]{0,30}", at)
 		}
 		if seen[r.Name] {
-			return fmt.Errorf("server.file_roots: duplicate name %q", r.Name)
+			add(at+".name", "%s.name: duplicate name", at)
 		}
 		seen[r.Name] = true
 		if !filepath.IsAbs(r.Path) {
-			return fmt.Errorf("server.file_roots[%s]: path %q must be absolute", r.Name, r.Path)
+			add(at+".path", "%s.path: must be absolute", at)
 		}
 	}
 	if c.Server.DebCacheDir != "" && !filepath.IsAbs(c.Server.DebCacheDir) {
-		return fmt.Errorf("server.deb_cache_dir %q must be absolute", c.Server.DebCacheDir)
+		add("server.deb_cache_dir", "server.deb_cache_dir: must be absolute")
 	}
 	switch strings.TrimSpace(c.Server.BuildConcurrency) {
 	case "", "auto", "serial", "parallel":
 	default:
-		return fmt.Errorf("server.build_concurrency %q must be auto, serial or parallel", c.Server.BuildConcurrency)
+		add("server.build_concurrency", "server.build_concurrency: must be auto, serial or parallel")
 	}
-	if err := c.Server.validateServiceLogLimits(); err != nil {
-		return err
-	}
-	return c.Server.StartGate.validate()
+	c.Server.validateServiceLogLimits(add)
+	c.Server.StartGate.validate(add)
 }
 
 // IsProtectedProject reports whether a compose project is in the protected set.
@@ -674,7 +681,8 @@ func edgeDefaultClientIPHeader(trustedProxies []string) string {
 }
 
 // validateEdgeTrustedProxy accepts a CIDR, an IP address (no zone) or a preset name, and refuses a
-// prefix that contains every address of its family. Same rule as edge.ParseTrustedProxy.
+// prefix that contains every address of its family. Same rule as edge.ParseTrustedProxy. Its error
+// is a validation message: it says what is expected and never quotes the entry.
 func validateEdgeTrustedProxy(s string) error {
 	e := strings.TrimSpace(s)
 	if e == "" {
@@ -685,10 +693,10 @@ func validateEdgeTrustedProxy(s string) error {
 	}
 	p, err := parsePrefix(e)
 	if err != nil || strings.Contains(e, "%") {
-		return fmt.Errorf("%q is not a CIDR, an IP address or a preset (cloudflare)", s)
+		return errors.New("must be a CIDR, an IP address or a preset (cloudflare)")
 	}
 	if p.Bits() == 0 {
-		return fmt.Errorf("%s trusts every address (any client could set its own address)", e)
+		return errors.New("trusts every address (any client could set its own address)")
 	}
 	return nil
 }
@@ -702,11 +710,11 @@ var edgeNonClientIPHeaders = []string{"Host", "Forwarded", "Cookie", "Authorizat
 
 func validateEdgeClientIPHeader(h string) error {
 	if !edgeClientIPHeaderRe.MatchString(h) {
-		return fmt.Errorf("%q is not a header name (letters, digits and '-', at most 64)", h)
+		return errors.New("must be a header name (letters, digits and '-', at most 64)")
 	}
 	for _, n := range edgeNonClientIPHeaders {
 		if strings.EqualFold(h, n) {
-			return fmt.Errorf("%q does not carry a client address", h)
+			return errors.New("must be a header that carries a client address (not " + strings.Join(edgeNonClientIPHeaders, ", ") + ")")
 		}
 	}
 	return nil
@@ -1040,11 +1048,20 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	}
 	parsed, err := ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("invalid duration %q: %w", s, err)
+		// The position goes in the message ("line N, column M: …", the line as yaml.v3 writes its
+		// own): this type decodes itself, so the diagnostics can place the error only from that, and
+		// two durations on one line ("session: {idle_timeout: 10m, absolute_timeout: x}") need the
+		// column to be told apart.
+		// Intentional: the value is NOT in the message. This text is printed by the diagnostics and
+		// reaches the journal, and a secret pasted under a duration key must not be (v0.34.0).
+		return fmt.Errorf("line %d, column %d: %s", value.Line, value.Column, invalidDurationMsg)
 	}
 	*d = Duration(parsed)
 	return nil
 }
+
+// invalidDurationMsg is what Duration.UnmarshalYAML says; diag.go puts the key's path in front of it.
+const invalidDurationMsg = "not a valid duration: use a number and a unit like 30s, 5m, 12h or 30d"
 
 // ParseDuration is time.ParseDuration plus a whole-day form, "30d", for retention-style
 // windows. Days can't be mixed with other units ("1d12h" is rejected).
@@ -1186,24 +1203,12 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("config: read %s: %w", path, err)
 	}
-	return Parse(raw)
+	return ParseNamed(raw, path)
 }
 
 // Parse decodes and validates config bytes (used by Load and by tests). Unknown
 // keys are a hard error so a typo or smuggled key cannot slip through.
-func Parse(raw []byte) (*Config, error) {
-	c := &Config{}
-	dec := yaml.NewDecoder(strings.NewReader(string(raw)))
-	dec.KnownFields(true)
-	if err := dec.Decode(c); err != nil {
-		return nil, fmt.Errorf("config: parse: %w", err)
-	}
-	applyDefaults(c)
-	if err := c.Validate(); err != nil {
-		return nil, err
-	}
-	return c, nil
-}
+func Parse(raw []byte) (*Config, error) { return ParseNamed(raw, "config.yaml") }
 
 // DevInsecurePermsEnv, when set to a truthy value, relaxes the config-file
 // ownership/permission enforcement for LOCAL DEVELOPMENT only. It is read from
@@ -1250,89 +1255,141 @@ func checkPerms(path string) error {
 	// root tool (e.g. `sudo mooring doctor`) is not the service, so os.Getgid() is the
 	// invoking shell's group, not the service's — comparing to it false-alarms. `serve`
 	// runs non-root as the service, so it still enforces this (the real chokepoint).
-	if perm&0o040 != 0 && gid != 0 && os.Geteuid() != 0 && gid != uint32(os.Getgid()) {
-		return fmt.Errorf("config: %s is group-readable by gid %d, not the service group %d", path, gid, os.Getgid())
+	return checkGroup(path, perm, gid, os.Geteuid(), os.Getgid())
+}
+
+// checkGroup is checkPerms' group rule for a root-owned file: a group-readable file must belong to
+// the caller's primary group, unless the group or the caller is root. The error wraps ErrOtherGroup
+// (the file may be fine for the service; this caller cannot tell).
+func checkGroup(path string, perm os.FileMode, fileGID uint32, euid, gid int) error {
+	if perm&0o040 != 0 && fileGID != 0 && euid != 0 && fileGID != uint32(gid) {
+		return &otherGroupError{msg: fmt.Sprintf("config: %s is group-readable by gid %d, not the service group %d", path, fileGID, gid)}
 	}
 	return nil
 }
 
+// otherGroupError keeps checkPerms' message of before and unwraps to ErrOtherGroup.
+type otherGroupError struct{ msg string }
+
+func (e *otherGroupError) Error() string { return e.msg }
+func (e *otherGroupError) Unwrap() error { return ErrOtherGroup }
+
+// addFn records one validation problem: the key path it is about ("users[1].role"; a cross-field
+// check names its primary key) and its message.
+//
+// Intentional: a message is VALUE-FREE (owner decision 2026-11-25). It names the key (a list entry
+// by its index, never by a name read from the file) and says what is expected; it never says what
+// was found — no %q/%s/%v of a config value, no error text that quotes one, no number read from the
+// file. These messages reach the journal and the terminal, and a secret typed under the wrong key,
+// reached through a YAML alias or written as a block scalar would be printed with them. Limits and
+// expectations (">= 1m", "at most 64 names") are fine. TestValidationNeverQuotesAValue and
+// TestNoMutationShowsASecret hold this.
+type addFn func(path, format string, a ...any)
+
 // Validate runs every fail-closed boot check. All violations are collected so a
 // misconfigured operator sees them at once; any violation refuses boot.
-func (c *Config) Validate() error {
-	var errs []string
-	add := func(format string, a ...any) { errs = append(errs, fmt.Sprintf(format, a...)) }
+func (c *Config) Validate() error { return refusal(c.Problems()) }
+
+// refusal is the error for a config with problems ps (nil for none).
+func refusal(ps []yamldiag.Problem) error {
+	if len(ps) == 0 {
+		return nil
+	}
+	msgs := make([]string, len(ps))
+	for i, p := range ps {
+		msgs[i] = p.Msg
+	}
+	return fmt.Errorf("config: refusing to boot:\n  - %s", strings.Join(msgs, "\n  - "))
+}
+
+// Problems is what Validate refuses the config for, each with the key path it is about (none: the
+// config is valid). Like Validate it fills the parsed allowlist and trusted proxies.
+func (c *Config) Problems() []yamldiag.Problem {
+	var out []yamldiag.Problem
+	add := func(path, format string, a ...any) {
+		out = append(out, yamldiag.Problem{Kind: yamldiag.KindSemantic, Path: path, Msg: fmt.Sprintf(format, a...)})
+	}
+	c.parsedAllowlist, c.parsedProxies = nil, nil
 
 	// --- encryption key ---
 	if key, err := DecodeKey(c.EncryptionKey); err != nil {
-		add("encryption_key: %v", err)
+		if strings.TrimSpace(c.EncryptionKey) == "" {
+			add("encryption_key", "encryption_key: empty")
+		} else {
+			add("encryption_key", "encryption_key: not valid base64")
+		}
 	} else if len(key) != 32 {
-		add("encryption_key: must be 32 bytes (AES-256) after base64-decode; got %d", len(key))
+		add("encryption_key", "encryption_key: must be 32 bytes (AES-256) after base64-decode")
 	}
 	if c.EncryptionKeyPrevious != "" {
 		if key, err := DecodeKey(c.EncryptionKeyPrevious); err != nil {
-			add("encryption_key_previous: %v", err)
+			add("encryption_key_previous", "encryption_key_previous: not valid base64")
 		} else if len(key) != 32 {
-			add("encryption_key_previous: must be 32 bytes; got %d", len(key))
+			add("encryption_key_previous", "encryption_key_previous: must be 32 bytes (AES-256) after base64-decode")
 		}
 	}
 
 	// --- IP allowlist: empty = deny-all, refused at boot (plan §5.1/§5.2) ---
+	var allowAt []int // index in ip_allowlist of each parsedAllowlist entry
 	if len(c.IPAllowlist) == 0 {
-		add("ip_allowlist: empty (this is deny-all and would lock you out); set at least one CIDR")
+		add("ip_allowlist", "ip_allowlist: empty (this is deny-all and would lock you out); set at least one CIDR")
 	} else {
-		for _, s := range c.IPAllowlist {
+		for i, s := range c.IPAllowlist {
 			p, err := parsePrefix(s)
 			if err != nil {
-				add("ip_allowlist: %v", err)
+				add(fmt.Sprintf("ip_allowlist[%d]", i), "ip_allowlist[%d]: must be an IP address or a CIDR (203.0.113.7, 203.0.113.0/24)", i)
 				continue
 			}
 			c.parsedAllowlist = append(c.parsedAllowlist, p)
+			allowAt = append(allowAt, i)
 		}
 	}
 
 	// --- trusted proxies: only validated/required when trust_proxy is on ---
 	if c.TrustProxy {
 		if len(c.TrustedProxies) == 0 {
-			add("trust_proxy is on but trusted_proxies is empty (would trust a spoofed XFF from anyone)")
+			add("trust_proxy", "trust_proxy is on but trusted_proxies is empty (would trust a spoofed XFF from anyone)")
 		}
-		for _, s := range c.TrustedProxies {
+		var proxyAt []int // index in trusted_proxies of each parsedProxies entry
+		for i, s := range c.TrustedProxies {
 			p, err := parsePrefix(s)
 			if err != nil {
-				add("trusted_proxies: %v", err)
+				add(fmt.Sprintf("trusted_proxies[%d]", i), "trusted_proxies[%d]: must be an IP address or a CIDR", i)
 				continue
 			}
 			if tooBroad(p) {
-				add("trusted_proxies: %s is too broad; must be a specific proxy IP (>= /24 for IPv4, never a bridge CIDR)", s)
+				add(fmt.Sprintf("trusted_proxies[%d]", i), "trusted_proxies[%d]: too broad; must be a specific proxy IP (>= /24 for IPv4, never a bridge CIDR)", i)
 				continue
 			}
 			c.parsedProxies = append(c.parsedProxies, p)
+			proxyAt = append(proxyAt, i)
 		}
 		// The edge proxy must never also be in the allowlist (review #15): a
 		// trusted-proxy peer with a missing/forged XFF falls back to being treated
 		// as the peer, and the allowlist must then reject it. Overlap would admit
 		// edge-sourced requests that present no valid client identity.
-		for _, pp := range c.parsedProxies {
-			for _, ap := range c.parsedAllowlist {
+		for i, pp := range c.parsedProxies {
+			for j, ap := range c.parsedAllowlist {
 				if pp.Overlaps(ap) {
-					add("trusted_proxies %s overlaps ip_allowlist %s; the edge proxy must never be in the allowlist", pp, ap)
+					add(fmt.Sprintf("trusted_proxies[%d]", proxyAt[i]), "trusted_proxies[%d] overlaps ip_allowlist[%d]; the edge proxy must never be in the allowlist", proxyAt[i], allowAt[j])
 				}
 			}
 		}
 	} else if len(c.TrustedProxies) > 0 {
-		add("trusted_proxies is set but trust_proxy is off (ambiguous; enable trust_proxy or remove the list)")
+		add("trusted_proxies", "trusted_proxies is set but trust_proxy is off (ambiguous; enable trust_proxy or remove the list)")
 	}
 
 	// --- auth ---
 	if c.Auth.Username == "" {
-		add("auth.username: required")
+		add("auth.username", "auth.username: required")
 	}
 	if c.Auth.PasswordHash == "" {
-		add("auth.password_hash: required (run `mooring hash-password`)")
+		add("auth.password_hash", "auth.password_hash: required (run `mooring hash-password`)")
 	} else if _, _, _, err := crypto.ParseArgon2(c.Auth.PasswordHash); err != nil {
-		add("auth.password_hash: %v", err)
+		add("auth.password_hash", "auth.password_hash: %s", argon2Problem(err))
 	}
 	if c.Auth.TOTPSecret != "" && !validBase32(c.Auth.TOTPSecret) {
-		add("auth.totp_secret: not valid base32 (run `mooring gen-totp`)")
+		add("auth.totp_secret", "auth.totp_secret: not valid base32 (run `mooring gen-totp`)")
 	}
 
 	// --- additional users (RBAC) ---
@@ -1343,61 +1400,62 @@ func (c *Config) Validate() error {
 	ownerParams, _, _, ownerParamErr := crypto.ParseArgon2(c.Auth.PasswordHash)
 	seenUser := map[string]bool{c.Auth.Username: true}
 	for i, u := range c.ExtraUsers {
+		at := fmt.Sprintf("users[%d]", i)
 		if u.Username == "" {
-			add("users[%d].username: required", i)
+			add(at+".username", "users[%d].username: required", i)
 			continue
 		}
 		if seenUser[u.Username] {
-			add("users[%d]: duplicate username %q (already the auth owner or another user)", i, u.Username)
+			add(at+".username", "users[%d]: duplicate username (already the auth owner or another user)", i)
 		}
 		seenUser[u.Username] = true
 		if u.PasswordHash == "" {
-			add("users[%d] (%s): password_hash required (run `mooring hash-password`)", i, u.Username)
+			add(at+".password_hash", "users[%d]: password_hash required (run `mooring hash-password`)", i)
 		} else if p, _, _, err := crypto.ParseArgon2(u.PasswordHash); err != nil {
-			add("users[%d] (%s).password_hash: %v", i, u.Username, err)
+			add(at+".password_hash", "users[%d].password_hash: %s", i, argon2Problem(err))
 		} else if ownerParamErr == nil && (p.Memory != ownerParams.Memory || p.Time != ownerParams.Time || p.Parallelism != ownerParams.Parallelism) {
-			add("users[%d] (%s).password_hash: argon2 cost (memory/time/parallelism) must match the auth owner's — hash all users with the same `mooring hash-password` settings", i, u.Username)
+			add(at+".password_hash", "users[%d].password_hash: argon2 cost (memory/time/parallelism) must match the auth owner's — hash all users with the same `mooring hash-password` settings", i)
 		}
 		if u.TOTPSecret != "" && !validBase32(u.TOTPSecret) {
-			add("users[%d] (%s).totp_secret: not valid base32", i, u.Username)
+			add(at+".totp_secret", "users[%d].totp_secret: not valid base32", i)
 		}
 		if !validRole(u.Role) {
-			add("users[%d] (%s).role: must be owner, deployer, or viewer", i, u.Username)
+			add(at+".role", "users[%d].role: must be owner, deployer, or viewer", i)
 		}
 	}
 
 	// --- bind address: admin UI binds loopback only (plan §3) ---
 	if !isLoopbackBind(c.BindAddr) {
-		add("bind_addr: must bind loopback only (127.0.0.1 / [::1]); the edge fronts the public ports, got %q", c.BindAddr)
+		add("bind_addr", "bind_addr: must bind loopback only (127.0.0.1 / [::1]); the edge fronts the public ports")
 	}
 
 	// --- edge mode ---
 	switch c.Edge.Mode {
 	case EdgeManaged:
 		if strings.TrimSpace(c.Edge.ACMEEmail) == "" {
-			add("edge.acme_email: required in managed mode (ACME contact); fail-closed")
+			add("edge.acme_email", "edge.acme_email: required in managed mode (ACME contact); fail-closed")
 		}
 		if strings.TrimSpace(c.Edge.ACMECA) == "" {
-			add("edge.acme_ca: required in managed mode (pin a single ACME issuer)")
+			add("edge.acme_ca", "edge.acme_ca: required in managed mode (pin a single ACME issuer)")
 		}
 		if bd := strings.TrimSpace(c.Edge.BaseDomain); bd != "" && (len(bd) > 253 || !edgeHostnameRe.MatchString(bd)) {
-			add("edge.base_domain %q must be a valid FQDN with no wildcards (e.g. mooring.example.com)", bd)
+			add("edge.base_domain", "edge.base_domain: must be a valid FQDN with no wildcards (e.g. mooring.example.com)")
 		}
 		if d := c.Edge.DNS01; d != nil {
 			if strings.TrimSpace(c.Edge.BaseDomain) == "" {
-				add("edge.dns01 (wildcard cert) requires edge.base_domain")
+				add("edge.dns01", "edge.dns01 (wildcard cert) requires edge.base_domain")
 			}
 			if !dnsProviderRe.MatchString(strings.TrimSpace(d.Provider)) {
-				add("edge.dns01.provider %q must be a caddy DNS module name [a-z0-9._-] (e.g. cloudflare)", d.Provider)
+				add("edge.dns01.provider", "edge.dns01.provider: must be a caddy DNS module name [a-z0-9._-] (e.g. cloudflare)")
 			}
 			if strings.TrimSpace(d.APIToken) == "" {
-				add("edge.dns01.api_token is required for the DNS-01 wildcard cert")
+				add("edge.dns01.api_token", "edge.dns01.api_token is required for the DNS-01 wildcard cert")
 			}
 		}
 		// A catch-all route (subdomain: "*") is served by the namespace's wildcard certificate, so
 		// edge.catch_all is meaningless — and unsafe — without dns01 on the default namespace.
 		if c.Edge.CatchAll && c.Edge.DNS01 == nil {
-			add("edge.catch_all requires edge.dns01 (the catch-all is served by the namespace's wildcard certificate)")
+			add("edge.catch_all", "edge.catch_all requires edge.dns01 (the catch-all is served by the namespace's wildcard certificate)")
 		}
 	case EdgeExternal:
 		// Stronger fail-closed boot for external mode (plan §3.1): must have a
@@ -1406,30 +1464,36 @@ func (c *Config) Validate() error {
 		// the managed-edge milestone (M11) and is NOT yet implemented; the
 		// loopback-only bind_addr check below is the in-scope guarantee today.
 		if !c.TrustProxy || len(c.parsedProxies) == 0 {
-			add("edge.mode external requires trust_proxy + a specific trusted_proxies edge IP (<= /24)")
+			add("edge.mode", "edge.mode external requires trust_proxy + a specific trusted_proxies edge IP (<= /24)")
 		}
 	default:
-		add("edge.mode: must be %q or %q, got %q", EdgeManaged, EdgeExternal, c.Edge.Mode)
+		add("edge.mode", "edge.mode: must be %q or %q", EdgeManaged, EdgeExternal)
 	}
 
 	// --- extra edge CAs (private issuers) ---
 	seenCA := map[string]bool{}
 	for i, ca := range c.Edge.CAs {
+		at := fmt.Sprintf("edge.cas[%d]", i)
 		if !edgeCANameRe.MatchString(ca.Name) {
-			add("edge.cas[%d].name: must match [a-z][a-z0-9-]{0,30} (got %q)", i, ca.Name)
+			add(at+".name", "edge.cas[%d].name: must match [a-z][a-z0-9-]{0,30}", i)
 		}
 		if seenCA[ca.Name] {
-			add("edge.cas: duplicate CA name %q", ca.Name)
+			add(at+".name", "edge.cas[%d].name: duplicate CA name", i)
 		}
 		seenCA[ca.Name] = true
 		if !strings.HasPrefix(strings.TrimSpace(ca.DirectoryURL), "https://") {
-			add("edge.cas[%d] (%s): directory_url must be an https ACME directory URL", i, ca.Name)
+			add(at+".directory_url", "edge.cas[%d]: directory_url must be an https ACME directory URL", i)
 		}
 		if ca.TrustedRoot != "" {
-			if b, err := os.ReadFile(ca.TrustedRoot); err != nil {
-				add("edge.cas[%d] (%s): trusted_root %q is not readable: %v", i, ca.Name, ca.TrustedRoot, err)
+			// The OS error quotes the path, so only its kind is said.
+			if b, err := os.ReadFile(ca.TrustedRoot); errors.Is(err, fs.ErrNotExist) {
+				add(at+".trusted_root", "edge.cas[%d]: trusted_root is not readable: the file does not exist", i)
+			} else if errors.Is(err, fs.ErrPermission) {
+				add(at+".trusted_root", "edge.cas[%d]: trusted_root is not readable: permission denied", i)
+			} else if err != nil {
+				add(at+".trusted_root", "edge.cas[%d]: trusted_root is not readable", i)
 			} else if !bytes.Contains(b, []byte("BEGIN CERTIFICATE")) {
-				add("edge.cas[%d] (%s): trusted_root %q is not a PEM certificate", i, ca.Name, ca.TrustedRoot)
+				add(at+".trusted_root", "edge.cas[%d]: trusted_root is not a PEM certificate", i)
 			}
 		}
 	}
@@ -1440,113 +1504,119 @@ func (c *Config) Validate() error {
 	// ambiguous. The default scalar base_domain participates in the disjointness check so a
 	// named namespace can't shadow it.
 	seenBD := map[string]bool{}
-	seenBDDomain := map[string]string{} // lowercased domain -> owning namespace label (for error text)
+	seenBDDomain := map[string]string{} // lowercased domain -> the key it is written under (for error text)
 	if bd := strings.ToLower(strings.TrimSpace(c.Edge.BaseDomain)); bd != "" {
 		seenBDDomain[bd] = "edge.base_domain"
 	}
 	for i, b := range c.Edge.BaseDomains {
+		at := fmt.Sprintf("edge.base_domains[%d]", i)
 		if !edgeCANameRe.MatchString(b.Name) {
-			add("edge.base_domains[%d].name: must match [a-z][a-z0-9-]{0,30} (got %q)", i, b.Name)
+			add(at+".name", "edge.base_domains[%d].name: must match [a-z][a-z0-9-]{0,30}", i)
 		}
 		if seenBD[b.Name] {
-			add("edge.base_domains: duplicate name %q", b.Name)
+			add(at+".name", "edge.base_domains[%d].name: duplicate name", i)
 		}
 		seenBD[b.Name] = true
 		// Validate the raw (trimmed, NOT lowercased) domain against the lowercase-only FQDN
-		// grammar — same as the scalar base_domain at line ~966 — so an uppercase apex is
+		// grammar — same as the scalar base_domain above — so an uppercase apex is
 		// rejected here rather than silently lowercased. The lowercased `dom` is used only for
 		// the disjointness/overlap check below (and BaseDomainByName normalizes at use).
 		rawDom := strings.TrimSpace(b.Domain)
 		dom := strings.ToLower(rawDom)
 		if rawDom == "" || len(rawDom) > 253 || !edgeHostnameRe.MatchString(rawDom) {
-			add("edge.base_domains[%d] (%s): domain %q must be a valid lowercase FQDN with no wildcards (e.g. staging.example.com)", i, b.Name, b.Domain)
+			add(at+".domain", "edge.base_domains[%d]: domain must be a valid lowercase FQDN with no wildcards (e.g. staging.example.com)", i)
 		} else {
 			for other, owner := range seenBDDomain {
 				switch {
 				case dom == other:
-					add("edge.base_domains[%d] (%s): domain %q duplicates %s — namespaces must be distinct", i, b.Name, b.Domain, owner)
+					add(at+".domain", "edge.base_domains[%d]: domain duplicates %s — namespaces must be distinct", i, owner)
 				case strings.HasSuffix(dom, "."+other) || strings.HasSuffix(other, "."+dom):
-					add("edge.base_domains[%d] (%s): domain %q nests with %s (%s) — namespaces must be disjoint apexes", i, b.Name, b.Domain, owner, other)
+					add(at+".domain", "edge.base_domains[%d]: domain nests with %s — namespaces must be disjoint apexes", i, owner)
 				}
 			}
-			seenBDDomain[dom] = fmt.Sprintf("edge.base_domains[%d] (%s)", i, b.Name)
+			seenBDDomain[dom] = fmt.Sprintf("edge.base_domains[%d].domain", i)
 		}
 		if d := b.DNS01; d != nil {
 			if !dnsProviderRe.MatchString(strings.TrimSpace(d.Provider)) {
-				add("edge.base_domains[%d] (%s): dns01.provider %q must be a caddy DNS module name [a-z0-9._-] (e.g. cloudflare)", i, b.Name, d.Provider)
+				add(at+".dns01.provider", "edge.base_domains[%d]: dns01.provider must be a caddy DNS module name [a-z0-9._-] (e.g. cloudflare)", i)
 			}
 			if strings.TrimSpace(d.APIToken) == "" {
-				add("edge.base_domains[%d] (%s): dns01.api_token is required for the wildcard cert", i, b.Name)
+				add(at+".dns01.api_token", "edge.base_domains[%d]: dns01.api_token is required for the wildcard cert", i)
 			}
 		}
 		if b.CatchAll && b.DNS01 == nil {
-			add("edge.base_domains[%d] (%s): catch_all requires dns01 (the catch-all is served by the namespace's wildcard certificate)", i, b.Name)
+			add(at+".catch_all", "edge.base_domains[%d]: catch_all requires dns01 (the catch-all is served by the namespace's wildcard certificate)", i)
 		}
 	}
 
 	// --- edge.trusted_proxies: proxies in front of the managed edge ---
 	if len(c.Edge.TrustedProxies) > 0 && c.Edge.Mode != EdgeManaged {
-		add("edge.trusted_proxies applies only to edge.mode: managed (Mooring renders no edge in %s mode)", c.Edge.Mode)
+		add("edge.trusted_proxies", "edge.trusted_proxies applies only to edge.mode: managed (Mooring renders no edge in any other mode)")
 	}
 	for i, s := range c.Edge.TrustedProxies {
 		if err := validateEdgeTrustedProxy(s); err != nil {
-			add("edge.trusted_proxies[%d]: %v", i, err)
+			add(fmt.Sprintf("edge.trusted_proxies[%d]", i), "edge.trusted_proxies[%d]: %v", i, err)
 		}
 	}
 	if h := c.Edge.ClientIPHeader; h != "" {
 		if len(c.Edge.TrustedProxies) == 0 {
-			add("edge.client_ip_header is set but edge.trusted_proxies is empty (the header is read only from a trusted proxy)")
+			add("edge.client_ip_header", "edge.client_ip_header is set but edge.trusted_proxies is empty (the header is read only from a trusted proxy)")
 		} else if err := validateEdgeClientIPHeader(h); err != nil {
-			add("edge.client_ip_header: %v", err)
+			add("edge.client_ip_header", "edge.client_ip_header: %v", err)
 		}
 	}
 
 	// --- admin.listen, when set, must never be routable ---
 	if c.Admin.Listen != "" && !adminListenSafe(c.Admin.Listen) {
-		add("admin.listen: must be a unix socket (unix//...) or 127.0.0.1:2019, never routable; got %q", c.Admin.Listen)
+		add("admin.listen", "admin.listen: must be a unix socket (unix//...) or 127.0.0.1:2019, never routable")
 	}
 
 	// --- exposing the admin dashboard through the managed edge (fail-closed) ---
 	if c.Admin.Subdomain != "" && c.Admin.Hostname != "" {
-		add("admin: set admin.hostname OR admin.subdomain, not both")
+		add("admin.subdomain", "admin: set admin.hostname OR admin.subdomain, not both")
 	}
 	if c.Admin.Subdomain != "" && !subdomainLabelRe.MatchString(c.Admin.Subdomain) {
-		add("admin.subdomain %q must be a single DNS label [a-z0-9-] (it becomes <subdomain>.<edge.base_domain>)", c.Admin.Subdomain)
+		add("admin.subdomain", "admin.subdomain: must be a single DNS label [a-z0-9-] (it becomes <subdomain>.<edge.base_domain>)")
 	}
 	if c.Admin.Subdomain != "" && strings.TrimSpace(c.Edge.BaseDomain) == "" {
-		add("admin.subdomain needs edge.base_domain set")
+		add("admin.subdomain", "admin.subdomain needs edge.base_domain set")
 	}
 	if c.AdminExposed() {
+		// The key the dashboard's hostname comes from (AdminHostnameResolved).
+		hostKey := "admin.subdomain"
+		if strings.TrimSpace(c.Admin.Hostname) != "" {
+			hostKey = "admin.hostname"
+		}
 		if c.Edge.Mode != EdgeManaged {
-			add("exposing the admin dashboard (admin.hostname/admin.subdomain) requires edge.mode: managed")
+			add(hostKey, "exposing the admin dashboard (admin.hostname/admin.subdomain) requires edge.mode: managed")
 		}
 		h := c.AdminHostnameResolved()
 		if len(h) > 253 || !edgeHostnameRe.MatchString(h) {
-			add("admin hostname %q is not a valid FQDN", h)
+			add(hostKey, "%s: the dashboard's hostname is not a valid FQDN", hostKey)
 		}
 		// Admin must never sit on a namespace APEX (the default base_domain OR any named
 		// base_domains apex): the admin plane sends HSTS includeSubDomains, so an apex admin
 		// would pin every app subdomain under that namespace, and the *.<apex> wildcard doesn't
 		// even cover the apex (cert divergence). Case-insensitive.
 		if h != "" && strings.EqualFold(h, strings.TrimSpace(c.Edge.BaseDomain)) {
-			add("admin must be a subdomain (e.g. admin.%s), not the base_domain apex — apex HSTS would pin every app subdomain", c.Edge.BaseDomain)
+			add(hostKey, "admin must be a subdomain (e.g. admin.<edge.base_domain>), not the base_domain apex — apex HSTS would pin every app subdomain")
 		}
-		for _, b := range c.Edge.BaseDomains {
+		for i, b := range c.Edge.BaseDomains {
 			if h != "" && strings.EqualFold(h, strings.TrimSpace(b.Domain)) {
-				add("admin must be a subdomain, not the %q namespace apex %q — apex HSTS would pin every app subdomain under it", b.Name, b.Domain)
+				add(hostKey, "admin must be a subdomain, not the apex of edge.base_domains[%d] — apex HSTS would pin every app subdomain under it", i)
 			}
 		}
 		if !isLoopbackBind(c.AdminEdgeListen()) {
-			add("admin.edge_listen %q must be loopback (127.0.0.1:PORT), never routable", c.AdminEdgeListen())
+			add("admin.edge_listen", "admin.edge_listen: must be loopback (127.0.0.1:PORT), never routable")
 		}
 		if c.AdminEdgeListen() == strings.TrimSpace(c.BindAddr) {
-			add("admin.edge_listen must differ from bind_addr (%s) — they are two separate listeners", c.BindAddr)
+			add("admin.edge_listen", "admin.edge_listen must differ from bind_addr — they are two separate listeners")
 		}
 		// The IP allowlist becomes the edge's public gate for the admin vhost — a
 		// catch-all would put the login on the open internet (behind password+TOTP only).
 		for _, p := range c.parsedAllowlist {
 			if p.Bits() == 0 {
-				add("admin exposure with a catch-all ip_allowlist (%s) puts the login on the open internet — restrict ip_allowlist to your networks", p)
+				add("ip_allowlist", "admin exposure with a catch-all ip_allowlist (an entry ending in /0) puts the login on the open internet — restrict ip_allowlist to your networks")
 				break
 			}
 		}
@@ -1556,27 +1626,27 @@ func (c *Config) Validate() error {
 	switch c.Cookie.Prefix {
 	case "__Host-":
 		if c.Cookie.BasePath != "" && c.Cookie.BasePath != "/" {
-			add("cookie.prefix __Host- forbids a base_path other than \"/\"")
+			add("cookie.base_path", "cookie.prefix __Host- forbids a base_path other than \"/\"")
 		}
 	case "__Secure-":
 		if c.Cookie.BasePath == "" {
-			add("cookie.prefix __Secure- requires cookie.base_path")
+			add("cookie.prefix", "cookie.prefix __Secure- requires cookie.base_path")
 		}
 	default:
-		add("cookie.prefix: must be __Host- or __Secure-, got %q", c.Cookie.Prefix)
+		add("cookie.prefix", "cookie.prefix: must be __Host- or __Secure-")
 	}
 
 	// --- docker proxy: must be a loopback endpoint (never the raw/remote socket) ---
 	if !isLoopbackBind(c.Docker.ProxyAddr) {
-		add("docker.proxy_addr: must be a loopback host:port (the read-only socket-proxy), got %q", c.Docker.ProxyAddr)
+		add("docker.proxy_addr", "docker.proxy_addr: must be a loopback host:port (the read-only socket-proxy)")
 	}
 
 	// --- editor modes ---
 	if c.CaddyEditor.Mode != EditorStrict && c.CaddyEditor.Mode != EditorReview {
-		add("caddy_editor.mode: must be strict or review")
+		add("caddy_editor.mode", "caddy_editor.mode: must be strict or review")
 	}
 	if c.ComposeValidation.Mode != EditorStrict && c.ComposeValidation.Mode != EditorReview {
-		add("compose_validation.mode: must be strict or review")
+		add("compose_validation.mode", "compose_validation.mode: must be strict or review")
 	}
 
 	// --- setup sandbox (Mode 3; plan §7/§9, hard-gated) ---
@@ -1584,48 +1654,46 @@ func (c *Config) Validate() error {
 		// A digest-pinned jail image is mandatory (no mutable :tag for the thing
 		// that runs hostile scripts).
 		if !strings.Contains(c.Setup.Image, "@sha256:") {
-			add("setup.image: must be digest-pinned (name@sha256:...) when setup.enabled")
+			add("setup.image", "setup.image: must be digest-pinned (name@sha256:...) when setup.enabled")
 		}
 		if c.Setup.WallClock.D() < time.Second || c.Setup.WallClock.D() > time.Hour {
-			add("setup.wall_clock: must be between 1s and 1h")
+			add("setup.wall_clock", "setup.wall_clock: must be between 1s and 1h")
 		}
 		if c.Setup.MemoryMB < 16 || c.Setup.MemoryMB > 8192 {
-			add("setup.memory_mb: must be between 16 and 8192")
+			add("setup.memory_mb", "setup.memory_mb: must be between 16 and 8192")
 		}
 		if c.Setup.PidsLimit < 1 || c.Setup.PidsLimit > 4096 {
-			add("setup.pids_limit: must be between 1 and 4096")
+			add("setup.pids_limit", "setup.pids_limit: must be between 1 and 4096")
 		}
 		if c.Setup.ScratchMB < 1 {
-			add("setup.scratch_mb: must be >= 1")
+			add("setup.scratch_mb", "setup.scratch_mb: must be >= 1")
 		}
 		if c.Setup.OutputCapKB < 1 {
-			add("setup.output_cap_kb: must be >= 1")
+			add("setup.output_cap_kb", "setup.output_cap_kb: must be >= 1")
 		}
 	}
 
 	// --- retention (Tier-1; plan §16.1) ---
 	if c.Retention.Interval.D() < time.Minute {
-		add("retention.interval: must be >= 1m (got %s)", c.Retention.Interval.D())
+		add("retention.interval", "retention.interval: must be >= 1m")
 	}
 	if c.Retention.EventsMaxAge.D() < 24*time.Hour {
-		add("retention.events_max_age: must be >= 24h so audit history is not lost (got %s)", c.Retention.EventsMaxAge.D())
+		add("retention.events_max_age", "retention.events_max_age: must be >= 24h so audit history is not lost")
 	}
 	if c.Retention.EventsMaxRows < 1000 {
-		add("retention.events_max_rows: must be >= 1000 (got %d)", c.Retention.EventsMaxRows)
+		add("retention.events_max_rows", "retention.events_max_rows: must be >= 1000")
 	}
 	if c.Retention.ArchiveMaxMB < 1 {
-		add("retention.archive_max_mb: must be >= 1 (got %d)", c.Retention.ArchiveMaxMB)
+		add("retention.archive_max_mb", "retention.archive_max_mb: must be >= 1")
 	}
 
 	// --- Server tab (read-only host inspection + .deb cleanup) ---
-	if err := c.validateServer(); err != nil {
-		add("%v", err)
-	}
+	c.validateServer(add)
 
 	// --- Scheduled app-data backups (opt-in) ---
 	if c.Backups.Enabled {
 		if len(c.EncryptionKey) == 0 {
-			add("backups.enabled requires encryption_key (snapshots are AES-256 encrypted)")
+			add("backups.enabled", "backups.enabled requires encryption_key (snapshots are AES-256 encrypted)")
 		}
 		if s := c.Backups.S3; s != nil {
 			validateS3("backups.s3", s, add)
@@ -1635,39 +1703,48 @@ func (c *Config) Validate() error {
 		// incomplete block turns that off with a warning instead of refusing boot: before the state
 		// backup existed such a block was ignored, so an upgrade must not refuse to start on it.
 		if p := s.Problems("backups.s3"); len(p) > 0 {
-			c.LoadWarnings = append(c.LoadWarnings, "backups.s3: incomplete, so the daily Mooring-state backup to S3 is off: "+strings.Join(p, "; "))
+			w := "backups.s3: incomplete, so the daily Mooring-state backup to S3 is off: " + strings.Join(p, "; ")
+			if !slices.Contains(c.LoadWarnings, w) { // Problems may run more than once on one Config
+				c.LoadWarnings = append(c.LoadWarnings, w)
+			}
 		}
 	}
 
 	// --- Security logs (on by default) ---
 	c.validateSecurityLogs(add)
 
-	if len(errs) > 0 {
-		return fmt.Errorf("config: refusing to boot:\n  - %s", strings.Join(errs, "\n  - "))
+	return out
+}
+
+// argon2Problem is why a password hash is refused, without the hash: crypto's two fixed sentences,
+// and a fixed one for any other error.
+func argon2Problem(err error) string {
+	if errors.Is(err, crypto.ErrIncompatibleVersion) {
+		return crypto.ErrIncompatibleVersion.Error()
 	}
-	return nil
+	return crypto.ErrInvalidHash.Error()
 }
 
 // Problems lists what an S3 destination block named key is missing (none when it is complete).
 func (s *BackupS3) Problems(key string) []string {
 	var out []string
-	validateS3(key, s, func(format string, a ...any) { out = append(out, fmt.Sprintf(format, a...)) })
+	validateS3(key, s, func(_, format string, a ...any) { out = append(out, fmt.Sprintf(format, a...)) })
 	return out
 }
 
 // validateS3 checks an S3 destination block named key (backups.s3, security_logs.archive.s3).
-func validateS3(key string, s *BackupS3, add func(string, ...any)) {
+func validateS3(key string, s *BackupS3, add addFn) {
 	if strings.TrimSpace(s.Bucket) == "" {
-		add("%s.bucket is required when %s is set", key, key)
+		add(key+".bucket", "%s.bucket is required when %s is set", key, key)
 	}
 	if strings.TrimSpace(s.Region) == "" {
-		add("%s.region is required when %s is set", key, key)
+		add(key+".region", "%s.region is required when %s is set", key, key)
 	}
 	if strings.TrimSpace(s.Endpoint) == "" {
-		add("%s.endpoint is required when %s is set (e.g. s3.us-east-1.amazonaws.com)", key, key)
+		add(key+".endpoint", "%s.endpoint is required when %s is set (e.g. s3.us-east-1.amazonaws.com)", key, key)
 	}
 	if strings.TrimSpace(s.AccessKeyID) == "" || strings.TrimSpace(s.SecretAccessKey) == "" {
-		add("%s requires access_key_id and secret_access_key", key)
+		add(key, "%s requires access_key_id and secret_access_key", key)
 	}
 }
 

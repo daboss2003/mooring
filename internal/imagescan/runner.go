@@ -2,6 +2,7 @@ package imagescan
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -61,6 +62,9 @@ type Runner struct {
 
 // NewRunner builds a Runner. interval floors at 1h in Run.
 func NewRunner(scanner scanIface, store *Store, alerts alertSink, targets func(context.Context) []Target, interval time.Duration, log *slog.Logger) *Runner {
+	if sc, ok := scanner.(*Scanner); ok && sc != nil && sc.log == nil {
+		sc.log = log // the scanner's own warnings (a scan container it could not remove) go to the same log
+	}
 	return &Runner{
 		scanner: scanner, store: store, alerts: alerts, targets: targets, interval: interval, log: log,
 		alerted: map[string]string{}, reboot: serverinfo.RebootRequired,
@@ -142,6 +146,20 @@ func (r *Runner) ScanProject(ctx context.Context, project string) {
 	}
 }
 
+// appScanFailed is what the Server tab shows next to an app when a target's scan failed for a reason
+// that is only safe in the log (the scanner's stderr).
+const appScanFailed = "one or more targets could not be scanned"
+
+// appFailure is the Server tab's text for a failed app target, and whether it names the reason: it
+// does when the scanner ran but its report could not be used (as hostFailure does for the host).
+func appFailure(err error) (string, bool) {
+	var oe *outputError
+	if errors.As(err, &oe) {
+		return appScanFailed + ": " + oe.reason, true
+	}
+	return appScanFailed, false
+}
+
 func (r *Runner) scanApp(ctx context.Context, project string, tgs []Target) {
 	a := AppScan{Project: project, ScannedAt: time.Now().Unix()}
 	for _, t := range tgs {
@@ -158,9 +176,17 @@ func (r *Runner) scanApp(ctx context.Context, project string, tgs []Target) {
 			continue
 		}
 		if err != nil {
-			r.log.Debug("imagescan: target failed", "project", project, "target", t.Label, "err", err)
-			if a.Error == "" {
-				a.Error = "one or more targets could not be scanned"
+			text, explicit := appFailure(err)
+			if explicit {
+				r.log.Warn("imagescan: target failed", "project", project, "target", t.Label, "err", err)
+			} else {
+				// Intentional: Debug. An image Trivy can't pull (a private registry) fails on
+				// every pass, and the cause is the scanner's stderr.
+				r.log.Debug("imagescan: target failed", "project", project, "target", t.Label, "err", err)
+			}
+			// The first reason wins; a reason replaces the text that has none.
+			if a.Error == "" || (a.Error == appScanFailed && explicit) {
+				a.Error = text
 			}
 			continue
 		}

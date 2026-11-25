@@ -39,7 +39,7 @@ func cmdGenKey(args []string) error {
 	}
 	key := crypto.RandomBytes(32)
 	fmt.Printf("encryption_key: %q\n", base64.StdEncoding.EncodeToString(key))
-	fmt.Fprintln(os.Stderr, "Paste this into /etc/mooring/config.yaml (0600 root:root). Back it up offsite, separately from the DB.")
+	fmt.Fprintln(os.Stderr, "Paste this into /etc/mooring/config.yaml (root:mooring, mode 0640). Back it up offsite, separately from the DB.")
 	return nil
 }
 

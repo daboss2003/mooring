@@ -131,7 +131,7 @@ func (s *Server) opsWriteBack(r *http.Request, project string) {
 		s.log.Warn("ops write-back: could not render canonical (ops config applied)", "project", project, "err", cerr)
 		return
 	}
-	if _, perr := definition.Parse(canon); perr != nil {
+	if _, perr := definition.ParseStored(canon); perr != nil {
 		s.log.Warn("ops write-back: canonical re-validation failed (ops config applied)", "project", project, "err", perr)
 		return
 	}

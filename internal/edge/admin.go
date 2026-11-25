@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -107,6 +108,38 @@ type ConfigRejectedError struct {
 
 func (e *ConfigRejectedError) Error() string {
 	return fmt.Sprintf("edge: admin rejected config (status %d): %s", e.Status, e.Body)
+}
+
+// AllowlistDroppedError is Reconcile's error when the edge config IS applied — this reconcile's routes,
+// pools and wildcards are what Caddy serves, with the dashboard allowlist that was in force before —
+// and the list set by SetAdminAllowlist was given up: Err is why (Render's refusal of the list, or
+// Caddy's *ConfigRejectedError for the render that carried it, which errors.As still finds). It is
+// never returned when nothing was applied.
+type AllowlistDroppedError struct{ Err error }
+
+func (e *AllowlistDroppedError) Error() string {
+	return "edge: config applied with the previous ip_allowlist; the new list was refused: " + e.Err.Error()
+}
+
+func (e *AllowlistDroppedError) Unwrap() error { return e.Err }
+
+// AllowlistPendingError is Reconcile's error when the edge config IS applied with the dashboard
+// allowlist that was in force before, and the list set by SetAdminAllowlist is still pending: Caddy
+// refused its render once and accepted the previous list's, and the second try (Err, never a
+// *ConfigRejectedError) didn't reach Caddy. The next reconcile tries the list again.
+type AllowlistPendingError struct{ Err error }
+
+func (e *AllowlistPendingError) Error() string {
+	return "edge: config applied with the previous ip_allowlist; the new list is still pending: " + e.Err.Error()
+}
+
+func (e *AllowlistPendingError) Unwrap() error { return e.Err }
+
+// ConfigApplied reports whether a Reconcile that returned err left Caddy serving that reconcile's
+// config: err is nil, an *AllowlistDroppedError or an *AllowlistPendingError (only the new dashboard
+// allowlist is missing from it). Any other error means the edge serves what it served before.
+func ConfigApplied(err error) bool {
+	return err == nil || errors.As(err, new(*AllowlistDroppedError)) || errors.As(err, new(*AllowlistPendingError))
 }
 
 // Discovery is one container-discovery pass over the route set (see SetPoolDiscoverer).
@@ -213,6 +246,15 @@ type Reconciler struct {
 	// hooksMu guards poolFn, onStatus, blocklist and onBlockDrop: they are wired after the Caddy
 	// supervisor has started, and a Caddy launch reconciles from its own goroutine.
 	hooksMu sync.RWMutex
+	// pendingAllow is a dashboard allowlist set by SetAdminAllowlist that no accepted render carries
+	// yet (nil: none); base.AdminAllowlist stays the list Caddy last accepted. Guarded by hooksMu.
+	pendingAllow *[]string
+	// onAllowAccepted is told each dashboard allowlist Caddy accepted (see SetAdminAllowlistAccepted).
+	// Guarded by hooksMu.
+	onAllowAccepted func(list []string)
+	// allowCbMu serializes onAllowAccepted calls; allowTold (guarded by it) is the allowSeq last told.
+	allowCbMu sync.Mutex
+	allowTold uint64
 
 	gen atomic.Uint64 // discovery generation, taken before each discovery starts
 
@@ -221,6 +263,8 @@ type Reconciler struct {
 	// applied is the config Caddy last accepted. Unlike lastGood, a Caddy restart doesn't clear it
 	// (ReloadAfterRestart clears lastGood only to force the next /load).
 	applied []byte
+	// allowSeq counts the dashboard allowlist changes committed to base.AdminAllowlist.
+	allowSeq uint64
 	// refused is Caddy's error (tokens redacted) for the latest render it refused — not one namespace's
 	// wildcard, which is left out instead — while no render has been accepted since; "" otherwise.
 	// refusedCfg is that render, byte for byte (nil when refused is "").
@@ -484,6 +528,166 @@ func (r *Reconciler) SetBlockDrop(fn func(p netip.Prefix, why string)) {
 	r.hooksMu.Unlock()
 }
 
+// SetAdminAllowlist replaces the dashboard route's allowlist (canonical prefixes, as
+// config.AllowlistStrings gives them) from the next reconcile on: serve calls it on a reload, then
+// reconciles. The list only becomes the Reconciler's own once Caddy has accepted a render with it. It
+// is given up (the previous list stays in force) when Render refuses it — an entry that is no address,
+// or one that admits every address — or when Caddy refuses it twice while accepting the same render
+// with the previous list. The reconcile that gives it up still applies its routes with the previous
+// list and returns an *AllowlistDroppedError; if that render isn't applied either (Caddy refuses it,
+// or isn't reachable), it returns that error joined with the list's. The list stays pending for the
+// next reconcile when the /load doesn't reach Caddy, when Caddy refuses the previous list's render
+// too, or when the render fails for another reason. AdminAllowlistState tells the outcome. Safe to
+// call from any goroutine.
+func (r *Reconciler) SetAdminAllowlist(list []string) {
+	cp := append([]string{}, list...)
+	r.hooksMu.Lock()
+	r.pendingAllow = &cp
+	r.hooksMu.Unlock()
+}
+
+func (r *Reconciler) pendingAdminAllowlist() *[]string {
+	r.hooksMu.RLock()
+	defer r.hooksMu.RUnlock()
+	return r.pendingAllow
+}
+
+// AdminAllowlistState returns a copy of the dashboard allowlist in force — the one the edge serves for
+// the dashboard route, and feeds a restarted Caddy — and whether a list set by SetAdminAllowlist is
+// still waiting for a reconcile to apply it. After SetAdminAllowlist(l) and a reconcile: inForce equal
+// to l means applied (by that reconcile or a concurrent one); pending means not decided yet; neither
+// means the list was given up. Safe to call from any goroutine; it waits for a running reconcile's
+// commit, so it must not be called from a hook that runs under the reconcile lock.
+func (r *Reconciler) AdminAllowlistState() (inForce []string, pending bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hooksMu.RLock()
+	defer r.hooksMu.RUnlock()
+	return append([]string{}, r.base.AdminAllowlist...), r.pendingAllow != nil
+}
+
+// settleAdminAllowlist ends the pending list pend a reconcile rendered: accepted makes it the
+// Reconciler's list (changed reports whether it differs from the one before), otherwise it is given
+// up. A list set meanwhile stays pending. Called under r.mu.
+func (r *Reconciler) settleAdminAllowlist(pend *[]string, accepted bool, why error) (changed bool) {
+	if pend == nil {
+		return false
+	}
+	r.hooksMu.Lock()
+	if r.pendingAllow == pend {
+		r.pendingAllow = nil
+	}
+	r.hooksMu.Unlock()
+	if accepted {
+		if slices.Equal(r.base.AdminAllowlist, *pend) {
+			return false
+		}
+		r.base.AdminAllowlist = *pend
+		r.allowSeq++
+		return true
+	}
+	if r.log != nil {
+		r.log.Error("edge: the new ip_allowlist was refused; the dashboard route keeps the previous list", "err", why)
+	}
+	return false
+}
+
+// SetAdminAllowlistAccepted registers fn, called each time Caddy accepted a render that changed the
+// dashboard allowlist (a list set by SetAdminAllowlist that differs from the one in force), with a
+// copy of that list: serve re-renders the boot floor with it, so a relaunched Caddy starts on the
+// list in force. fn runs on the reconciling goroutine after the reconcile lock is released, also
+// when the list was applied by a later (periodic) reconcile than the one that followed the reload.
+// Calls never overlap and never go backwards: when two changes are accepted close together, fn may
+// be called once, with the newer list. A refused or still pending list is never reported. fn must
+// not set a new list and reconcile synchronously.
+func (r *Reconciler) SetAdminAllowlistAccepted(fn func(list []string)) {
+	r.hooksMu.Lock()
+	r.onAllowAccepted = fn
+	r.hooksMu.Unlock()
+}
+
+// notifyAllowlistAccepted tells the hook the list in force, unless a concurrent reconcile's call
+// already reported it. Called WITHOUT r.mu, by a reconcile that committed a changed list.
+func (r *Reconciler) notifyAllowlistAccepted() {
+	r.hooksMu.RLock()
+	fn := r.onAllowAccepted
+	r.hooksMu.RUnlock()
+	if fn == nil {
+		return
+	}
+	r.allowCbMu.Lock()
+	defer r.allowCbMu.Unlock()
+	r.mu.Lock()
+	seq, list := r.allowSeq, append([]string{}, r.base.AdminAllowlist...)
+	r.mu.Unlock()
+	if seq == r.allowTold {
+		return
+	}
+	r.allowTold = seq
+	fn(list)
+}
+
+// allowVerdict is what loadPreviousAllowlist found out about a new list Caddy refused.
+type allowVerdict int
+
+const (
+	allowUnknown  allowVerdict = iota // the previous list isn't accepted either: nothing was loaded
+	allowAccepted                     // the refusal was transient: the render with the new list is loaded
+	allowRefused                      // refused twice while the previous list loads: the previous list's render is loaded
+	allowUnpinned                     // the previous list's render is loaded; the second try didn't reach Caddy
+)
+
+// loadPreviousAllowlist handles Caddy's rejection of full, a render carrying a new dashboard allowlist.
+// The same render with the list in force is loaded: if Caddy refuses that too, the rejection isn't
+// about the list (a restarted child's admin API answers 4xx while it settles) and nothing is concluded.
+// If it loads, the new list's render is tried once more, so the list is blamed only when Caddy refuses
+// it twice around a render it accepts. It returns the config now applied (with the wildcards Caddy
+// refused in it) unless the verdict is allowUnknown; err is the second try's error for allowUnpinned.
+// The second try is ONE /load, with the wildcards the previous list's render ended up with: the
+// wildcard isolation (loadWithoutWildcards) runs at most once here, not again per list, since every
+// /load closes the proxied WebSockets. Called under r.mu.
+func (r *Reconciler) loadPreviousAllowlist(ctx context.Context, base BaseConfig, routes []Route, full []byte) (applied []byte, rejected []wildcardRejection, v allowVerdict, err error) {
+	prev := base
+	prev.AdminAllowlist = r.base.AdminAllowlist
+	prevCfg, rerr := Render(prev, routes, r.certOnly())
+	if rerr != nil {
+		return nil, nil, allowUnknown, nil
+	}
+	pa, prej, kept, perr := r.loadIsolating(ctx, prev, routes, prevCfg)
+	if perr != nil {
+		return nil, nil, allowUnknown, nil
+	}
+	// kept is a subset of base.Wildcards in the same order: fewer means the isolation left some out.
+	retry := full
+	if len(kept) != len(base.Wildcards) {
+		nb := base
+		nb.Wildcards = kept
+		if retry, rerr = Render(nb, routes, r.certOnly()); rerr != nil {
+			return pa, prej, allowUnpinned, rerr
+		}
+	}
+	ferr := r.admin.Load(ctx, retry)
+	switch {
+	case ferr == nil:
+		return retry, prej, allowAccepted, nil
+	case errors.As(ferr, new(*ConfigRejectedError)):
+		return pa, prej, allowRefused, nil
+	default:
+		return pa, prej, allowUnpinned, ferr
+	}
+}
+
+// loadIsolating loads cfg, the render of base and routes; a rejection goes through
+// loadWithoutWildcards. It returns the config now applied, the wildcards Caddy refused and the ones
+// the applied config carries, or the error to give up with. Called under r.mu.
+func (r *Reconciler) loadIsolating(ctx context.Context, base BaseConfig, routes []Route, cfg []byte) ([]byte, []wildcardRejection, []WildcardCert, error) {
+	err := r.admin.Load(ctx, cfg)
+	if err == nil {
+		return cfg, nil, base.Wildcards, nil
+	}
+	return r.loadWithoutWildcards(ctx, base, routes, cfg, err)
+}
+
 // renderBase returns the base config for this reconcile, applying the reactive access-log decision.
 func (r *Reconciler) renderBase() BaseConfig {
 	base := r.base
@@ -585,8 +789,30 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	now := r.clock()
 	lkg, status, changes := r.plan(routes, disc, poolFn != nil, now)
 	base := r.renderBase()
-	dropFn, drops := r.newBlockDrops(base)
+	pendAllow := r.pendingAdminAllowlist()
+	if pendAllow != nil {
+		base.AdminAllowlist = *pendAllow
+	}
 	cfg, err := Render(base, routes, r.certOnly())
+	// listErr is Render's refusal of the pending list, once the list is given up for it.
+	var listErr error
+	if err != nil && pendAllow != nil {
+		// Give the new list up only when it is what fails the render: with another cause (an unsafe
+		// route) it stays pending for the reconcile after that is fixed.
+		prev := base
+		prev.AdminAllowlist = r.base.AdminAllowlist
+		if prevCfg, perr := Render(prev, routes, r.certOnly()); perr == nil {
+			// Intentional: the reconcile goes on with the previous list instead of returning here. It
+			// may be a deploy's or the scaler's, carrying a route or pool change that must not wait for
+			// the next reconcile because a reload's list was refused. The refused list is in no render
+			// from here on.
+			listErr = fmt.Errorf("edge: render: %w", err)
+			r.settleAdminAllowlist(pendAllow, false, err)
+			pendAllow = nil
+			base, cfg, err = prev, prevCfg, nil
+		}
+	}
+	dropFn, drops := r.newBlockDrops(base)
 	if err != nil {
 		r.mu.Unlock()
 		reportBlockDrops(dropFn, drops)
@@ -595,23 +821,53 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// Idempotent: a render byte-identical to the last applied one (the common case for the periodic
 	// refresh when nothing moved) skips the /load — Mooring is the sole source of Caddy's config.
 	var rejected []wildcardRejection
+	// allowErr is returned AFTER the commit: the new list's render failed, and the same render with the
+	// previous list is what Caddy now serves.
+	var allowErr error
+	if listErr != nil {
+		allowErr = &AllowlistDroppedError{Err: listErr}
+	}
 	if !bytes.Equal(cfg, r.lastGood) {
-		if err := r.admin.Load(ctx, cfg); err != nil {
-			applied, rej, lerr := r.loadWithoutWildcards(ctx, base, routes, cfg, err)
-			if lerr != nil {
-				lerr = redactTokens(lerr, base.Wildcards)
-				if errors.As(lerr, new(*ConfigRejectedError)) {
-					r.refused, r.refusedCfg = lerr.Error(), cfg
-				}
-				r.mu.Unlock()
-				reportBlockDrops(dropFn, drops)
-				return lerr
+		applied, rej, _, lerr := r.loadIsolating(ctx, base, routes, cfg)
+		if lerr != nil && pendAllow != nil && errors.As(lerr, new(*ConfigRejectedError)) {
+			pa, prej, verdict, perr := r.loadPreviousAllowlist(ctx, base, routes, cfg)
+			switch verdict {
+			case allowAccepted:
+				applied, rej, lerr = pa, prej, nil
+			case allowRefused:
+				// Intentional: a list Caddy refuses while it accepts the same render with the previous
+				// list is given up, and this reconcile still returns Caddy's error although a render was
+				// committed. Kept pending, it would fail every later reconcile and no route could
+				// change. When the previous list is refused too (allowUnknown) the list stays pending.
+				why := redactTokens(lerr, base.Wildcards)
+				allowErr = &AllowlistDroppedError{Err: why}
+				r.settleAdminAllowlist(pendAllow, false, why)
+				pendAllow = nil
+				applied, rej, lerr = pa, prej, nil
+			case allowUnpinned:
+				allowErr = &AllowlistPendingError{Err: redactTokens(perr, base.Wildcards)}
+				pendAllow = nil // still pending: the next reconcile tries it again
+				applied, rej, lerr = pa, prej, nil
 			}
-			rejected, cfg = rej, applied
 		}
+		if lerr != nil {
+			lerr = redactTokens(lerr, base.Wildcards)
+			if errors.As(lerr, new(*ConfigRejectedError)) {
+				r.refused, r.refusedCfg = lerr.Error(), cfg
+			}
+			r.mu.Unlock()
+			reportBlockDrops(dropFn, drops)
+			if listErr != nil {
+				// Nothing was applied: the load's own error, with the list's (it is given up either way).
+				return errors.Join(lerr, listErr)
+			}
+			return lerr
+		}
+		rejected, cfg = rej, applied
 		r.lastGood, r.applied = cfg, cfg
 	}
 	// Accepted now, or the same render as the config Caddy serves.
+	allowChanged := r.settleAdminAllowlist(pendAllow, true, nil)
 	refusalCleared := r.refused != ""
 	r.refused, r.refusedCfg = "", nil
 	r.committedGen = gen
@@ -626,6 +882,9 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	}
 	r.mu.Unlock()
 	reportBlockDrops(dropFn, drops)
+	if allowChanged {
+		r.notifyAllowlistAccepted()
+	}
 	if refusalCleared && r.onRefusalCleared != nil {
 		r.onRefusalCleared()
 	}
@@ -638,7 +897,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	if onStatus != nil && len(changes) > 0 {
 		onStatus(changes)
 	}
-	return nil
+	return allowErr
 }
 
 // wildcardRejection is one wildcard Caddy refused, with Caddy's error (not yet redacted).
@@ -655,28 +914,28 @@ type wildcardRejection struct {
 // settles), the full render is tried once more after the bare one loads. If Caddy refuses it again, the
 // wildcards are added back one at a time on top of the ones it accepted, so one namespace's bad config
 // doesn't take another namespace's wildcard down with it; a wildcard is blamed only when Caddy refuses
-// it twice. It returns the config now applied and the wildcards Caddy refused, or the error to give up
-// with. Called under r.mu.
-func (r *Reconciler) loadWithoutWildcards(ctx context.Context, base BaseConfig, routes []Route, full []byte, loadErr error) (applied []byte, rejected []wildcardRejection, err error) {
+// it twice. It returns the config now applied, the wildcards Caddy refused and the ones the applied
+// config carries (kept), or the error to give up with. Called under r.mu.
+func (r *Reconciler) loadWithoutWildcards(ctx context.Context, base BaseConfig, routes []Route, full []byte, loadErr error) (applied []byte, rejected []wildcardRejection, kept []WildcardCert, err error) {
 	var rej *ConfigRejectedError
 	if len(base.Wildcards) == 0 || !errors.As(loadErr, &rej) {
-		return nil, nil, loadErr
+		return nil, nil, nil, loadErr
 	}
 	nb := base
 	nb.Wildcards = nil
 	bare, rerr := Render(nb, routes, r.certOnly())
 	if rerr != nil {
-		return nil, nil, loadErr
+		return nil, nil, nil, loadErr
 	}
 	if lerr := r.admin.Load(ctx, bare); lerr != nil {
-		return nil, nil, loadErr // not the wildcards' fault: the bare config doesn't load either
+		return nil, nil, nil, loadErr // not the wildcards' fault: the bare config doesn't load either
 	}
 	if lerr := r.admin.Load(ctx, full); lerr == nil {
-		return full, nil, nil // the first rejection was transient
+		return full, nil, base.Wildcards, nil // the first rejection was transient
 	} else if !errors.As(lerr, &rej) {
 		// Can't pin it (the admin API went away mid-check). The bare config stays loaded and nothing is
 		// reported; the next reconcile tries the full render again.
-		return bare, nil, nil
+		return bare, nil, nil, nil
 	}
 	applied = bare
 	var accepted []WildcardCert
@@ -699,10 +958,10 @@ func (r *Reconciler) loadWithoutWildcards(ctx context.Context, base BaseConfig, 
 		default:
 			// The admin API went away mid-check: keep what is loaded and report only the wildcards already
 			// pinned; the next reconcile tries the rest again.
-			return applied, rejected, nil
+			return applied, rejected, accepted, nil
 		}
 	}
-	return applied, rejected, nil
+	return applied, rejected, accepted, nil
 }
 
 // redactTokens removes every dns01 api_token of ws from a Caddy rejection's text. A provider module may

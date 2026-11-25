@@ -34,9 +34,31 @@ Group=mooring
 # names a group the host lacks (exit 216/GROUP), and not every distribution has adm.
 SupplementaryGroups=docker
 ExecStart=/usr/local/bin/mooring serve --config /etc/mooring/config.yaml
+# `systemctl reload mooring` checks the file first. systemd runs the ExecReload= lines in order and
+# stops at the first that fails, so a config.yaml that is refused (exit 78) makes the reload fail
+# visibly, never sends the SIGHUP, and leaves the running service on the config it has. The check
+# runs as the service user, like serve. --errors-only: a valid file prints nothing to the journal;
+# a refused one prints what is wrong (`sudo mooring config check` prints the full report).
+ExecReload=/usr/local/bin/mooring config check --errors-only --config /etc/mooring/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
+# 78 is serve's exit status for a start-up failure that restarting can't fix; one ERROR line in the
+# journal names the cause and what to do:
+#   - config.yaml is refused: it doesn't parse or validate, or its owner, group or mode is refused
+#     (`sudo mooring config check` says why);
+#   - config.yaml is there and the service user may not read it (permission denied);
+#   - encryption_key doesn't match the database;
+#   - setup.enabled is set and the host has no working sandbox.
+# The unit then stays failed instead of restarting every 2s; start it again once the cause is
+# fixed. Every other failure is still restarted (exit 1), also with one ERROR line for these two:
+#   - config.yaml is not there;
+#   - data_dir (or the apps or Caddy directory) is missing or isn't writable: see ReadWritePaths
+#     below.
+# Both can end by themselves when the path is on a volume that attaches after the service starts:
+# the retry every 2s then picks it up. Docker, the database and anything transient are retried
+# the same way.
+RestartPreventExitStatus=78
 
 # --- Memory accounting: MemoryMax kills INSIDE this cgroup, incl. the supervised
 # Caddy + nginx children AND forked docker/compose and journalctl (plan §0, §3). They are

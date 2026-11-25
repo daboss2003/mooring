@@ -21,6 +21,13 @@ Host setup (Linux; the runtime service is unprivileged, so these are admin-run):
                    nginx+stream) and print the exact fix for anything missing.
   setup            Print a fix plan for the above; --yes applies it (root, apt).
 
+Host config file (/etc/mooring/config.yaml):
+  config check     Check config.yaml as serve does at start; exit 0 valid, 78 refused
+                   (--quiet prints nothing, --errors-only prints only what is
+                   wrong, --json prints the problems as JSON).
+  config edit      Edit config.yaml in your editor and install it only when it is
+                   valid (root, on a terminal); the previous file is kept.
+
 Definition file (mooring.yaml — same validation as the dashboard):
   validate         Parse + validate a mooring.yaml through the §5.6/§6.2 chokepoints
                    (read-only, no DB — safe in CI).
@@ -70,6 +77,8 @@ func main() {
 		err = cmdDoctor(args)
 	case "setup":
 		err = cmdSetup(args)
+	case "config":
+		err = cmdConfig(args)
 	case "validate":
 		err = cmdValidate(args)
 	case "init":
@@ -100,8 +109,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "mooring: unknown command %q\n\n%s", cmd, usage)
 		os.Exit(2)
 	}
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "mooring %s: %v\n", cmd, err)
-		os.Exit(1)
+	if code := exitStatus(cmd, err, os.Stderr); code != 0 {
+		os.Exit(code)
 	}
 }

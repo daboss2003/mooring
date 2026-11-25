@@ -29,6 +29,7 @@ Any change touching one of these re-triggers the relevant security gates (see
 - ACME / cert handling
 - the edge config renderer
 - the git invocation hardening
+- `mooring config edit` (the privileged write of the root-of-trust file)
 
 ## Required checks
 

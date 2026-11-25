@@ -66,8 +66,11 @@ type Supervisor struct {
 	// falls back to CaddyBin.
 	BinFn       func() string
 	AdminListen string
-	InitialCfg  []byte // the typed base render (Layer 0) — the recovery floor
-	Log         *slog.Logger
+	// InitialCfg is the typed base render (Layer 0) every child boots on — the recovery floor. Set the
+	// field only while building the Supervisor; once Run has started, replace it with SetInitialCfg and
+	// read it with BootConfig (both take cfgMu; the launch loop reads it the same way).
+	InitialCfg []byte
+	Log        *slog.Logger
 	// AccessLine, when set, captures Caddy's STDOUT line-by-line and hands each raw line here (the
 	// per-request JSON access log, when the render opted into it — see BaseConfig.AccessLog). It
 	// feeds the in-process latency aggregator for edge-measured autoscaling. The callback MUST NOT
@@ -84,6 +87,8 @@ type Supervisor struct {
 	// config again (see Reconciler.ReloadAfterRestart); otherwise every app host answers 404 until the
 	// render next changes.
 	OnLaunch func()
+
+	cfgMu sync.Mutex // guards InitialCfg after Run has started (not mu: launch reads it holding mu)
 
 	mu         sync.Mutex
 	cur        *os.Process // the running child, nil between launches
@@ -217,7 +222,7 @@ func (s *Supervisor) launch(ctx context.Context) error {
 	// — never in between, where it would miss the child and leave the old binary running.
 	s.mu.Lock()
 	cmd := exec.CommandContext(ctx, s.bin(), "run", "--config", "-", "--adapter", "")
-	cmd.Stdin = bytes.NewReader(s.InitialCfg)
+	cmd.Stdin = bytes.NewReader(s.initialCfg())
 	cmd.Env = caddyEnv()
 	cmd.Stderr = os.Stderr // Caddy's own logs + errors always surface in journald (not /dev/null)
 	if s.Stderr != nil {
@@ -305,4 +310,22 @@ func dropTrailingNL(b []byte) []byte {
 		}
 	}
 	return b
+}
+
+// SetInitialCfg replaces the config every later (re)launched child boots on; the running child is not
+// touched. Safe from any goroutine while Run is going. The bytes are copied.
+func (s *Supervisor) SetInitialCfg(cfg []byte) {
+	cp := append([]byte(nil), cfg...)
+	s.cfgMu.Lock()
+	s.InitialCfg = cp
+	s.cfgMu.Unlock()
+}
+
+// BootConfig is the config the next (re)launched child boots on. Safe from any goroutine.
+func (s *Supervisor) BootConfig() []byte { return s.initialCfg() }
+
+func (s *Supervisor) initialCfg() []byte {
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	return s.InitialCfg
 }

@@ -525,6 +525,9 @@ type fakeCaddyAdmin struct {
 	bodies   [][]byte // every /load body, in order
 	reject   func(body []byte, n int) bool
 	errBody  func(body []byte) string
+	// drop, when set and true for a call, closes the connection without an answer (the admin API not
+	// reachable: a transport error, not a rejection).
+	drop func(body []byte, n int) bool
 }
 
 func (f *fakeCaddyAdmin) server(t *testing.T) *httptest.Server {
@@ -534,6 +537,15 @@ func (f *fakeCaddyAdmin) server(t *testing.T) *httptest.Server {
 		defer f.mu.Unlock()
 		f.calls++
 		f.bodies = append(f.bodies, body)
+		if f.drop != nil && f.drop(body, f.calls) {
+			if hj, ok := w.(http.Hijacker); ok {
+				if c, _, err := hj.Hijack(); err == nil {
+					c.Close()
+					return
+				}
+			}
+			panic(http.ErrAbortHandler)
+		}
 		if f.reject(body, f.calls) {
 			msg := `loading tls app module: decoding module config: dns.providers.route53: json: unknown field "api_token"`
 			if f.errBody != nil {

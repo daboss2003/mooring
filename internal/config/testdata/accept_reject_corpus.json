@@ -1,0 +1,1490 @@
+[
+ {
+  "yaml": "",
+  "accept": false
+ },
+ {
+  "yaml": "\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"198.51.100.7\"\n  - \"2001:db8::1\"\n  - \"203.0.113.77/24\"\n  - \"::ffff:192.0.2.9\"\n  - \" 192.0.2.200 \"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"$argon2id$v=19$m=8192,t=2,p=1$FS5kTswSWeHAHG9iWRMVOQ$Vr27dqCQ8ixg6sVplnaRoTv9lVVHKr2tTIbEZyQ4xng\"\nedge:\n  mode: \"managed\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"external\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"external\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\ntrust_proxy: true\ntrusted_proxies: [\"192.0.2.1\"]\n",
+  "accept": true
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"managed\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"not-a-real-hash\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"nope\"\n  - \"10.0.0.0/33\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - 0.0.0.0/0\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - 0.0.0.0/0\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\nsecurity_logs:\n  response:\n    mode: recommend\n",
+  "accept": true
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist: []\nauth:\n  username: \"operator\"\n  password_hash: \"$argon2id$v=19$m=8192,t=2,p=1$c2FsdHNhbHRzYWx0$aGFzaGhhc2hoYXNoaGFzaA\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist: []\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"c2hvcnQ=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"$argon2id$v=19$m=8192,t=2,p=1$S7FJU8XWC7WQge8YRBDtDQ$7FgBCjNyr03Vvk3ucALLltwvg52SLJDwF6RdUCyurFE\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\nbind_addr: \"127.0.0.1:9000\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"managed\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "\r\nbind_addr: \"127.0.0.1:9000\"\r\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\r\nip_allowlist:\r\n  - \"203.0.113.10/32\"\r\nauth:\r\n  username: \"operator\"\r\n  password_hash: \"@HASH@\"\r\nedge:\r\n  mode: \"managed\"\r\n  acme_email: \"ops@example.com\"\r\n  acme_ca: \"https://acme.example/directory\"\r\n",
+  "accept": true
+ },
+ {
+  "yaml": "# only a comment\n",
+  "accept": false
+ },
+ {
+  "yaml": "---\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@\n\nbind_addr: \"0.0.0.0:9000\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@\ncookie:\n  prefix: \"__Secure-\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@\ntotally_unknown_key: \"smuggled\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@\ntrust_proxy: true\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@\ntrust_proxy: true\ntrusted_proxies:\n  - \"10.0.0.0/8\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@\ntrust_proxy: true\ntrusted_proxies:\n  - \"203.0.113.10/32\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  acme_emial: x@example.com\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domain: \"example.com\"\n  base_domains:\n    - name: b\n      domain: \"sub.example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domain: \"example.com\"\n  catch_all: true\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domain: \"prod.example.com\"\n  base_domains:\n    - name: staging\n      domain: \"staging.example.com\"\n    - name: edge\n      domain: \"edge.example.com\"\n      dns01:\n        provider: cloudflare\n        api_token: \"tok\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  base_domain: apps.example.com\nadmin:\n  subdomain: admin\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  base_domain: apps.example.com\nadmin:\n  subdomain: apps\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: \"Bad Name\"\n      domain: \"x.example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: a\n      domain: \"Staging.Example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: a\n      domain: \"a.example.com\"\n      catch_all: true\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: a\n      domain: \"a.example.com\"\n      dns01:\n        provider: cloudflare\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: a\n      domain: \"a.example.com\"\n    - name: a\n      domain: \"b.example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: a\n      domain: \"dup.example.com\"\n    - name: b\n      domain: \"dup.example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: a\n      domain: \"example.com\"\n    - name: b\n      domain: \"sub.example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: ok\n      domain: \"not a domain\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: shop\n      domain: \"shop.example.com\"\n      dns01:\n        provider: cloudflare\n        api_token: \"tok\"\n      catch_all: true\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  base_domains:\n    - name: staging\n      domain: \"staging.example.com\"\nadmin:\n  hostname: \"staging.example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  cas:\n    - name: \"Bad Name\"\n      directory_url: \"https://x/d\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  cas:\n    - name: a\n      directory_url: \"https://x/d\"\n    - name: a\n      directory_url: \"https://y/d\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  cas:\n    - name: internal\n      directory_url: \"http://insecure/d\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  cas:\n    - name: internal\n      directory_url: \"https://ca.lan/acme/acme/directory\"\n      email: \"pki@lan\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  cas:\n    - name: internal\n      directory_url: \"https://x/d\"\n      trusted_root: \"/no/such/file.pem\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  client_ip_header: CF-Connecting-IP\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"\"]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"0.0.0.0/0\"]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"10.0.0.0/33\"]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"10.0.0.0/8,10.1.0.0/16\"]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\", \"192.0.2.7\"]\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: \"X Forwarded For\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: -Bad\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: CF-Connecting-IP\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: Cookie\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: Forwarded\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: Host\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: X_Forwarded_For\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"198.51.100.0/24\"]\n  client_ip_header: host\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"::/0\"]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"::ffff:0.0.0.0/96\"]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [\"fe80::1%eth0\"]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [Cloudflare]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [cloudflare, \"198.51.100.0/24\", \"2001:db8::/32\", \"192.0.2.7\"]\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [cloudflare, \"198.51.100.0/24\"]\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [cloudflare]\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [cloudflare]\n  client_ip_header: True-Client-IP\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [cloudflare]\n  client_ip_header: X-Forwarded-For\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@  trusted_proxies: [fastly]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@&a x: 1\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@---\nbind_addr: \"0.0.0.0:9000\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@<<: {trust_proxy: true}\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@? [complex, key]\n: 1\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@admin:\n  hostname: \"admin.example.com\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@admin:\n  hostname: admin.example.com\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@admin:\n  subdomain: admin\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: \"22\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: -1\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: -1\n  quiet_end_hour: -1\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: -1\n  quiet_end_hour: 7\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: -2\n  quiet_end_hour: 7\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 0\n  quiet_end_hour: 24\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 0\n  quiet_end_hour: 7\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: -1\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: -5\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: 0\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: 25\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 22\n  quiet_end_hour: 7\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 23\n  quiet_end_hour: 23\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: 24\n  quiet_end_hour: 7\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@alerting:\n  quiet_start_hour: twenty\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@anchors: &a 1\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@auth:\n  username: other\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@backups:\n  enabled: \"true\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@backups:\n  enabled: true\n  s3:\n    bucket: b\n    region: r\n    access_key_id: k\n    secret_access_key: s\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@backups:\n  s3:\n    bucket: b\n    region: r\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@backups:\n  s3:\n    bucket: b\n    region: r\n    endpoint: s3.example.com\n    access_key_id: a\n    secret_access_key: s\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@bind_addr: \"127.0.0.1:9000\"\u0000\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@bind_addr: \"127.0.0.1:9000\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@cookie:\n  prefix: __Secure-\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@cookie:\n  prefix: none\ncaddy_editor:\n  mode: loose\ndocker:\n  proxy_addr: 10.0.0.1:2375\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@data_dir: [a]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@docker:\n  write_plane_min_mb: 0x10\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@docker:\n  write_plane_min_mb: 1.5\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@edge: ~\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@edgee:\n  mode: managed\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@git:\n  poll_interval: \"\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@git:\n  poll_interval: \"-1s\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@git:\n  poll_interval: \"0s\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@git:\n  poll_interval: ~\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@git: ~\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@ip_allowlist:\n  - 10.0.0.0/8\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@ip_allowlist: 203.0.113.10/32\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@protected_projects: [one, two]\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@protected_projects: one\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@retention:\n  events_max_rows: \"5000\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@retention:\n  events_max_rows: 5000\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@retention:\n  interval: 10\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@retention:\n  interval: 10m\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@retention:\n  interval: ten minutes\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    retention: 1h\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"  \"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"  \"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"  \"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"  \"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"  \"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"../x/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"./x/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \".hidden/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"/mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"Prod.2026/security-logs/\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"a..b/\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"a/.../\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"a/../b/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"a/./\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"a//b/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"a/b-c_d.e/\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"moo ring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n    retention: -24h\n  hot_retention: 1d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n    retention: 14d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n    retention: 1h\n  hot_retention: 1d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n    retention: 2h\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n    retention: 3h\n  hot_retention: 200d\n  hot_max_disk_mb: 7\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n    retention: 7d\n  hot_retention: 30d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_max_disk_mb: -5\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_max_disk_mb: 100\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_max_disk_mb: 256\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_retention: -5h\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_retention: 12h\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_retention: 1d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_retention: 200d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_retention: 30d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  hot_retention: 90m\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/.git/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/security-logs/\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring?x/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring\\\\x/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"m\u00f8\u00f8ring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"x/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"x/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      bucket: \"sec-logs\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  archive:\n    s3:\n      endpoint: \"s3.eu-west-1.amazonaws.com\"\n      region: \"eu-west-1\"\n      access_key_id: \"AKIAEXAMPLE\"\n      secret_access_key: \"secret\"\n      prefix: \"mooring/\"\n  enabled: false\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    l4: true\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    never_block:\n      - 10.0.0.1\n      - 10.0.1.1\n      - 10.0.2.1\n      - 10.0.3.1\n      - 10.0.4.1\n      - 10.0.5.1\n      - 10.0.6.1\n      - 10.0.7.1\n      - 10.0.8.1\n      - 10.0.9.1\n      - 10.0.10.1\n      - 10.0.11.1\n      - 10.0.12.1\n      - 10.0.13.1\n      - 10.0.14.1\n      - 10.0.15.1\n      - 10.0.16.1\n      - 10.0.17.1\n      - 10.0.18.1\n      - 10.0.19.1\n      - 10.0.20.1\n      - 10.0.21.1\n      - 10.0.22.1\n      - 10.0.23.1\n      - 10.0.24.1\n      - 10.0.25.1\n      - 10.0.26.1\n      - 10.0.27.1\n      - 10.0.28.1\n      - 10.0.29.1\n      - 10.0.30.1\n      - 10.0.31.1\n      - 10.0.32.1\n      - 10.0.33.1\n      - 10.0.34.1\n      - 10.0.35.1\n      - 10.0.36.1\n      - 10.0.37.1\n      - 10.0.38.1\n      - 10.0.39.1\n      - 10.0.40.1\n      - 10.0.41.1\n      - 10.0.42.1\n      - 10.0.43.1\n      - 10.0.44.1\n      - 10.0.45.1\n      - 10.0.46.1\n      - 10.0.47.1\n      - 10.0.48.1\n      - 10.0.49.1\n      - 10.0.50.1\n      - 10.0.51.1\n      - 10.0.52.1\n      - 10.0.53.1\n      - 10.0.54.1\n      - 10.0.55.1\n      - 10.0.56.1\n      - 10.0.57.1\n      - 10.0.58.1\n      - 10.0.59.1\n      - 10.0.60.1\n      - 10.0.61.1\n      - 10.0.62.1\n      - 10.0.63.1\n      - 10.0.64.1\n      - 10.0.65.1\n      - 10.0.66.1\n      - 10.0.67.1\n      - 10.0.68.1\n      - 10.0.69.1\n      - 10.0.70.1\n      - 10.0.71.1\n      - 10.0.72.1\n      - 10.0.73.1\n      - 10.0.74.1\n      - 10.0.75.1\n      - 10.0.76.1\n      - 10.0.77.1\n      - 10.0.78.1\n      - 10.0.79.1\n      - 10.0.80.1\n      - 10.0.81.1\n      - 10.0.82.1\n      - 10.0.83.1\n      - 10.0.84.1\n      - 10.0.85.1\n      - 10.0.86.1\n      - 10.0.87.1\n      - 10.0.88.1\n      - 10.0.89.1\n      - 10.0.90.1\n      - 10.0.91.1\n      - 10.0.92.1\n      - 10.0.93.1\n      - 10.0.94.1\n      - 10.0.95.1\n      - 10.0.96.1\n      - 10.0.97.1\n      - 10.0.98.1\n      - 10.0.99.1\n      - 10.0.100.1\n      - 10.0.101.1\n      - 10.0.102.1\n      - 10.0.103.1\n      - 10.0.104.1\n      - 10.0.105.1\n      - 10.0.106.1\n      - 10.0.107.1\n      - 10.0.108.1\n      - 10.0.109.1\n      - 10.0.110.1\n      - 10.0.111.1\n      - 10.0.112.1\n      - 10.0.113.1\n      - 10.0.114.1\n      - 10.0.115.1\n      - 10.0.116.1\n      - 10.0.117.1\n      - 10.0.118.1\n      - 10.0.119.1\n      - 10.0.120.1\n      - 10.0.121.1\n      - 10.0.122.1\n      - 10.0.123.1\n      - 10.0.124.1\n      - 10.0.125.1\n      - 10.0.126.1\n      - 10.0.127.1\n      - 10.0.128.1\n      - 10.0.129.1\n      - 10.0.130.1\n      - 10.0.131.1\n      - 10.0.132.1\n      - 10.0.133.1\n      - 10.0.134.1\n      - 10.0.135.1\n      - 10.0.136.1\n      - 10.0.137.1\n      - 10.0.138.1\n      - 10.0.139.1\n      - 10.0.140.1\n      - 10.0.141.1\n      - 10.0.142.1\n      - 10.0.143.1\n      - 10.0.144.1\n      - 10.0.145.1\n      - 10.0.146.1\n      - 10.0.147.1\n      - 10.0.148.1\n      - 10.0.149.1\n      - 10.0.150.1\n      - 10.0.151.1\n      - 10.0.152.1\n      - 10.0.153.1\n      - 10.0.154.1\n      - 10.0.155.1\n      - 10.0.156.1\n      - 10.0.157.1\n      - 10.0.158.1\n      - 10.0.159.1\n      - 10.0.160.1\n      - 10.0.161.1\n      - 10.0.162.1\n      - 10.0.163.1\n      - 10.0.164.1\n      - 10.0.165.1\n      - 10.0.166.1\n      - 10.0.167.1\n      - 10.0.168.1\n      - 10.0.169.1\n      - 10.0.170.1\n      - 10.0.171.1\n      - 10.0.172.1\n      - 10.0.173.1\n      - 10.0.174.1\n      - 10.0.175.1\n      - 10.0.176.1\n      - 10.0.177.1\n      - 10.0.178.1\n      - 10.0.179.1\n      - 10.0.180.1\n      - 10.0.181.1\n      - 10.0.182.1\n      - 10.0.183.1\n      - 10.0.184.1\n      - 10.0.185.1\n      - 10.0.186.1\n      - 10.0.187.1\n      - 10.0.188.1\n      - 10.0.189.1\n      - 10.0.190.1\n      - 10.0.191.1\n      - 10.0.192.1\n      - 10.0.193.1\n      - 10.0.194.1\n      - 10.0.195.1\n      - 10.0.196.1\n      - 10.0.197.1\n      - 10.0.198.1\n      - 10.0.199.1\n      - 10.0.200.1\n      - 10.0.201.1\n      - 10.0.202.1\n      - 10.0.203.1\n      - 10.0.204.1\n      - 10.0.205.1\n      - 10.0.206.1\n      - 10.0.207.1\n      - 10.0.208.1\n      - 10.0.209.1\n      - 10.0.210.1\n      - 10.0.211.1\n      - 10.0.212.1\n      - 10.0.213.1\n      - 10.0.214.1\n      - 10.0.215.1\n      - 10.0.216.1\n      - 10.0.217.1\n      - 10.0.218.1\n      - 10.0.219.1\n      - 10.0.220.1\n      - 10.0.221.1\n      - 10.0.222.1\n      - 10.0.223.1\n      - 10.0.224.1\n      - 10.0.225.1\n      - 10.0.226.1\n      - 10.0.227.1\n      - 10.0.228.1\n      - 10.0.229.1\n      - 10.0.230.1\n      - 10.0.231.1\n      - 10.0.232.1\n      - 10.0.233.1\n      - 10.0.234.1\n      - 10.0.235.1\n      - 10.0.236.1\n      - 10.0.237.1\n      - 10.0.238.1\n      - 10.0.239.1\n      - 10.0.240.1\n      - 10.0.241.1\n      - 10.0.242.1\n      - 10.0.243.1\n      - 10.0.244.1\n      - 10.0.245.1\n      - 10.0.246.1\n      - 10.0.247.1\n      - 10.0.248.1\n      - 10.0.249.1\n      - 10.0.250.1\n      - 10.0.251.1\n      - 10.0.252.1\n      - 10.0.253.1\n      - 10.0.254.1\n      - 10.0.255.1\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    never_block:\n      - 10.0.0.1\n      - 10.0.1.1\n      - 10.0.2.1\n      - 10.0.3.1\n      - 10.0.4.1\n      - 10.0.5.1\n      - 10.0.6.1\n      - 10.0.7.1\n      - 10.0.8.1\n      - 10.0.9.1\n      - 10.0.10.1\n      - 10.0.11.1\n      - 10.0.12.1\n      - 10.0.13.1\n      - 10.0.14.1\n      - 10.0.15.1\n      - 10.0.16.1\n      - 10.0.17.1\n      - 10.0.18.1\n      - 10.0.19.1\n      - 10.0.20.1\n      - 10.0.21.1\n      - 10.0.22.1\n      - 10.0.23.1\n      - 10.0.24.1\n      - 10.0.25.1\n      - 10.0.26.1\n      - 10.0.27.1\n      - 10.0.28.1\n      - 10.0.29.1\n      - 10.0.30.1\n      - 10.0.31.1\n      - 10.0.32.1\n      - 10.0.33.1\n      - 10.0.34.1\n      - 10.0.35.1\n      - 10.0.36.1\n      - 10.0.37.1\n      - 10.0.38.1\n      - 10.0.39.1\n      - 10.0.40.1\n      - 10.0.41.1\n      - 10.0.42.1\n      - 10.0.43.1\n      - 10.0.44.1\n      - 10.0.45.1\n      - 10.0.46.1\n      - 10.0.47.1\n      - 10.0.48.1\n      - 10.0.49.1\n      - 10.0.50.1\n      - 10.0.51.1\n      - 10.0.52.1\n      - 10.0.53.1\n      - 10.0.54.1\n      - 10.0.55.1\n      - 10.0.56.1\n      - 10.0.57.1\n      - 10.0.58.1\n      - 10.0.59.1\n      - 10.0.60.1\n      - 10.0.61.1\n      - 10.0.62.1\n      - 10.0.63.1\n      - 10.0.64.1\n      - 10.0.65.1\n      - 10.0.66.1\n      - 10.0.67.1\n      - 10.0.68.1\n      - 10.0.69.1\n      - 10.0.70.1\n      - 10.0.71.1\n      - 10.0.72.1\n      - 10.0.73.1\n      - 10.0.74.1\n      - 10.0.75.1\n      - 10.0.76.1\n      - 10.0.77.1\n      - 10.0.78.1\n      - 10.0.79.1\n      - 10.0.80.1\n      - 10.0.81.1\n      - 10.0.82.1\n      - 10.0.83.1\n      - 10.0.84.1\n      - 10.0.85.1\n      - 10.0.86.1\n      - 10.0.87.1\n      - 10.0.88.1\n      - 10.0.89.1\n      - 10.0.90.1\n      - 10.0.91.1\n      - 10.0.92.1\n      - 10.0.93.1\n      - 10.0.94.1\n      - 10.0.95.1\n      - 10.0.96.1\n      - 10.0.97.1\n      - 10.0.98.1\n      - 10.0.99.1\n      - 10.0.100.1\n      - 10.0.101.1\n      - 10.0.102.1\n      - 10.0.103.1\n      - 10.0.104.1\n      - 10.0.105.1\n      - 10.0.106.1\n      - 10.0.107.1\n      - 10.0.108.1\n      - 10.0.109.1\n      - 10.0.110.1\n      - 10.0.111.1\n      - 10.0.112.1\n      - 10.0.113.1\n      - 10.0.114.1\n      - 10.0.115.1\n      - 10.0.116.1\n      - 10.0.117.1\n      - 10.0.118.1\n      - 10.0.119.1\n      - 10.0.120.1\n      - 10.0.121.1\n      - 10.0.122.1\n      - 10.0.123.1\n      - 10.0.124.1\n      - 10.0.125.1\n      - 10.0.126.1\n      - 10.0.127.1\n      - 10.0.128.1\n      - 10.0.129.1\n      - 10.0.130.1\n      - 10.0.131.1\n      - 10.0.132.1\n      - 10.0.133.1\n      - 10.0.134.1\n      - 10.0.135.1\n      - 10.0.136.1\n      - 10.0.137.1\n      - 10.0.138.1\n      - 10.0.139.1\n      - 10.0.140.1\n      - 10.0.141.1\n      - 10.0.142.1\n      - 10.0.143.1\n      - 10.0.144.1\n      - 10.0.145.1\n      - 10.0.146.1\n      - 10.0.147.1\n      - 10.0.148.1\n      - 10.0.149.1\n      - 10.0.150.1\n      - 10.0.151.1\n      - 10.0.152.1\n      - 10.0.153.1\n      - 10.0.154.1\n      - 10.0.155.1\n      - 10.0.156.1\n      - 10.0.157.1\n      - 10.0.158.1\n      - 10.0.159.1\n      - 10.0.160.1\n      - 10.0.161.1\n      - 10.0.162.1\n      - 10.0.163.1\n      - 10.0.164.1\n      - 10.0.165.1\n      - 10.0.166.1\n      - 10.0.167.1\n      - 10.0.168.1\n      - 10.0.169.1\n      - 10.0.170.1\n      - 10.0.171.1\n      - 10.0.172.1\n      - 10.0.173.1\n      - 10.0.174.1\n      - 10.0.175.1\n      - 10.0.176.1\n      - 10.0.177.1\n      - 10.0.178.1\n      - 10.0.179.1\n      - 10.0.180.1\n      - 10.0.181.1\n      - 10.0.182.1\n      - 10.0.183.1\n      - 10.0.184.1\n      - 10.0.185.1\n      - 10.0.186.1\n      - 10.0.187.1\n      - 10.0.188.1\n      - 10.0.189.1\n      - 10.0.190.1\n      - 10.0.191.1\n      - 10.0.192.1\n      - 10.0.193.1\n      - 10.0.194.1\n      - 10.0.195.1\n      - 10.0.196.1\n      - 10.0.197.1\n      - 10.0.198.1\n      - 10.0.199.1\n      - 10.0.200.1\n      - 10.0.201.1\n      - 10.0.202.1\n      - 10.0.203.1\n      - 10.0.204.1\n      - 10.0.205.1\n      - 10.0.206.1\n      - 10.0.207.1\n      - 10.0.208.1\n      - 10.0.209.1\n      - 10.0.210.1\n      - 10.0.211.1\n      - 10.0.212.1\n      - 10.0.213.1\n      - 10.0.214.1\n      - 10.0.215.1\n      - 10.0.216.1\n      - 10.0.217.1\n      - 10.0.218.1\n      - 10.0.219.1\n      - 10.0.220.1\n      - 10.0.221.1\n      - 10.0.222.1\n      - 10.0.223.1\n      - 10.0.224.1\n      - 10.0.225.1\n      - 10.0.226.1\n      - 10.0.227.1\n      - 10.0.228.1\n      - 10.0.229.1\n      - 10.0.230.1\n      - 10.0.231.1\n      - 10.0.232.1\n      - 10.0.233.1\n      - 10.0.234.1\n      - 10.0.235.1\n      - 10.0.236.1\n      - 10.0.237.1\n      - 10.0.238.1\n      - 10.0.239.1\n      - 10.0.240.1\n      - 10.0.241.1\n      - 10.0.242.1\n      - 10.0.243.1\n      - 10.0.244.1\n      - 10.0.245.1\n      - 10.0.246.1\n      - 10.0.247.1\n      - 10.0.248.1\n      - 10.0.249.1\n      - 10.0.250.1\n      - 10.0.251.1\n      - 10.0.252.1\n      - 10.0.253.1\n      - 10.0.254.1\n      - 10.0.255.1\n      - 10.1.0.1\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    never_block:\n      - 203.0.113.7\n      - \"\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    never_block:\n      - 203.0.113.7\n      - \"10.0.0.0/33\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    never_block:\n      - 203.0.113.7\n      - \"203.0.113.300\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    never_block:\n      - 203.0.113.7\n      - \"example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  blocking:\n    never_block:\n      - 203.0.113.7\n      - 198.51.100.0/24\n      - 198.51.100.77/24\n      - ::ffff:192.0.2.1\n      - 2001:db8::/32\n      - 2001:db8::1\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    enabled: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    enabled: false\n  response:\n    mode: enforce\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      enabled: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - app0\n      - app1\n      - app2\n      - app3\n      - app4\n      - app5\n      - app6\n      - app7\n      - app8\n      - app9\n      - app10\n      - app11\n      - app12\n      - app13\n      - app14\n      - app15\n      - app16\n      - app17\n      - app18\n      - app19\n      - app20\n      - app21\n      - app22\n      - app23\n      - app24\n      - app25\n      - app26\n      - app27\n      - app28\n      - app29\n      - app30\n      - app31\n      - app32\n      - app33\n      - app34\n      - app35\n      - app36\n      - app37\n      - app38\n      - app39\n      - app40\n      - app41\n      - app42\n      - app43\n      - app44\n      - app45\n      - app46\n      - app47\n      - app48\n      - app49\n      - app50\n      - app51\n      - app52\n      - app53\n      - app54\n      - app55\n      - app56\n      - app57\n      - app58\n      - app59\n      - app60\n      - app61\n      - app62\n      - app63\n      - app64\n      - app65\n      - app66\n      - app67\n      - app68\n      - app69\n      - app70\n      - app71\n      - app72\n      - app73\n      - app74\n      - app75\n      - app76\n      - app77\n      - app78\n      - app79\n      - app80\n      - app81\n      - app82\n      - app83\n      - app84\n      - app85\n      - app86\n      - app87\n      - app88\n      - app89\n      - app90\n      - app91\n      - app92\n      - app93\n      - app94\n      - app95\n      - app96\n      - app97\n      - app98\n      - app99\n      - app100\n      - app101\n      - app102\n      - app103\n      - app104\n      - app105\n      - app106\n      - app107\n      - app108\n      - app109\n      - app110\n      - app111\n      - app112\n      - app113\n      - app114\n      - app115\n      - app116\n      - app117\n      - app118\n      - app119\n      - app120\n      - app121\n      - app122\n      - app123\n      - app124\n      - app125\n      - app126\n      - app127\n      - app128\n      - app129\n      - app130\n      - app131\n      - app132\n      - app133\n      - app134\n      - app135\n      - app136\n      - app137\n      - app138\n      - app139\n      - app140\n      - app141\n      - app142\n      - app143\n      - app144\n      - app145\n      - app146\n      - app147\n      - app148\n      - app149\n      - app150\n      - app151\n      - app152\n      - app153\n      - app154\n      - app155\n      - app156\n      - app157\n      - app158\n      - app159\n      - app160\n      - app161\n      - app162\n      - app163\n      - app164\n      - app165\n      - app166\n      - app167\n      - app168\n      - app169\n      - app170\n      - app171\n      - app172\n      - app173\n      - app174\n      - app175\n      - app176\n      - app177\n      - app178\n      - app179\n      - app180\n      - app181\n      - app182\n      - app183\n      - app184\n      - app185\n      - app186\n      - app187\n      - app188\n      - app189\n      - app190\n      - app191\n      - app192\n      - app193\n      - app194\n      - app195\n      - app196\n      - app197\n      - app198\n      - app199\n      - app200\n      - app201\n      - app202\n      - app203\n      - app204\n      - app205\n      - app206\n      - app207\n      - app208\n      - app209\n      - app210\n      - app211\n      - app212\n      - app213\n      - app214\n      - app215\n      - app216\n      - app217\n      - app218\n      - app219\n      - app220\n      - app221\n      - app222\n      - app223\n      - app224\n      - app225\n      - app226\n      - app227\n      - app228\n      - app229\n      - app230\n      - app231\n      - app232\n      - app233\n      - app234\n      - app235\n      - app236\n      - app237\n      - app238\n      - app239\n      - app240\n      - app241\n      - app242\n      - app243\n      - app244\n      - app245\n      - app246\n      - app247\n      - app248\n      - app249\n      - app250\n      - app251\n      - app252\n      - app253\n      - app254\n      - app255\n      - app256\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - shop\n      - \"\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - shop\n      - \"-shop\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - shop\n      - \"Shop\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - shop\n      - \"sh op\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - shop\n      - \"shop/web\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - shop\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      exclude_apps:\n      - shop\n      - blog-pr12\n      - a_b\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      max_cpu_percent: -3\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      max_cpu_percent: 10\n  response:\n    max_blocks_per_hour: 100\n    max_block_duration: 48h\n  blocking:\n    max_entries: 500\n    manual_max_duration: 7d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    patterns:\n      max_cpu_percent: 50\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  detection:\n    rules: []\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: \"no\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  blocking:\n    manual_max_duration: 90d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  blocking:\n    max_entries: 20000\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  feeds:\n    dshield_contact: \"soc\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  feeds:\n    geoip: true\n    spamhaus: true\n    tor: true\n    dshield_contact: \"soc@example.com\"\n  detection:\n    enabled: true\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  hot_retention: 1h\n  hot_max_disk_mb: 1\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  response:\n    mode: enforce\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  response:\n    mode: on\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: false\n  response:\n    mode: recommend\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  enabled: true\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \" soc@example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"@example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"a.b+c_d-e@sub.example.co.uk\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"so c@example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@@example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@exa mple.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example.c\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example.com \"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example.com\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example.com\\r\\nX-Injected: 1\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example.com\\u007f\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc@example.com\\u0085\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc\\t@example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"soc\\u001b@example.com\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    dshield_contact: \"x@y.io\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    firehol: true\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    geoip: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    geoip: true\n    spamhaus: true\n    tor: true\n  detection:\n    enabled: true\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    spamhaus: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds:\n    tor: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  feeds: {}\n  detection: {}\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"./auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/srv/logs/fail2ban.log\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var//log/auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/../log/auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/./auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/auth.log\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/auth.log/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/auth.log\\nx\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/auth\\u0000.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/auth\\u001b[2J.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/auth\\u007f.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"/var/log/secure\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    auth_log: \"var/log/auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"./auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/srv/logs/fail2ban.log\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var//log/auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/../log/auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/./auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/auth.log\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/auth.log/\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/auth.log\\nx\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/auth\\u0000.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/auth\\u001b[2J.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/auth\\u007f.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"/var/log/secure\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  host_logs:\n    fail2ban_log: \"var/log/auth.log\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  hot_retention: 1h\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  hot_retention: 30d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - fa\n      - fxb\n      - fxxc\n      - fxxxd\n      - fxxxxe\n      - fxxxxxf\n      - fxxxxxxg\n      - fxxxxxxxh\n      - fxxxxxxxxi\n      - fxxxxxxxxxj\n      - fk\n      - fxl\n      - fxxm\n      - fxxxn\n      - fxxxxo\n      - fxxxxxp\n      - fxxxxxxq\n      - fxxxxxxxr\n      - fxxxxxxxxs\n      - fxxxxxxxxxt\n      - fu\n      - fxv\n      - fxxw\n      - fxxxx\n      - fxxxxy\n      - fxxxxxz\n      - fxxxxxxa\n      - fxxxxxxxb\n      - fxxxxxxxxc\n      - fxxxxxxxxxd\n      - fe\n      - fxf\n      - fxxg\n      - fxxxh\n      - fxxxxi\n      - fxxxxxj\n      - fxxxxxxk\n      - fxxxxxxxl\n      - fxxxxxxxxm\n      - fxxxxxxxxxn\n      - fo\n      - fxp\n      - fxxq\n      - fxxxr\n      - fxxxxs\n      - fxxxxxt\n      - fxxxxxxu\n      - fxxxxxxxv\n      - fxxxxxxxxw\n      - fxxxxxxxxxx\n      - fy\n      - fxz\n      - fxxa\n      - fxxxb\n      - fxxxxc\n      - fxxxxxd\n      - fxxxxxxe\n      - fxxxxxxxf\n      - fxxxxxxxxg\n      - fxxxxxxxxxh\n      - fi\n      - fxj\n      - fxxk\n      - fxxxl\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - fa\n      - fxb\n      - fxxc\n      - fxxxd\n      - fxxxxe\n      - fxxxxxf\n      - fxxxxxxg\n      - fxxxxxxxh\n      - fxxxxxxxxi\n      - fxxxxxxxxxj\n      - fk\n      - fxl\n      - fxxm\n      - fxxxn\n      - fxxxxo\n      - fxxxxxp\n      - fxxxxxxq\n      - fxxxxxxxr\n      - fxxxxxxxxs\n      - fxxxxxxxxxt\n      - fu\n      - fxv\n      - fxxw\n      - fxxxx\n      - fxxxxy\n      - fxxxxxz\n      - fxxxxxxa\n      - fxxxxxxxb\n      - fxxxxxxxxc\n      - fxxxxxxxxxd\n      - fe\n      - fxf\n      - fxxg\n      - fxxxh\n      - fxxxxi\n      - fxxxxxj\n      - fxxxxxxk\n      - fxxxxxxxl\n      - fxxxxxxxxm\n      - fxxxxxxxxxn\n      - fo\n      - fxp\n      - fxxq\n      - fxxxr\n      - fxxxxs\n      - fxxxxxt\n      - fxxxxxxu\n      - fxxxxxxxv\n      - fxxxxxxxxw\n      - fxxxxxxxxxx\n      - fy\n      - fxz\n      - fxxa\n      - fxxxb\n      - fxxxxc\n      - fxxxxxd\n      - fxxxxxxe\n      - fxxxxxxxf\n      - fxxxxxxxxg\n      - fxxxxxxxxxh\n      - fi\n      - fxj\n      - fxxk\n      - fxxxl\n      - fxxxxm\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - \"\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - \"a b\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - \"a*\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - \"a/b\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - \"a\\tb\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - \"\u00e9mail\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    drop_fields:\n      - imei\n      - device_id\n      - user.email\n      - X-Device-Id\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - fa\n      - fxb\n      - fxxc\n      - fxxxd\n      - fxxxxe\n      - fxxxxxf\n      - fxxxxxxg\n      - fxxxxxxxh\n      - fxxxxxxxxi\n      - fxxxxxxxxxj\n      - fk\n      - fxl\n      - fxxm\n      - fxxxn\n      - fxxxxo\n      - fxxxxxp\n      - fxxxxxxq\n      - fxxxxxxxr\n      - fxxxxxxxxs\n      - fxxxxxxxxxt\n      - fu\n      - fxv\n      - fxxw\n      - fxxxx\n      - fxxxxy\n      - fxxxxxz\n      - fxxxxxxa\n      - fxxxxxxxb\n      - fxxxxxxxxc\n      - fxxxxxxxxxd\n      - fe\n      - fxf\n      - fxxg\n      - fxxxh\n      - fxxxxi\n      - fxxxxxj\n      - fxxxxxxk\n      - fxxxxxxxl\n      - fxxxxxxxxm\n      - fxxxxxxxxxn\n      - fo\n      - fxp\n      - fxxq\n      - fxxxr\n      - fxxxxs\n      - fxxxxxt\n      - fxxxxxxu\n      - fxxxxxxxv\n      - fxxxxxxxxw\n      - fxxxxxxxxxx\n      - fy\n      - fxz\n      - fxxa\n      - fxxxb\n      - fxxxxc\n      - fxxxxxd\n      - fxxxxxxe\n      - fxxxxxxxf\n      - fxxxxxxxxg\n      - fxxxxxxxxxh\n      - fi\n      - fxj\n      - fxxk\n      - fxxxl\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - fa\n      - fxb\n      - fxxc\n      - fxxxd\n      - fxxxxe\n      - fxxxxxf\n      - fxxxxxxg\n      - fxxxxxxxh\n      - fxxxxxxxxi\n      - fxxxxxxxxxj\n      - fk\n      - fxl\n      - fxxm\n      - fxxxn\n      - fxxxxo\n      - fxxxxxp\n      - fxxxxxxq\n      - fxxxxxxxr\n      - fxxxxxxxxs\n      - fxxxxxxxxxt\n      - fu\n      - fxv\n      - fxxw\n      - fxxxx\n      - fxxxxy\n      - fxxxxxz\n      - fxxxxxxa\n      - fxxxxxxxb\n      - fxxxxxxxxc\n      - fxxxxxxxxxd\n      - fe\n      - fxf\n      - fxxg\n      - fxxxh\n      - fxxxxi\n      - fxxxxxj\n      - fxxxxxxk\n      - fxxxxxxxl\n      - fxxxxxxxxm\n      - fxxxxxxxxxn\n      - fo\n      - fxp\n      - fxxq\n      - fxxxr\n      - fxxxxs\n      - fxxxxxt\n      - fxxxxxxu\n      - fxxxxxxxv\n      - fxxxxxxxxw\n      - fxxxxxxxxxx\n      - fy\n      - fxz\n      - fxxa\n      - fxxxb\n      - fxxxxc\n      - fxxxxxd\n      - fxxxxxxe\n      - fxxxxxxxf\n      - fxxxxxxxxg\n      - fxxxxxxxxxh\n      - fi\n      - fxj\n      - fxxk\n      - fxxxl\n      - fxxxxm\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - \"\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - \"a b\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - \"a*\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - \"a/b\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - \"a\\tb\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - \"\u00e9mail\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    hash_fields:\n      - imei\n      - device_id\n      - user.email\n      - X-Device-Id\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - fa\n      - fxb\n      - fxxc\n      - fxxxd\n      - fxxxxe\n      - fxxxxxf\n      - fxxxxxxg\n      - fxxxxxxxh\n      - fxxxxxxxxi\n      - fxxxxxxxxxj\n      - fk\n      - fxl\n      - fxxm\n      - fxxxn\n      - fxxxxo\n      - fxxxxxp\n      - fxxxxxxq\n      - fxxxxxxxr\n      - fxxxxxxxxs\n      - fxxxxxxxxxt\n      - fu\n      - fxv\n      - fxxw\n      - fxxxx\n      - fxxxxy\n      - fxxxxxz\n      - fxxxxxxa\n      - fxxxxxxxb\n      - fxxxxxxxxc\n      - fxxxxxxxxxd\n      - fe\n      - fxf\n      - fxxg\n      - fxxxh\n      - fxxxxi\n      - fxxxxxj\n      - fxxxxxxk\n      - fxxxxxxxl\n      - fxxxxxxxxm\n      - fxxxxxxxxxn\n      - fo\n      - fxp\n      - fxxq\n      - fxxxr\n      - fxxxxs\n      - fxxxxxt\n      - fxxxxxxu\n      - fxxxxxxxv\n      - fxxxxxxxxw\n      - fxxxxxxxxxx\n      - fy\n      - fxz\n      - fxxa\n      - fxxxb\n      - fxxxxc\n      - fxxxxxd\n      - fxxxxxxe\n      - fxxxxxxxf\n      - fxxxxxxxxg\n      - fxxxxxxxxxh\n      - fi\n      - fxj\n      - fxxk\n      - fxxxl\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - fa\n      - fxb\n      - fxxc\n      - fxxxd\n      - fxxxxe\n      - fxxxxxf\n      - fxxxxxxg\n      - fxxxxxxxh\n      - fxxxxxxxxi\n      - fxxxxxxxxxj\n      - fk\n      - fxl\n      - fxxm\n      - fxxxn\n      - fxxxxo\n      - fxxxxxp\n      - fxxxxxxq\n      - fxxxxxxxr\n      - fxxxxxxxxs\n      - fxxxxxxxxxt\n      - fu\n      - fxv\n      - fxxw\n      - fxxxx\n      - fxxxxy\n      - fxxxxxz\n      - fxxxxxxa\n      - fxxxxxxxb\n      - fxxxxxxxxc\n      - fxxxxxxxxxd\n      - fe\n      - fxf\n      - fxxg\n      - fxxxh\n      - fxxxxi\n      - fxxxxxj\n      - fxxxxxxk\n      - fxxxxxxxl\n      - fxxxxxxxxm\n      - fxxxxxxxxxn\n      - fo\n      - fxp\n      - fxxq\n      - fxxxr\n      - fxxxxs\n      - fxxxxxt\n      - fxxxxxxu\n      - fxxxxxxxv\n      - fxxxxxxxxw\n      - fxxxxxxxxxx\n      - fy\n      - fxz\n      - fxxa\n      - fxxxb\n      - fxxxxc\n      - fxxxxxd\n      - fxxxxxxe\n      - fxxxxxxxf\n      - fxxxxxxxxg\n      - fxxxxxxxxxh\n      - fi\n      - fxj\n      - fxxk\n      - fxxxl\n      - fxxxxm\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - \"\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - \"a b\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - \"a*\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - \"a/b\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - \"a\\tb\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - \"\u00e9mail\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  pii:\n    keep_fields:\n      - imei\n      - device_id\n      - user.email\n      - X-Device-Id\n      - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    max_block_duration: 30d\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    max_block_duration: 30m\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    max_blocks_per_hour: 5000\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    max_revokes_per_hour: 500\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: \"\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: \"enforce \"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: Enforce\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: block\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: block\n  blocking:\n    never_block: [nope, 10.0.0.0/8]\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: enforce\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: off\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: on\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: recommend\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@security_logs:\n  response:\n    mode: true\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  build_concurrency: fast\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  build_concurrency: parallel\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  build_concurrency: serial\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  deb_cache_dir: \"/root/dl\"\n  file_roots:\n    - name: logs\n      path: \"/var/log/app\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  deb_cache_dir: \"relative\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  disk_gc_enabled: \"false\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  disk_gc_enabled: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  file_roots:\n    - name: \"Bad Name\"\n      path: \"/x\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  file_roots:\n    - name: BAD\n      path: rel\n    - name: ok\n      path: /var/log\n    - name: ok\n      path: /srv\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  file_roots:\n    - name: a\n      path: \"/x\"\n    - name: a\n      path: \"/y\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  file_roots:\n    - name: logs\n      path: \"relative/dir\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  host_scan_enabled: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  host_scan_enabled: true\n  image_scan_enabled: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_disk_mb: 102401\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_disk_mb: 63\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_lines: -1\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_lines: 10000001\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_lines: 99\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_retain: -2h\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_retain: 1d12h\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_retain: 1h\n  service_log_max_lines: 100\n  service_log_max_disk_mb: 64\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_retain: 30m\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_retain: 365d\n  service_log_max_lines: 10000000\n  service_log_max_disk_mb: 102400\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_retain: 366d\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  service_log_max_retain: 90d\n  service_log_max_lines: 500000\n  service_log_max_disk_mb: 4096\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    cpu_busy_pct: 5\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    cpu_busy_pct: 5\n    max_wait: 5s\n  build_concurrency: fast\n  deb_cache_dir: rel\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    cpu_settle_pct: 5000\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    deploy_wait: 0s\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    deploy_wait: 30s\n    service_settle: 5m\n    rollout_budget: 20m\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    deploy_wait: 45m\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    enabled: false\n    cpu_busy_pct: 70\n    settle_grace: 45s\n    max_settle: 5m\n    max_wait: 20m\n    cpu_settle_pct: 150\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    max_settle: 2s\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    max_wait: 5h\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    rollout_budget: 5h\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    service_settle: 5s\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  start_gate:\n    settle_grace: 5m\n    max_settle: 1m\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@server:\n  version_check_enabled: false\n  image_scan_enabled: false\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@server:\n  version_check_enabled: true\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@session:\n\tidle_timeout: 5m\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@session:\n  - idle_timeout: 5m\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@session:\n  idle_timeout: 5m\n   absolute_timeout: 1h\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@session:\n  idle_timeout:5m\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@session: 5m\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: !!bool \"true\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: !!str true\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: \"true\"\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: 'false'\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: 1\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: True\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: on\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@trust_proxy: yes\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@users:\n  - username: bob\n",
+  "accept": false
+ },
+ {
+  "yaml": "@BASE@users: []\n",
+  "accept": true
+ },
+ {
+  "yaml": "@BASE@users: {}\n",
+  "accept": false
+ },
+ {
+  "yaml": "[]\n",
+  "accept": false
+ },
+ {
+  "yaml": "just a string\n",
+  "accept": false
+ },
+ {
+  "yaml": "null\n",
+  "accept": false
+ },
+ {
+  "yaml": "trust_proxy: true\ntrusted_proxies: [\"10.9.9.9/32\"]\n\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"external\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n",
+  "accept": true
+ },
+ {
+  "yaml": "trust_proxy: true\ntrusted_proxies: [\"10.9.9.9/32\"]\n\nbind_addr: \"127.0.0.1:9000\"\nencryption_key: \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\nip_allowlist:\n  - \"203.0.113.10/32\"\nauth:\n  username: \"operator\"\n  password_hash: \"@HASH@\"\nedge:\n  mode: \"external\"\n  acme_email: \"ops@example.com\"\n  acme_ca: \"https://acme.example/directory\"\n  trusted_proxies: [cloudflare]\n",
+  "accept": false
+ },
+ {
+  "yaml": "{}\n",
+  "accept": false
+ },
+ {
+  "yaml": "\ufeff@BASE@",
+  "accept": true
+ }
+]

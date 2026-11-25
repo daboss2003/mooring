@@ -474,12 +474,24 @@ func (s *Server) security() *secState { return s.sec.Load() }
 func (s *Server) Reload(ctx context.Context) error {
 	cfg, err := config.Load(s.configPath)
 	if err != nil {
-		_ = s.audit.Log(ctx, audit.Event{
-			Action: "config_reload", Outcome: audit.Error, Level: audit.Security,
-			Detail: "rejected invalid config; keeping previous",
-		})
+		s.ReloadRejected(ctx)
 		return err
 	}
+	return s.ReloadWith(ctx, cfg)
+}
+
+// ReloadRejected records a reload whose config file did not load; nothing is changed.
+func (s *Server) ReloadRejected(ctx context.Context) {
+	_ = s.audit.Log(ctx, audit.Event{
+		Action: "config_reload", Outcome: audit.Error, Level: audit.Security,
+		Detail: "rejected invalid config; keeping previous",
+	})
+}
+
+// ReloadWith hot-swaps the allowlist + auth from cfg, a config the caller loaded; the file is not
+// read here, so the caller can give the same config to everything else a reload sets. On an error
+// the current state is kept.
+func (s *Server) ReloadWith(ctx context.Context, cfg *config.Config) error {
 	sec, err := buildSecState(cfg)
 	if err != nil {
 		return err

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/daboss2003/mooring/internal/crypto"
 	"github.com/daboss2003/mooring/internal/edge"
+	"github.com/daboss2003/mooring/internal/yamldiag"
 )
 
 // validBase builds a minimal YAML config with a real key + password hash, then
@@ -51,9 +53,25 @@ func mustReject(t *testing.T, yaml, wantSubstr string) {
 	if err == nil {
 		t.Fatalf("expected rejection containing %q, but config was accepted", wantSubstr)
 	}
-	if !strings.Contains(err.Error(), wantSubstr) {
-		t.Fatalf("error %q does not mention %q", err.Error(), wantSubstr)
+	if got := refusalText(err); !strings.Contains(got, wantSubstr) {
+		t.Fatalf("error %q does not mention %q", got, wantSubstr)
 	}
+}
+
+// refusalText is everything a refusal says: its one-line form, every problem's message, and the
+// errors it wraps (the pre-diagnostics "config: parse: …" / "config: refusing to boot: …" text).
+func refusalText(err error) string {
+	var parts []string
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		parts = append(parts, e.Error())
+	}
+	var d *yamldiag.Diagnostics
+	if errors.As(err, &d) {
+		for _, p := range d.Problems {
+			parts = append(parts, p.Msg)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func TestEdgeCAsValidatedAndParsed(t *testing.T) {
@@ -615,7 +633,7 @@ func TestServiceLogLimits(t *testing.T) {
 	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: 30m\n"), "service_log_max_retain")
 	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: 366d\n"), "service_log_max_retain")
 	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: -2h\n"), "service_log_max_retain")
-	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: 1d12h\n"), "invalid duration")
+	mustReject(t, validYAML(t, "server:\n  service_log_max_retain: 1d12h\n"), "not a valid duration")
 	mustReject(t, validYAML(t, "server:\n  service_log_max_lines: 99\n"), "service_log_max_lines")
 	mustReject(t, validYAML(t, "server:\n  service_log_max_lines: 10000001\n"), "service_log_max_lines")
 	mustReject(t, validYAML(t, "server:\n  service_log_max_lines: -1\n"), "service_log_max_lines")

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,8 +13,19 @@ import (
 	"github.com/daboss2003/mooring/internal/alert"
 )
 
-// hostScanFailed is what the Server tab shows when a host scan run fails; the cause is logged.
+// hostScanFailed is what the Server tab shows when a host scan run fails for a reason that is only
+// safe in the log (the scanner's stderr).
 const hostScanFailed = "the last host scan failed; the Mooring log (journalctl -u mooring) has the cause"
+
+// hostFailure is the Server tab's text for a failed host scan: the reason itself when the scanner ran
+// but its report could not be used, else hostScanFailed.
+func hostFailure(err error) string {
+	var oe *outputError
+	if errors.As(err, &oe) {
+		return "the last host scan failed: " + oe.reason
+	}
+	return hostScanFailed
+}
 
 // scanHost runs one host scan, stores it, raises the host alerts, hands a fixable Mooring-owned
 // Caddy build to the refresh hook, and checks whether the host needs a reboot.
@@ -27,12 +39,14 @@ func (r *Runner) scanHost(ctx context.Context) {
 			return // shutting down: not a scan failure
 		}
 		r.log.Warn("imagescan: host scan failed", "err", err)
-		// Keep the previous findings visible next to the error rather than blanking them.
+		// Keep the last completed scan's findings (and its time) next to the error rather than
+		// blanking them. A row without reports is an earlier failure, not a result: it is replaced,
+		// so its time is this attempt's.
 		prev, ok, gerr := r.hostStore.Get(ctx)
-		if gerr != nil || !ok {
+		if gerr != nil || !ok || len(prev.Reports) == 0 {
 			prev = HostScan{ScannedAt: time.Now().Unix()}
 		}
-		prev.Error = hostScanFailed
+		prev.Error = hostFailure(err)
 		h = prev
 	} else {
 		h.ScannedAt = time.Now().Unix()

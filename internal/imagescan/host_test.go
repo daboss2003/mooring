@@ -106,6 +106,10 @@ func TestScanHostArgvShape(t *testing.T) {
 	if _, err := sc.ScanHost(context.Background(), plan); err != nil {
 		t.Fatal(err)
 	}
+	if len(args) < 4 || args[2] != "--name" || !wantScanName.MatchString(args[3]) {
+		t.Fatalf("argv must start with run --rm --name <generated name>: %q", args)
+	}
+	args = append(args[:2:2], args[4:]...) // the rest is fixed
 	wantHead := []string{"run", "--rm", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
 		"--network", "bridge", "-v", cacheVolume + ":/root/.cache/trivy"}
 	if len(args) < len(wantHead) || strings.Join(args[:len(wantHead)], " ") != strings.Join(wantHead, " ") {
@@ -188,6 +192,10 @@ func TestScanImageAndFSArgv(t *testing.T) {
 		t.Fatalf("want 2 docker runs, got %q", got)
 	}
 	for i := range want {
+		if len(got[i]) < 4 || got[i][2] != "--name" || !wantScanName.MatchString(got[i][3]) {
+			t.Fatalf("argv %d must start with run --rm --name <generated name>: %q", i, got[i])
+		}
+		got[i] = append(got[i][:2:2], got[i][4:]...) // the rest is fixed
 		if s := strings.Join(got[i], " "); s != want[i] {
 			t.Errorf("argv %d =\n  %s\nwant\n  %s", i, s, want[i])
 		}

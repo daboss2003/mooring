@@ -33,6 +33,10 @@ func openCipher(cfg *config.Config) (*secret.Cipher, error) {
 	return secret.NewCipher(key, prev)
 }
 
+// errKeyMismatch: the configured key doesn't open the database's key-check sentinel. serve stops
+// without being restarted on it (a restart can't change the key).
+var errKeyMismatch = errors.New("KEY MISMATCH: the configured encryption_key does not match this DB — do NOT start the server; restore the correct key or DB")
+
 type sentinelResult int
 
 const (
@@ -55,7 +59,7 @@ func verifyOrInitSentinel(c *secret.Cipher, db *store.DB) (sentinelResult, error
 		}
 		pt, oerr := c.Open(blob)
 		if oerr != nil || string(pt) != keyCheckPlaintext {
-			return 0, errors.New("KEY MISMATCH: the configured encryption_key does not match this DB — do NOT start the server; restore the correct key or DB")
+			return 0, errKeyMismatch
 		}
 		// Re-seal under the current key so a previous→current rotation settles.
 		if nb, serr := c.Seal([]byte(keyCheckPlaintext)); serr == nil {

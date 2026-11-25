@@ -9,7 +9,7 @@ package imagescan
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"io"
 	"sort"
 	"strings"
 )
@@ -68,94 +68,180 @@ type trivyVuln struct {
 	PrimaryURL       string `json:"PrimaryURL"`
 }
 
-// trivyOutput is the subset of Trivy's JSON we read. Class is "os-pkgs" for the OS package result
-// and "lang-pkgs" for language packages (Type "gobinary" for a Go binary); Metadata.OS is set when
-// Trivy detected the operating system, with EOSL true (omitted when false) for a release past its
-// end of support.
-type trivyOutput struct {
-	Metadata struct {
-		OS *struct {
-			Family string `json:"Family"`
-			Name   string `json:"Name"`
-			EOSL   bool   `json:"EOSL"`
-		} `json:"OS"`
-	} `json:"Metadata"`
-	Results []struct {
-		Target          string      `json:"Target"`
-		Class           string      `json:"Class"`
-		Type            string      `json:"Type"`
-		Vulnerabilities []trivyVuln `json:"Vulnerabilities"`
-	} `json:"Results"`
+// trivyOS is Trivy's Metadata.OS: set when it detected the operating system, with EOSL true (omitted
+// when false) for a release past its end of support.
+type trivyOS struct {
+	Family string `json:"Family"`
+	Name   string `json:"Name"`
+	EOSL   bool   `json:"EOSL"`
+}
+
+// trivyResult is one entry of Trivy's Results with its findings already aggregated. Class is
+// "os-pkgs" for the OS package result and "lang-pkgs" for language packages (a Go binary among them).
+type trivyResult struct {
+	Target string
+	Class  string
+	vulns  *reportBuilder
 }
 
 const maxTop = 25
 
-// parseReport aggregates Trivy JSON into a Report for target. Unknown severities are
-// ignored; the Top list is worst-first and capped.
-func parseReport(target string, data []byte) (Report, error) {
-	var out trivyOutput
-	if err := json.Unmarshal(data, &out); err != nil {
+// readReport aggregates one Trivy JSON report read from r into a Report for target. Unknown
+// severities are ignored; the Top list is worst-first and capped.
+func readReport(target string, r io.Reader, lim limits) (Report, error) {
+	kept := newBudget(lim)
+	all := newReportBuilder(kept)
+	_, err := decodeTrivy(r, lim, kept, func(res trivyResult) error {
+		all.merge(res.vulns)
+		return nil
+	})
+	if err != nil {
 		return Report{}, err
 	}
-	var all []trivyVuln
-	for _, r := range out.Results {
-		all = append(all, r.Vulnerabilities...)
-	}
-	return buildReport(target, all), nil
+	return all.report(target), nil
 }
 
-// buildReport counts vulns by severity (and how many have a fixed version), keeps the fixable
-// High/Critical identities, and keeps the worst maxTop findings: by severity, then fixable first.
-func buildReport(target string, vulns []trivyVuln) Report {
-	rep := Report{Target: target}
-	var all []Vuln
-	hc, pkgs := map[string]bool{}, map[string]bool{}
-	for _, v := range vulns {
-		sev := strings.ToUpper(strings.TrimSpace(v.Severity))
-		fixed := strings.TrimSpace(v.FixedVersion)
-		fix := 0
-		if fixed != "" {
-			fix = 1
-		}
-		switch sev {
-		case sevCritical:
-			rep.Critical++
-			rep.FixableCritical += fix
-		case sevHigh:
-			rep.High++
-			rep.FixableHigh += fix
-		case sevMedium:
-			rep.Medium++
-			rep.FixableMedium += fix
-		case sevLow:
-			rep.Low++
-			rep.FixableLow += fix
-		default:
-			continue
-		}
-		if fix == 1 && (sev == sevCritical || sev == sevHigh) {
-			k := v.VulnerabilityID + "|" + v.PkgName
-			hc[k] = hc[k] || sev == sevCritical
-			pkgs[v.PkgName] = true
-		}
-		all = append(all, Vuln{
-			ID: v.VulnerabilityID, Package: v.PkgName, Installed: v.InstalledVersion,
-			Fixed: fixed, Severity: sev, Title: v.Title, URL: v.PrimaryURL,
-		})
+// topSlack is how many findings a reportBuilder holds before it sorts them and drops all but maxTop.
+const topSlack = 4 * maxTop
+
+// reportBuilder aggregates one target's findings as they are decoded, so a report with any number of
+// findings costs the counts, the worst maxTop findings and the fixable High/Critical identities — not
+// one entry per finding. kept (may be nil) bounds what it holds.
+type reportBuilder struct {
+	rep  Report
+	top  []Vuln // unsorted between compactions; the worst maxTop are always among them
+	kept *budget
+}
+
+func newReportBuilder(kept *budget) *reportBuilder {
+	return &reportBuilder{kept: kept, rep: Report{fixableHC: map[string]bool{}, fixablePkgs: map[string]bool{}}}
+}
+
+// add counts one finding by severity (and whether it has a fixed version), keeps the identity of a
+// fixable High/Critical one, and holds it as a candidate for the worst maxTop. A finding with an
+// unknown severity is ignored.
+func (b *reportBuilder) add(v trivyVuln) error {
+	sev := strings.ToUpper(strings.TrimSpace(v.Severity))
+	fixed := strings.TrimSpace(v.FixedVersion)
+	fix := 0
+	if fixed != "" {
+		fix = 1
 	}
-	sort.SliceStable(all, func(i, j int) bool {
-		if ri, rj := sevRank(all[i].Severity), sevRank(all[j].Severity); ri != rj {
+	rep := &b.rep
+	switch sev {
+	case sevCritical:
+		rep.Critical++
+		rep.FixableCritical += fix
+	case sevHigh:
+		rep.High++
+		rep.FixableHigh += fix
+	case sevMedium:
+		rep.Medium++
+		rep.FixableMedium += fix
+	case sevLow:
+		rep.Low++
+		rep.FixableLow += fix
+	default:
+		return nil
+	}
+	if fix == 1 && (sev == sevCritical || sev == sevHigh) {
+		if err := b.keepIdentity(v.VulnerabilityID+"|"+v.PkgName, v.PkgName, sev == sevCritical); err != nil {
+			return err
+		}
+	}
+	return b.hold(Vuln{
+		ID: v.VulnerabilityID, Package: v.PkgName, Installed: v.InstalledVersion,
+		Fixed: fixed, Severity: sev, Title: v.Title, URL: v.PrimaryURL,
+	})
+}
+
+func (b *reportBuilder) keepIdentity(id, pkg string, critical bool) error {
+	if _, ok := b.rep.fixableHC[id]; !ok {
+		if err := b.kept.take(keyCost(id)); err != nil {
+			return err
+		}
+	}
+	b.rep.fixableHC[id] = b.rep.fixableHC[id] || critical
+	if !b.rep.fixablePkgs[pkg] {
+		if err := b.kept.take(keyCost(pkg)); err != nil {
+			return err
+		}
+		b.rep.fixablePkgs[pkg] = true
+	}
+	return nil
+}
+
+func (b *reportBuilder) hold(v Vuln) error {
+	if err := b.kept.take(vulnCost(v)); err != nil {
+		return err
+	}
+	b.top = append(b.top, v)
+	if len(b.top) >= topSlack {
+		b.compact()
+	}
+	return nil
+}
+
+// compact sorts the held findings worst-first (by severity, then fixable first, then the order they
+// were added) and drops all but maxTop. Dropping early never changes the final list: a dropped finding
+// already has maxTop findings ahead of it.
+func (b *reportBuilder) compact() {
+	sort.SliceStable(b.top, func(i, j int) bool {
+		if ri, rj := sevRank(b.top[i].Severity), sevRank(b.top[j].Severity); ri != rj {
 			return ri > rj
 		}
-		return all[i].Fixed != "" && all[j].Fixed == ""
+		return b.top[i].Fixed != "" && b.top[j].Fixed == ""
 	})
-	if len(all) > maxTop {
-		all = all[:maxTop]
+	if len(b.top) > maxTop {
+		for _, v := range b.top[maxTop:] {
+			b.kept.give(vulnCost(v))
+		}
+		clear(b.top[maxTop:]) // release the dropped findings' strings
+		b.top = b.top[:maxTop]
 	}
-	rep.Top = all
-	rep.fixableHC, rep.fixablePkgs = hc, pkgs
+}
+
+// merge adds o's findings after b's own (several Trivy results can belong to one target). Both share
+// one budget, which o's findings are already counted against; o is not used afterwards.
+func (b *reportBuilder) merge(o *reportBuilder) {
+	b.rep.Critical += o.rep.Critical
+	b.rep.High += o.rep.High
+	b.rep.Medium += o.rep.Medium
+	b.rep.Low += o.rep.Low
+	b.rep.FixableCritical += o.rep.FixableCritical
+	b.rep.FixableHigh += o.rep.FixableHigh
+	b.rep.FixableMedium += o.rep.FixableMedium
+	b.rep.FixableLow += o.rep.FixableLow
+	for id, crit := range o.rep.fixableHC {
+		b.rep.fixableHC[id] = b.rep.fixableHC[id] || crit
+	}
+	for p := range o.rep.fixablePkgs {
+		b.rep.fixablePkgs[p] = true
+	}
+	b.top = append(b.top, o.top...)
+	if len(b.top) >= topSlack {
+		b.compact()
+	}
+}
+
+// report is the finished Report for target.
+func (b *reportBuilder) report(target string) Report {
+	b.compact()
+	rep := b.rep
+	rep.Target = target
+	if len(b.top) > 0 {
+		rep.Top = b.top
+	}
 	return rep
 }
+
+// vulnCost and keyCost are what one held finding and one kept identity count against the budget:
+// their strings plus a flat allowance for the headers and the map slot.
+func vulnCost(v Vuln) int64 {
+	return int64(len(v.ID)+len(v.Package)+len(v.Installed)+len(v.Fixed)+len(v.Severity)+len(v.Title)+len(v.URL)) + 128
+}
+
+func keyCost(k string) int64 { return int64(len(k)) + 64 }
 
 func sevRank(s string) int {
 	switch s {

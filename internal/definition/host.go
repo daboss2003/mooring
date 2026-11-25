@@ -2,6 +2,7 @@ package definition
 
 import (
 	"fmt"
+	"reflect"
 	"sort"
 )
 
@@ -75,49 +76,53 @@ type OrderEdge struct {
 
 // ParseHost parses + validates a kind:Host document through the same hardened,
 // parser-differential-resistant, Tier-1-rejecting pipeline as an App.
-func ParseHost(raw []byte) (*Host, error) {
+func ParseHost(raw []byte) (*Host, error) { return ParseHostNamed(raw, "host.yaml") }
+
+// ParseHostNamed is ParseHost with the file's name for its messages.
+func ParseHostNamed(raw []byte, file string) (*Host, error) {
 	var h Host
 	if err := hardenAndDecode(raw, &h); err != nil {
-		return nil, err
+		return nil, explainRefusal(raw, file, reflect.TypeOf(h), err)
 	}
 	if err := h.validateEnvelope(); err != nil {
-		return nil, err
+		return nil, explainRefusal(raw, file, reflect.TypeOf(h), err)
 	}
 	return &h, nil
 }
 
 func (h *Host) validateEnvelope() error {
 	if h.APIVersion != APIVersion {
-		return fmt.Errorf("apiVersion must be exactly %q (got %q)", APIVersion, h.APIVersion)
+		return atf("apiVersion", "apiVersion must be exactly %q (got %q)", APIVersion, h.APIVersion)
 	}
 	if h.Kind != "Host" {
-		return fmt.Errorf("kind must be \"Host\" (got %q)", h.Kind)
+		return atf("kind", "kind must be \"Host\" (got %q)", h.Kind)
 	}
 	return h.Spec.validate()
 }
 
 func (s *HostSpec) validate() error {
 	known := map[string]bool{}
-	for _, a := range s.Apps {
+	for i, a := range s.Apps {
+		entry := fmt.Sprintf("spec.apps[%d]", i)
 		if !slugRe.MatchString(a.Slug) {
-			return fmt.Errorf("registry app slug %q is invalid", a.Slug)
+			return atf(entry+".slug", "registry app slug %q is invalid", a.Slug)
 		}
 		if known[a.Slug] {
-			return fmt.Errorf("duplicate app %q in the registry", a.Slug)
+			return atf(entry+".slug", "duplicate app %q in the registry", a.Slug)
 		}
 		known[a.Slug] = true
 		if err := a.Source.validate(a.Slug); err != nil {
-			return err
+			return at(entry+".source", err)
 		}
 	}
 	if s.Defaults != nil {
 		if err := s.Defaults.validate(); err != nil {
-			return err
+			return at("spec.defaults.scaling", err)
 		}
 	}
 	if s.Orchestration != nil {
 		if err := s.Orchestration.validate(known); err != nil {
-			return err
+			return at("spec.orchestration", err)
 		}
 	}
 	return nil
@@ -161,21 +166,22 @@ func (src AppSource) validate(slug string) error {
 }
 
 func (o *Orchestration) validate(known map[string]bool) error {
-	for _, e := range o.DeployOrder {
+	for i, e := range o.DeployOrder {
+		entry := fmt.Sprintf("spec.orchestration.deploy_order[%d]", i)
 		if !known[e.Deploy] || !known[e.After] {
-			return fmt.Errorf("deploy_order references an unregistered app (%q after %q)", e.Deploy, e.After)
+			return atf(entry, "deploy_order references an unregistered app (%q after %q)", e.Deploy, e.After)
 		}
 		if e.Deploy == e.After {
-			return fmt.Errorf("deploy_order: %q cannot depend on itself", e.Deploy)
+			return atf(entry, "deploy_order: %q cannot depend on itself", e.Deploy)
 		}
 	}
-	for _, s := range o.SetupOrder {
+	for i, s := range o.SetupOrder {
 		if !known[s] {
-			return fmt.Errorf("setup_order references an unregistered app %q", s)
+			return atf(fmt.Sprintf("spec.orchestration.setup_order[%d]", i), "setup_order references an unregistered app %q", s)
 		}
 	}
 	if _, err := o.DeploySequence(); err != nil {
-		return err // cycle
+		return at("spec.orchestration.deploy_order", err) // cycle
 	}
 	return nil
 }

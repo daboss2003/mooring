@@ -75,6 +75,19 @@ nfpms:
         dst: /usr/share/mooring/socket-proxy/docker-compose.yml
       - src: deploy/nfpm/config.example.yaml
         dst: /usr/share/mooring/config.example.yaml
+      # needrestart (default on Ubuntu Server) restarts services that run a replaced binary
+      # after every apt run. postinstall leaves mooring.service on the old version when the
+      # new one refuses config.yaml; this keeps needrestart from restarting it anyway. A
+      # host without needrestart never reads the file.
+      # Intentional: the only packaged file under /etc, and a conffile (config|noreplace) —
+      # an operator's edit or removal survives upgrades, and it is removed on purge.
+      - src: deploy/needrestart/mooring.conf
+        dst: /etc/needrestart/conf.d/mooring.conf
+        type: config|noreplace
+        file_info:
+          mode: 0644
+          owner: root
+          group: root
       - src: LICENSE
         dst: /usr/share/doc/mooring/LICENSE
       - src: NOTICE

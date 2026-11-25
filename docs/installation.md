@@ -172,7 +172,8 @@ systemctl is-enabled caddy # disabled (or "not-found")
 ```
 
 After a package upgrade replaces Caddy or nginx, Mooring restarts its own copy on the updated files
-within a few minutes.
+within a few minutes. A Caddy that Mooring starts again uses the `ip_allowlist` in force for the
+dashboard hostname, including one applied by a reload.
 
 When `edge.dns01` is set for a namespace, Mooring installs a Caddy build with that DNS provider's
 plugin as `/var/lib/mooring/bin/caddy` and runs the edge from it. The Caddy package you installed
@@ -194,12 +195,16 @@ mooring gen-totp           # optional, recommended: two-factor sign-in (shows a 
 
 ## Step 6. Write the config file
 
-`/etc/mooring/config.yaml` is the only file you edit by hand. Start from the template:
+`/etc/mooring/config.yaml` is the only file you edit by hand. Open it:
 
 ```bash
-sudo cp /usr/share/mooring/config.example.yaml /etc/mooring/config.yaml
-sudo nano /etc/mooring/config.yaml
+sudo mooring config edit
 ```
+
+The file doesn't exist yet, so the command offers to start from the template
+(`/usr/share/mooring/config.example.yaml`); answer `y`. It opens the template in your editor
+(`$EDITOR`, else `nano` or `vi`), checks what you saved, and creates the file only when it is
+valid. A mistake is shown with its line and a hint, and you can edit again.
 
 Make it look like this, pasting in your values from Step 5:
 
@@ -242,15 +247,21 @@ data_dir: "/var/lib/mooring"
 Want the dashboard on its own address instead of the SSH tunnel? Add `admin.hostname` now or
 later: see [Put the dashboard on its own hostname](#optional-put-the-dashboard-on-its-own-hostname).
 
-Then lock the file down. Mooring refuses to start if anyone but root can write it, or if it's
-readable by anyone outside the `mooring` group:
+`config edit` creates the file owned by `root:mooring` with mode `0640`. Mooring refuses to start
+if anyone but root can write it, or if it's readable by anyone outside the `mooring` group. If you
+created the file another way (`sudo cp /usr/share/mooring/config.example.yaml /etc/mooring/config.yaml`
+and an editor), set the owner and mode yourself:
 
 ```bash
 sudo chown root:mooring /etc/mooring/config.yaml
 sudo chmod 0640 /etc/mooring/config.yaml
 ```
 
-**Check:** `sudo ls -l /etc/mooring/config.yaml` shows `-rw-r----- 1 root mooring`.
+**Check:** `sudo mooring config check` prints `OK: /etc/mooring/config.yaml is valid`, and
+`sudo ls -l /etc/mooring/config.yaml` shows `-rw-r----- 1 root mooring`. When the file is
+readable by root only, or belongs to another group than `mooring`, the check refuses it (exit
+status `78`) and prints the `chown` and `chmod` command above. It also refuses a file in a
+directory the `mooring` user cannot enter, and prints the command for the directory.
 
 ## Step 7. Point DNS at the server
 
@@ -285,8 +296,14 @@ belong to the service. Use `sudo` for `systemctl`: without it, `systemctl enable
 password prompt you never see.
 
 **Check:** `status` says `active (running)` and `doctor` has no `fail` lines. If Mooring doesn't
-start, the reason is in its log: `sudo journalctl -u mooring -n 50 --no-pager` (config mistakes
-name the exact key; see [Troubleshooting](#troubleshooting)).
+start, the reason is in its log: `sudo journalctl -u mooring -n 50 --no-pager`. With a mistake in
+the config file the service logs one `ERROR` line and stays stopped: `sudo mooring config check`
+shows the line to fix; then `sudo systemctl start mooring`. The service also stays stopped, with
+one `ERROR` line and its `hint`, when the `mooring` user cannot read the config file, the file
+belongs to another group, `encryption_key` does not match the database, or `setup.enabled` is set
+without a working sandbox. With a missing config file, or a required directory that is missing
+or not writable, the service logs the `ERROR` line and systemd starts it again every 2 seconds.
+See [Troubleshooting](#troubleshooting).
 
 ## Step 9. Open the dashboard
 
@@ -386,8 +403,8 @@ Namespaces must not overlap (no domain inside another). See
 
 Instead of the SSH tunnel, Mooring can serve the dashboard over HTTPS at its own address:
 
-1. In the config, add your own public IP to `ip_allowlist` (never a catch-all such as `0.0.0.0/0`:
-   Mooring refuses that) and set either:
+1. In the config (`sudo mooring config edit`), add your own public IP to `ip_allowlist` (never a
+   catch-all such as `0.0.0.0/0`: Mooring refuses that) and set either:
 
    ```yaml
    admin:
@@ -398,7 +415,23 @@ Instead of the SSH tunnel, Mooring can serve the dashboard over HTTPS at its own
 2. Turn on two-factor sign-in (`auth.totp_secret`): the login is now on the internet, behind your
    allow-list.
 3. Point the name's DNS at the server ([Step 7](#step-7-point-dns-at-the-server)), then
-   `sudo systemctl restart mooring` (a reload isn't enough for this).
+   `sudo systemctl restart mooring` (a reload isn't enough for `admin.*`).
+
+Later changes to `ip_allowlist` alone need only `sudo systemctl reload mooring`: the reload applies
+the list to the dashboard and to the edge route of the dashboard hostname. The log line
+`config reload: the edge serves the reloaded ip_allowlist for the dashboard hostname` confirms the
+edge took it.
+
+Removing the `admin` block needs a restart. After a reload only, the edge still serves the
+dashboard hostname and refuses a list with an entry that admits every address (`0.0.0.0/0`,
+`::/0`): the previous list stays at the edge until the restart. See
+[`ip_allowlist` at the edge](./config-editing.md#ip_allowlist-at-the-edge).
+
+| At the dashboard hostname you see | Cause |
+|---|---|
+| The page times out | Port 443 is closed in your provider's firewall, or the name's DNS record doesn't point at this server. |
+| A plain **404** | Your address isn't in `ip_allowlist`. |
+| A certificate error | Port 80 is closed, or the DNS record is proxied by a CDN, so the certificate could not be issued. |
 
 The dashboard must be a subdomain, never the base domain itself. The SSH tunnel keeps working
 alongside it. Using **Connect with GitHub**? Set your OAuth App's callback to
@@ -452,23 +485,53 @@ getent hosts github.com     # host DNS must still resolve
 
 ## Editing the config file (reload vs restart)
 
-`/etc/mooring/config.yaml` is read at **startup**. After you edit it, tell Mooring, and how depends
-on what you changed:
+Edit `/etc/mooring/config.yaml` with:
+
+```bash
+sudo mooring config edit
+```
+
+It opens the file in your editor, checks what you saved, and installs it only when it is valid.
+The previous file is kept as `/etc/mooring/config.yaml.last-good`. It then prints which of your
+changes need a reload and which need a restart. It runs neither. To check the file without
+editing it: `sudo mooring config check`.
 
 | You changed… | Apply with |
 |---|---|
-| Who can reach the dashboard (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), your login (`auth.username`, `auth.password_hash`, `auth.totp_secret`), `users`, or log retention (`retention.*`) | **`sudo systemctl reload mooring`**: applied live, no downtime |
-| **Anything else**: the `encryption_key`, `bind_addr`, `edge.*` (incl. `base_domain`, `base_domains`, `dns01`, `l4_enabled`), `admin.*`, `github.*`, `alerting.*`, `session.*`, `cookie.*`, `docker.*`, `protected_projects`, … | **`sudo systemctl restart mooring`** |
+| `ip_allowlist`, `trust_proxy`, `trusted_proxies`, `auth` (`username`, `password_hash`, `totp_secret`), `users`, `retention.*` | `sudo systemctl reload mooring` |
+| Anything else: `encryption_key`, `bind_addr`, `edge.*` (incl. `base_domain`, `base_domains`, `dns01`, `l4_enabled`), `admin.*`, `github.*`, `alerting.*`, `security_logs.*`, `session.*`, `cookie.*`, `docker.*`, `protected_projects`, … | `sudo systemctl restart mooring` |
 
-When in doubt, restart: a reload that touches a restart-only setting silently does nothing. A
-restart briefly drops the dashboard; your apps keep running. A reload checks the new file first and
-keeps the old config if the edit is invalid. Turning on or changing two-factor on reload signs you
-out, so you sign in again with the new factor.
+- A restart applies everything. The dashboard is unavailable for a moment; your apps keep running.
+- A reload does not apply a restart-only setting.
+- A reload applies `ip_allowlist` to the dashboard and, when the dashboard has its own hostname, to
+  the edge route of that hostname. When Caddy refuses the new list the edge keeps the previous one
+  and the service logs a warning ([`ip_allowlist` at the edge](./config-editing.md#ip_allowlist-at-the-edge)).
+- `config edit` keeps the file's owner, group and mode. When the service will not start with them
+  it prints a warning with the `chown` and `chmod` command to run.
+- A reload checks the file first. With a refused file `systemctl reload mooring` fails and the
+  running service keeps its configuration.
+- A change to `auth` or `users` signs everyone out, so you sign in again with the new login or
+  factor.
+- A restart with a refused file does not loop: the service logs one `ERROR` line and stays stopped
+  (exit status `78`) until you fix the file and run `sudo systemctl start mooring`. The same holds
+  for a file the `mooring` user cannot read, a file of another group, an `encryption_key`
+  that does not match the database, and `setup.enabled` without a working sandbox. With a missing
+  file, or a required directory that is missing or not writable, the service exits with status
+  `1` and systemd starts it again every 2 seconds ([the log lines](./config-editing.md#start)).
+
+Full reference: [Checking and editing `config.yaml`](./config-editing.md).
 
 ## Keep Mooring up to date
 
 - **APT repository (Step 3):** `sudo apt-get update && sudo apt-get install --only-upgrade mooring`.
-  The package keeps the service enabled and restarts it on the new version. A full
+  The package keeps the service enabled and restarts it on the new version. Before the restart
+  the new version checks `/etc/mooring/config.yaml`, as the `mooring` user and group when
+  `runuser` is installed. If it refuses the file, or the `mooring` user cannot read it, the service is not
+  restarted and the installer prints what to fix. A service that was running keeps running on the
+  previous version; a service that was not running stays stopped. Fix the file, then run
+  `sudo mooring config check` and `sudo systemctl restart mooring`. The package installs
+  `/etc/needrestart/conf.d/mooring.conf`: needrestart lists `mooring.service` as deferred and does
+  not restart it. The package upgrade restarts the service after the config check. A full
   `sudo apt upgrade` also upgrades Docker when an update for it is available, which restarts Docker
   and every container on the host.
 - **`.deb` file:** download the newer release the same way and `sudo apt install` it. To let the
@@ -506,7 +569,13 @@ sudo systemctl daemon-reload
 
 Then continue at [Step 4](#step-4-install-caddy-the-https-edge) (install Caddy from
 <https://caddyserver.com/docs/install> on a non-Debian system: the official build, 2.11 or later),
-and copy the template from `/etc/mooring/config.example.yaml` in Step 6.
+and in Step 6 run `sudo mooring config edit` as on a package install: it looks for the template at
+`/usr/share/mooring/config.example.yaml`, then at `/etc/mooring/config.example.yaml`.
+
+When you upgrade the binary, install the release's `deploy/systemd/mooring.service` to
+`/etc/systemd/system/mooring.service` again and run `sudo systemctl daemon-reload`. A unit copied
+from a release before v0.34.0 restarts the service every 2 seconds on a refused config file and
+reloads without checking the file.
 
 ## Troubleshooting
 
@@ -514,6 +583,21 @@ and copy the template from `/etc/mooring/config.example.yaml` in Step 6.
 |---|---|---|
 | `edge.acme_ca: required in managed mode` | the config has no ACME issuer | add `edge.acme_ca` exactly as in [Step 6](#step-6-write-the-config-file), restart |
 | `ip_allowlist: empty …` | the allow-list has no entry | add `127.0.0.1/32` and `::1/128` |
+| `systemctl status mooring` says `failed` with exit status `78`; the log has `config.yaml is not valid; not starting` | the config file is refused. The service does not restart on its own | `sudo mooring config check` shows the line; fix it with `sudo mooring config edit`, then `sudo systemctl start mooring` |
+| The service restarts every 2 seconds (exit status `1`); the log has `config.yaml not found; not starting` | the file is missing | create it with `sudo mooring config edit`. The next start picks it up |
+| Exit status `78`; the log has `config.yaml can't be read; not starting` | the `mooring` user cannot read the file | `sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml`; then `sudo systemctl start mooring` |
+| `sudo mooring config check` prints `/etc/mooring/config.yaml can't be used by the service (user mooring): stat /etc/mooring/config.yaml: permission denied` (exit status `78`) | the `mooring` user cannot enter `/etc/mooring` | `sudo chown root:mooring /etc/mooring && sudo chmod 0750 /etc/mooring` |
+| Exit status `78`; the log has `config.yaml belongs to another group than the service's; not starting` | the file's group is not `mooring` | `sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml`; then `sudo systemctl start mooring` |
+| The service restarts every 2 seconds (exit status `1`); the log has `a required directory is missing or not writable; not starting` | `data_dir`, `<data_dir>-apps` or `/var/lib/caddy` is missing or not writable by the service, or a non-default `data_dir` is not in the unit's `ReadWritePaths` | make it writable by the `mooring` user and list it in `ReadWritePaths`. The next start picks it up (after a change to the unit: `sudo systemctl daemon-reload && sudo systemctl restart mooring`) |
+| `sudo mooring config check` prints `/etc/mooring/config.yaml is readable by root only (mode 0600): the service (user mooring) can't read it`, or `belongs to group id N, not to the service's group mooring` (exit status `78`) | the content is valid; the `mooring` user cannot use the file | `sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml` |
+| Exit status `78`; the log has `encryption_key does not match the database; not starting` | the key in the config is not the one the database was created with | put back that `encryption_key`, or restore the database that belongs to this key, then `sudo systemctl restart mooring` |
+| Exit status `78`; the log has `setup.enabled is set but this host has no working sandbox; not starting` | `setup.enabled: true` without a working sandbox | install what the sandbox needs, or set `setup.enabled: false`, then `sudo systemctl restart mooring` |
+| `mooring config check` prints `can't judge /etc/mooring/config.yaml as this user (the file belongs to another group)` | the command was run without `sudo` by a user outside the file's group | `sudo mooring config check` |
+| `systemctl reload mooring` fails | the config file is refused; the running service is unchanged | `sudo mooring config check`, fix the file, reload again |
+| After an upgrade: `mooring: NOT restarted. This version refuses /etc/mooring/config.yaml` | the new version refuses the file, or the `mooring` user cannot read it or it belongs to another group. A service that was running keeps running on the previous version | fix what the installer printed, `sudo mooring config check`, then `sudo systemctl restart mooring` |
+| The dashboard hostname times out | port 443 is closed in your provider's firewall, or the DNS record doesn't point at this server | open port 443 ([Step 1](#step-1-open-ports-80-and-443)); check `dig +short <name>` |
+| A plain **404** at the dashboard hostname | your address isn't in `ip_allowlist` | add it with `sudo mooring config edit`, then `sudo systemctl reload mooring` |
+| A certificate error at the dashboard hostname | port 80 is closed, or the DNS record is proxied by a CDN | open port 80; set the record to DNS-only |
 | A plain **404** at <http://127.0.0.1:9000> through the tunnel | the tunnel arrives from loopback, which isn't in `ip_allowlist` | add `127.0.0.1/32` and `::1/128`, then `sudo systemctl reload mooring` |
 | `bind_addr: must bind loopback only` | `bind_addr` is a public address | set `bind_addr: "127.0.0.1:9000"` |
 | `config: … must not be world-accessible` / `… group-writable` / `… owned by root` | the file's owner or mode is wrong | `sudo chown root:mooring /etc/mooring/config.yaml && sudo chmod 0640 /etc/mooring/config.yaml` |

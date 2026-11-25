@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,18 +70,32 @@ import (
 )
 
 func cmdServe(args []string) error {
+	// Intentional: the first statement, before the flags and the config are read. Go's default
+	// for SIGHUP is to end the process, and systemd counts a death by SIGHUP as a clean exit
+	// (Restart=on-failure leaves the unit down), so a `systemctl reload` during start-up, even
+	// while config.yaml was still being read, stopped the service. A HUP taken during start-up
+	// waits in the channel and is handled as one reload once the server exists.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	configPath := fs.String("config", config.DefaultPath, "path to config.yaml")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	baseLogHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	baseLogHandler := slog.NewTextHandler(serveLogOut, &slog.HandlerOptions{Level: slog.LevelInfo})
 	log := slog.New(baseLogHandler)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
-		return err // fail-closed: refuse to boot
+		// fail-closed: refuse to boot, with one line. A file that is refused, or that the service
+		// may not read, exits with the status the unit doesn't restart on
+		// (RestartPreventExitStatus): restarting can't fix a file. Only that and the two start-up
+		// refusals below (refuseStart) use it. A file that isn't there exits 1 and is retried
+		// (configStartExit), like a Docker or database failure.
+		logConfigRefused(log, *configPath, err)
+		return &exitError{code: configStartExit(err), err: err, printed: true}
 	}
 	for _, w := range cfg.LoadWarnings {
 		log.Warn("config: " + w)
@@ -130,8 +146,11 @@ func cmdServe(args []string) error {
 	// BEFORE the first deploy/edge-start EROFS's lazily. A missing ReadWritePaths
 	// entry (e.g. a changed data_dir, or no RuntimeDirectory) becomes a clear boot
 	// error naming the path, not a mysterious "deploy hangs / edge crash-loops".
+	// Intentional (owner decision): exit 1, which the unit restarts on, not 78. The directory may
+	// be on a volume that attaches after the service starts; the retry every 2s picks it up.
 	if err := checkWritablePaths(cfg, log); err != nil {
-		return err
+		return failStart(log, "a required directory is missing or not writable; not starting", err,
+			"make it writable by the service user and list it in the unit's ReadWritePaths (a non-default data_dir must be added there); "+unitRetryNote)
 	}
 
 	db, err := store.Open(filepath.Join(cfg.DataDir, "mooring.db"))
@@ -144,7 +163,20 @@ func cmdServe(args []string) error {
 	// sentinel exists, the configured key MUST open it, else refuse to boot rather
 	// than seal future writes under a key that can't read existing rows.
 	if err := checkKeySentinel(cfg, db); err != nil {
-		return err
+		if errors.Is(err, errKeyMismatch) {
+			return refuseStart(log, "encryption_key does not match the database; not starting", err,
+				"put back the encryption_key this database was created with (or restore the database that belongs to this key), then: "+restartCommand)
+		}
+		return err // the sentinel could not be read: a database failure, retried
+	}
+	// Setup sandbox (M9, Mode 3 — OFF by default, hard-gated). Fail-closed boot precondition: if
+	// setup is enabled the host MUST provide a working sandbox (plan §5.1) or we refuse to boot.
+	// Checked here, before anything is started.
+	if cfg.Setup.Enabled {
+		if ok, why := sandboxAvailable(); !ok {
+			return refuseStart(log, "setup.enabled is set but this host has no working sandbox; not starting", errors.New(why),
+				"install what the sandbox needs, or set setup.enabled: false in config.yaml, then: "+restartCommand)
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -263,15 +295,8 @@ func cmdServe(args []string) error {
 		log.Info("docker.external_proxy set; Mooring will NOT manage the socket-proxy", "addr", cfg.Docker.ProxyAddr)
 	}
 
-	// Setup sandbox (M9, Mode 3 — OFF by default, hard-gated). Fail-closed boot
-	// precondition: if setup is enabled the host MUST provide a working sandbox
-	// (plan §5.1) or we refuse to boot.
+	// Setup sandbox (M9, Mode 3 — OFF by default, hard-gated); its boot precondition was checked above.
 	setupStore := setupstore.New(db, cipher)
-	if cfg.Setup.Enabled {
-		if ok, why := sandbox.Available(); !ok {
-			return fmt.Errorf("setup.enabled but no working sandbox: %s", why)
-		}
-	}
 
 	// Audit/events retention (M7, plan §16.1): bounds the events table so it can
 	// never wedge the disk, while NEVER silently dropping a security row. Joined
@@ -735,9 +760,20 @@ func cmdServe(args []string) error {
 			// Likewise without the trusted-proxy fields (Caddy ≥ 2.11), and then without HTTP/3 so
 			// the first reconcile opens QUIC with 0-RTT refused (see edge.BootFloor). Rendered here, before
 			// the install loop starts, because checkBuild reads it.
+			// bootCfg is serve's own copy of what the child boots on, for checkBuild (the Supervisor's
+			// field is its own to guard once the list can change).
+			var bootCfg atomic.Pointer[[]byte]
 			if initCfg, rerr := edge.Render(edge.BootFloor(base), nil, nil); rerr == nil {
 				sup.InitialCfg = initCfg
+				bootCfg.Store(&initCfg)
 			}
+			// A reloaded ip_allowlist Caddy accepted (at the reload, or later when the reload's own
+			// reconcile failed and the list stayed pending) is logged, and becomes part of the boot
+			// config: a relaunched Caddy must start on the list in force, not on the one of serve's start.
+			edgeRecon.SetAdminAllowlistAccepted(adminAllowlistAccepted(base, func(cfg []byte) {
+				sup.SetInitialCfg(cfg)
+				bootCfg.Store(&cfg)
+			}, log))
 			// Caddy logs the error of a refused /load, which can carry a dns01 token (a provider module
 			// echoes one it finds malformed): keep the tokens out of the journal.
 			var tokens []string
@@ -753,7 +789,11 @@ func cmdServe(args []string) error {
 			}
 			checkBuild := func(c context.Context, bin string) error {
 				refused, why, render := edgeRecon.LoadRefused()
-				return caddyBuildCheck(c, bin, procExe(sup.PID()), edgeRenders{Initial: sup.InitialCfg,
+				var initial []byte
+				if p := bootCfg.Load(); p != nil {
+					initial = *p
+				}
+				return caddyBuildCheck(c, bin, procExe(sup.PID()), edgeRenders{Initial: initial,
 					LastApplied: edgeRecon.LastApplied(), Refused: refused, RefusedWhy: why, RefusedCfg: render}, validate)
 			}
 			// A build checkBuild holds back because of the config Caddy refuses (edge.ErrHeldByConfig) isn't
@@ -1481,29 +1521,30 @@ func cmdServe(args []string) error {
 		go func() { defer wg.Done(); srv.RunCertRenewWatcher(ctx, time.Hour) }()
 	}
 
-	// SIGHUP hot-reloads the allowlist + auth (plan §5.1), never keys/bind.
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
+	// SIGHUP hot-reloads the allowlist (the dashboard's and the edge's) + auth (plan §5.1), never
+	// keys/bind. The channel is watched since serve began (above).
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-hup:
-				if err := srv.Reload(ctx); err != nil {
-					log.Error("config reload rejected; keeping previous", "err", err)
-				} else {
-					log.Info("config reloaded (allowlist + auth)")
-					// srv.Reload already validated the file; re-read it to hot-swap the
-					// Tier-1 retention policy too (plan §16.1 SIGHUP-reloadable).
-					if newCfg, lerr := config.Load(*configPath); lerr == nil {
+				reloadConfig(ctx, configReload{
+					path: *configPath, load: config.Load, reload: srv.ReloadWith, rejected: srv.ReloadRejected, log: log,
+					apply: func(newCfg *config.Config) {
+						// Tier-1 retention policy (plan §16.1 SIGHUP-reloadable).
 						retentionRunner.SetConfig(toRetentionConfig(newCfg))
 						log.Info("retention policy reloaded")
+						// The edge gates the dashboard's hostname with the same list: without this a
+						// reloaded ip_allowlist admitted an address at the dashboard and not at the edge.
+						if edgeRecon != nil {
+							pushAdminAllowlist(ctx, edgeRecon, newCfg.AllowlistStrings(), log)
+						}
 						for _, w := range newCfg.LoadWarnings {
 							log.Warn("config (on reload; alerting and security_logs settings apply at the next restart): " + w)
 						}
-					}
-				}
+					},
+				})
 			}
 		}
 	}()
@@ -1552,7 +1593,7 @@ func edgeBaseConfig(cfg *config.Config) edge.BaseConfig {
 		ACMECA:         cfg.Edge.ACMECA,
 		CAs:            edgeCAs(cfg),
 		AdminHostname:  cfg.AdminHostnameResolved(), // "" unless admin is exposed; admin.subdomain expanded
-		AdminAllowlist: cfg.IPAllowlist,             // becomes the edge's remote_ip gate for the admin vhost
+		AdminAllowlist: cfg.AllowlistStrings(),      // canonical prefixes: the edge's remote_ip gate for the admin vhost
 		AdminUpstream:  cfg.AdminEdgeListen(),       // the dedicated edge listener (not the SSH-tunnel bind)
 		TrustedProxies: cfg.Edge.TrustedProxies,     // CDN/LB in front of the edge; app routes only, never the admin gate
 		ClientIPHeader: cfg.Edge.ClientIPHeader,
@@ -1562,6 +1603,124 @@ func edgeBaseConfig(cfg *config.Config) edge.BaseConfig {
 		base.LBCookieSecret = edge.DeriveLBCookieSecret(dk)
 	}
 	return base
+}
+
+// adminAllowlistEdge is the part of the edge reconciler a reload pushes the allowlist through.
+type adminAllowlistEdge interface {
+	SetAdminAllowlist(list []string)
+	Reconcile(ctx context.Context) error
+	// AdminAllowlistState is the list the edge serves for the dashboard hostname, and whether a
+	// list that was set is still waiting for a reconcile Caddy accepts.
+	AdminAllowlistState() (inForce []string, pending bool)
+}
+
+// edgeAllowlistPushTimeout bounds the reconcile a reload triggers.
+const edgeAllowlistPushTimeout = 30 * time.Second
+
+// edgeAllowlistRefusedLine is the edge's own log line for a list it gave up (internal/edge,
+// settleAdminAllowlist); the reload's warning points at it.
+const edgeAllowlistRefusedLine = "edge: the new ip_allowlist was refused"
+
+// pushAdminAllowlist gives the edge the reloaded ip_allowlist and reconciles once, on a bounded
+// context. The dashboard's own list is already swapped by then.
+// Intentional: what is logged comes from the edge's state after the reconcile, not from the
+// reconcile's error. A reconcile that returns nil may not have applied the list (another reconcile
+// took it and gave it up, or left it pending), and one that fails may have left it pending or
+// given it up; only the state says which:
+//   - the edge serves the pushed list: applied;
+//   - a list is still pending: the next reconcile Caddy accepts applies it, which
+//     adminAllowlistAccepted logs;
+//   - neither: the edge gave the list up and keeps the previous one; its own line says why.
+func pushAdminAllowlist(ctx context.Context, e adminAllowlistEdge, list []string, log *slog.Logger) {
+	e.SetAdminAllowlist(list)
+	rctx, cancel := context.WithTimeout(ctx, edgeAllowlistPushTimeout)
+	defer cancel()
+	err := e.Reconcile(rctx)
+	inForce, pending := e.AdminAllowlistState()
+	attrs := []any{"entries", len(list)}
+	if err != nil {
+		attrs = append(attrs, "err", err)
+	}
+	switch {
+	case slices.Equal(inForce, list):
+		if err != nil {
+			log.Warn("config reload: the edge serves the reloaded ip_allowlist for the dashboard hostname, but its reconcile reported an error", attrs...)
+			return
+		}
+		log.Info("config reload: the edge serves the reloaded ip_allowlist for the dashboard hostname", attrs...)
+	case pending:
+		log.Warn("config reload: the edge has not applied the new ip_allowlist yet; it keeps the previous list for the dashboard hostname, and the new one stays pending until the next reconcile that Caddy accepts (logged then as \"ip_allowlist applied at the edge\")", attrs...)
+	default:
+		log.Warn("config reload: the edge refused the new ip_allowlist and keeps the previous list for the dashboard hostname; its own line (\""+edgeAllowlistRefusedLine+"\") says why", append(attrs, "hint", "fix ip_allowlist in config.yaml, then: "+reloadCommand)...)
+	}
+}
+
+// adminAllowlistAccepted is the edge's callback for a dashboard allowlist Caddy accepted: it logs
+// the list as applied and renders the boot config again with it (base's other fields as at start),
+// handing the render to setInitial.
+func adminAllowlistAccepted(base edge.BaseConfig, setInitial func(cfg []byte), log *slog.Logger) func(list []string) {
+	return func(list []string) {
+		log.Info("ip_allowlist applied at the edge", "entries", len(list))
+		b := base
+		b.AdminAllowlist = append([]string{}, list...)
+		cfg, err := edge.Render(edge.BootFloor(b), nil, nil)
+		if err != nil {
+			log.Warn("edge: could not render the boot config with the new ip_allowlist; a relaunched Caddy starts on the previous list until its first reconcile", "err", err)
+			return
+		}
+		setInitial(cfg)
+	}
+}
+
+// serveLogOut is where serve logs (tests capture it).
+var serveLogOut io.Writer = os.Stderr
+
+// sandboxAvailable is sandbox.Available (tests replace it).
+var sandboxAvailable = sandbox.Available
+
+// refuseStart is serve's exit for a start-up failure that restarting can't fix: one ERROR line
+// naming the cause and what to do, and config.ExitInvalid, which the unit doesn't restart on
+// (RestartPreventExitStatus). Without it the unit restarted every 2s for ever.
+func refuseStart(log *slog.Logger, msg string, cause error, hint string) error {
+	log.Error(msg, "detail", cause.Error(), "hint", hint)
+	return &exitError{code: config.ExitInvalid, err: cause, printed: true}
+}
+
+// failStart is serve's exit for a start-up failure that can end by itself (a volume that attaches
+// late): the same single ERROR line, and exit 1, which the unit restarts on.
+func failStart(log *slog.Logger, msg string, cause error, hint string) error {
+	log.Error(msg, "detail", cause.Error(), "hint", hint)
+	return &exitError{code: 1, err: cause, printed: true}
+}
+
+// configReload is one SIGHUP reload: load reads the file at path once, reload swaps the dashboard's
+// allowlist and auth to that config (web.Server.ReloadWith) and apply sets the rest from the same
+// config (the retention policy and the edge's allowlist). rejected records a file that did not load.
+type configReload struct {
+	path     string
+	load     func(path string) (*config.Config, error)
+	reload   func(ctx context.Context, cfg *config.Config) error
+	rejected func(ctx context.Context)
+	apply    func(cfg *config.Config)
+	log      *slog.Logger
+}
+
+// reloadConfig runs a reload from one read of the file, so the dashboard and the edge cannot end up
+// on different allowlists. A file that does not load, or a config the dashboard refuses, changes
+// nothing anywhere.
+func reloadConfig(ctx context.Context, r configReload) {
+	cfg, err := r.load(r.path)
+	if err != nil {
+		r.rejected(ctx)
+		r.log.Error("config reload rejected; keeping previous", "err", err)
+		return
+	}
+	if err := r.reload(ctx, cfg); err != nil {
+		r.log.Error("config reload: the dashboard refused the config; nothing was applied (the dashboard, the edge's ip_allowlist and the retention policy keep the previous settings)", "err", err)
+		return
+	}
+	r.log.Info("config reloaded (allowlist + auth)")
+	r.apply(cfg)
 }
 
 // logCursorsFile is where the log capture keeps each container's last captured line.

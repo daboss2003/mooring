@@ -127,9 +127,14 @@
     <p class="muted">On. Results appear here after the first host scan completes (a few minutes after start, then every <code>server.image_scan_interval</code>).</p>
     {{else}}
     {{with .HostScan}}
-    <p class="muted">{{if .OS}}<span class="mono">{{.OS}}</span>{{else}}Operating system not detected{{end}} · scanned {{if .ScannedAt}}{{template "ts" .ScannedAt}}{{else}}—{{end}} · {{.Total}} findings, {{.Fixable}} with a fix</p>
-    {{if .EOSL}}<div class="notice" role="status">This OS release is end of life: it gets no more security fixes, so a clean result doesn't mean it's safe.</div>{{end}}
+    {{if and .Error (not .Reports)}}
+    {{/* A failed scan with no completed scan before it: there is no result, so none is shown. */}}
+    <div class="error" role="alert">{{.Error}}</div>
+    <p class="muted">No host scan has completed yet, so there are no results to show{{if .ScannedAt}} (last attempt {{template "ts" .ScannedAt}}){{end}}. The next scan runs on the <code>server.image_scan_interval</code> schedule.</p>
+    {{else}}
     {{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+    <p class="muted">{{if .Error}}Results of the last scan that completed, not of the failed one: {{end}}{{if .OS}}<span class="mono">{{.OS}}</span>{{else}}Operating system not detected{{end}} · scanned {{if .ScannedAt}}{{template "ts" .ScannedAt}}{{else}}—{{end}} · {{.Total}} findings, {{.Fixable}} with a fix</p>
+    {{if .EOSL}}<div class="notice" role="status">This OS release is end of life: it gets no more security fixes, so a clean result doesn't mean it's safe.</div>{{end}}
     <div class="table-scroll"><table class="grid">
       <thead><tr><th>Target</th><th class="num">Critical</th><th class="num">High</th><th class="num">Medium</th><th class="num">Low</th><th>Findings</th></tr></thead>
       <tbody>
@@ -160,6 +165,7 @@
       </tbody>
     </table></div>
     <p class="muted">Fix by upgrading only the flagged packages: <code>sudo apt-get update &amp;&amp; sudo apt-get install --only-upgrade &lt;package&gt;…</code>, or <code>sudo dnf upgrade &lt;package&gt;…</code> (<code>yum</code> on Amazon Linux 2 and release 7). A full <code>apt-get upgrade</code> or <code>dnf upgrade</code> can also upgrade Docker, and upgrading Docker or the container runtime restarts Docker and every container on this host. Binaries update with the packages that installed them; <code>mooring</code> updates with a Mooring release; Mooring refreshes its own Caddy build. A High or Critical finding with a fix raises an alert the first time a scan finds it; the alert gives the command with the package names.</p>
+    {{end}}
     {{end}}
     {{end}}
   </section>

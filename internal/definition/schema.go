@@ -752,7 +752,9 @@ type ScheduledTask struct {
 // validateScheduledTasks checks each task names a valid, declared service, has a unique name,
 // a sane interval, and that a scheduled (one-shot) service is not ALSO an auto-scaling target
 // (a profiled one-shot can't scale).
-func (s *Spec) validateScheduledTasks() error {
+func (s *Spec) validateScheduledTasks() (err error) {
+	entry := "" // the task being checked: an error without a path of its own is located there
+	defer func() { err = at(entry, err) }()
 	declared := map[string]bool{}
 	for n := range s.Compose.Services {
 		declared[n] = true
@@ -778,46 +780,47 @@ func (s *Spec) validateScheduledTasks() error {
 		}
 	}
 	names := map[string]bool{}
-	for _, t := range s.ScheduledTasks {
+	for i, t := range s.ScheduledTasks {
+		entry = fmt.Sprintf("spec.scheduled_tasks[%d]", i)
 		if !taskNameRe.MatchString(t.Name) {
-			return fmt.Errorf("scheduled_task name %q must match [a-z0-9][a-z0-9-]{0,38}", t.Name)
+			return atf(entry+".name", "scheduled_task name %q must match [a-z0-9][a-z0-9-]{0,38}", t.Name)
 		}
 		if names[t.Name] {
-			return fmt.Errorf("scheduled_task name %q declared twice", t.Name)
+			return atf(entry+".name", "scheduled_task name %q declared twice", t.Name)
 		}
 		names[t.Name] = true
 		if !svcRe.MatchString(t.Service) {
-			return fmt.Errorf("scheduled_task %q must name a valid service", t.Name)
+			return atf(entry+".service", "scheduled_task %q must name a valid service", t.Name)
 		}
 		if !declared[t.Service] {
-			return fmt.Errorf("scheduled_task %q targets unknown service %q", t.Name, t.Service)
+			return atf(entry+".service", "scheduled_task %q targets unknown service %q", t.Name, t.Service)
 		}
 		if scaled[t.Service] {
-			return fmt.Errorf("scheduled_task %q: service %q is an auto-scaling target and cannot also be a scheduled one-shot", t.Name, t.Service)
+			return atf(entry+".service", "scheduled_task %q: service %q is an auto-scaling target and cannot also be a scheduled one-shot", t.Name, t.Service)
 		}
 		// A scheduled service is profiled out of `up`, so it must not be a long-running SERVER:
 		// a service that publishes a port would silently stop serving once scheduled. Reject it
 		// (declare a separate one-shot service for the job).
 		if svc, ok := s.Compose.Services[t.Service]; ok && len(svc.Ports) > 0 {
-			return fmt.Errorf("scheduled_task %q: service %q publishes ports (it's a server) — a scheduled one-shot can't serve; use a separate service for the job", t.Name, t.Service)
+			return atf(entry+".service", "scheduled_task %q: service %q publishes ports (it's a server) — a scheduled one-shot can't serve; use a separate service for the job", t.Name, t.Service)
 		}
 		if routed[t.Service] {
-			return fmt.Errorf("scheduled_task %q: service %q is an edge/L4 route target (a server) — a scheduled one-shot can't serve; use a separate service for the job", t.Name, t.Service)
+			return atf(entry+".service", "scheduled_task %q: service %q is an edge/L4 route target (a server) — a scheduled one-shot can't serve; use a separate service for the job", t.Name, t.Service)
 		}
 		if dependedOn[t.Service] {
-			return fmt.Errorf("scheduled_task %q: service %q is a depends_on target — scheduling it would break the dependent service's startup; use a separate service for the job", t.Name, t.Service)
+			return atf(entry+".service", "scheduled_task %q: service %q is a depends_on target — scheduling it would break the dependent service's startup; use a separate service for the job", t.Name, t.Service)
 		}
 		d, err := time.ParseDuration(t.Every)
 		if err != nil || d <= 0 {
-			return fmt.Errorf("scheduled_task %q: every %q is not a valid positive duration (e.g. 24h, 15m)", t.Name, t.Every)
+			return atf(entry+".every", "scheduled_task %q: every %q is not a valid positive duration (e.g. 24h, 15m)", t.Name, t.Every)
 		}
 		if t.Timeout != "" {
 			to, terr := time.ParseDuration(t.Timeout)
 			if terr != nil || to <= 0 {
-				return fmt.Errorf("scheduled_task %q: timeout %q is not a valid positive duration (e.g. 1h, 45m)", t.Name, t.Timeout)
+				return atf(entry+".timeout", "scheduled_task %q: timeout %q is not a valid positive duration (e.g. 1h, 45m)", t.Name, t.Timeout)
 			}
 			if to > 24*time.Hour {
-				return fmt.Errorf("scheduled_task %q: timeout %q exceeds the 24h ceiling (a task holds the single docker slot for its whole run)", t.Name, t.Timeout)
+				return atf(entry+".timeout", "scheduled_task %q: timeout %q exceeds the 24h ceiling (a task holds the single docker slot for its whole run)", t.Name, t.Timeout)
 			}
 		}
 	}
@@ -962,13 +965,13 @@ func ManagedCertDir(service, hostname string) string {
 
 func (d *Definition) validateEnvelope() error {
 	if d.APIVersion != APIVersion {
-		return fmt.Errorf("apiVersion must be exactly %q (got %q) — unknown versions are rejected", APIVersion, d.APIVersion)
+		return atf("apiVersion", "apiVersion must be exactly %q (got %q) — unknown versions are rejected", APIVersion, d.APIVersion)
 	}
 	if d.Kind != "App" {
-		return fmt.Errorf("kind must be \"App\" (got %q)", d.Kind)
+		return atf("kind", "kind must be \"App\" (got %q)", d.Kind)
 	}
 	if !slugRe.MatchString(d.Metadata.Slug) {
-		return fmt.Errorf("metadata.slug must match [a-z][a-z0-9-]{1,30} (got %q)", d.Metadata.Slug)
+		return atf("metadata.slug", "metadata.slug must match [a-z][a-z0-9-]{1,30} (got %q)", d.Metadata.Slug)
 	}
 	return d.Spec.validate()
 }
@@ -978,16 +981,16 @@ func (s *Spec) validate() error {
 	case "", SourceGenerated:
 		// ok — Mooring generates the compose.
 	case "repo_path", "inline":
-		return fmt.Errorf("compose.source %q is no longer supported — Mooring generates the compose; "+
+		return atf("spec.compose.source", "compose.source %q is no longer supported — Mooring generates the compose; "+
 			"declare your services (with image: or build:) under compose.services (source: generated)", s.Compose.Source)
 	default:
-		return fmt.Errorf("compose.source must be \"generated\" (got %q) — Mooring generates the compose", s.Compose.Source)
+		return atf("spec.compose.source", "compose.source must be \"generated\" (got %q) — Mooring generates the compose", s.Compose.Source)
 	}
 	if s.Compose.Path != "" || s.Compose.Inline != "" {
-		return fmt.Errorf("compose.path/compose.inline are no longer supported — Mooring generates the compose from compose.services")
+		return atf("spec.compose", "compose.path/compose.inline are no longer supported — Mooring generates the compose from compose.services")
 	}
 	if len(s.Compose.Services) == 0 {
-		return fmt.Errorf("compose.services is required (Mooring generates the compose from your services)")
+		return atf("spec.compose.services", "compose.services is required (Mooring generates the compose from your services)")
 	}
 	if err := s.validateServices(); err != nil {
 		return err
@@ -1017,7 +1020,8 @@ func (s *Spec) validate() error {
 }
 
 // validateRelease checks spec.release names a declared service and a well-formed command.
-func (s *Spec) validateRelease() error {
+func (s *Spec) validateRelease() (err error) {
+	defer func() { err = at("spec.release", err) }()
 	r := s.Release
 	if r == nil {
 		return nil
@@ -1047,49 +1051,50 @@ func (s *Spec) validateRelease() error {
 // image is refused at submit, see ValidateForSubmit). A fixed count can't be combined with
 // autoscaling or a scheduled task.
 func (s *Spec) validateServiceSizing(name string, svc Service) error {
+	sp := servicePath(name)
 	if svc.Replicas < 0 || svc.Replicas > MaxReplicas {
-		return fmt.Errorf("service %q replicas %d must be between 1 and %d", name, svc.Replicas, MaxReplicas)
+		return atf(sp+".replicas", "service %q replicas %d must be between 1 and %d", name, svc.Replicas, MaxReplicas)
 	}
 	if svc.Replicas > 0 {
 		for _, sc := range s.Scaling {
 			if sc.Service == name {
-				return fmt.Errorf("service %q sets replicas and is under spec.scaling — use one or the other", name)
+				return atf(sp+".replicas", "service %q sets replicas and is under spec.scaling — use one or the other", name)
 			}
 		}
 		for _, t := range s.ScheduledTasks {
 			if t.Service == name {
-				return fmt.Errorf("service %q sets replicas but runs only as scheduled_task %q", name, t.Name)
+				return atf(sp+".replicas", "service %q sets replicas but runs only as scheduled_task %q", name, t.Name)
 			}
 		}
 	}
 	if svc.Replicas > 1 {
 		for _, v := range svc.Volumes {
 			if !v.ReadOnly {
-				return fmt.Errorf("service %q replicas %d: volume %q is writable — copies can't share it (mount it read_only or run one copy)", name, svc.Replicas, v.Target)
+				return atf(sp+".replicas", "service %q replicas %d: volume %q is writable — copies can't share it (mount it read_only or run one copy)", name, svc.Replicas, v.Target)
 			}
 		}
 		for _, p := range svc.Ports {
 			if p.Publish {
-				return fmt.Errorf("service %q replicas %d: port %d is published on the host — copies would collide (route it through the edge or run one copy)", name, svc.Replicas, p.Internal)
+				return atf(sp+".replicas", "service %q replicas %d: port %d is published on the host — copies would collide (route it through the edge or run one copy)", name, svc.Replicas, p.Internal)
 			}
 		}
 	}
 	if svc.ShmSize != "" && !memSizeRe.MatchString(svc.ShmSize) {
-		return fmt.Errorf("service %q shm_size %q is not a valid size (e.g. 256m, 1g)", name, svc.ShmSize)
+		return atf(sp+".shm_size", "service %q shm_size %q is not a valid size (e.g. 256m, 1g)", name, svc.ShmSize)
 	}
 	if svc.CPUs != "" {
 		if !cpusRe.MatchString(svc.CPUs) || strings.Trim(svc.CPUs, "0.") == "" {
-			return fmt.Errorf("service %q cpus %q must be a positive number of cores with at most two decimals (e.g. 0.5, 2)", name, svc.CPUs)
+			return atf(sp+".cpus", "service %q cpus %q must be a positive number of cores with at most two decimals (e.g. 0.5, 2)", name, svc.CPUs)
 		}
 	}
 	if l := svc.Logs; l != nil {
 		if l.Retain != "" {
 			if d, err := config.ParseDuration(l.Retain); err != nil || d <= 0 {
-				return fmt.Errorf("service %q logs.retain %q is not a valid duration (e.g. 72h, 30d)", name, l.Retain)
+				return atf(sp+".logs.retain", "service %q logs.retain %q is not a valid duration (e.g. 72h, 30d)", name, l.Retain)
 			}
 		}
 		if l.MaxLines < 0 || l.MaxLines > 10_000_000 {
-			return fmt.Errorf("service %q logs.max_lines %d must be between 1 and 10000000", name, l.MaxLines)
+			return atf(sp+".logs.max_lines", "service %q logs.max_lines %d must be between 1 and 10000000", name, l.MaxLines)
 		}
 	}
 	return nil
@@ -1114,11 +1119,11 @@ func (s *Spec) validateSelfHealing() error {
 		{"backoff_max_secs", sh.BackoffMaxSecs},
 	} {
 		if f.v < 0 {
-			return fmt.Errorf("self_healing.%s must be >= 0", f.name)
+			return atf("spec.self_healing."+f.name, "self_healing.%s must be >= 0", f.name)
 		}
 	}
 	if sh.BackoffBaseSecs > 0 && sh.BackoffMaxSecs > 0 && sh.BackoffMaxSecs < sh.BackoffBaseSecs {
-		return fmt.Errorf("self_healing.backoff_max_secs (%d) cannot be less than backoff_base_secs (%d)", sh.BackoffMaxSecs, sh.BackoffBaseSecs)
+		return atf("spec.self_healing.backoff_max_secs", "self_healing.backoff_max_secs (%d) cannot be less than backoff_base_secs (%d)", sh.BackoffMaxSecs, sh.BackoffBaseSecs)
 	}
 	return nil
 }
@@ -1131,7 +1136,7 @@ func (s *Spec) validateSelfHealing() error {
 func (s *Spec) validateOpsInterface() error {
 	// App-level (legacy) + each per-service ops_interface use identical predicates.
 	if err := s.validateOIFields(s.OpsInterface, "ops_interface"); err != nil {
-		return err
+		return at("spec.ops_interface", err)
 	}
 	alerting := 0
 	if s.OpsInterface != nil && len(s.OpsInterface.Alerts) > 0 {
@@ -1139,7 +1144,7 @@ func (s *Spec) validateOpsInterface() error {
 	}
 	for name, svc := range s.Compose.Services {
 		if err := s.validateOIFields(svc.OpsInterface, "services."+name+".ops_interface"); err != nil {
-			return err
+			return at(servicePath(name)+".ops_interface", err)
 		}
 		if svc.OpsInterface != nil && len(svc.OpsInterface.Alerts) > 0 {
 			alerting++
@@ -1295,40 +1300,45 @@ func validateOpsMetricRef(at string, m OpsMetricRef) error {
 // service appears twice, and the fields are structurally sane. The full controller
 // contract (dead band, breach window, cooldowns) is applied + re-validated when the
 // policy is persisted at deploy.
-func (s *Spec) validateScaling() error {
+func (s *Spec) validateScaling() (err error) {
+	entry := "" // the entry being checked: an error without a path of its own is located there
+	defer func() { err = at(entry, err) }()
 	declared := map[string]bool{}
 	for n := range s.Compose.Services {
 		declared[n] = true
 	}
 	seen := map[string]bool{}
-	for _, sc := range s.Scaling {
+	for i, sc := range s.Scaling {
+		entry = fmt.Sprintf("spec.scaling[%d]", i)
 		if !svcRe.MatchString(sc.Service) {
-			return fmt.Errorf("scaling entry must name a valid service")
+			return atf(entry+".service", "scaling entry must name a valid service")
 		}
 		if !declared[sc.Service] {
-			return fmt.Errorf("scaling targets unknown service %q", sc.Service)
+			return atf(entry+".service", "scaling targets unknown service %q", sc.Service)
 		}
 		if seen[sc.Service] {
-			return fmt.Errorf("scaling declared twice for service %q", sc.Service)
+			return atf(entry+".service", "scaling declared twice for service %q", sc.Service)
 		}
 		seen[sc.Service] = true
 		if sc.Min < 0 || sc.Max < 0 {
 			return fmt.Errorf("scaling %q: min/max must be >= 0", sc.Service)
 		}
 		if sc.Max > 0 && sc.Min > sc.Max {
-			return fmt.Errorf("scaling %q: min (%d) cannot exceed max (%d)", sc.Service, sc.Min, sc.Max)
+			return atf(entry+".min", "scaling %q: min (%d) cannot exceed max (%d)", sc.Service, sc.Min, sc.Max)
 		}
 		for _, p := range []struct {
 			name string
 			v    float64
 		}{{"up_cpu_pct", sc.UpCPUPct}, {"down_cpu_pct", sc.DownCPUPct}, {"up_mem_pct", sc.UpMemPct}, {"down_mem_pct", sc.DownMemPct}} {
 			if p.v < 0 || p.v > 100 {
-				return fmt.Errorf("scaling %q: %s must be within 0–100", sc.Service, p.name)
+				return atf(entry+"."+p.name, "scaling %q: %s must be within 0–100", sc.Service, p.name)
 			}
 		}
 		// Custom scaling signals (additive; CPU/mem above are unchanged).
 		metricNames := map[string]bool{}
-		for _, mt := range sc.Metrics {
+		scalingEntry := entry
+		for j, mt := range sc.Metrics {
+			entry = fmt.Sprintf("%s.metrics[%d]", scalingEntry, j)
 			if !svcRe.MatchString(mt.Name) {
 				return fmt.Errorf("scaling %q: a custom metric needs a name [a-z0-9_-]", sc.Service)
 			}
@@ -1365,7 +1375,9 @@ func (s *Spec) serviceNames() []string {
 	return names
 }
 
-func (s *Spec) validateServices() error {
+func (s *Spec) validateServices() (err error) {
+	entry := "" // the service being checked: an error without a path of its own is located there
+	defer func() { err = at(entry, err) }()
 	declaredSecrets := map[string]bool{}
 	for _, sec := range s.Secrets {
 		declaredSecrets[sec.Name] = true
@@ -1380,6 +1392,7 @@ func (s *Spec) validateServices() error {
 		names[n] = true
 	}
 	for _, name := range s.serviceNames() {
+		entry = servicePath(name)
 		if !svcRe.MatchString(name) {
 			return fmt.Errorf("service name %q is invalid", name)
 		}
@@ -1392,10 +1405,11 @@ func (s *Spec) validateServices() error {
 		}
 		if hasBuild {
 			if err := validateBuild(name, svc.Build); err != nil {
-				return err
+				return at(entry+".build", err)
 			}
 		}
-		for _, p := range svc.Ports {
+		for i, p := range svc.Ports {
+			entry = fmt.Sprintf("%s.ports[%d]", servicePath(name), i)
 			if p.Internal < 1 || p.Internal > 65535 {
 				return fmt.Errorf("service %q port %d is out of range", name, p.Internal)
 			}
@@ -1423,45 +1437,46 @@ func (s *Spec) validateServices() error {
 				}
 			}
 		}
+		entry = servicePath(name)
 		if err := validateServiceEnv(name, svc.Env, declaredSecrets); err != nil {
-			return err
+			return at(entry+".env", err)
 		}
 		if err := validateUlimits(name, svc.Ulimits); err != nil {
-			return err
+			return at(entry+".ulimits", err)
 		}
 		for _, sf := range svc.SecretFiles {
 			if !declaredSecrets[sf] {
-				return fmt.Errorf("service %q secret_files references undeclared secret %q", name, sf)
+				return atf(entry+".secret_files", "service %q secret_files references undeclared secret %q", name, sf)
 			}
 		}
 		// Cert bindings first: a config-file `{ cert: HOSTNAME.field }` may only
 		// reference a cert bound on the SAME service, so collect this service's cert
 		// hostnames before validating its config files.
 		certHosts := map[string]bool{}
-		for _, cb := range svc.CertBindings {
+		for i, cb := range svc.CertBindings {
 			if err := validateCertBinding(name, cb); err != nil {
-				return err
+				return at(fmt.Sprintf("%s.cert_bindings[%d]", entry, i), err)
 			}
 			certHosts[cb.Hostname] = true
 		}
-		for _, cf := range svc.ConfigFiles {
+		for i, cf := range svc.ConfigFiles {
 			if err := validateConfigFile(name, cf, declaredSecrets, certHosts); err != nil {
-				return err
+				return at(fmt.Sprintf("%s.config_files[%d]", entry, i), err)
 			}
 		}
-		for _, v := range svc.Volumes {
+		for i, v := range svc.Volumes {
 			if err := validateVolume(name, v); err != nil {
-				return err
+				return at(fmt.Sprintf("%s.volumes[%d]", entry, i), err)
 			}
 		}
 		if !validRestart[svc.Restart] {
-			return fmt.Errorf("service %q restart %q is not allowed", name, svc.Restart)
+			return atf(entry+".restart", "service %q restart %q is not allowed", name, svc.Restart)
 		}
 		if err := validateExec("command", name, svc.Command); err != nil {
-			return err
+			return at(entry+".command", err)
 		}
 		if err := validateHealthcheck(name, svc.Healthcheck); err != nil {
-			return err
+			return at(entry+".healthcheck", err)
 		}
 		if err := s.validateServiceSizing(name, svc); err != nil {
 			return err
@@ -1470,15 +1485,15 @@ func (s *Spec) validateServices() error {
 			switch sh.OnUnhealthy {
 			case "", OnUnhealthyRestart, OnUnhealthyNotify:
 			default:
-				return fmt.Errorf("service %q self_healing.on_unhealthy %q must be restart or notify", name, sh.OnUnhealthy)
+				return atf(entry+".self_healing.on_unhealthy", "service %q self_healing.on_unhealthy %q must be restart or notify", name, sh.OnUnhealthy)
 			}
 		}
 		for _, d := range svc.DependsOn {
 			if d == name {
-				return fmt.Errorf("service %q cannot depend on itself", name)
+				return atf(entry+".depends_on", "service %q cannot depend on itself", name)
 			}
 			if !names[d] {
-				return fmt.Errorf("service %q depends_on unknown service %q", name, d)
+				return atf(entry+".depends_on", "service %q depends_on unknown service %q", name, d)
 			}
 		}
 	}
@@ -1782,8 +1797,11 @@ func validateVolume(svc string, v Volume) error {
 	return nil
 }
 
-func (s *Spec) validateSecrets() error {
-	for _, sec := range s.Secrets {
+func (s *Spec) validateSecrets() (err error) {
+	entry := ""
+	defer func() { err = at(entry, err) }()
+	for i, sec := range s.Secrets {
+		entry = fmt.Sprintf("spec.secrets[%d]", i)
 		if !secretRe.MatchString(sec.Name) {
 			return fmt.Errorf("secret name %q is invalid", sec.Name)
 		}
@@ -1803,15 +1821,18 @@ func (s *Spec) validateSecrets() error {
 	return nil
 }
 
-func (s *Spec) validateEdge() error {
+func (s *Spec) validateEdge() (err error) {
+	entry := "" // the route being checked: an error without a path of its own is located there
+	defer func() { err = at(entry, err) }()
 	declared := map[string]bool{}
 	for n := range s.Compose.Services {
 		declared[n] = true
 	}
 	if err := validateBaseDomainName("edge", s.Edge.BaseDomain); err != nil {
-		return err
+		return at("spec.edge.base_domain", err)
 	}
-	for _, r := range s.Edge.Routes {
+	for i, r := range s.Edge.Routes {
+		entry = fmt.Sprintf("spec.edge.routes[%d]", i)
 		id := r.Hostname
 		if id == "" {
 			id = r.Subdomain
@@ -1820,92 +1841,94 @@ func (s *Spec) validateEdge() error {
 			return err
 		}
 		if err := validateBaseDomainName("edge route "+id, r.BaseDomain); err != nil {
-			return err
+			return at(entry+".base_domain", err)
 		}
 		if r.BaseDomain != "" && r.Subdomain == "" {
-			return fmt.Errorf("edge route %q sets base_domain without a subdomain — base_domain only selects the namespace for the subdomain shorthand", id)
+			return atf(entry+".base_domain", "edge route %q sets base_domain without a subdomain — base_domain only selects the namespace for the subdomain shorthand", id)
 		}
 		if !svcRe.MatchString(r.Service) {
-			return fmt.Errorf("edge route %q must name a valid service (upstream is a selector, never a literal dial target)", id)
+			return atf(entry+".service", "edge route %q must name a valid service (upstream is a selector, never a literal dial target)", id)
 		}
 		if !declared[r.Service] {
-			return fmt.Errorf("edge route %q targets unknown service %q", id, r.Service)
+			return atf(entry+".service", "edge route %q targets unknown service %q", id, r.Service)
 		}
 		if r.Port != 0 && controlPort(r.Port) {
-			return fmt.Errorf("edge route %q port %d is a reserved control-plane port", id, r.Port)
+			return atf(entry+".port", "edge route %q port %d is a reserved control-plane port", id, r.Port)
 		}
 		if r.UpstreamScheme != "" && r.UpstreamScheme != "http" && r.UpstreamScheme != "https" {
-			return fmt.Errorf("edge route %q upstream_scheme %q must be http or https", id, r.UpstreamScheme)
+			return atf(entry+".upstream_scheme", "edge route %q upstream_scheme %q must be http or https", id, r.UpstreamScheme)
 		}
 		if !edge.ValidLB(r.LB) {
-			return fmt.Errorf("edge route %q lb %q must be least_conn, round_robin, ip_hash or cookie", id, r.LB)
+			return atf(entry+".lb", "edge route %q lb %q must be least_conn, round_robin, ip_hash or cookie", id, r.LB)
 		}
 		if r.CA != "" && !edgeCANameRe.MatchString(r.CA) {
-			return fmt.Errorf("edge route %q ca %q must match [a-z][a-z0-9-]{0,30} (a CA defined in config.yaml edge.cas)", id, r.CA)
+			return atf(entry+".ca", "edge route %q ca %q must match [a-z][a-z0-9-]{0,30} (a CA defined in config.yaml edge.cas)", id, r.CA)
 		}
 	}
 	// L4 (TCP/UDP) routes: the LB owns each listen port, replicas stay internal.
 	l4Listen := map[string]bool{} // "proto:port" dedupe
 	listenPorts := map[int]bool{}
-	for _, r := range s.Edge.L4Routes {
+	for i, r := range s.Edge.L4Routes {
+		entry = fmt.Sprintf("spec.edge.l4_routes[%d]", i)
 		if r.Protocol != "tcp" && r.Protocol != "udp" {
-			return fmt.Errorf("edge l4_route protocol %q must be tcp or udp", r.Protocol)
+			return atf(entry+".protocol", "edge l4_route protocol %q must be tcp or udp", r.Protocol)
 		}
 		if r.Listen < 1 || r.Listen > 65535 {
-			return fmt.Errorf("edge l4_route listen port %d is out of range", r.Listen)
+			return atf(entry+".listen", "edge l4_route listen port %d is out of range", r.Listen)
 		}
 		if r.Listen == 80 || r.Listen == 443 {
-			return fmt.Errorf("edge l4_route listen port %d is reserved for the HTTP edge", r.Listen)
+			return atf(entry+".listen", "edge l4_route listen port %d is reserved for the HTTP edge", r.Listen)
 		}
 		if controlPort(r.Listen) {
-			return fmt.Errorf("edge l4_route listen port %d is a reserved control-plane port", r.Listen)
+			return atf(entry+".listen", "edge l4_route listen port %d is a reserved control-plane port", r.Listen)
 		}
 		key := fmt.Sprintf("%s:%d", r.Protocol, r.Listen)
 		if l4Listen[key] {
-			return fmt.Errorf("edge l4_route listen %d/%s is declared twice", r.Listen, r.Protocol)
+			return atf(entry+".listen", "edge l4_route listen %d/%s is declared twice", r.Listen, r.Protocol)
 		}
 		l4Listen[key] = true
 		listenPorts[r.Listen] = true
 		if !svcRe.MatchString(r.Service) {
-			return fmt.Errorf("edge l4_route on %d must name a valid service", r.Listen)
+			return atf(entry+".service", "edge l4_route on %d must name a valid service", r.Listen)
 		}
 		if !declared[r.Service] {
-			return fmt.Errorf("edge l4_route on %d targets unknown service %q", r.Listen, r.Service)
+			return atf(entry+".service", "edge l4_route on %d targets unknown service %q", r.Listen, r.Service)
 		}
 		if r.Port < 1 || r.Port > 65535 || controlPort(r.Port) {
-			return fmt.Errorf("edge l4_route on %d has an invalid or reserved upstream port %d", r.Listen, r.Port)
+			return atf(entry+".port", "edge l4_route on %d has an invalid or reserved upstream port %d", r.Listen, r.Port)
 		}
 		switch r.TLS {
 		case "", "passthrough":
 		case "terminate":
-			return fmt.Errorf("edge l4_route on %d: tls: terminate is not yet supported (use passthrough)", r.Listen)
+			return atf(entry+".tls", "edge l4_route on %d: tls: terminate is not yet supported (use passthrough)", r.Listen)
 		default:
-			return fmt.Errorf("edge l4_route on %d: tls %q must be passthrough", r.Listen, r.TLS)
+			return atf(entry+".tls", "edge l4_route on %d: tls %q must be passthrough", r.Listen, r.TLS)
 		}
 		switch r.LB {
 		case "", "round_robin", "least_conn", "hash_client_ip":
 		default:
-			return fmt.Errorf("edge l4_route on %d: lb %q must be round_robin, least_conn, or hash_client_ip", r.Listen, r.LB)
+			return atf(entry+".lb", "edge l4_route on %d: lb %q must be round_robin, least_conn, or hash_client_ip", r.Listen, r.LB)
 		}
 		switch r.Forward {
 		case "", "proxy", "kernel":
 		default:
-			return fmt.Errorf("edge l4_route on %d: forward %q must be proxy or kernel", r.Listen, r.Forward)
+			return atf(entry+".forward", "edge l4_route on %d: forward %q must be proxy or kernel", r.Listen, r.Forward)
 		}
 		if r.Kernel() {
 			if r.LB != "" {
-				return fmt.Errorf("edge l4_route on %d: forward: kernel serves one copy — remove lb", r.Listen)
+				return atf(entry+".lb", "edge l4_route on %d: forward: kernel serves one copy — remove lb", r.Listen)
 			}
 			if n := s.Compose.Services[r.Service].Replicas; n > 1 {
-				return fmt.Errorf("edge l4_route on %d: forward: kernel needs service %q to run one copy (it sets replicas %d)", r.Listen, r.Service, n)
+				return atf(entry+".forward", "edge l4_route on %d: forward: kernel needs service %q to run one copy (it sets replicas %d)", r.Listen, r.Service, n)
 			}
 			for _, sc := range s.Scaling {
 				if sc.Service == r.Service && sc.Enabled {
-					return fmt.Errorf("edge l4_route on %d: forward: kernel needs service %q to run one copy (disable its spec.scaling entry)", r.Listen, r.Service)
+					return atf(entry+".forward", "edge l4_route on %d: forward: kernel needs service %q to run one copy (disable its spec.scaling entry)", r.Listen, r.Service)
 				}
 			}
 		}
 	}
+	entry = ""
 	// A service may not publish a host port the L4 LB already owns (collision): the
 	// LB binds it and fans to internal replicas.
 	for name, svc := range s.Compose.Services {
@@ -1918,7 +1941,7 @@ func (s *Spec) validateEdge() error {
 				host = p.Published
 			}
 			if listenPorts[host] {
-				return fmt.Errorf("service %q publishes host port %d, which is owned by an edge l4_route", name, host)
+				return atf(servicePath(name)+".ports", "service %q publishes host port %d, which is owned by an edge l4_route", name, host)
 			}
 		}
 	}
@@ -1932,7 +1955,7 @@ func (s *Spec) validateSetup() error {
 	autoDeploy := s.Git != nil && s.Git.AutoDeploy
 	ss := sandbox.ScriptSet{Script: s.Setup.Script, Trigger: s.Setup.Trigger, Produces: s.Setup.Produces}
 	if err := ss.Validate(autoDeploy); err != nil {
-		return fmt.Errorf("spec.setup: %w", err)
+		return at("spec.setup", fmt.Errorf("spec.setup: %w", err))
 	}
 	return nil
 }

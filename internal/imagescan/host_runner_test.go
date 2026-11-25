@@ -601,3 +601,57 @@ func TestRunnerHostCancelledScanNotSaved(t *testing.T) {
 		t.Error("a scan cut short by shutdown must not store a failure")
 	}
 }
+
+// A scan whose report could not be used stores the reason itself for the Server tab; any other
+// failure (the scanner's stderr) stays in the log.
+func TestRunnerHostScanFailureReason(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want string
+	}{
+		{errNoOutput, "the last host scan failed: the scanner returned no output"},
+		{fmt.Errorf("wrapped: %w", errReportTooLarge(defaultLimits)), "the last host scan failed: the scan report is larger than 1024 MiB"},
+		{&outputError{reason: "the scan report is incomplete", cause: errors.New("it ends after 33554432 bytes")}, "the last host scan failed: the scan report is incomplete"},
+		{errors.New("trivy scan failed: exit status 1: FATAL token=abc"), hostScanFailed},
+	} {
+		sc := &fakeScanner{hostErr: c.err}
+		r, hs := newHostRunner(t, sc, &fakeSink{}, nil, nil)
+		r.ScanAll(context.Background())
+		got, ok, _ := hs.Get(context.Background())
+		if !ok || got.Error != c.want {
+			t.Errorf("%v: stored error %q; want %q", c.err, got.Error, c.want)
+		}
+		if len(got.Reports) != 0 || got.OS != "" || got.Total() != 0 {
+			t.Errorf("a failed first scan stores no result: %+v", got)
+		}
+	}
+}
+
+// A row without reports is an earlier failure: the next failure replaces it (its time is the latest
+// attempt's), while a completed scan's results and time survive later failures.
+func TestRunnerHostScanFailureRowTimes(t *testing.T) {
+	ctx := context.Background()
+	sc := &fakeScanner{hostErr: errNoOutput}
+	r, hs := newHostRunner(t, sc, &fakeSink{}, nil, nil)
+	if err := hs.Save(ctx, HostScan{ScannedAt: 1000, Error: hostScanFailed}); err != nil {
+		t.Fatal(err)
+	}
+	r.ScanAll(ctx)
+	got, _, _ := hs.Get(ctx)
+	if got.ScannedAt <= 1000 || got.Error != "the last host scan failed: the scanner returned no output" {
+		t.Errorf("a failure after a failure must store this attempt's time and reason: %+v", got)
+	}
+
+	good := hostScanOf("ubuntu 24.04", buildReport(OSReportTarget, []trivyVuln{{VulnerabilityID: "CVE-9", PkgName: "x", Severity: "LOW"}}))
+	good.ScannedAt = 2000
+	if err := hs.Save(ctx, good); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		r.ScanAll(ctx)
+		got, _, _ = hs.Get(ctx)
+		if got.ScannedAt != 2000 || got.Low != 1 || len(got.Reports) != 1 || got.Error == "" {
+			t.Errorf("failure %d after a completed scan must keep its results and time: %+v", i+1, got)
+		}
+	}
+}

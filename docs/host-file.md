@@ -57,7 +57,7 @@ Layers 2 and 3 are defined in their definition files (the host file and each app
 
 ## The `config.yaml` reference
 
-`config.yaml` (default `/etc/mooring/config.yaml`) is the **root of trust** — edited only over SSH, never by the dashboard. [Installation](./installation.md) walks through the essentials; this is the complete surface. Every block is optional except `encryption_key` and the `auth` block (and `edge.acme_email` in managed mode); sensible defaults apply to the rest.
+`config.yaml` (default `/etc/mooring/config.yaml`) is the **root of trust** — edited only over SSH, never by the dashboard. Edit it with `sudo mooring config edit` and check it with `sudo mooring config check`; an error names the line ([Checking and editing `config.yaml`](./config-editing.md)). [Installation](./installation.md) walks through the essentials; this is the complete surface. Every block is optional except `encryption_key`, `ip_allowlist` and the `auth` block (and `edge.acme_email` in managed mode); sensible defaults apply to the rest.
 
 ```yaml
 # --- Identity & network ---
@@ -67,7 +67,7 @@ encryption_key_previous: ""          # set during a key rotation so old data sti
 data_dir: "/var/lib/mooring"         # where the database, git clones, and backups live
 protected_projects: []               # compose projects Mooring must never start/stop (its own infra)
 
-ip_allowlist: ["203.0.113.0/24"]     # CIDRs allowed to reach the dashboard (empty = only loopback/tunnel)
+ip_allowlist: ["127.0.0.1/32", "::1/128", "203.0.113.0/24"]  # REQUIRED — addresses or CIDRs allowed to reach the dashboard; an empty list is refused. The SSH tunnel arrives from loopback
 trust_proxy: false                   # honor X-Forwarded-For (only behind the managed edge / a trusted proxy)
 trusted_proxies: []                  # in external-edge mode: the specific edge IP(s), ≤ /24
 
@@ -257,7 +257,17 @@ read right to left (the last address not in `trusted_proxies`); apps receive it 
 These are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
 dashboard listener in external-edge mode.
 
-> **Reload vs. restart.** `systemctl reload mooring` applies the dashboard allowlist (`ip_allowlist`, `trust_proxy`, `trusted_proxies`), `auth`/`users` and `retention.*`. Everything else is read only at boot and needs a full `systemctl restart`, including every `alerting.*` setting (quiet hours, intervals, the heartbeat), every `security_logs.*` setting, the GitHub credentials, the bind address, the encryption key, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`. See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
+> **Reload vs. restart.** `sudo systemctl reload mooring` applies `ip_allowlist`, `trust_proxy`, `trusted_proxies`, `auth`, `users` and `retention.*`. `ip_allowlist` is applied to the dashboard and to the edge route of the dashboard hostname; when Caddy refuses the new list the edge keeps the previous one, and while the edge serves the dashboard hostname it refuses a list with an entry that admits every address ([`ip_allowlist` at the edge](./config-editing.md#ip_allowlist-at-the-edge)). Every other setting is read at start and needs `sudo systemctl restart mooring`, including every `alerting.*` setting (quiet hours, intervals, the heartbeat), every `security_logs.*` setting, the GitHub credentials, the bind address, the encryption key, `admin.*`, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`. A reload checks the file first and fails, leaving the running service unchanged, when the file is refused. `mooring config check` and `mooring config edit` print which of the two a change needs. See [reload or restart](./config-editing.md#apply-a-change-reload-or-restart).
+
+### Files in `/etc/mooring`
+
+| File | Owner and mode | What it is |
+|---|---|---|
+| `config.yaml` | `root:mooring`, `0640` | The configuration. |
+| `config.yaml.last-good` | `root`, `0600` | The file `mooring config edit` last replaced. Holds the same secrets as `config.yaml`. |
+| `.config.lock` | `root`, `0600` | The lock of `mooring config edit`. Empty; it stays in place between runs. |
+
+`ip_allowlist` entries are an address or a CIDR. An address without a prefix length is that one address, an IPv4-mapped IPv6 address (`::ffff:198.51.100.7`) is the IPv4 address, and spaces around an entry are ignored. The dashboard and the edge use the same canonical list.
 
 ### Security logs
 

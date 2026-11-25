@@ -50,13 +50,73 @@ fi
 # shipped one; `mooring doctor` reports a MemoryMax that stayed below 1G. A fresh install has no
 # config yet and is left for the operator to enable after writing config.yaml (see the steps
 # printed below).
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload || true
-    if [ -f /etc/mooring/config.yaml ]; then
-        systemctl enable mooring >/dev/null 2>&1 || true
-        systemctl restart mooring >/dev/null 2>&1 || true
+#
+# Before the restart the NEW binary checks the existing config.yaml. A new version can refuse a
+# file the old one accepted; restarting then would stop a working service and leave it down. When
+# the file is refused (exit status 78) nothing is restarted: the old process keeps running and the
+# problem is printed with the commands to run after fixing it. Any other result (valid, or the
+# check itself could not run) restarts as before; a refused file can't crash-loop either way,
+# because the unit doesn't restart on 78.
+# The check runs as the service user when it can: serve runs as that user, while root reads a file
+# the service can't. It runs with the unit's group too (`-g mooring`, the unit's Group=): runuser
+# alone uses the user's primary group from the passwd database, which need not be that group, and
+# the file's group rule compares against it. When runuser is missing, or doesn't take -g, or the
+# user doesn't exist, the check runs as root. As the service user, exit status 2 (the file can't be
+# read) also means serve would not start, so it is handled like 78. As root only 78 is (root's
+# check also reports a file the service can't read, or of another group, as 78).
+# Every command here is guarded: this script runs under `set -e` and must never fail the install.
+# upgrade-restart: begin
+MOORING_BIN=/usr/local/bin/mooring
+MOORING_CONFIG=/etc/mooring/config.yaml
+mooring_check_as_service=no
+if command -v runuser >/dev/null 2>&1 && id -u mooring >/dev/null 2>&1; then
+    # A probe: does this runuser run a command as the user with the group?
+    if runuser -u mooring -g mooring -- true >/dev/null 2>&1; then
+        mooring_check_as_service=yes
     fi
 fi
+# mooring_config_check [flags]: `mooring config check` on the config, as the service user when possible.
+mooring_config_check() {
+    if [ "$mooring_check_as_service" = yes ]; then
+        runuser -u mooring -g mooring -- "$MOORING_BIN" config check "$@" --config "$MOORING_CONFIG"
+    else
+        "$MOORING_BIN" config check "$@" --config "$MOORING_CONFIG"
+    fi
+}
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    if [ -f "$MOORING_CONFIG" ]; then
+        systemctl enable mooring >/dev/null 2>&1 || true
+        config_rc=0
+        mooring_config_check --quiet >/dev/null 2>&1 || config_rc=$?
+        config_refused=no
+        if [ "$config_rc" -eq 78 ]; then
+            config_refused=yes
+        elif [ "$config_rc" -eq 2 ] && [ "$mooring_check_as_service" = yes ]; then
+            config_refused=yes
+        fi
+        if [ "$config_refused" = yes ]; then
+            echo "" || true
+            echo "mooring: NOT restarted. This version refuses $MOORING_CONFIG:" || true
+            echo "" || true
+            mooring_config_check 2>&1 || true
+            echo "" || true
+            if systemctl is-active --quiet mooring >/dev/null 2>&1; then
+                echo "The service that was running keeps running on the previous version until it is" || true
+                echo "restarted; it will not start again with this file. Fix the file, then run:" || true
+            else
+                echo "The service is not running, and it will not start with this file. Fix the file," || true
+                echo "then run:" || true
+            fi
+            echo "  sudo mooring config check" || true
+            echo "  sudo systemctl restart mooring" || true
+            echo "" || true
+        else
+            systemctl restart mooring >/dev/null 2>&1 || true
+        fi
+    fi
+fi
+# upgrade-restart: end
 
 # Only print the first-run setup steps on a FRESH install (no config yet) — not on every upgrade.
 if [ ! -f /etc/mooring/config.yaml ]; then

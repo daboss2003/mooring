@@ -16,6 +16,7 @@ import (
 	"github.com/daboss2003/mooring/internal/crypto"
 	"github.com/daboss2003/mooring/internal/definition"
 	"github.com/daboss2003/mooring/internal/envstore"
+	"github.com/daboss2003/mooring/internal/gitstore"
 	"github.com/daboss2003/mooring/internal/sandbox"
 	"github.com/daboss2003/mooring/internal/secret"
 )
@@ -148,7 +149,7 @@ func (s *Server) handleSetupSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "attach your mooring.yaml", http.StatusBadRequest)
 		return
 	}
-	file, _, err := r.FormFile("definition")
+	file, hdr, err := r.FormFile("definition")
 	if err != nil {
 		http.Error(w, "attach your mooring.yaml (field 'definition')", http.StatusBadRequest)
 		return
@@ -159,9 +160,19 @@ func (s *Server) handleSetupSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not read the upload", http.StatusBadRequest)
 		return
 	}
-	d, err := definition.Parse(raw)
+	// The name in the messages is the uploaded file's when it is a mooring file name; the browser
+	// sends it, so anything else is not echoed.
+	name := "mooring.yaml"
+	if base := filepath.Base(hdr.Filename); gitstore.ValidMooringFile(base) {
+		name = base
+	}
+	d, err := definition.ParseNamed(raw, name)
 	if err != nil {
-		http.Error(w, "mooring.yaml rejected: "+err.Error(), http.StatusUnprocessableEntity)
+		msg := "mooring.yaml rejected: " + err.Error()
+		if detail := definitionDetail(err); detail != "" {
+			msg = "mooring.yaml rejected:\n" + detail
+		}
+		http.Error(w, msg, http.StatusUnprocessableEntity) // text/plain + nosniff: the excerpt is the upload's own text
 		return
 	}
 	if d.Spec.Setup == nil {

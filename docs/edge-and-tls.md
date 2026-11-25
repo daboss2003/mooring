@@ -660,6 +660,20 @@ hostname is proxied by the CDN, requests arrive from the CDN's addresses and are
 addresses are in `ip_allowlist`. Point the admin hostname at the server with a DNS-only (not proxied)
 record.
 
+`sudo systemctl reload mooring` applies a changed `ip_allowlist` to the admin vhost:
+
+- When Caddy refuses the config with the new list and accepts the same config with the previous
+  list, the edge keeps the previous list. When Caddy refuses both (it has just restarted), the new
+  list stays pending and is applied at the next refresh.
+- While the edge serves the admin hostname it refuses a list with an entry that admits every
+  address (`0.0.0.0/0`, `::/0`, and IPv4-mapped forms of all of IPv4). The previous list stays.
+  This applies when the `admin` block was removed and Mooring was reloaded, not restarted: the
+  admin vhost is served until the restart.
+- A Caddy that Mooring starts again starts with the list in force, not the list from Mooring's
+  start.
+
+The log messages: [`ip_allowlist` at the edge](./config-editing.md#ip_allowlist-at-the-edge).
+
 ### Blocked addresses
 
 With `trusted_proxies` set, the edge's [block list](./security-responses.md#behind-a-cdn-or-proxy)

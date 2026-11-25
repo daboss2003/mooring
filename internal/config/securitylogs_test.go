@@ -56,7 +56,7 @@ func TestSecurityLogsArchiveS3Validated(t *testing.T) {
 	}
 	for p, want := range map[string]string{
 		`"/mooring/"`:                           "must not start with '/'",
-		`"mooring"`:                             `must end with '/' (use "mooring/")`,
+		`"mooring"`:                             "must end with '/'",
 		`"moo ring/"`:                           "only letters, digits",
 		`"mooring\\x/"`:                         "only letters, digits",
 		`"mooring?x/"`:                          "only letters, digits",
@@ -66,9 +66,9 @@ func TestSecurityLogsArchiveS3Validated(t *testing.T) {
 		`"./x/"`:                                `path element`,
 		`"a/../b/"`:                             `path element`,
 		`"a/./"`:                                `path element`,
-		`".hidden/"`:                            `path element ".hidden"`,
-		`"mooring/.git/"`:                       `path element ".git"`,
-		`"a/.../"`:                              `path element "..."`,
+		`".hidden/"`:                            `path element`,
+		`"mooring/.git/"`:                       `path element`,
+		`"a/.../"`:                              `path element`,
 		`"` + strings.Repeat("a", 129) + `/"`:   "longer than 128 characters",
 		`"x/` + strings.Repeat("b", 129) + `/"`: "longer than 128 characters",
 		`"` + strings.Repeat("a", 256) + `/"`:   "at most 256 characters",
@@ -94,10 +94,10 @@ func TestSecurityLogsHostLogPathsValidated(t *testing.T) {
 		for p, want := range map[string]string{
 			`"var/log/auth.log"`:           "must be an absolute path",
 			`"./auth.log"`:                 "must be an absolute path",
-			`"/var/log/../log/auth.log"`:   `not a clean path (use "/var/log/auth.log")`,
-			`"/var//log/auth.log"`:         "not a clean path",
-			`"/var/log/auth.log/"`:         "not a clean path",
-			`"/var/log/./auth.log"`:        "not a clean path",
+			`"/var/log/../log/auth.log"`:   "must be a clean path",
+			`"/var//log/auth.log"`:         "must be a clean path",
+			`"/var/log/auth.log/"`:         "must be a clean path",
+			`"/var/log/./auth.log"`:        "must be a clean path",
 			`"/var/log/auth.log\nx"`:       "control character",
 			`"/var/log/auth\u0000.log"`:    "control character",
 			`"/var/log/auth\u007f.log"`:    "control character",
@@ -131,9 +131,9 @@ func TestSecurityLogsPIIListsValidated(t *testing.T) {
 		if _, err := Parse([]byte(validYAML(t, pii(key, many(64)...)))); err != nil {
 			t.Errorf("%s: 64 names refused: %v", key, err)
 		}
-		mustReject(t, validYAML(t, pii(key, many(65)...)), "security_logs.pii."+key+": at most 64 names, got 65")
+		mustReject(t, validYAML(t, pii(key, many(65)...)), "security_logs.pii."+key+": at most 64 names")
 		for _, bad := range []string{`""`, `"a b"`, `"a*"`, `"émail"`, `"a/b"`, `"a\tb"`, strings.Repeat("a", 65)} {
-			mustReject(t, validYAML(t, pii(key, "imei", bad)), "security_logs.pii."+key+": ")
+			mustReject(t, validYAML(t, pii(key, "imei", bad)), "security_logs.pii."+key+"[1]: use letters")
 			mustReject(t, validYAML(t, pii(key, "imei", bad)), "letters, digits, '_', '-' and '.'")
 		}
 	}

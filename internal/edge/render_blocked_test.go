@@ -200,7 +200,7 @@ func TestRenderBlockedNeverDeniesAllowlistedPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	rs := blockRoutes(t, out)
-	if rs[0].Match[0].RemoteIP == nil || !reflect.DeepEqual(rs[0].Match[0].RemoteIP.Ranges, base.AdminAllowlist) {
+	if rs[0].Match[0].RemoteIP == nil || !reflect.DeepEqual(rs[0].Match[0].RemoteIP.Ranges, []string{"203.0.113.0/24", "2001:db8:aaaa::/48", "192.0.2.5/32"}) {
 		t.Fatalf("the admin vhost must be first with the allowlist:\n%s", out)
 	}
 	ranges, ok := isDenyRoute(rs[1])

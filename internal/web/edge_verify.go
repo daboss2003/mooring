@@ -39,7 +39,10 @@ func (s *Server) verifyEdgeTargetsExcept(ctx context.Context, slug string, windo
 		rctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		rerr := s.edgeRecon.Reconcile(rctx)
 		cancel()
-		if rerr != nil {
+		// Intentional: an error that says the config WAS applied (a reloaded dashboard allowlist
+		// given up or still waiting, with the previous one in force) is no failure of this deploy:
+		// its routes are live and are checked below.
+		if rerr != nil && !edge.ConfigApplied(rerr) {
 			lines = []string{"✗ edge config not applied: " + rerr.Error()}
 			failures = []string{"edge config not applied: " + rerr.Error()}
 		} else {

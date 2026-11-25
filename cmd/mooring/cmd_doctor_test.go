@@ -1532,6 +1532,13 @@ func setupCheckConfig(t *testing.T) *config.Config {
 	withDNS01(cfg, "cloudflare", "route53")
 	cfg.Edge.DNS01.APIToken = tokCF
 	cfg.Edge.BaseDomains[0].DNS01.APIToken = tokR53
+	// Intentional: the error is ignored. Validate is called only because it parses ip_allowlist
+	// into the canonical list the edge is rendered with (a loaded config always has it); this
+	// hand-built fixture isn't a complete config.yaml.
+	_ = cfg.Validate()
+	if len(cfg.AllowlistStrings()) != 1 {
+		t.Fatalf("fixture: ip_allowlist not parsed: %v", cfg.AllowlistStrings())
+	}
 	return cfg
 }
 

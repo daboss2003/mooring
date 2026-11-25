@@ -158,9 +158,17 @@ Critical / High / Medium / Low issues each app has, and the worst ones spelled o
 version that fixes them. Anything **High or Critical** also sends you an alert. To clear a
 finding, update the flagged package (bump a dependency, or update the base image) and redeploy.
 
+When a target of an app could not be scanned, the app's row shows
+`one or more targets could not be scanned` in parentheses after the scan time. When Trivy ran but
+its report could not be used, the text is followed by `: ` and the reason, one of the
+[reasons listed for the host scan](#host-vulnerabilities), and the Mooring log has the detail
+(`imagescan: target failed`).
+
 The scanner runs the pinned Trivy image with no Docker socket, dropped capabilities, and
-`no-new-privileges`; its vulnerability database is cached in a persistent volume so it isn't
-re-downloaded every scan. Trivy's usage telemetry and update check are turned off
+`no-new-privileges`, one `docker run` per scan in a container named `mooring-scan-` followed by
+16 hex digits. A scan container that was stopped or whose run failed is
+[removed](#host-vulnerabilities) (`docker rm -f`). The vulnerability database is cached in a
+persistent volume so it isn't re-downloaded every scan. Trivy's usage telemetry and update check are turned off
 (`--disable-telemetry --skip-version-check`), so a scan contacts only the image registry and the
 vulnerability database mirrors (`mirror.gcr.io`, then `ghcr.io`).
 
@@ -207,7 +215,9 @@ has published, so an end-of-life release shows few or no findings. No alert is s
 
 How it runs:
 
-- One `docker run` of the pinned Trivy image per scan (`trivy rootfs`). The release files, the
+- One `docker run` of the pinned Trivy image per scan (`trivy rootfs`). The container is named
+  `mooring-scan-` followed by 16 hex digits, a new name for every scan (visible in `docker ps`).
+  The release files, the
   package database and each binary are bind-mounted read-only under `/host`, each at `/host`
   followed by its path with symlinks resolved (on Amazon Linux 2023, `/etc/system-release` is
   mounted as `/host/usr/lib/system-release`); nothing else on the host is visible to the scanner,
@@ -217,8 +227,39 @@ How it runs:
 - It runs on the app scan's schedule (`server.image_scan_interval`, default 24h; the first run is
   about 2 minutes after Mooring starts), before the app scans, one Trivy container at a time. It
   runs even when `server.image_scan_enabled` is `false`.
-- A failed scan keeps the previous results on the page and shows the error; the cause is in the
-  Mooring log (`journalctl -u mooring`).
+- Trivy's JSON report is read as a stream. Limits: 1024 MiB for the report, 4 MiB for one entry
+  of it (one finding, one string), 32 MiB of kept findings, and 512 levels of nesting. A report
+  over a limit fails the scan and the scanner is stopped: `docker run` gets `SIGTERM` and is
+  killed when it has not exited after 10 seconds. The app scans have the same limits.
+- After a scan whose `docker run` did not end by itself with exit status 0 (stopped for a report
+  limit, the scan timeout or a shutdown of Mooring, or a failed run), Mooring removes the scan
+  container with `docker rm -f <name>`, with a limit of 30 seconds. A removal that fails is logged
+  as `WARN` `imagescan: scan container not removed; it can run until the scanner's own timeout`
+  (with `container`, `err` and `docker_stderr`); the scan's failure reason is unchanged. The app
+  scans do the same.
+
+A failed scan:
+
+- With no completed scan before it, the section shows only the failure, "No host scan has
+  completed yet, so there are no results to show", and the time of the last attempt.
+- After a completed scan, the section shows the failure and the earlier results, labelled
+  "Results of the last scan that completed, not of the failed one", with that scan's time.
+- When Trivy ran but its report could not be used, the failure is `the last host scan failed: `
+  followed by one of the reasons below. For any other failure (Docker, the image pull, Trivy's
+  exit status) it is `the last host scan failed; the Mooring log (journalctl -u mooring) has the
+  cause`. The Mooring log has the detail in both cases (`imagescan: host scan failed`).
+- A failed scan sends no `host_vulnerabilities` alert.
+
+| Reason | Meaning |
+|---|---|
+| `the scanner returned no output` | Trivy wrote no report. |
+| `the scan report is incomplete` | The report ends before its JSON is complete. |
+| `the scan report is larger than 1024 MiB` | The report limit. |
+| `one entry of the scan report is larger than 4 MiB` | The limit for one entry. |
+| `the scan report has more findings than Mooring keeps (32 MiB)` | The limit for kept findings. |
+| `the scan report is nested deeper than 512 levels` | The limit for nesting. |
+| `the scan report is not valid JSON` | The report is not JSON. |
+| `the scan report is not in the format Mooring reads` | The JSON is not a Trivy report in the expected form. |
 
 Alerts (see [Alerts](./alerting.md#host-and-edge-maintenance-alerts)):
 

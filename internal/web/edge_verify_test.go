@@ -152,3 +152,37 @@ func TestVerifyEdgeTargetsReportsListingError(t *testing.T) {
 		t.Fatalf("the listing must be done once per service per pass, got %d calls", calls)
 	}
 }
+
+// A reconcile that applied the config but gave up a reloaded dashboard allowlist (the edge refuses
+// a list that admits every address) is no failed deploy: the routes are live, so they are checked
+// as usual. Only an edge that did not apply the config fails the verification.
+func TestVerifyEdgeTargetsWhenTheAllowlistWasDropped(t *testing.T) {
+	admin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) }))
+	t.Cleanup(admin.Close)
+	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	rs := edge.NewRouteStore(db)
+	if err := rs.Save(context.Background(), shopWeb()); err != nil {
+		t.Fatal(err)
+	}
+	rec := edge.NewReconciler(rs, edge.NewAdmin(admin.Listener.Addr().String()), edge.BaseConfig{
+		AdminListen: "127.0.0.1:2019", ACMEEmail: "ops@example.com", ACMECA: "https://acme.example/directory",
+		AdminHostname: "admin.example.com", AdminAllowlist: []string{"203.0.113.0/24"}, AdminUpstream: "127.0.0.1:9001",
+	}, quietWebLog())
+	s := &Server{docker: dockerServingContainers(t, containersJSON), log: quietWebLog(), edgeRecon: rec, edgeRoutes: rs}
+	rec.SetPoolDiscoverer(s.DiscoverEdgePools)
+	if err := rec.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec.SetAdminAllowlist([]string{"0.0.0.0/0"})
+	var lines []string
+	if err := s.verifyEdgeTargets(context.Background(), "shop", 0, writeIDsOf("1", "2"), func(l string) { lines = append(lines, l) }); err != nil {
+		t.Fatalf("the config was applied with the previous allowlist; verification should pass, got %v", err)
+	}
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "✓ app.example.com → ") {
+		t.Fatalf("want the route's ✓ line, got %v", lines)
+	}
+}

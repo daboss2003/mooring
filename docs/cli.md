@@ -4,7 +4,7 @@ The `mooring` binary is both the long-running server (the dashboard + managed ed
 
 > **An app is defined by its `mooring.yaml`.** That file — in the app's Git repo — is the single source of truth for its *shape*: services, build, ports, and edge/L4 routes. You create an app by **connecting its repo**; Mooring fetches the file, generates the compose, and deploys it. The dashboard *reflects* that shape (read-only — edit the file and deploy) and is where you manage the **operational** pieces: **secret values** and **env**, **config files** and **cert bindings** (editable in the dashboard; optionally seeded from the file), the **auto-scaling policy**, and **lifecycle actions** (deploy / restart / scale-now). The CLI is deliberately small and exists for three things:
 >
-> 1. **The install-time root of trust** — `gen-key`, `hash-password`, `gen-totp`, `verify-key`. These credentials and keys must be generated over SSH and pasted into the root-owned config; there is no web route that reads or writes them.
+> 1. **The install-time root of trust** — `gen-key`, `hash-password`, `gen-totp`, `verify-key`. These credentials and keys must be generated over SSH and pasted into the root-owned config; there is no web route that reads or writes them. `config check` and `config edit` check and edit that file.
 > 2. **Authoring helpers** — `validate` (the same checks a deploy runs, no DB, safe in CI), `init` (scaffold a `mooring.yaml`), and `secret import` (load a `.env` into an app's encrypted store).
 > 3. **Disaster recovery** — `restore` rebuilds the database from an encrypted backup with the service stopped.
 >
@@ -21,6 +21,8 @@ See also: [README](../README.md) · [Configuration / root of trust](./architectu
 - [Command reference](#command-reference)
   - [`serve`](#mooring-serve)
   - [`doctor` / `setup`](#mooring-doctor--setup)
+  - [`config check`](#mooring-config-check)
+  - [`config edit`](#mooring-config-edit)
   - [`validate`](#mooring-validate)
   - [`init`](#mooring-init)
   - [`secret import`](#mooring-secret-import)
@@ -72,6 +74,21 @@ For each command: **purpose**, **usage**, **flags**, and an **example**.
 - **Usage:** `mooring serve [--config PATH]`
 - **Flags:** `--config PATH` (default `/etc/mooring/config.yaml`).
 - **Notes:** fail-closed on boot — a bad config, a key/DB mismatch, or (when `setup.enabled`) a missing sandbox refuses to start. `SIGHUP` hot-reloads the IP allowlist + auth + retention policy, but **not** keys or the bind address (those require a restart).
+- **Exit status at start:** `serve` logs one `ERROR` line with `detail` and `hint` and exits in these cases. The systemd unit does not restart on `78`. On `1` it starts the service again every 2 seconds, so a file or directory on a volume that attaches late is picked up. Every other start failure exits `1`.
+
+  | Cause | Exit status | `msg` |
+  |---|---|---|
+  | `config.yaml` does not exist | `1` | `config.yaml not found; not starting` |
+  | `config.yaml` cannot be reached for another reason than its permissions | `1` | `config.yaml can't be read; not starting` |
+  | The service may not read `config.yaml` (permission denied) | `78` | `config.yaml can't be read; not starting` |
+  | `config.yaml` is group-readable and its group is neither `root` nor the service's | `78` | `config.yaml belongs to another group than the service's; not starting` |
+  | `config.yaml` is refused | `78` | `config.yaml is not valid; not starting` (with `file`, `line` and `problems`) |
+  | `data_dir`, `<data_dir>-apps` or, with `edge.mode: managed`, `/var/lib/caddy` is missing or not writable | `1` | `a required directory is missing or not writable; not starting` |
+  | `encryption_key` does not open the database | `78` | `encryption_key does not match the database; not starting` |
+  | `setup.enabled: true` without a working sandbox | `78` | `setup.enabled is set but this host has no working sandbox; not starting` |
+
+  Do what the `hint` says. After status `78`, run `sudo systemctl start mooring`. The hints: [a refused file at start, reload and upgrade](./config-editing.md#start).
+- **Reload:** `systemctl reload mooring` runs `mooring config check --errors-only` first and sends `SIGHUP` only when the file is valid. A reload applies `ip_allowlist` to the dashboard and to the edge route of the dashboard hostname; the log says whether the edge took the list: `config reload: the edge serves the reloaded ip_allowlist for the dashboard hostname`, or a warning that the list is pending until the next reconcile Caddy accepts, or that the edge refused it and keeps the previous list ([`ip_allowlist` at the edge](./config-editing.md#ip_allowlist-at-the-edge)). A reload reads `config.yaml` once and applies that configuration to the dashboard, the edge's `ip_allowlist` and the retention policy; it logs `config reloaded (allowlist + auth)`. When the file does not load it logs the `ERROR` line `config reload rejected; keeping previous`, and when the dashboard refuses the configuration an `ERROR` line that starts with `config reload: the dashboard refused the config; nothing was applied`; in both cases nothing is applied. A `SIGHUP` sent during start-up is handled once start-up finishes. See [reload or restart](./config-editing.md#apply-a-change-reload-or-restart).
 
 ```console
 $ mooring serve --config /etc/mooring/config.yaml
@@ -107,6 +124,8 @@ mooring serving bind=127.0.0.1:9000 edge_mode=managed db=/var/lib/mooring/moorin
   - **Mooring-owned build:** installs a Caddy build from `caddyserver.com` as `<data_dir>/bin/caddy` when a configured `dns01` provider's plugin is missing from the Caddy the edge runs, or when that Caddy is older than 2.11 and a setting needs 2.11 (`edge.trusted_proxies`, a `dns01` namespace, `catch_all`). When the same run upgrades the system `caddy`, the build for 2.11 is installed only if the system `caddy` is still older than 2.11 after the upgrade. Before it is installed, the build must run, be 2.11 or later, have each `dns01` provider's module, and accept the edge's startup config and the edge config rendered from the edge settings in `config.yaml` (`caddy validate`, run as the `mooring` user; without app routes or DNS-01 wildcards). That config includes the issuer of each `edge.cas` CA, so a `trusted_root` the `mooring` user can't read, or that isn't a PEM certificate, fails the check. No certificate is requested and no CA is contacted. If the build fails, setup prints a warning and carries on. Mooring retries a build for a `dns01` plugin at startup; the build for 2.11 alone is retried only by running `sudo mooring setup --yes` again. A build that fails the config check is not installed and the warning carries Caddy's error, with the `dns01` tokens removed: fix that setting in `config.yaml` and run `sudo mooring setup --yes` again.
   - **The running service:** at the end, setup prints what the running mooring service needs. It was running without an edge because no Caddy was installed: restart it (`sudo systemctl restart mooring`) so the edge starts. A Mooring-owned build was installed: restart it so the edge switches to the build. The running edge used the upgraded system `caddy`: Mooring restarts the edge on it within a few minutes (`sudo systemctl restart mooring` switches at once). It added the `mooring` user to `adm` while the service runs: restart it so the service gets the group. `--restart` restarts the service instead.
   - **Other steps:** with `--l4` installs `nginx` + `libnginx-mod-stream`; disables the **distro** caddy/nginx units (Mooring supervises its own children), including the unit a package installed in the same run brings; **caps Docker's container logs** — it merges `log-opts.max-size` into `/etc/docker/daemon.json` (preserving your other keys, backing up the original) and restarts Docker; adds the `mooring` user to `adm` (`usermod -aG adm mooring`) when the host has that group, the user isn't in it, and neither `security_logs.enabled` nor `security_logs.host_logs.enabled` is `false`; and enables the mooring service when it is disabled. (The bind capability + runtime/state dirs are already provided by the unit + postinstall — no drop-in step.)
+- **`config.yaml` in `doctor`:** a file that is refused is a `fail` on the `config` line, with the problems (file, line, column, the line and a hint) below it; the other checks then use the defaults. Run as root on a host with a `mooring` group, a file that loads for root and that the service cannot use is also a `fail`, judged as in [`config check`](#mooring-config-check): `<path> is readable by root only (mode 0600): the service (user mooring) can't read it; the service will not start with it (what is in the file is valid)`, with the fix `sudo chown root:mooring <path> && sudo chmod 0640 <path>`, or `<path> can't be used by the service (user mooring): <reason>; the service will not start with it (what is in the file is valid)`, with the fix `the service must be able to enter <dir>: sudo chown root:mooring <dir> && sudo chmod 0750 <dir>`. A warning, not a `fail`: a file that is missing, a file the user running `doctor` cannot read, and a group-readable file whose group is not that user's primary group when `doctor` is not run as root (`can't judge <path> as this user (the file belongs to another group): run sudo mooring config check`). The other checks use the defaults in these cases too.
+- **Exit status of `doctor`:** `0` when no check failed, `1` when at least one check is a `fail`. Warnings do not change it.
 - **What it will NOT do automatically:** rewrite host DNS / free `:53` (it prints the steps — too easy to lock yourself out). The Docker restart **bounces running containers**, so it's a labelled step in the dry-run plan you review first — run `setup` *before* deploying apps and it disrupts nothing.
 
 ```console
@@ -128,18 +147,78 @@ $ sudo mooring setup --yes          # applies the plan above
 
 ---
 
+### `mooring config check`
+
+- **Purpose:** run the checks `mooring serve` runs on `config.yaml` at start, without starting anything. Read-only. No value from the file is printed.
+- **Usage:** `mooring config check [--config PATH] [--quiet] [--errors-only] [--json]`
+- **Flags:**
+  - `--config PATH` — the file (default `/etc/mooring/config.yaml`).
+  - `--quiet` — print nothing; the exit status is the answer. Cannot be combined with `--errors-only` or `--json` (exit `2`).
+  - `--errors-only` — print nothing for a valid file; for any other file the output is the same as without the flag.
+  - `--json` — print the result as one line of JSON on stdout.
+- **Exit status:** `0` valid; `78` refused (an empty file, a YAML mistake, an unknown key, a wrong type, a value the validation refuses, a wrong owner, group or mode); `2` the file is missing or unreadable, the file cannot be judged as this user, or wrong arguments. `--errors-only` does not change the exit status.
+- **Output:** for a valid file `OK: <file> is valid`, the warnings, the hostnames a certificate is requested for, when `config.yaml.last-good` exists and is readable (root) the settings changed since it with the command that applies each, and a note when `config.yaml.rejected-edit` exists (an edit `config edit` kept instead of installing; `rejected_edit` in the JSON). For a refused file, every problem on stderr with its line and a caret. Every value is masked and no message quotes one; a key is shown only when it is a key of `config.yaml`. With `--json`, a file that is missing, unreadable or cannot be judged as this user prints `{"ok":false,"file":…,"error":…}` on stdout (exit `2`). Formats and the JSON fields: [Checking and editing `config.yaml`](./config-editing.md#check-the-file).
+- **Notes:** run it with `sudo`. Run as a user who is neither root nor has the file's group as primary group, it does not judge a group-readable file: it prints `can't judge <path> as this user (the file belongs to another group): run sudo mooring config check` and exits `2`. Run as root on a host with a `mooring` group, it refuses (exit `78`) a file that loads for root and that the service cannot use. On a host with a `mooring` user it reads the file again as that user, with the unit's group and supplementary groups, in a child process, and that read decides: a file the user reads through an ACL is not refused; a file in a directory the user cannot enter is. Without a `mooring` user, or when the child process gives no answer within 5 seconds, the file's owner, group and mode decide. The messages: `<path> is readable by root only (mode 0600): the service (user mooring) can't read it`, or `<path> belongs to group id N, not to the service's group mooring (id M): …`, followed by the fix `sudo chown root:mooring <path> && sudo chmod 0640 <path>`; for any other reason `<path> can't be used by the service (user mooring): <reason>` (for example `stat <path>: permission denied`), followed by `The service must be able to enter <dir>:` and `sudo chown root:mooring <dir> && sudo chmod 0750 <dir>` when a directory above the file is closed to the user. With `--json` the message is `problems[0].msg` and the fix is `problems[0].hint`. `systemctl reload mooring` (as the `mooring` user, with `--errors-only`) and the package upgrade (as the `mooring` user and group when it can, otherwise as root) run it before they touch the service.
+
+```console
+$ sudo mooring config check
+/etc/mooring/config.yaml:3:1: unknown key on this line
+  2 | encryption_key: …
+  3 | …
+    | ^
+   hint: did you mean ip_allowlist?
+
+/etc/mooring/config.yaml is refused: mooring will not start or reload with it.
+$ echo $?
+78
+```
+
+---
+
+### `mooring config edit`
+
+- **Purpose:** edit `config.yaml` in an editor and install the result only when it passes the checks of `config check`. Root, on a terminal.
+- **Usage:** `sudo mooring config edit [--config PATH]`
+- **Flags:** `--config PATH` (default `/etc/mooring/config.yaml`).
+- **Exit status:** `0` installed or unchanged; `1` nothing installed (discarded, editor failed, locked, changed underneath, interrupted, or the offer to start from the example declined); `2` not root, no terminal, or wrong arguments.
+- **Editor:** the first installed of `$SUDO_EDITOR`, `$VISUAL`, `$EDITOR`, `sensible-editor`, `nano`, `vi`. It runs in its own process group. Under a shell with job control, `Ctrl-Z` in the editor suspends `mooring config edit` with it and `fg` continues both; where nothing can continue the command (for example `ssh -t host 'sudo mooring config edit'`), `Ctrl-Z` does not suspend it.
+- **What it does:** locks `/etc/mooring/.config.lock`, opens a private copy (`0600`) in the editor, checks it, and on a refused copy asks `(e)dit again / (x) discard`. A valid copy replaces the file with the same owner, group and mode; the previous file is kept as `config.yaml.last-good`. It then prints which changed settings need `sudo systemctl reload mooring` and which need `sudo systemctl restart mooring`. It runs neither. When `mooring serve` will not start with the installed file for its owner, group or mode, it prints a warning (`warning: mooring serve will not start with <path> as it is now, whatever is in it: …`) with the `chown` and `chmod` command; it does not change them. The editor's backup and swap files of the copy are removed with it.
+- **Refusals:** a symlink, a file with several hard links, a directory not owned by root or writable by others, a second `config edit` on the same file, and a file whose content, owner, group or mode changed while it was being edited. In the last case the edit is kept as `config.yaml.rejected-edit` (`root`, `0600`); later runs do not remove it.
+- **A missing file:** it offers to start from the example, looked for at `/usr/share/mooring/config.example.yaml`, then `/etc/mooring/config.example.yaml`.
+- **Signals:** `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` stop the editor's process group with `SIGTERM` (killed after 3 seconds), restore the terminal, remove the copy and exit `1` without installing. When an edit was kept as `config.yaml.rejected-edit`, the message names it.
+- **Details:** [Checking and editing `config.yaml`](./config-editing.md#edit-the-file).
+
+```console
+$ sudo mooring config edit
+/etc/mooring/config.yaml installed; the previous file is kept as /etc/mooring/config.yaml.last-good
+To apply (nothing was reloaded or restarted):
+  reload  (sudo systemctl reload mooring): ip_allowlist
+```
+
+---
+
 ### `mooring validate`
 
 - **Purpose:** parse and validate a `mooring.yaml` through the **same §5.6/§6.2 chokepoints** a deploy runs — with **no database** and **no write plane**. Read-only and safe to run in CI.
-- **Usage:** `mooring validate [--from mooring.yaml] [--run-dir DIR]`
+- **Usage:** `mooring validate [--from mooring.yaml] [--run-dir DIR] [--json]`
 - **Flags:**
   - `--from <path>` — the definition file (default `mooring.yaml`).
   - `--run-dir <dir>` — the app run directory bind mounts must stay under (optional; lets the binds-confinement check run as it would on the host).
+  - `--json` — print the result as one line of JSON on stdout: `{"ok":true,"file":…,"kind":…,"slug":…}` for a valid `kind: App` file (`"apps": N` instead of `slug` for `kind: Host`), `{"file":…,"problems":[…]}` for a refused one. The problem fields are those of [`config check --json`](./config-editing.md#a-refused-file).
+- **Exit status:** `0` valid; `1` refused; `2` the file is missing or cannot be read, or a flag is wrong. With `--json` a missing or unreadable file prints `{"ok":false,"file":…,"error":…}` on stdout; without it the message is on stderr.
+- **Errors:** a refused file is printed on stderr with the file, line and column, the line itself with a caret, and a hint. The messages for a value of the wrong type quote the value (`(found "3")`). Every YAML, unknown-key and type problem is listed; of the values the validation refuses, the first. See [reading the errors](./config-editing.md#reading-the-errors).
 - **Notes:** this is the CLI/deploy **parity** guarantee — a `mooring.yaml` that validates here is one Mooring would accept on deploy, because both run the one reconciler. Run it in CI so a bad commit fails before you ever click **Deploy**. A sibling `.env` next to the file is used to resolve `${VAR}` references during validation. Both `kind: App` and `kind: Host` files are accepted.
 
 ```console
 $ mooring validate --from mooring.yaml
 OK: billing-api (kind=App, compose.source=generated) is valid
+
+$ mooring validate --from mooring.yaml
+mooring.yaml:17:9: unknown key "servce" in spec.edge.routes[0]
+  16 |       - hostname: app.example.com
+  17 |         servce: web
+     |         ^
+   hint: did you mean service?
 ```
 
 ---
@@ -340,7 +419,7 @@ $ sudo mooring security-logs decrypt ./audit/v1/2026/11/21/09/web-1-0001.ndjson.
 
 ### Root of trust: `gen-key` / `hash-password` / `gen-totp` / `verify-key`
 
-These bootstrap and verify the credentials and keys in `/etc/mooring/config.yaml`. They print material you paste into the root-owned config (`0600 root:root`) — they do **not** edit the file for you. No web route reads or writes auth, the IP allowlist, the master key, or the bind address. Passwords are read from `/dev/tty`, never `argv`.
+These bootstrap and verify the credentials and keys in `/etc/mooring/config.yaml`. They print material you paste into the root-owned config (`root:mooring`, mode `0640`; edit it with `sudo mooring config edit`) — they do **not** edit the file for you. No web route reads or writes auth, the IP allowlist, the master key, or the bind address. Passwords are read from `/dev/tty`, never `argv`.
 
 After pasting, apply the change: **`hash-password` and `gen-totp`** (login/two-factor) take effect with `sudo systemctl reload mooring`, but **`gen-key`** (the master key) is read only at startup and needs `sudo systemctl restart mooring`. See [editing the config file](./installation.md#editing-the-config-file-reload-vs-restart).
 
@@ -354,7 +433,7 @@ After pasting, apply the change: **`hash-password` and `gen-totp`** (login/two-f
 ```console
 $ mooring gen-key
 encryption_key: "9f3c1d...=="
-Paste this into /etc/mooring/config.yaml (0600 root:root). Back it up offsite, separately from the DB.
+Paste this into /etc/mooring/config.yaml (root:mooring, mode 0640). Back it up offsite, separately from the DB.
 ```
 
 #### `mooring hash-password`
@@ -412,5 +491,6 @@ verify-key: OK — key matches the DB
 | Code | Meaning |
 |---|---|
 | `0` | Success. |
-| `1` | The command returned an error — a validation rejection (`validate`, `secret import`), a key/DB mismatch (`verify-key`), a wrong/corrupt archive (`restore`), a missing required flag, an unparseable flag, or any other runtime failure. The message is printed to stderr as `mooring <command>: <error>`. |
-| `2` | No command given, or an unknown command (the usage summary is printed to stderr). |
+| `1` | The command returned an error — a validation rejection (`validate`, `secret import`), a key/DB mismatch (`verify-key`), a wrong/corrupt archive (`restore`), a missing required flag, an unparseable flag, or any other runtime failure. The message is printed to stderr as `mooring <command>: <error>`. `doctor`: at least one check is a `fail`. `config edit`: nothing was installed. `serve`: `config.yaml` is missing or cannot be reached, a required directory is missing or not writable, or another start failure; the systemd unit starts the service again every 2 seconds. |
+| `2` | No command given, or an unknown command (the usage summary is printed to stderr). `config check`: the file is missing or unreadable, cannot be judged as this user, or wrong arguments. `config edit`: not root, no terminal, or wrong arguments. `validate`: the file is missing or unreadable, or a flag is wrong. |
+| `78` | `config check`: `config.yaml` is refused, or, run as root, the service cannot reach or read it or it belongs to another group than the service's. `serve`: `config.yaml` is refused, the service may not read it, it belongs to another group than the service's, `encryption_key` does not match the database, or `setup.enabled` is set without a working sandbox. The systemd unit does not restart on this status. |

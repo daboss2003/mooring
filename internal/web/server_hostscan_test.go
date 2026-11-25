@@ -139,3 +139,79 @@ func TestServerTabRebootNoticeHidden(t *testing.T) {
 		t.Error("no reboot notice unless /run/reboot-required exists")
 	}
 }
+
+func hostSection(t *testing.T, e *testEnv) string {
+	t.Helper()
+	page := serverPage(t, e)
+	start, end := strings.Index(page, "<h2>Host vulnerabilities"), strings.Index(page, "<h2>Image updates")
+	if start < 0 || end < start {
+		t.Fatal("host section not found")
+	}
+	return page[start:end]
+}
+
+// A failed scan with no completed scan before it is not a result: the page shows the failure and its
+// reason, never "Operating system not detected · 0 findings" or an empty findings table.
+func TestServerTabHostScanFailedWithoutResults(t *testing.T) {
+	withReboot(t, false, nil)
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	hs := imagescan.NewHostStore(e.srv.db)
+	e.srv.hostScans = hs
+	for _, msg := range []string{
+		"the last host scan failed: the scan report is larger than 1024 MiB",
+		// The row a release before this one stored.
+		"the last host scan failed; the Mooring log (journalctl -u mooring) has the cause",
+	} {
+		if err := hs.Save(context.Background(), imagescan.HostScan{ScannedAt: 1700000000, Error: msg}); err != nil {
+			t.Fatal(err)
+		}
+		sec := hostSection(t, e)
+		for _, want := range []string{msg, "No host scan has completed yet, so there are no results to show", "last attempt", `data-ts="1700000000"`} {
+			if !strings.Contains(sec, want) {
+				t.Errorf("failed-scan section missing %q:\n%s", want, sec)
+			}
+		}
+		for _, not := range []string{"Operating system not detected", "0 findings", "<table", "with a fix", "Fix by upgrading"} {
+			if strings.Contains(sec, not) {
+				t.Errorf("failed-scan section must not show %q as if it were a result:\n%s", not, sec)
+			}
+		}
+	}
+}
+
+// A failed scan after a completed one shows the failure first, then the earlier results marked as such.
+func TestServerTabHostScanFailedKeepsEarlierResults(t *testing.T) {
+	withReboot(t, false, nil)
+	e := buildServer(t, []string{"127.0.0.1/32"}, false, nil, "")
+	hs := imagescan.NewHostStore(e.srv.db)
+	e.srv.hostScans = hs
+	h := imagescan.HostScan{
+		ScannedAt: 1700000000, OS: "ubuntu 24.04", High: 1, FixableHigh: 1,
+		Reports: []imagescan.Report{{Target: imagescan.OSReportTarget, High: 1, FixableHigh: 1, Top: []imagescan.Vuln{
+			{ID: "CVE-2026-123007", Package: "nginx", Installed: "1.24.0-2ubuntu7", Fixed: "1.24.0-2ubuntu7.6", Severity: "HIGH"},
+		}}},
+	}
+	const marker = "Results of the last scan that completed, not of the failed one:"
+	if err := hs.Save(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	if sec := hostSection(t, e); strings.Contains(sec, marker) || strings.Contains(sec, `role="alert"`) || !strings.Contains(sec, "ubuntu 24.04") {
+		t.Errorf("a completed scan has no failure text:\n%s", sec)
+	}
+	h.Error = "the last host scan failed: the scanner returned no output"
+	if err := hs.Save(context.Background(), h); err != nil {
+		t.Fatal(err)
+	}
+	sec := hostSection(t, e)
+	for _, want := range []string{h.Error, marker, "ubuntu 24.04", `data-ts="1700000000"`, "1 findings, 1 with a fix", "CVE-2026-123007"} {
+		if !strings.Contains(sec, want) {
+			t.Errorf("section missing %q:\n%s", want, sec)
+		}
+	}
+	if strings.Contains(sec, "No host scan has completed yet") {
+		t.Error("the earlier results exist, so the page must not say no scan completed")
+	}
+	if strings.Index(sec, h.Error) > strings.Index(sec, marker) {
+		t.Error("the failure comes before the earlier results")
+	}
+}

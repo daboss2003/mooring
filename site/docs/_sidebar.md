@@ -22,6 +22,7 @@
   - [Scaling & self-healing](scaling-and-self-healing.md)
   - [Per-service ops (rich monitoring)](app-ops-interface.md)
   - [The Server tab](server-tab.md)
+  - [Checking & editing config.yaml](config-editing.md)
 
 - Reference
   - [CLI](cli.md)

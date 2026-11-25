@@ -79,7 +79,7 @@ type BaseConfig struct {
 	ACMECA         string   // pinned default issuer directory URL
 	CAs            []CA     // extra named issuers (private CAs) a subject can opt into
 	AdminHostname  string   // "" = NO admin vhost (reach the UI via SSH tunnel)
-	AdminAllowlist []string // IP-allowlist CIDRs for the admin vhost (typed, mandatory if AdminHostname set)
+	AdminAllowlist []string // IP-allowlist CIDRs for the admin vhost (typed, mandatory if AdminHostname set; rendered masked, a bare address as /32 or /128)
 	AdminUpstream  string   // the ONLY loopback upstream, identity-pinned (e.g. 127.0.0.1:9000)
 	// Wildcards enable OPTIONAL *.<Domain> wildcard certs via ACME DNS-01 — one entry per
 	// operator-declared subdomain namespace (the default base_domain and each edge.base_domains)
@@ -374,10 +374,10 @@ type blockGuard struct {
 
 func newBlockGuard(base BaseConfig) blockGuard {
 	g := blockGuard{cdn: CDNRanges()}
-	for _, s := range base.AdminAllowlist {
+	for i, s := range base.AdminAllowlist {
 		p, err := parseAllowEntry(s)
 		if err != nil {
-			g.err = fmt.Errorf("ip_allowlist entry %q can't be checked", s)
+			g.err = fmt.Errorf("ip_allowlist[%d] can't be checked", i)
 			return g
 		}
 		g.allow = append(g.allow, p)
@@ -394,8 +394,8 @@ func newBlockGuard(base BaseConfig) blockGuard {
 }
 
 // parseAllowEntry parses an ip_allowlist entry (a CIDR or an address) the way Caddy's remote_ip
-// compares it: masked, IPv4-mapped as IPv4. Unlike a trusted proxy, 0.0.0.0/0 is a valid entry (it
-// then protects every address).
+// compares it: masked, IPv4-mapped as IPv4. Unlike a trusted proxy, 0.0.0.0/0 parses (it then protects
+// every address from the block list); Render refuses it for the dashboard route.
 func parseAllowEntry(s string) (netip.Prefix, error) {
 	s = strings.TrimSpace(s)
 	p, err := netip.ParsePrefix(s)
@@ -678,12 +678,29 @@ func Render(base BaseConfig, routes []Route, certOnly []CertHost) ([]byte, error
 		if base.AdminUpstream == "" {
 			return nil, fmt.Errorf("admin vhost requires the pinned admin upstream")
 		}
+		// Rendered in the form the dashboard compares (config.AllowlistStrings), so both gates admit
+		// the same addresses; an entry Caddy couldn't parse fails here instead of at /load.
+		adminRanges := make([]string, 0, len(base.AdminAllowlist))
+		for i, s := range base.AdminAllowlist {
+			p, err := parseAllowEntry(s)
+			if err != nil {
+				return nil, fmt.Errorf("ip_allowlist[%d] is not an IP address or a CIDR", i)
+			}
+			// Intentional: the same rule as config validation (a /0 entry with admin exposure), repeated
+			// here because a reload can hand over a list validated for a file without the admin block
+			// while this edge still serves the dashboard hostname it started with. Checked on the
+			// canonical prefix, so ::ffff:0.0.0.0/96 (all of IPv4) is caught as 0.0.0.0/0.
+			if p.Bits() == 0 {
+				return nil, fmt.Errorf("ip_allowlist[%d] admits every address: refused while the edge serves the dashboard hostname %s (restrict ip_allowlist, or restart Mooring if the admin block was removed)", i, ah)
+			}
+			adminRanges = append(adminRanges, p.String())
+		}
 		httpRoutes = append(httpRoutes, caddyRoute{
 			// Intentional: remote_ip and the remote.host X-Forwarded-For are the TCP peer even with
 			// edge.trusted_proxies — never client_ip / {http.vars.client_ip}, which a trusted proxy
 			// fills from a header the client can forge. The dashboard re-checks ip_allowlist against
 			// this X-Forwarded-For, so both gates stay on the real connection.
-			Match: []caddyMatch{{Host: []string{ah}, RemoteIP: &caddyRemoteIP{Ranges: base.AdminAllowlist}}},
+			Match: []caddyMatch{{Host: []string{ah}, RemoteIP: &caddyRemoteIP{Ranges: adminRanges}}},
 			Handle: []caddyHandler{{
 				Handler:   "reverse_proxy",
 				Upstreams: []caddyUpstream{{Dial: base.AdminUpstream}},

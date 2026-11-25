@@ -856,6 +856,11 @@ func (s *Server) deployRepoApp(ctx context.Context, cfg gitstore.Config, sha, so
 	}
 	if derr != nil {
 		s.gitStore.SetState(bg, slug, "update_blocked")
+		// The deploy output also gets the offending line with a caret and the hint (the returned
+		// error stays one line).
+		if detail := definitionDetail(derr); detail != "" {
+			onLine(detail)
+		}
 		return nil, derr
 	}
 	if scaffolded {

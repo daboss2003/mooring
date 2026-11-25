@@ -59,6 +59,7 @@ fuzz internal/siem/feeds  FuzzDecodeSnapshot
 fuzz internal/siem/detect FuzzEvent
 fuzz internal/siem/detect FuzzPatternMine
 fuzz internal/edge        FuzzRenderBlocked
+fuzz internal/yamldiag    FuzzExplain
 
 hr "Phase-1 external static tools (run if installed)"
 if have govulncheck; then run "govulncheck (zero reachable)" govulncheck ./...; else skip govulncheck; fi
