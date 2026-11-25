@@ -16,7 +16,6 @@ func TestEvidenceBrowser(t *testing.T) {
 		want bool
 	}{
 		{siem.Event{Src: siem.SrcEdge, TS: at, F: map[string]any{"fetch_site": "cross-site"}}, true},
-		{siem.Event{Src: siem.SrcEdge, TS: at, F: map[string]any{"fetch_site": "other"}}, true},
 		{siem.Event{Src: siem.SrcEdge, TS: at, F: map[string]any{"status": 404.0}}, false},
 		{siem.Event{Src: siem.SrcEdge, TS: at, F: map[string]any{"fetch_site": ""}}, false},
 		{siem.Event{Src: siem.SrcEdge, TS: at, F: map[string]any{"fetch_site": true}}, false},

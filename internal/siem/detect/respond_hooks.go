@@ -49,11 +49,22 @@ func (e *Engine) respondCommit(a *activeDet) {
 	switch req.Action {
 	case siem.ResponseBlock:
 		now := e.now()
+		// Intentional: a recommendation and an automatic request are held apart (owner decision,
+		// v0.33.1): a recommendation must not hold the automatic block back — a client can make its
+		// own block a recommendation with a browser's header — while each kind is still asked for at
+		// most every blockAskEvery.
+		last := &a.blockAsked
+		if !req.Automatic {
+			last = &a.recAsked
+		}
+		waiting := slices.ContainsFunc(a.resp, func(r siem.ResponseRequest) bool {
+			return r.Action == siem.ResponseBlock && r.Automatic == req.Automatic
+		})
 		// Intentional: a last request in the future (the clock stepped back) doesn't hold the next.
-		if len(a.resp) > 0 || (!a.blockAsked.IsZero() && !now.Before(a.blockAsked) && now.Sub(a.blockAsked) < blockAskEvery) {
+		if waiting || (!last.IsZero() && !now.Before(*last) && now.Sub(*last) < blockAskEvery) {
 			return
 		}
-		a.blockAsked = now
+		*last = now
 	case siem.ResponseRevoke:
 		if slices.Contains(a.signedOut, req.Target) {
 			return
@@ -125,10 +136,10 @@ func (e *Engine) sendResponses(a *activeDet) {
 //     counts an app's events only recommends, whichever event fired it (an app says what the
 //     address is, so its events are forgeable). Addresses in Mooring's and the host's logs are never
 //     blocked;
-//   - unless the rule needs a listed address: no block when a browser sent any event counted in the
-//     firing (a web page can make its visitors' browsers send requests anywhere), and a
-//     recommendation only when one came with a browser's or a mail client's agent (sentBy). The
-//     address baseline's firings say so too (baseline_ip.go);
+//   - unless the rule needs a listed address: a recommendation only when any event counted in the
+//     firing came with browser fetch metadata (a web page can make its visitors' browsers send
+//     requests anywhere) or with a browser's or a mail client's agent (sentBy). The address
+//     baseline's firings say so too (baseline_ip.go);
 //   - a sign-out only of a Mooring account: the key of an actor-keyed rule, or the account of the
 //     last event (the successful sign-in) of an address-keyed one.
 func (e *Engine) responseFor(a *activeDet) (siem.ResponseRequest, bool) {
@@ -159,14 +170,15 @@ func (e *Engine) responseFor(a *activeDet) (siem.ResponseRequest, bool) {
 		default:
 			return siem.ResponseRequest{}, false
 		}
-		// Intentional: only a rule that needs the address on a threat list blocks on a browser's
-		// request (the address itself is listed); any other rule, one-event ones included, could be
-		// steered onto a web page's visitors.
+		// Intentional: only a rule that needs the address on a threat list blocks automatically on a
+		// browser's request (the address itself is listed); any other rule, one-event ones included,
+		// could be steered onto a web page's visitors.
+		// Intentional: fetch metadata gives a recommendation, not silence (owner decision, v0.33.1).
+		// Sec-Fetch-Site is a request header like the User-Agent, so a scanner can send it too; asking
+		// for nothing let one that did go unblocked and unlisted. The owner applies the block.
 		if !needsList(c.q) {
 			switch {
-			case a.byBrowser:
-				return siem.ResponseRequest{}, false
-			case a.byAgent:
+			case a.byBrowser, a.byAgent:
 				req.Automatic = false
 			// Intentional: the address baseline records what sent the requests it counted (ipSlot), so
 			// its block follows the rules above (owner decision). No other baseline kind is keyed by an

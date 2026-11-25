@@ -62,10 +62,10 @@ A rule's response is asked for each time the rule fires for a detection: when th
 first recorded, and at each update. Each firing is checked by itself, as things are at that time:
 the requests it counted (see [Requests sent by a browser](#requests-sent-by-a-browser)), the rule's
 snooze, the mutes, and whether the rule is on and can have the response. A detection whose earlier
-firings asked for nothing (a browser's request was counted, the rule was snoozed, the detection was
-muted) asks at the first firing that qualifies.
+firings asked for nothing (the rule was snoozed, the detection was muted) asks at the first firing that qualifies.
 
-- A block is asked for at most once every 5 minutes per detection.
+- A block is asked for at most once every 5 minutes per detection; an automatic block and a
+  recommendation are counted apart, so a recommendation never delays the automatic block.
 - A block request is dropped while the address's own block, active or
   [suspended](#suspended-blocks), has 2 minutes or more to go. Nothing is recorded for it: no
   response, no count toward a [cap](#caps), no audit record, no event and no timeline entry. A
@@ -109,11 +109,13 @@ not only the evidence events kept with the detection:
 
 | A counted request | Is | Block |
 |---|---|---|
-| Has a `Sec-Fetch-Site` header (stored as [`f.fetch_site`](./security-logs.md#kinds)) | Sent by a browser | None is asked for. |
-| Has no `Sec-Fetch-Site` header, and a User-Agent ([`f.ua`](./security-logs.md#kinds)) that starts with `Mozilla/` or contains `ms-office`, `Microsoft Office` or `Thunderbird` (in any letter case) | Sent with a browser-like agent | Recommend only, in every mode. |
+| Has a `Sec-Fetch-Site` header with one of the values browsers send: `cross-site`, `same-origin`, `same-site`, `none` (stored as [`f.fetch_site`](./security-logs.md#kinds)) | Sent by a browser | Recommend only, in every mode. |
+| Has no such `Sec-Fetch-Site` header (none, or another value), and a User-Agent ([`f.ua`](./security-logs.md#kinds)) that starts with `Mozilla/` or contains `ms-office`, `Microsoft Office` or `Thunderbird` (in any letter case) | Sent with a browser-like agent | Recommend only, in every mode. |
 
-- A request with a `Sec-Fetch-Site` header among the counted ones decides: no block is asked for,
-  whatever the others are.
+- One such request among the counted ones is enough: the block is a recommendation, whatever the
+  others are.
+- Any client can send these headers. A scanner that sends them is not blocked automatically; its
+  block waits on the Responses page for an owner to apply.
 - A rule whose query needs the address on a threat-intelligence list (a positive `list:` term, as
   in `edge.spamhaus_ip` and `edge.dshield_ip`) is not affected: it blocks whatever sent the
   request.

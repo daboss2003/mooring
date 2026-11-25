@@ -184,19 +184,20 @@ func TestResponseAppAddressRecommendOnly(t *testing.T) {
 	}
 }
 
-// Requests a browser sent never count toward a block of a counting rule; a listed address (count
-// 1) is blocked whatever sent its request.
+// A request with browser fetch metadata among those a counting rule counted makes its block a
+// recommendation (owner decision, v0.33.1; no request at all before: a scanner can send the header
+// too); a listed address (count 1) is blocked whatever sent its request.
 func TestResponseBrowserEvidence(t *testing.T) {
 	h, fr := respHarness(t, false)
 	h.only(t, edgeRule(3))
 	h.feed(edgeHit(0, addrX, ""), edgeHit(time.Second, addrX, "cross-site"), edgeHit(2*time.Second, addrX, ""))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 0 {
+	if got := fr.all(); !recommended(got, addrX) {
 		t.Fatalf("a counting rule's detection with browser evidence: %+v", got)
 	}
 	h.feed(edgeHit(0, addrY, ""), edgeHit(time.Second, addrY, ""), edgeHit(2*time.Second, addrY, ""))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 1 || got[0].Target != addrY {
+	if got := fr.all(); len(got) != 2 || got[1].Target != addrY || !got[1].Automatic {
 		t.Fatalf("no browser evidence: %+v", got)
 	}
 
@@ -213,7 +214,7 @@ func TestResponseBrowserEvidence(t *testing.T) {
 	}
 
 	// A one-event rule that doesn't need a listed address (a page's visitors can be made to request
-	// any path) doesn't block on a browser's request either; on a scripted one it does.
+	// any path) only recommends on a browser's request too; on a scripted one it blocks.
 	h, fr = respHarness(t, false)
 	h.only(t, siem.Rule{ID: "custom.wplogin", Type: siem.RuleThreshold, Query: "src:edge kind:http.request f.path:/wp-login.php",
 		GroupBy: "ip", Count: 1, Window: time.Hour, Response: blockResp(time.Hour)})
@@ -224,12 +225,12 @@ func TestResponseBrowserEvidence(t *testing.T) {
 	}
 	h.feed(wp(addrX, "cross-site"))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 0 {
-		t.Fatalf("a one-event rule without a list blocked a browser's request: %+v", got)
+	if got := fr.all(); !recommended(got, addrX) {
+		t.Fatalf("a one-event rule without a list on a browser's request: %+v", got)
 	}
 	h.feed(wp(addrY, ""))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 1 || got[0].Target != addrY {
+	if got := fr.all(); len(got) != 2 || got[1].Target != addrY || !got[1].Automatic {
 		t.Fatalf("a one-event rule on a scripted request: %+v", got)
 	}
 }

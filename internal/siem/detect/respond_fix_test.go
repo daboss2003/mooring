@@ -53,7 +53,7 @@ func TestSentBy(t *testing.T) {
 
 // Finding 1: every counted event says whether a browser sent it, not only the last four (the
 // evidence kept): 96 requests a page made a visitor's browser send, then 4 scripted ones, block
-// nobody.
+// nobody automatically (a recommendation; no request at all before v0.33.1).
 func TestResponseBrowserCountedBeyondEvidence(t *testing.T) {
 	h, fr := respHarness(t, false)
 	r := edgeRule(100)
@@ -69,7 +69,7 @@ func TestResponseBrowserCountedBeyondEvidence(t *testing.T) {
 	if ds := h.all(t); len(ds) != 1 {
 		t.Fatalf("detections %+v", ds)
 	}
-	if got := fr.all(); len(got) != 0 {
+	if got := fr.all(); !recommended(got, addrX) {
 		t.Fatalf("browser-sent requests counted toward a block: %+v", got)
 	}
 	// 100 scripted requests from another address: blocked.
@@ -77,7 +77,7 @@ func TestResponseBrowserCountedBeyondEvidence(t *testing.T) {
 		h.feed(edgeHit(3*time.Minute+time.Duration(i)*100*time.Millisecond, addrY, ""))
 	}
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 1 || got[0].Target != addrY || !got[0].Automatic {
+	if got := fr.all(); len(got) != 2 || got[1].Target != addrY || !got[1].Automatic {
 		t.Fatalf("scripted requests: %+v", got)
 	}
 }
@@ -97,18 +97,18 @@ func TestResponseBrowserOutsideWindow(t *testing.T) {
 	if got := fr.all(); len(got) != 1 || !got[0].Automatic {
 		t.Fatalf("a browser request before the window: %+v", got)
 	}
-	// A browser's request inside the window: no block; the next address is judged on its own.
+	// A browser's request inside the window: a recommendation; the next address is judged on its own.
 	h.feed(edgeHit(20*time.Minute, addrY, "none"), edgeHit(20*time.Minute+time.Second, addrY, ""),
 		edgeHit(20*time.Minute+2*time.Second, addrY, ""))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 1 {
+	if got := fr.all(); len(got) != 2 || got[1].Automatic || got[1].Target != addrY {
 		t.Fatalf("browser request in the window: %+v", got)
 	}
 	for i := range 3 {
 		h.feed(edgeHit(20*time.Minute+3*time.Second+time.Duration(i)*time.Second, addrZ, ""))
 	}
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 2 || got[1].Target != addrZ {
+	if got := fr.all(); len(got) != 3 || got[2].Target != addrZ || !got[2].Automatic {
 		t.Fatalf("another address: %+v", got)
 	}
 }
@@ -162,7 +162,7 @@ func TestResponseBrowserCountedOtherTypes(t *testing.T) {
 		// The first counted event (long out of the evidence kept) and the last (a sequence's closing
 		// event).
 		for _, i := range []int{0, len(paths) - 1} {
-			if got := run(i, "cross-site", ""); len(got) != 0 {
+			if got := run(i, "cross-site", ""); !recommended(got, addrX) {
 				t.Errorf("%s, event %d sent by a browser: %+v", tc.name, i, got)
 			}
 			if got := run(i, "", chromeWin); len(got) != 1 || got[0].Automatic {
@@ -173,8 +173,8 @@ func TestResponseBrowserCountedOtherTypes(t *testing.T) {
 }
 
 // Owner decision: a counted request with a browser's (or mail client's) User-Agent and no fetch
-// metadata makes the block a recommendation; fetch metadata anywhere in the count still means no
-// request; a rule that needs a listed address blocks whatever sent the request.
+// metadata makes the block a recommendation; so does fetch metadata anywhere in the count (v0.33.1;
+// no request before); a rule that needs a listed address blocks whatever sent the request.
 func TestResponseBrowserAgentRecommendsOnly(t *testing.T) {
 	h, fr := respHarness(t, false)
 	h.only(t, edgeRule(3))
@@ -186,12 +186,12 @@ func TestResponseBrowserAgentRecommendsOnly(t *testing.T) {
 	}
 	h.feed(edgeUA(0, addrY, "", chromeWin), edgeUA(time.Second, addrY, "same-site", chromeWin), edgeUA(2*time.Second, addrY, "", ""))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 1 {
+	if got := fr.all(); len(got) != 2 || got[1].Automatic || got[1].Target != addrY {
 		t.Fatalf("fetch metadata beside a browser agent: %+v", got)
 	}
 	h.feed(edgeUA(0, addrZ, "", "curl/8"), edgeUA(time.Second, addrZ, "", ""), edgeUA(2*time.Second, addrZ, "", "python-requests/2"))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 2 || !got[1].Automatic || got[1].Target != addrZ {
+	if got := fr.all(); len(got) != 3 || !got[2].Automatic || got[2].Target != addrZ {
 		t.Fatalf("scripted agents: %+v", got)
 	}
 
@@ -428,8 +428,9 @@ func TestResponseBlockAskedAgainWhileItKeepsFiring(t *testing.T) {
 	}
 }
 
-// A repeat request is decided like a first one: not for a firing a browser sent (which doesn't
-// hold the next request back either), not within the interval, not while the rule is snoozed.
+// A repeat request is decided like a first one: a recommendation for a firing a browser sent
+// (which holds the next request back like any other), none within the interval, none while the rule
+// is snoozed.
 func TestResponseBlockRepeatIsDecidedAgain(t *testing.T) {
 	h, fr := respHarness(t, false)
 	r := edgeRule(1)
@@ -444,32 +445,34 @@ func TestResponseBlockRepeatIsDecidedAgain(t *testing.T) {
 	}
 	h.feed(edgeHit(8*time.Minute, addrX, "cross-site"))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 1 {
-		t.Fatalf("a browser's request repeated the block: %+v", got)
+	if got := fr.all(); len(got) != 2 || got[1].Automatic || got[1].Target != addrX {
+		t.Fatalf("a browser's request repeated the block automatically, or asked nothing: %+v", got)
 	}
+	// The recommendation doesn't hold the automatic repeat back (v0.33.1).
 	h.feed(edgeHit(9*time.Minute, addrX, ""))
-	if got := fr.all(); len(got) != 2 || got[1].DetectionID != got[0].DetectionID || got[1].DetectionID == 0 {
+	if got := fr.all(); len(got) != 3 || !got[2].Automatic || got[2].DetectionID != got[0].DetectionID || got[2].DetectionID == 0 {
 		t.Fatalf("repeat (sent at once: the detection has its ID): %+v", got)
 	}
 	h.feed(edgeHit(9*time.Minute+time.Second, addrX, ""))
 	h.clk.advance(writeEvery)
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 2 {
+	if got := fr.all(); len(got) != 3 {
 		t.Fatalf("asked twice: %+v", got)
 	}
 	// The rule snoozed meanwhile: no repeat.
 	h.e.rules.Load().byID["custom.edge"].r.SnoozedUntil = h.clk.now().Add(time.Hour)
 	h.feed(edgeHit(30*time.Minute, addrX, ""))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 2 {
+	if got := fr.all(); len(got) != 3 {
 		t.Fatalf("a snoozed rule's detection repeated its block: %+v", got)
 	}
 }
 
 // The address baseline's firing says what sent the requests it counted (owner decision, reversing
 // "a baseline rule only recommends"; TestBaselineIPBlockFollowsSenders feeds real requests): its
-// block is automatic when the firing carries no browser and no browser agent, a recommendation with
-// a browser agent, and none when a counted request or the firing one came from a browser. A
+// block is automatic when the firing carries no browser and no browser agent, and a recommendation
+// with a browser agent or when a counted request or the firing one came with browser fetch metadata
+// (v0.33.1; no request before). A
 // baseline of another kind keyed by an address (none passes validation today) keeps no senders:
 // its block is a recommendation. A rule that fires on one event (new value) is judged on that event.
 func TestResponseBaselineAndOneEventRules(t *testing.T) {
@@ -504,30 +507,30 @@ func TestResponseBaselineAndOneEventRules(t *testing.T) {
 		t.Fatalf("address baseline, scripted requests: %+v", got)
 	}
 	fire("baseline.ip_behaviour", addrY, "same-origin")
-	if got := fr.all(); len(got) != 1 {
+	if got := fr.all(); len(got) != 2 || got[1].Automatic || got[1].Target != addrY {
 		t.Fatalf("baseline rule fired by a browser's request: %+v", got)
 	}
 	counted("192.0.2.50", firing{browser: true})
-	if got := fr.all(); len(got) != 1 {
+	if got := fr.all(); len(got) != 3 || got[2].Automatic || got[2].Target != "192.0.2.50" {
 		t.Fatalf("address baseline, a browser's request counted: %+v", got)
 	}
 	counted("192.0.2.51", firing{agent: true})
-	if got := fr.all(); len(got) != 2 || got[1].Automatic || got[1].Target != "192.0.2.51" {
+	if got := fr.all(); len(got) != 4 || got[3].Automatic || got[3].Target != "192.0.2.51" {
 		t.Fatalf("address baseline, a browser agent's request counted: %+v", got)
 	}
 	fire("baseline.other", "192.0.2.52", "")
-	if got := fr.all(); len(got) != 3 || got[2].Automatic || got[2].Target != "192.0.2.52" {
+	if got := fr.all(); len(got) != 5 || got[4].Automatic || got[4].Target != "192.0.2.52" {
 		t.Fatalf("a baseline of another kind keyed by an address: %+v", got)
 	}
 	fr.mu.Lock()
 	fr.got = fr.got[:1]
 	fr.mu.Unlock()
 	fire("custom.nv", addrY, "same-origin")
-	if got := fr.all(); len(got) != 1 {
+	if got := fr.all(); len(got) != 2 || got[1].Automatic || got[1].Target != addrY || got[1].RuleID != "custom.nv" {
 		t.Fatalf("new-value rule fired by a browser's request: %+v", got)
 	}
 	fire("custom.nv", addrZ, "")
-	if got := fr.all(); len(got) != 2 || !got[1].Automatic || got[1].Target != addrZ {
+	if got := fr.all(); len(got) != 3 || !got[2].Automatic || got[2].Target != addrZ {
 		t.Fatalf("new-value rule fired by a scripted request: %+v", got)
 	}
 }

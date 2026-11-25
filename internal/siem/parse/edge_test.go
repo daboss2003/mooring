@@ -160,8 +160,9 @@ func TestAudit(t *testing.T) {
 	}
 }
 
-// Sec-Fetch-Site is kept as f.fetch_site: the four values browsers send as written, anything else as
-// "other" (still a browser's request, no free text); no header, no field.
+// Sec-Fetch-Site is kept as f.fetch_site only for the four values browsers send (trimmed,
+// lower-cased); any other value, like no header, stores no field: a made-up value is not evidence
+// of a browser ("other" was stored before v0.33.1), and no free text is kept.
 func TestEdgeAccessFetchSite(t *testing.T) {
 	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 	ts := float64(now.Unix())
@@ -170,7 +171,8 @@ func TestEdgeAccessFetchSite(t *testing.T) {
 	}
 	for v, want := range map[string]string{
 		`"cross-site"`: "cross-site", `"same-origin"`: "same-origin", `"same-site"`: "same-site", `"none"`: "none",
-		`" Cross-Site "`: "cross-site", `"evil<script>"`: "other", `"x"`: "other", `""`: "",
+		`" Cross-Site "`: "cross-site", `"NONE"`: "none", `"\tSame-Origin"`: "same-origin",
+		`"evil<script>"`: "", `"x"`: "", `"other"`: "", `"cross-site, none"`: "", `"cross-sitex"`: "", `" "`: "", `""`: "",
 	} {
 		e, ok := EdgeAccess(line(v), now)
 		if !ok {

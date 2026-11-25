@@ -71,6 +71,7 @@ type activeDet struct {
 	// What it remembers of the requests it made, in memory only (respondCommit): when it last asked
 	// for a block, and the accounts it asked a sign-out for (at most maxSignOuts).
 	blockAsked time.Time
+	recAsked   time.Time // like blockAsked, for a block asked for as a recommendation
 	signedOut  []string
 	// byBrowser, byAgent: its last firing's (firing.browser, firing.agent).
 	byBrowser, byAgent bool

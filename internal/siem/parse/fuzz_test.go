@@ -39,8 +39,10 @@ func FuzzEdgeAccess(f *testing.F) {
 	f.Add(caddyLine(1795440881.5, ""))
 	f.Add([]byte(`{"logger":"http.log.access","ts":1e300,"status":1e308,"duration":1e306,"request":{"client_ip":"::ffff:1.2.3.4"}}`))
 	f.Add([]byte(`{"logger":"http.log.access.x","request":{"headers":{"User-Agent":[""]},"uri":"?"}}`))
+	f.Add([]byte(`{"logger":"http.log.access.x","request":{"headers":{"Sec-Fetch-Site":[" Cross-Site "]}}}`))
+	f.Add([]byte(`{"logger":"http.log.access.x","request":{"headers":{"Sec-Fetch-Site":["evil<script>","none"]}}}`))
 	allowed := map[string]bool{"method": true, "host": true, "path": true, "query": true, "proto": true, "status": true,
-		"dur_ms": true, "size": true, "bytes_read": true, "ua": true, "sni": true, "user_id": true}
+		"dur_ms": true, "size": true, "bytes_read": true, "ua": true, "sni": true, "user_id": true, "fetch_site": true}
 	now := time.Unix(1795440881, 0)
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		e, ok := EdgeAccess(raw, now)
@@ -52,6 +54,10 @@ func FuzzEdgeAccess(f *testing.F) {
 			if !allowed[k] {
 				t.Fatalf("unexpected field %q", k)
 			}
+		}
+		// Only the four values browsers send are ever stored: no text of the client's own.
+		if v, has := e.F["fetch_site"]; has && v != "cross-site" && v != "same-origin" && v != "same-site" && v != "none" {
+			t.Fatalf("f.fetch_site = %q", v)
 		}
 		if d := e.TS.Sub(now); d > window || d < -window {
 			t.Fatalf("TS %v outside the window", e.TS)

@@ -52,7 +52,7 @@ Limits: `msg` 8 KiB; `f` at most 64 fields, keys up to 64 bytes, string values u
 | Kind | Source | `out` | `f` |
 |---|---|---|---|
 | `log` | any | | Unclassified output. |
-| `http.request` | `edge` | | One access log entry: `method`, `host`, `path`, `query`, `proto`, `sni`, `status`, `dur_ms`, `size`, `bytes_read`, `ua` (the User-Agent), `user_id`; `fetch_site` when the request has a `Sec-Fetch-Site` header (a browser sent it): `cross-site`, `same-origin`, `same-site` or `none`, and `other` for any other value. `lvl` is `warn` for a status of 400 and above, `error` for 500 and above. |
+| `http.request` | `edge` | | One access log entry: `method`, `host`, `path`, `query`, `proto`, `sni`, `status`, `dur_ms`, `size`, `bytes_read`, `ua` (the User-Agent), `user_id`; `fetch_site` when the request has a `Sec-Fetch-Site` header with one of the values browsers send: `cross-site`, `same-origin`, `same-site` or `none` (letter case and surrounding spaces ignored); another value is not stored. `lvl` is `warn` for a status of 400 and above, `error` for 500 and above. |
 | `ssh.login` | `host` | `success` / `failure` | `method` (`password`, `publickey`, `keyboard-interactive`), `user`, `key_fp`, `port` |
 | `ssh.invalid_user` | `host` | | `user` |
 | `ssh.disconnect` | `host` | | `user`, `reason` (disconnects before authentication, "Too many authentication failures") |

@@ -135,14 +135,14 @@ func Audit(ts time.Time, ev audit.Event) siem.Event {
 }
 
 // fetchSite is a Sec-Fetch-Site value as stored in f.fetch_site: one of the four values browsers
-// send, or "other" for anything else (present, so the request still counts as a browser's; only
-// the four are kept as written so a client can't put free text there). "" for an empty header.
+// send (trimmed, lower-cased), or "" for anything else.
+// Intentional: a value no browser sends stores nothing. Any client can set the header, so a
+// made-up value is not evidence of a browser (the request is then judged by its User-Agent like
+// any other), and no free text from a client reaches the field.
 func fetchSite(v string) string {
 	switch v = strings.ToLower(strings.TrimSpace(v)); v {
-	case "":
-		return ""
 	case "cross-site", "same-origin", "same-site", "none":
 		return v
 	}
-	return "other"
+	return ""
 }

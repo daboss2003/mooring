@@ -1,6 +1,7 @@
 package detect
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -41,8 +42,9 @@ func ipRespHarness(t *testing.T) (*harness, *fakeResponder) {
 }
 
 // Owner decision: the address baseline's block follows what sent the requests its firing counted,
-// like the other counting rules': fetch metadata on any of them → no request; else a browser's
-// agent on any of them → a recommendation; else automatic.
+// like the other counting rules': fetch metadata or a browser's agent on any of them → a
+// recommendation; else automatic. (Fetch metadata meant no request before v0.33.1: a scanner can
+// send the header too.)
 func TestBaselineIPBlockFollowsSenders(t *testing.T) {
 	if p := packByID["baseline.ip_behaviour"]; p.Response.Action != "" {
 		t.Fatalf("the pack gives baseline.ip_behaviour a response: %+v", p.Response)
@@ -55,16 +57,16 @@ func TestBaselineIPBlockFollowsSenders(t *testing.T) {
 		name string
 		// Request which of the burst's 50 (-1: none) came with fetch metadata, with a browser's agent.
 		site, agent int
-		want        string // "": no request
+		want        string
 	}{
 		{"scripted requests", -1, -1, "auto"},
 		{"a browser's agent on one counted request", -1, 7, "recommend"},
 		{"the last one with a browser's agent", -1, 49, "recommend"},
-		{"fetch metadata on one counted request", 7, -1, ""},
-		{"fetch metadata on the last", 49, -1, ""},
-		{"fetch metadata and a browser's agent", 3, 30, ""},
+		{"fetch metadata on one counted request", 7, -1, "recommend"},
+		{"fetch metadata on the last", 49, -1, "recommend"},
+		{"fetch metadata and a browser's agent", 3, 30, "recommend"},
 		{"a browser's agent in the first slot counted", -1, 0, "recommend"},
-		{"fetch metadata in the first slot counted", 0, -1, ""},
+		{"fetch metadata in the first slot counted", 0, -1, "recommend"},
 	} {
 		ip, d := ipv4(i+1), 2*i // each address on days of its own
 		learnAddrOn(h, ip, d, 20)
@@ -88,11 +90,8 @@ func TestBaselineIPBlockFollowsSenders(t *testing.T) {
 				got = append(got, r)
 			}
 		}
-		switch {
-		case tc.want == "" && len(got) != 0:
-			t.Errorf("%s: asked %+v", tc.name, got)
-		case tc.want != "" && (len(got) != 1 || got[0].Action != siem.ResponseBlock || got[0].Automatic != (tc.want == "auto") ||
-			got[0].Duration != time.Hour):
+		if len(got) != 1 || got[0].Action != siem.ResponseBlock || got[0].Automatic != (tc.want == "auto") ||
+			got[0].Duration != time.Hour {
 			t.Errorf("%s: want %s, got %+v", tc.name, tc.want, got)
 		}
 	}
@@ -115,8 +114,9 @@ func TestBaselineIPSendersOfTheWindowOnly(t *testing.T) {
 		t.Fatalf("browser requests before the window: %+v", got)
 	}
 
-	// A firing a browser's request was counted in asks nothing; the window it fired on is folded
-	// into the usual mix, so the next 50 scripted requests fire on their own and block.
+	// A firing a browser's request was counted in only recommends; the window it fired on is folded
+	// into the usual mix, so the next 50 scripted requests fire on their own and block. The requests
+	// are 7 s apart so the second firing is past blockAskEvery after the first.
 	ip = "198.51.100.9"
 	learnAddrOn(h, ip, 2, 1000) // 1 of 240: with the first window folded in, 51 of 290
 	for j := range 100 {
@@ -124,19 +124,23 @@ func TestBaselineIPSendersOfTheWindowOnly(t *testing.T) {
 		if j == 20 {
 			site = "cross-site"
 		}
-		h.feed(sentReq(at(3, 2, 0).Add(time.Duration(j)*time.Second), ip, site, ""))
+		h.feed(sentReq(at(3, 2, 0).Add(time.Duration(j)*7*time.Second), ip, site, ""))
 		h.e.flush(false)
-		n := 0
+		var auto []bool
 		for _, r := range fr.all() {
 			if r.Target == ip {
-				n++
-				if !r.Automatic {
-					t.Fatalf("request %d: %+v", j, r)
-				}
+				auto = append(auto, r.Automatic)
 			}
 		}
-		if want := j / 99; n != want {
-			t.Fatalf("after request %d: %d block requests, want %d", j, n, want)
+		want := []bool(nil)
+		switch {
+		case j == 99:
+			want = []bool{false, true}
+		case j >= 49:
+			want = []bool{false}
+		}
+		if !slices.Equal(auto, want) {
+			t.Fatalf("after request %d: block requests (automatic) %v, want %v", j, auto, want)
 		}
 	}
 	for _, d := range h.detections(t, "baseline.ip_behaviour") {
@@ -173,14 +177,9 @@ func TestBaselineIPSendersAcrossRestart(t *testing.T) {
 		h.feed(sentReq(burst.Add(89*time.Second), ip, site, ""))
 		h.e.flush(false)
 		got := fr.all()
-		if site != "" {
-			if len(got) != i {
-				t.Fatalf("fetch metadata after the restart: %+v", got)
-			}
-			continue
-		}
-		if len(got) != 1 || !got[0].Automatic || got[0].Target != ip {
-			t.Fatalf("50 scripted requests after the restart: %+v", got)
+		// The 50th scripted: automatic; with fetch metadata: a recommendation.
+		if len(got) != i+1 || got[i].Automatic != (site == "") || got[i].Target != ip {
+			t.Fatalf("the 50th request after the restart (fetch metadata %q): %+v", site, got)
 		}
 	}
 }

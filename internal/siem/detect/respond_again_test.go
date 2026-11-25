@@ -19,18 +19,20 @@ func (h *harness) retireAll() {
 	}
 }
 
-// Every firing of a block rule is judged on its own: a detection whose first firing asked for
-// nothing (a browser's request, a snoozed rule, a mute since lifted) asks at a later firing that
-// qualifies.
+// Every firing of a block rule is judged on its own: a detection whose first firing only
+// recommended (a browser's request) or asked for nothing (a snoozed rule, a mute since lifted) asks
+// for its block at a later firing that qualifies.
 func TestResponseBlockAskedAtALaterFiringThatQualifies(t *testing.T) {
-	// The first firing was a browser's request.
+	// The first firing was a browser's request: a recommendation (no request at all before v0.33.1).
 	h, fr := respHarness(t, false)
 	h.only(t, edgeRule(1))
 	h.feed(edgeHit(0, addrX, "cross-site"))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 0 {
+	if got := fr.all(); !recommended(got, addrX) {
 		t.Fatalf("a browser's request: %+v", got)
 	}
+	// A recommendation doesn't hold the automatic block back: the scripted firing a minute later
+	// asks for it at once (v0.33.1).
 	h.feed(edgeHit(time.Minute, addrX, ""))
 	h.e.flush(false)
 	got := fr.all()
@@ -38,13 +40,13 @@ func TestResponseBlockAskedAtALaterFiringThatQualifies(t *testing.T) {
 	if len(ds) != 1 || ds[0].Count != 2 {
 		t.Fatalf("detections %+v", ds)
 	}
-	if len(got) != 1 || got[0].Target != addrX || !got[0].Automatic || got[0].DetectionID != ds[0].ID || got[0].DetectionID == 0 {
+	if len(got) != 2 || got[1].Target != addrX || !got[1].Automatic || got[1].DetectionID != ds[0].ID || got[1].DetectionID == 0 {
 		t.Fatalf("the scripted firing after a browser's: %+v", got)
 	}
-	// A later browser firing asks nothing, whatever the time since the last request.
+	// A later browser firing recommends again, never blocks.
 	h.feed(edgeHit(20*time.Minute, addrX, "same-origin"))
 	h.e.flush(false)
-	if got := fr.all(); len(got) != 1 {
+	if got := fr.all(); len(got) != 3 || got[2].Automatic || got[2].Target != addrX {
 		t.Fatalf("a later browser firing: %+v", got)
 	}
 
@@ -243,10 +245,10 @@ func TestResponseBrowserMergedIntoItsSecond(t *testing.T) {
 	if got := run(edgeHit(late, addrX, ""), edgeHit(early, addrX, "")); len(got) != 1 || !got[0].Automatic {
 		t.Fatalf("scripted requests: %+v", got)
 	}
-	if got := run(edgeHit(late, addrX, ""), edgeHit(early, addrX, "cross-site")); len(got) != 0 {
+	if got := run(edgeHit(late, addrX, ""), edgeHit(early, addrX, "cross-site")); !recommended(got, addrX) {
 		t.Fatalf("a browser's request merged into its second's entry: %+v", got)
 	}
-	if got := run(edgeHit(late, addrX, "cross-site"), edgeHit(early, addrX, "")); len(got) != 0 {
+	if got := run(edgeHit(late, addrX, "cross-site"), edgeHit(early, addrX, "")); !recommended(got, addrX) {
 		t.Fatalf("a browser's request first in its second: %+v", got)
 	}
 	if got := run(edgeHit(late, addrX, ""), edgeUA(early, addrX, "", chromeWin)); len(got) != 1 || got[0].Automatic {
@@ -305,7 +307,7 @@ func TestResponseAnomalyOldestSlotBrowser(t *testing.T) {
 	if got := run("", ""); len(got) != 1 || !got[0].Automatic {
 		t.Fatalf("scripted: %+v", got)
 	}
-	if got := run("cross-site", ""); len(got) != 0 {
+	if got := run("cross-site", ""); !recommended(got, addrX) {
 		t.Fatalf("a browser's request in the oldest counted slot: %+v", got)
 	}
 	if got := run("", chromeWin); len(got) != 1 || got[0].Automatic {

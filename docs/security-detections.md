@@ -564,7 +564,7 @@ is recorded in Mooring's audit log.
   event), filtered by minimum severity, rule, app and the time of the last event. A detection's page shows its summary, key, location, MITRE ATT&CK techniques,
   first and last time, count and evidence; each evidence event links to the matching events on the
   Security logs page. An evidence event of the edge is marked `browser` (the request had a
-  `Sec-Fetch-Site` header) or `browser-like agent` (a browser's or mail client's User-Agent):
+  `Sec-Fetch-Site` header with a value browsers send) or `browser-like agent` (a browser's or mail client's User-Agent):
   see [Requests sent by a browser](./security-responses.md#requests-sent-by-a-browser).
   **Related events** searches the rule's events for the detection's key
   (an address or /64, an account, a host name with or without a port; a roll-up or a rule without a

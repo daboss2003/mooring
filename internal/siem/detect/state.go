@@ -352,7 +352,7 @@ func evidenceOf(e *siem.Event) siem.Evidence {
 // carried browser fetch metadata (Sec-Fetch-Site, parsed into f.fetch_site); else agent when its
 // User-Agent (f.ua) is a browser's ("Mozilla/…") or a mail client's (Office, Thunderbird), which
 // fetch what a page or an email tells them to.
-// Intentional: a User-Agent is whatever the client says, so agent only ever lowers a block to a
+// Intentional: both headers are whatever the client says, so either only ever lowers a block to a
 // recommendation (responseFor): a scanner claiming to be a browser is shown, not hidden.
 func sentBy(e *siem.Event) (browser, agent bool) {
 	if e.Src != siem.SrcEdge {
