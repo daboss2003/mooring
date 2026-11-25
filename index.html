@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="google-site-verification" content="PkuSMId0UAbJlQ-wI8AB1HFFVsSbJrXy2oOtxfDBClk">
+<title>Mooring — self-hosted PaaS for Docker | CapRover, Coolify &amp; Dokploy alternative</title>
+<meta name="description" content="Mooring is a lightweight, security-first self-hosted PaaS and control plane for Docker. Deploy multi-service apps from one typed YAML with automatic HTTPS, monitoring, alerts, backups, Git deploys and self-healing — no Docker Swarm or Kubernetes. A self-hosted Heroku/Railway and CapRover/Coolify/Dokploy alternative.">
+<meta name="keywords" content="self-hosted PaaS, Docker PaaS, control plane for Docker, CapRover alternative, Coolify alternative, Dokploy alternative, Dokku alternative, Heroku alternative self-hosted, Railway alternative, Docker deployment platform, docker compose dashboard, deploy docker apps, Mooring">
+<link rel="canonical" href="https://daboss2003.github.io/mooring/">
+<link rel="icon" type="image/svg+xml" href="assets/logo.svg">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Mooring">
+<meta property="og:title" content="Mooring — self-hosted PaaS for Docker (CapRover / Coolify / Dokploy alternative)">
+<meta property="og:description" content="Deploy multi-service Docker apps from one typed YAML: automatic HTTPS, monitoring, alerts, backups, Git deploys, self-healing — no Swarm or Kubernetes.">
+<meta property="og:url" content="https://daboss2003.github.io/mooring/">
+<meta property="og:image" content="https://daboss2003.github.io/mooring/assets/og.svg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Mooring — self-hosted PaaS for Docker">
+<meta name="twitter:description" content="A lightweight, security-first self-hosted PaaS / control plane for Docker. A CapRover / Coolify / Dokploy alternative — no Swarm or Kubernetes.">
+<meta name="twitter:image" content="https://daboss2003.github.io/mooring/assets/og.svg">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"Mooring","applicationCategory":"DeveloperApplication","operatingSystem":"Linux","description":"A lightweight, security-first self-hosted PaaS and control plane for Docker. Deploy multi-service apps from one typed YAML with automatic HTTPS, monitoring, alerts, backups, Git deploys and self-healing — no Docker Swarm or Kubernetes.","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"url":"https://github.com/daboss2003/mooring","codeRepository":"https://github.com/daboss2003/mooring","license":"https://www.apache.org/licenses/LICENSE-2.0","programmingLanguage":"Go","keywords":"self-hosted PaaS, Docker, CapRover alternative, Coolify alternative, Dokploy alternative, Heroku alternative"}
+</script>
+<style>
+:root{
+  --ink:#12172b; --body:#4a5169; --muted:#6b7391; --line:#e7e9f2; --bg:#ffffff; --bg2:#f6f7fc;
+  --brand:#6366f1; --brand2:#4f46e5; --brand-soft:#eef0fe;
+  --navy:#0b1024; --navy2:#141b3a; --code:#0d1330; --ok:#2ec27e;
+  --radius:14px; --wrap:1120px; --font:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+*{box-sizing:border-box} html{scroll-behavior:smooth}
+body{margin:0;font-family:var(--font);color:var(--body);background:var(--bg);line-height:1.65;-webkit-font-smoothing:antialiased}
+a{color:var(--brand2);text-decoration:none} a:hover{text-decoration:underline}
+.wrap{max-width:var(--wrap);margin:0 auto;padding:0 22px}
+h1,h2,h3{color:var(--ink);line-height:1.2;letter-spacing:-.01em}
+.btn{display:inline-flex;align-items:center;gap:.5rem;font-weight:600;font-size:15px;padding:.7rem 1.15rem;border-radius:10px;border:1px solid transparent;cursor:pointer;transition:.15s}
+.btn-primary{background:var(--brand);color:#fff} .btn-primary:hover{background:var(--brand2);text-decoration:none}
+.btn-ghost{background:transparent;border-color:rgba(255,255,255,.22);color:#fff} .btn-ghost:hover{border-color:rgba(255,255,255,.5);text-decoration:none}
+.btn-dark{background:#fff;color:var(--navy);border-color:var(--line)} .btn-dark:hover{border-color:#c9cde3;text-decoration:none}
+
+/* top nav */
+.nav{position:sticky;top:0;z-index:20;background:rgba(11,16,36,.85);backdrop-filter:blur(8px);border-bottom:1px solid rgba(255,255,255,.08)}
+.nav .wrap{display:flex;align-items:center;gap:20px;height:62px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;color:#fff;font-size:18px}
+.brand svg{width:26px;height:26px}
+.nav a.link{color:#c7ccea;font-size:15px;font-weight:500} .nav a.link:hover{color:#fff;text-decoration:none}
+.nav .spacer{flex:1}
+.nav .links{display:flex;gap:22px;align-items:center}
+
+/* hero */
+.hero{background:radial-gradient(1100px 480px at 78% -8%,rgba(99,102,241,.28),transparent 60%),linear-gradient(180deg,var(--navy),var(--navy2));color:#dfe3f5;padding:76px 0 92px}
+.hero .wrap{display:grid;grid-template-columns:1.05fr .95fr;gap:52px;align-items:center}
+.eyebrow{display:inline-block;font-size:13px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#a9b0e0;background:rgba(99,102,241,.14);border:1px solid rgba(99,102,241,.3);padding:.3rem .7rem;border-radius:999px;margin-bottom:18px}
+.hero h1{color:#fff;font-size:44px;margin:0 0 16px}
+.hero h1 .grad{background:linear-gradient(90deg,#a5b4fc,#818cf8);-webkit-background-clip:text;background-clip:text;color:transparent}
+.hero p.lead{font-size:19px;color:#c3c9ea;margin:0 0 26px;max-width:34rem}
+.hero .cta{display:flex;gap:12px;flex-wrap:wrap}
+.hero .mini{margin-top:20px;font-size:13.5px;color:#9aa2cf}
+.hero .mini code{background:rgba(255,255,255,.08);padding:.15em .45em;border-radius:6px;color:#dfe3f5;font-family:var(--mono)}
+
+/* terminal card */
+.card{background:var(--code);border:1px solid rgba(255,255,255,.1);border-radius:var(--radius);box-shadow:0 30px 60px -25px rgba(0,0,0,.6);overflow:hidden}
+.card .bar{display:flex;gap:7px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.07)}
+.card .bar i{width:11px;height:11px;border-radius:50%;background:#3a4166;display:block}
+.card .bar i:nth-child(1){background:#ff5f57}.card .bar i:nth-child(2){background:#febc2e}.card .bar i:nth-child(3){background:#28c840}
+.card pre{margin:0;padding:18px 18px 20px;font-family:var(--mono);font-size:13px;line-height:1.7;color:#cdd3f5;overflow:auto}
+.card .k{color:#c4b5fd}.card .s{color:#86efac}.card .c{color:#6b74a8}.card .p{color:#7dd3fc}
+
+/* sections */
+section{padding:78px 0}
+.section-head{text-align:center;max-width:44rem;margin:0 auto 46px}
+.section-head h2{font-size:32px;margin:0 0 12px}
+.section-head p{font-size:17px;color:var(--muted);margin:0}
+.alt{background:var(--bg2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+
+/* features */
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+.feat{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:24px}
+.feat .ico{width:40px;height:40px;border-radius:10px;background:var(--brand-soft);color:var(--brand2);display:flex;align-items:center;justify-content:center;margin-bottom:14px}
+.feat h3{font-size:17px;margin:0 0 7px}
+.feat p{margin:0;font-size:14.5px;color:var(--body)}
+
+/* control plane strip */
+.flow{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;margin-top:8px}
+.flow .node{background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px 20px;font-weight:600;color:var(--ink)}
+.flow .node.mid{background:var(--brand);color:#fff;border-color:var(--brand)}
+.flow .arrow{color:var(--muted);font-size:22px}
+
+/* comparison */
+.cmp{max-width:820px;margin:0 auto;border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;background:#fff}
+table{border-collapse:collapse;width:100%;font-size:15px}
+th,td{padding:13px 16px;text-align:left;border-bottom:1px solid var(--line)}
+thead th{background:var(--bg2);font-size:13px;letter-spacing:.02em;color:var(--muted);text-transform:uppercase}
+td.c{text-align:center;width:96px} .yes{color:var(--ok);font-weight:700} .no{color:#c2c7da}
+tbody tr:last-child td{border-bottom:0} td:first-child{font-weight:500;color:var(--ink)}
+.cmp th.me,.cmp td.me{background:var(--brand-soft)}
+
+/* install */
+.install{max-width:760px;margin:0 auto}
+.install pre{background:var(--code);color:#dfe3f5;border-radius:12px;padding:18px 20px;overflow:auto;font-family:var(--mono);font-size:13.5px;line-height:1.75}
+.install .tabnote{color:var(--muted);font-size:14px;margin:10px 2px 0}
+
+/* footer */
+footer{background:var(--navy);color:#aeb4dc;padding:40px 0}
+footer .wrap{display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap;align-items:center}
+footer a{color:#c7ccea} footer .links{display:flex;gap:20px;flex-wrap:wrap}
+
+@media(max-width:900px){
+  .hero .wrap{grid-template-columns:1fr;gap:34px} .hero h1{font-size:34px}
+  .grid{grid-template-columns:1fr} .nav .links{display:none}
+  .section-head h2{font-size:26px}
+}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="/"><img src="assets/logo.svg" alt="" width="26" height="26" style="width:26px;height:26px"> Mooring</a>
+    <div class="spacer"></div>
+    <nav class="links">
+      <a class="link" href="docs/">Docs</a>
+      <a class="link" href="#features">Features</a>
+      <a class="link" href="#install">Install</a>
+      <a class="link" href="https://github.com/daboss2003/mooring">GitHub</a>
+      <a class="btn btn-primary" href="#install" style="padding:.5rem .95rem">Get started</a>
+    </nav>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <div>
+      <span class="eyebrow">Self-hosted · Docker · No Kubernetes</span>
+      <h1>Push to Git. Get HTTPS. <span class="grad">On your own server.</span></h1>
+      <p class="lead">Mooring is a <strong>self-hosted PaaS for Docker</strong>. You describe your app in one <code>mooring.yaml</code>; it writes the Dockerfile and the Compose, issues and renews the certs, deploys when you <code>git push</code>, and keeps an eye on the whole thing — health, alerts, backups, self-healing. No Kubernetes. No Swarm. No reverse proxy or certbot to babysit.</p>
+      <div class="cta">
+        <a class="btn btn-primary" href="#install">Get started →</a>
+        <a class="btn btn-ghost" href="https://github.com/daboss2003/mooring">★ Star on GitHub</a>
+        <a class="btn btn-ghost" href="docs/">Read the docs</a>
+      </div>
+      <p class="mini">A self-hosted alternative to Heroku &amp; Railway — and to <code>CapRover</code>, <code>Coolify</code> &amp; <code>Dokploy</code>.</p>
+    </div>
+    <div class="card" aria-hidden="true">
+      <div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="c"># mooring.yaml — one file describes your whole app</span>
+<span class="k">services</span>:
+  <span class="k">api</span>:
+    <span class="k">build</span>: { <span class="k">language</span>: <span class="s">node</span> }
+    <span class="k">domains</span>: [<span class="s">api.example.com</span>]   <span class="c"># auto HTTPS</span>
+  <span class="k">worker</span>:
+    <span class="k">build</span>: { <span class="k">language</span>: <span class="s">node</span> }
+  <span class="k">db</span>:
+    <span class="k">image</span>: <span class="s">postgres:16</span>
+
+<span class="c">$</span> <span class="p">git push</span>  <span class="c"># connect the repo, click Deploy</span>
+<span class="s">✓</span> built · <span class="s">✓</span> HTTPS issued · <span class="s">✓</span> healthy</pre>
+    </div>
+  </div>
+</section>
+
+<section id="features">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>The stuff you'd otherwise wire up by hand</h2>
+      <p>Certs, routing, deploys, monitoring, backups — set up for you, locked down by default, and out of your way.</p>
+    </div>
+    <div class="grid">
+      <div class="feat"><div class="ico">🔒</div><h3>Automatic HTTPS</h3><p>Give an app a domain; Mooring issues and renews the certificate and routes traffic. No proxy to run, no certbot.</p></div>
+      <div class="feat"><div class="ico">🚀</div><h3>Deploy from Git</h3><p>Connect a repo, hit Deploy. Mooring writes and owns the Compose file and the Dockerfile — you never touch either.</p></div>
+      <div class="feat"><div class="ico">📊</div><h3>Monitoring &amp; alerts</h3><p>Live health for every app and the host, with email, webhook, Slack, Discord or Telegram alerts and quiet hours.</p></div>
+      <div class="feat"><div class="ico">💾</div><h3>Backups &amp; recovery</h3><p>Encrypted snapshots of your whole setup, with a safe restore onto a fresh server.</p></div>
+      <div class="feat"><div class="ico">⚖️</div><h3>Scaling &amp; self-healing</h3><p>Opt-in and conservative by default: it keeps stateless services responsive, restarts crashed ones, and pages you when it can't cope on its own.</p></div>
+      <div class="feat"><div class="ico">🛡️</div><h3>Least privilege by default</h3><p>Mooring reaches Docker through a read-only proxy — never the raw socket. It ships with a written threat model, and checks its own version against security advisories.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="alt">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>A control plane, not another Docker dashboard</h2>
+      <p>Most tools put a UI on top of Docker, or layer a PaaS on Swarm/Kubernetes. Mooring sits in between as a typed control plane.</p>
+    </div>
+    <div class="flow">
+      <div class="node">Typed YAML</div><span class="arrow">→</span>
+      <div class="node mid">Mooring</div><span class="arrow">→</span>
+      <div class="node">Docker Engine</div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Why Mooring</h2>
+      <p>vs. the tools people usually compare it to.</p>
+    </div>
+    <div class="cmp">
+      <table>
+        <thead><tr><th>&nbsp;</th><th class="c me">Mooring</th><th class="c">CapRover</th><th class="c">Coolify</th><th class="c">Dokploy</th></tr></thead>
+        <tbody>
+          <tr><td>No Docker Swarm required</td><td class="c me yes">✓</td><td class="c no">✕</td><td class="c yes">✓</td><td class="c yes">✓</td></tr>
+          <tr><td>No Kubernetes</td><td class="c me yes">✓</td><td class="c yes">✓</td><td class="c yes">✓</td><td class="c yes">✓</td></tr>
+          <tr><td>Generates &amp; owns Compose + Dockerfile</td><td class="c me yes">✓</td><td class="c no">✕</td><td class="c no">✕</td><td class="c no">✕</td></tr>
+          <tr><td>Single static binary (no extra DB)</td><td class="c me yes">✓</td><td class="c no">✕</td><td class="c no">✕</td><td class="c no">✕</td></tr>
+          <tr><td>Documented security / threat model</td><td class="c me yes">✓</td><td class="c no">~</td><td class="c no">~</td><td class="c no">~</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p style="text-align:center;color:var(--muted);font-size:13.5px;margin-top:14px">Comparisons are best-effort based on each project's public docs — corrections welcome.</p>
+  </div>
+</section>
+
+<section id="install" class="alt">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Install in a couple of minutes</h2>
+      <p>On any Linux server with Docker. Debian / Ubuntu:</p>
+    </div>
+    <div class="install">
+<pre>curl -fsSL https://daboss2003.github.io/mooring/gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/mooring.gpg
+echo "deb [signed-by=/usr/share/keyrings/mooring.gpg] https://daboss2003.github.io/mooring stable main" | sudo tee /etc/apt/sources.list.d/mooring.list
+sudo apt update &amp;&amp; sudo apt install mooring</pre>
+      <p class="tabnote">Prefer a one-off? Grab a <code>.deb</code> / <code>.rpm</code> / static binary from the <a href="https://github.com/daboss2003/mooring/releases/latest">latest release</a>. Then follow the <a href="docs/#/installation">installation guide</a>.</p>
+      <div style="text-align:center;margin-top:26px">
+        <a class="btn btn-primary" href="docs/">Open the docs →</a>
+        <a class="btn btn-dark" href="https://github.com/daboss2003/mooring">View on GitHub</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="brand"><img src="assets/logo.svg" alt="" width="24" height="24" style="width:24px;height:24px"> Mooring</div>
+    <div class="links">
+      <a href="docs/">Docs</a>
+      <a href="https://github.com/daboss2003/mooring">GitHub</a>
+      <a href="https://github.com/daboss2003/mooring/releases">Releases</a>
+      <a href="https://github.com/daboss2003/mooring/blob/main/LICENSE">Apache-2.0</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

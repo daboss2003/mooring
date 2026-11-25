@@ -1,0 +1,7 @@
+Origin: . stable
+Label: . stable
+Archive: stable
+Suite: stable
+Codename: stable
+Architecture: arm64
+Component: main

@@ -1,0 +1,302 @@
+# Running many apps on one server
+
+A per-app definition describes one app. When you run several apps on a server, a few things belong to the **server**, not to any single app — shared alert channels, server-wide defaults, and the order apps should come up in. That's what the host file is for.
+
+See also: [The `mooring.yaml` file](./definition-file.md) · [Installation](./installation.md)
+
+---
+
+## The host file
+
+The host file (`kind: Host`) is an optional, server-level definition where you set:
+
+- **Shared defaults** — values that apply to every app unless the app overrides them (for example, common labels or sensible resource defaults).
+- **Which apps live on this server**, and the **order to deploy them** — so a database comes up before the app that depends on it.
+
+A host file looks like this:
+
+```yaml
+apiVersion: mooring/v1
+kind: Host
+spec:
+  # The registry of apps on this box (registering does NOT deploy — it just lists them).
+  apps:
+    - slug: db
+      enabled: true
+      source: { repo: "git@github.com:me/db.git", ref: "refs/heads/main" }
+    - slug: web
+      enabled: true
+      source: { repo: "git@github.com:me/web.git", ref: "refs/heads/main" }
+      # source can also be `{ path: /srv/app }` (a local checkout) or `{ managed: true }`.
+
+  # Defaults projected beneath every app (the app's own value always wins). A default may
+  # only TIGHTEN a posture, never silently widen one.
+  defaults:
+    scaling: { min: 1, max: 3 }   # a replica ceiling every app's scaling stays within
+    self_healing: true            # supervise every app unless it opts out
+    auto_deploy: false            # git auto-deploy off by default
+
+  # Sequence a multi-app bring-up: deploy `web` only once `db` is healthy.
+  orchestration:
+    deploy_order:
+      - { deploy: web, after: db }
+    setup_order: [db, web]
+```
+
+Like the per-app file, the host file is the source of truth: you keep it in version control, and the dashboard reads it (it shows the deployed server settings, and is read-only for them).
+
+## Where settings live (and what the dashboard can change)
+
+Mooring keeps settings in three layers, by how sensitive they are:
+
+1. **The root of trust** — your master key, the dashboard login, the IP allowlist, and the network address. These live in `config.yaml` and are set **over SSH at install**. The dashboard can **never** change them; they're set over SSH at install only.
+2. **Server settings** — the host-wide defaults and coordination above.
+3. **App settings** — everything about an individual app: its image, env, secrets, routes, scaling, and so on.
+
+Layers 2 and 3 are defined in their definition files (the host file and each app's `mooring.yaml`); the dashboard reflects them read-only, except the operational things it deliberately owns — secret values, lifecycle actions, and the auto-scaling policy. Layer 1 stays SSH-only on purpose. Settings combine in order — a built-in default, then a server default, then the app's own value — with the most specific winning, and the same safety checks apply no matter which layer a value came from.
+
+## The `config.yaml` reference
+
+`config.yaml` (default `/etc/mooring/config.yaml`) is the **root of trust** — edited only over SSH, never by the dashboard. Edit it with `sudo mooring config edit` and check it with `sudo mooring config check`; an error names the line ([Checking and editing `config.yaml`](./config-editing.md)). [Installation](./installation.md) walks through the essentials; this is the complete surface. Every block is optional except `encryption_key`, `ip_allowlist` and the `auth` block (and `edge.acme_email` in managed mode); sensible defaults apply to the rest.
+
+```yaml
+# --- Identity & network ---
+bind_addr: "127.0.0.1:9000"          # loopback admin listener (default); the edge fronts public ports
+encryption_key: "<base64 32 bytes>"  # REQUIRED — master key for encrypting secrets at rest
+encryption_key_previous: ""          # set during a key rotation so old data still decrypts
+data_dir: "/var/lib/mooring"         # where the database, git clones, and backups live
+protected_projects: []               # compose projects Mooring must never start/stop (its own infra)
+
+ip_allowlist: ["127.0.0.1/32", "::1/128", "203.0.113.0/24"]  # REQUIRED — addresses or CIDRs allowed to reach the dashboard; an empty list is refused. The SSH tunnel arrives from loopback
+trust_proxy: false                   # honor X-Forwarded-For (only behind the managed edge / a trusted proxy)
+trusted_proxies: []                  # in external-edge mode: the specific edge IP(s), ≤ /24
+
+# --- Operators & roles (RBAC) ---
+auth:                                 # the PRIMARY operator — always an owner
+  username: "admin"
+  password_hash: "<mooring hash-password>"
+  totp_secret: "<mooring gen-totp>"   # optional 2FA
+users:                                # ADDITIONAL operators (omit for single-user)
+  - username: "deploy-bot"
+    password_hash: "..."
+    role: deployer                    # owner | deployer | viewer
+
+# --- The edge (HTTPS / routing) ---  see docs/edge-and-tls.md for the full treatment
+edge:
+  mode: managed                       # managed (default) | external
+  acme_email: "ops@example.com"       # REQUIRED in managed mode
+  acme_ca: "https://acme-v02.api.letsencrypt.org/directory"
+  base_domain: "example.com"          # optional: enables the `subdomain:` shorthand
+  dns01: { provider: cloudflare, api_token: "..." }   # optional: one wildcard cert; Mooring installs the Caddy DNS plugin (edge-and-tls.md)
+  base_domains: []                    # optional: additional NAMED namespaces (prod + staging on one box)
+  cas: []                             # optional: private/internal ACME issuers to opt into by name
+  apply_probe_window: 20s
+  l4_enabled: false                   # managed TCP/UDP load balancer (child nginx); needs nginx on host
+  l4_nginx_digest: ""                 # optional pinned nginx digest
+  trusted_proxies: []                 # optional: CDN/load balancer in front of the edge (see below)
+  client_ip_header: ""                # optional: header a trusted proxy's client address is read from
+
+# --- Exposing the dashboard through the edge (default: loopback-only) ---
+admin:
+  hostname: ""                        # e.g. admin.example.com — or use `subdomain` with edge.base_domain
+  subdomain: ""                       # shorthand: <subdomain>.<edge.base_domain>
+  edge_listen: "127.0.0.1:9001"       # internal listener the edge dials for the admin vhost
+
+# --- Docker access (Mooring never touches the raw socket) ---
+docker:
+  proxy_addr: "127.0.0.1:2375"        # the read-only socket-proxy Mooring manages by default
+  external_proxy: false               # true = you run your own proxy at proxy_addr
+  write_plane_min_mb: 0               # 0 = default (~900 MiB of RAM+swap gates the write plane);
+                                      # lower it to run on a tiny box at your own risk (builds need headroom)
+
+# --- Read plane & git polling ---
+monitor:
+  poll_interval: 10s                  # host/app metrics poll
+  metrics_retention: 168h             # keep 7 days of metrics
+git:
+  poll_interval: 2m                   # auto-fetch connected repos (0 or negative disables)
+github:                               # optional one-click "Connect with GitHub"
+  client_id: ""
+  client_secret: ""
+
+# --- Sessions ---
+session:
+  idle_timeout: 10m                   # focused dashboard never idles out; abandoned one logs out
+  absolute_timeout: 12h               # hard ceiling regardless of activity
+cookie:
+  prefix: "__Host-"                   # or "__Secure-" (pairs with base_path)
+
+# --- Audit retention (never silently drops a security row) ---
+retention:
+  interval: 6h
+  events_max_age: 8760h               # 365d (min 24h)
+  events_max_rows: 200000
+  archive_max_mb: 64
+
+# --- Alerting (off by default) ---  see docs/alerting.md
+alerting:
+  enabled: false
+  eval_interval: 30s
+  notify_min_interval: 5s
+  quiet_start_hour: -1                # 0-23, or -1 to disable quiet hours (holds WARNING until they end; CRITICAL always pages)
+  quiet_end_hour: -1                  # 0-23 (0 = midnight), or -1; any other value turns quiet hours off (logged at startup)
+  dead_mans_url: ""                   # outbound heartbeat to an external cron-monitor
+  dead_mans_interval: 5m
+
+# --- The Server tab (host inspection & upkeep) ---  see docs/server-tab.md
+server:
+  file_roots: []                      # [{name, path}] read-only browsable dirs (opt-in)
+  deb_cache_dir: ""                   # absolute dir where you download .deb updates (enables cleanup)
+  version_check_enabled: true         # self-update / security-advisory check (api.github.com only)
+  version_check_interval: 6h
+  image_scan_enabled: true            # Trivy vulnerability scanning (heavy — turn off on a tiny box)
+  image_scan_interval: 24h            # also the host scan's schedule (1h floor)
+  host_scan_enabled: true             # Trivy scan of the host's OS packages + the binaries Mooring runs (Server tab); on by default
+  image_update_check_enabled: true    # detect newer images for pull-image services (Server tab); on by default
+  image_update_interval: 24h          # how often to re-check the registry (1h floor)
+  route_error_log_enabled: true       # the per-route edge error log (Errors tab); on by default
+  service_log_enabled: true           # capture+retain each service's stdout/stderr for search; on by default
+                                      # (writes app output to disk; see docs/service-trends-and-logs.md)
+  service_log_max_retain: 30d         # cap on any service's logs.retain (1h–365d); the default is 48h
+  service_log_max_lines: 200000       # cap on any service's logs.max_lines (100–10000000); the default is 2000
+  service_log_max_disk_mb: 2048       # disk budget for all captured logs; oldest files removed first (64–102400)
+  disk_gc_enabled: true               # reclaim dangling images + build cache when disk is tight
+  disk_gc_threshold: 75               # % disk usage that triggers it (50–95)
+  build_cache_keep_enabled: true      # trim BuildKit cache after each build-deploy
+  build_cache_keep: "5GB"             # how much recent cache to keep
+  build_concurrency: auto             # auto (one image at a time on ≤2 CPUs) | serial | parallel
+  start_gate:                         # pacing of automatic container starts — see docs/scaling-and-self-healing.md#start-pacing
+    enabled: true
+    cpu_busy_pct: 85                  # host CPU % at which automatic starts wait (10–100)
+    settle_grace: 30s                 # minimum start-up time of a container without a healthcheck
+    cpu_settle_pct: 50                # % of one core below which such a container has settled
+    max_settle: 3m                    # longest one start holds others back
+    max_wait: 10m                     # longest an action waits for CPU
+    deploy_wait: 2m                   # deploys/operator actions: total wait for CPU or other starts
+    service_settle: 15m               # deploys/operator actions: longest wait for one service to become healthy
+    rollout_budget: 45m               # deploys/operator actions: total pacing, then the rest start unpaced
+
+# --- App-data backups (off by default) ---  see docs/backup-and-recovery.md
+backups:
+  enabled: false
+  schedule: 24h                       # 1h floor
+  retention: 7                        # snapshots kept per volume
+  helper_image: "busybox:1.36"
+  s3: null                            # optional off-box destination (bucket/endpoint/region/keys/…); when set,
+                                      # the Mooring-state backup is also uploaded daily at 03:00, 10 kept (even with enabled: false)
+
+# --- Security logs (on by default) ---  see docs/security-logs.md
+security_logs:
+  enabled: true
+  hot_retention: 14d                  # kept and searchable on this server (1d–90d)
+  hot_max_disk_mb: 10240              # disk for the on-server segments + security.db (minimum 256)
+  archive:
+    retention: 365d                   # archived hours older than this are deleted from S3 (minimum 1d)
+    s3: null                          # optional encrypted off-box copy: the same keys as backups.s3
+  pii:
+    hash_fields: []                   # more field names stored as a keyed hash
+    drop_fields: []                   # more field names removed
+    keep_fields: []                   # names taken out of the built-in lists
+  host_logs:
+    enabled: true
+    auth_log: ""                      # "" = /var/log/auth.log, else /var/log/secure
+    fail2ban_log: ""                  # "" = /var/log/fail2ban.log
+    journal: null                     # null = the journal only when there is no auth log file
+  feeds:                              # enrichment data Mooring downloads (GeoIP, threat-intel lists)
+    geoip: true                       # DB-IP City + ASN Lite, checked daily
+    spamhaus: true                    # Spamhaus DROP lists, daily
+    tor: true                         # Tor exit list, every 6 hours
+    dshield_contact: ""               # an email address: also DShield's block list, daily
+  detection:
+    enabled: true                     # the detection rules
+    patterns:                         # log patterns (see docs/security-patterns.md)
+      enabled: true
+      max_cpu_percent: 5              # the miner's share of one CPU core (1–25)
+      exclude_apps: []                # app slugs whose lines are not mined
+  response:                           # automated response (see docs/security-responses.md)
+    mode: off                         # off | recommend | enforce
+    max_blocks_per_hour: 60           # automatic blocks placed in an hour (1–1000)
+    max_revokes_per_hour: 3           # automatic sign-outs in an hour (1–100)
+    max_block_duration: 24h           # the longest automatic block (1h–7d)
+  blocking:                           # the edge block list; applies with security logs off too
+    max_entries: 1000                 # automatic blocks in force (1–10000)
+    manual_max_duration: 30d          # the longest manual block (1h–30d)
+    l4: false                         # true: L4 forward: proxy listeners refuse blocked IPv4 addresses
+    never_block: []                   # IP addresses and CIDRs never blocked
+
+# --- Mode-3 setup-script sandbox (off by default, hard-gated) ---
+setup:
+  enabled: false
+  image: "<digest-pinned jail image>"
+  wall_clock: 5m
+  cpus: "1.0"
+  memory_mb: 512
+  pids_limit: 256
+  scratch_mb: 512
+  output_cap_kb: 256
+
+# --- Softening lints (default strict) ---
+caddy_editor: { mode: strict }        # strict | review
+compose_validation: { mode: strict }
+```
+
+### Edge trusted proxies
+
+| Key | Default | Accepted values |
+|---|---|---|
+| `edge.trusted_proxies` | *(none)* | A list of CIDRs (`198.51.100.0/24`), IP addresses (`192.0.2.7`) and preset names (`cloudflare`: Cloudflare's published IPv4 and IPv6 ranges, shipped with Mooring and refreshed each release). `0.0.0.0/0`, `::/0` and `::ffff:0.0.0.0/96` are refused. `edge.mode: managed` only. |
+| `edge.client_ip_header` | `CF-Connecting-IP` when `trusted_proxies` lists `cloudflare`, else `X-Forwarded-For` | A header name: letters, digits and `-`, at most 64 characters. A value you set always applies. Refused without `trusted_proxies`, and for `Host`, `Forwarded`, `Cookie`, `Authorization`, `Proxy-Authorization`, `Connection`, `Content-Length`, `Transfer-Encoding` and `Upgrade`. |
+
+A request whose TCP peer is in `trusted_proxies` gets its client address from `client_ip_header`,
+read right to left (the last address not in `trusted_proxies`); apps receive it as
+`X-Forwarded-For`. From any other peer, `X-Forwarded-For` is the peer address. The admin vhost's
+`ip_allowlist` check always uses the TCP peer. With `trusted_proxies` set the edge refuses HTTP/3
+0-RTT (early data). Requires Caddy 2.11 or later; restart Mooring after a change. See
+[Behind a CDN or proxy](./edge-and-tls.md#behind-a-cdn-or-proxy).
+
+These are separate from the top-level `trust_proxy` / `trusted_proxies`, which apply to the
+dashboard listener in external-edge mode.
+
+> **Reload vs. restart.** `sudo systemctl reload mooring` applies `ip_allowlist`, `trust_proxy`, `trusted_proxies`, `auth`, `users` and `retention.*`. `ip_allowlist` is applied to the dashboard and to the edge route of the dashboard hostname; when Caddy refuses the new list the edge keeps the previous one, and while the edge serves the dashboard hostname it refuses a list with an entry that admits every address ([`ip_allowlist` at the edge](./config-editing.md#ip_allowlist-at-the-edge)). Every other setting is read at start and needs `sudo systemctl restart mooring`, including every `alerting.*` setting (quiet hours, intervals, the heartbeat), every `security_logs.*` setting, the GitHub credentials, the bind address, the encryption key, `admin.*`, and the `edge.*` settings such as `dns01`, `base_domains` and `catch_all`. A reload checks the file first and fails, leaving the running service unchanged, when the file is refused. `mooring config check` and `mooring config edit` print which of the two a change needs. See [reload or restart](./config-editing.md#apply-a-change-reload-or-restart).
+
+### Files in `/etc/mooring`
+
+| File | Owner and mode | What it is |
+|---|---|---|
+| `config.yaml` | `root:mooring`, `0640` | The configuration. |
+| `config.yaml.last-good` | `root`, `0600` | The file `mooring config edit` last replaced. Holds the same secrets as `config.yaml`. |
+| `.config.lock` | `root`, `0600` | The lock of `mooring config edit`. Empty; it stays in place between runs. |
+
+`ip_allowlist` entries are an address or a CIDR. An address without a prefix length is that one address, an IPv4-mapped IPv6 address (`::ffff:198.51.100.7`) is the IPv4 address, and spaces around an entry are ignored. The dashboard and the edge use the same canonical list.
+
+### Security logs
+
+`security_logs` is on by default; the keys, their ranges and the `archive.s3` destination are in
+[Security logs](./security-logs.md#configuration). Without `archive.s3`, security logs are kept on
+this server only, and Mooring logs a `config:` warning at startup. The `feeds` downloads connect to
+`download.db-ip.com`, `www.spamhaus.org`, `check.torproject.org` and, with `dshield_contact`,
+`feeds.dshield.org` over HTTPS ([Enrichment](./security-logs.md#outbound-connections)).
+
+| Key | Default | Accepted values |
+|---|---|---|
+| `security_logs.detection.patterns.enabled` | `true` | `false` turns [log patterns](./security-patterns.md) off. |
+| `security_logs.detection.patterns.max_cpu_percent` | `5` | `1`–`25`: the miner's share of one CPU core. |
+| `security_logs.detection.patterns.exclude_apps` | `[]` | Up to 256 app slugs whose lines are not mined. |
+| `security_logs.response.mode` | `off` | `off`, `recommend` or `enforce`: see [Automated response](./security-responses.md#turning-it-on). `recommend` and `enforce` need detection on, and Caddy 2.11 or later for automatic blocks. |
+| `security_logs.response.max_blocks_per_hour` | `60` | `1`–`1000`: automatic blocks placed in an hour. |
+| `security_logs.response.max_revokes_per_hour` | `3` | `1`–`100`: automatic sign-outs of Mooring accounts in an hour. |
+| `security_logs.response.max_block_duration` | `24h` | `1h`–`7d`: the longest automatic block. |
+| `security_logs.blocking.max_entries` | `1000` | `1`–`10000`: automatic blocks in force. |
+| `security_logs.blocking.manual_max_duration` | `30d` | `1h`–`30d`: the longest manual block. |
+| `security_logs.blocking.l4` | `false` | `true`: L4 `forward: proxy` listeners refuse new connections from blocked IPv4 addresses. Needs `edge.l4_enabled: true`. |
+| `security_logs.blocking.never_block` | `[]` | Up to 256 IP addresses and CIDRs that are never blocked, besides the [built-in ones](./security-responses.md#addresses-that-are-never-blocked). |
+
+A number or duration outside its range is clamped, with a `config:` warning at startup. Mooring
+also logs a `config:` warning for a `response.mode` of `recommend` or `enforce` with security logs
+or detection off, and for `blocking.l4: true` with `edge.l4_enabled` off. An unknown
+`mode`, a `never_block` entry that is no IP address or CIDR, and an `exclude_apps` entry that is no
+app slug refuse startup. The `blocking` keys apply with `security_logs.enabled: false` too.
+
+## Acknowledging changes
+
+If a setting that *broadens* what an app can do changes (say, opening a new route or raising a limit), Mooring surfaces it for you to acknowledge rather than applying it silently — so an unexpected change in a file you committed can't quietly take effect.
